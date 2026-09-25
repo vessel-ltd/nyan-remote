@@ -85,16 +85,21 @@ function home(lang) {
     t('nyan-remote — Claude Code をスマホで', 'nyan-remote — Claude Code on your phone'),
     `<section class="hero"><img class="cat" src="/icon.png" alt=""><div class="text">
 <h1>${t('いつもの claude のまま、<br>Claude Code をスマホで。', 'Keep running claude.<br>Use it from your phone.')}</h1>
-<p class="dim">${t('全部のマシンと全部のアカウントのセッションを1つの画面に。終わったら通知、承認はスマホから。応答中はねこが走ります。', 'Every session on every machine and every account in one list. Get notified when a turn ends, answer approvals from your phone. A cat runs while Claude is working.')}</p>
+<p class="nope">${t('tmux なし。SSH なし。起動し直しなし。出かける前の準備なし。', 'No tmux. No SSH. No relaunching. No setup before you leave.')}</p>
+<p class="dim">${t('アカウント2つ、PC 2台、朝いつもの <code>claude</code> で始めたセッションが3つ。スマホを開けば3つとも並んでいて、どれにでも返事ができます。無料から始められて、オープンソースです。', 'Two accounts, two PCs, three sessions you started this morning with plain <code>claude</code>. On your phone, all three are there, and you can reply to any of them. Free to start, open source.')}</p>
 <p><a class="btn" href="#install">${t('はじめる', 'Get started')}</a> <a class="btn ghost" href="#pricing">${t('料金', 'Pricing')}</a></p>
 </div></section>
 
 <h2>${t('できること', 'What it does')}</h2>
 <div class="grid">
-<div class="card"><h3>${t('起動のしかたは変えない', 'No new way to start')}</h3><p class="dim">${t('いつもどおり <code>claude</code> で起動したセッションが、そのままスマホから見えて、打てます。専用のコマンドで起動し直す必要はありません。', 'Sessions you start with plain claude show up on your phone as they are, and you can type into them. No wrapper command to relaunch with.')}</p></div>
-<div class="card"><h3>${t('全部のマシン・全部のアカウント', 'All machines, all accounts')}</h3><p class="dim">${t('WSL・mac・Linux の複数のマシンと、1台の中の複数の Claude アカウントを、1つの一覧にまとめます。', 'Several machines (WSL, macOS, Linux) and several Claude accounts on one machine, merged into one list.')}</p></div>
-<div class="card"><h3>${t('通知と承認', 'Notifications and approvals')}</h3><p class="dim">${t('ターンが終わった・承認を待っている、をスマホに通知（iPhone・Android）。承認と選択肢には、その場で答えられます。', 'Push notifications (iPhone and Android) when a turn ends or an approval is waiting. Answer approvals and choices right there.')}</p></div>
-<div class="card"><h3>${t('中身は暗号化・自分で建てられる', 'End-to-end encrypted, self-hostable')}</h3><p class="dim">${t('スマホと PC の間は E2E で暗号化。relay には中身が見えません。Tailscale や、自分の Cloudflare に建てた relay なら無料で、アカウントも要りません（OSS・MIT）。', 'Phone ↔ PC traffic is end-to-end encrypted; the relay cannot read it. With Tailscale or your own Cloudflare relay it is free and needs no account (open source, MIT).')}</p></div>
+<div class="card"><h3>${t('いつもの <code>claude</code> のまま', 'Keep typing <code>claude</code>')}</h3><p class="dim">${t('もう始めてあるセッションを、そのまま。起動し直しも、tmux も、SSH も、ポートを開けることも要りません。', 'The sessions you already started, as they are. Nothing to relaunch, no tmux, no SSH, no port to open.')}</p></div>
+<div class="card"><h3>${t('全部のアカウント・全部のマシン', 'Every account, every machine')}</h3><p class="dim">${t('どの PC の <code>~/.claude</code> も <code>~/.claude-*</code> も自動で見つけて、1つの一覧にまとめます。承認待ちが先頭に来ます。', '<code>~/.claude</code> and every <code>~/.claude-*</code> on every PC, found automatically and merged into one list. Waiting approvals come first.')}</p></div>
+<div class="card"><h3>${t('通知と承認', 'Notifications and approvals')}</h3><p class="dim">${t('ターンが終わったとき、Claude が呼んでいるときに通知（iPhone・Android）。承認・質問への回答・止める、をスマホから。', 'A push when a turn ends or Claude needs you, on iPhone and Android. Approve, answer Claude\'s questions, or stop a running turn, right from your phone.')}</p></div>
+<div class="card"><h3>${t('自動承認は、条件つきで', 'Auto-approve, on your terms')}</h3><p class="dim">${t('1つのセッションを3時間か24時間だけ任せきりに。オンの間はずっと画面に出ていて、1タップで止まります。', 'Let one session run unattended for 3 or 24 hours. It stays on screen the whole time, and one tap turns it off.')}</p></div>
+<div class="card"><h3>${t('E2E で暗号化', 'End-to-end encrypted')}</h3><p class="dim">${t('コードとプロンプトはスマホと PC の間で暗号化。relay が運ぶのは暗号文と接続のメタデータだけです。', 'Your code and prompts are encrypted between your phone and your PC. The relay only passes ciphertext and connection metadata.')}</p></div>
+<div class="card"><h3>${t('オープンソース・自分で建てられる', 'Open source, self-hostable')}</h3><p class="dim">${t('MIT。Tailscale か、自分の Cloudflare に建てた relay なら、無料でアカウントも要りません。', 'MIT licensed. Use it over Tailscale or run the relay in your own Cloudflare account: free, no account needed.')}</p></div>
+<div class="card"><h3>${t('ストアは要らない', 'No app store needed')}</h3><p class="dim">${t('ホーム画面に追加する Web アプリ。今日から iPhone でも Android でも使えます。', 'A web app you add to your home screen. Works on iPhone and Android today.')}</p></div>
+<div class="card"><h3>${t('ねこがいます', 'A cat for company')}</h3><p class="dim">${t('7匹から選べます。Claude が動いている間だけ走ります。', 'Pick one of seven cats. It runs while Claude is working.')}</p></div>
 </div>
 
 <h2 id="soon">Coming soon</h2>

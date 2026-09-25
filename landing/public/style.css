@@ -21,6 +21,8 @@ code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.92em}
 /* ★ 文中の code は本文と同じ字体（等幅に切り替わると浮いて見えた / 2026-09-25）。等幅はコマンドの枠（pre）だけ */
 p code,li code,td code{font-family:inherit;font-size:inherit;font-weight:600}
 .card p code{white-space:nowrap}
+.hero .nope{font-weight:600;margin:4px 0 10px}
+h3 code{font-family:inherit;font-size:inherit}
 table{width:100%;border-collapse:collapse;margin:12px 0}
 th,td{text-align:left;vertical-align:top;padding:10px 8px;border-top:1px solid var(--line)}
 th{width:34%;font-weight:600}
