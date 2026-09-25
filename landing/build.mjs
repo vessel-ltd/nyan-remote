@@ -32,6 +32,28 @@ const SUPPORT_FORM = `${ACCOUNT}/#support`
 const FREE = PLAN_LIMITS.free
 const PLUS = PLAN_LIMITS.plus
 
+const SITE = 'https://nyan-remote.app'
+
+/**
+ * ★ Link previews (X, Slack, LINE, Discord …). The image is the same as the GitHub social preview
+ *   (`landing/public/og.png`, 1280×640 — made from `docs/brand/social-preview.html`). ⚠️ Absolute URLs only.
+ */
+function ogTags(url, title, description, lang) {
+  return [
+    `<meta property="og:type" content="website">`,
+    `<meta property="og:site_name" content="nyan-remote">`,
+    `<meta property="og:url" content="${esc(url)}">`,
+    `<meta property="og:title" content="${esc(title)}">`,
+    `<meta property="og:description" content="${esc(description)}">`,
+    `<meta property="og:image" content="${SITE}/og.png">`,
+    `<meta property="og:image:width" content="1280">`,
+    `<meta property="og:image:height" content="640">`,
+    `<meta property="og:image:alt" content="nyan-remote — Claude Code sessions on your phone">`,
+    `<meta property="og:locale" content="${lang === 'ja' ? 'ja_JP' : 'en_US'}">`,
+    `<meta name="twitter:card" content="summary_large_image">`,
+  ].join('\n')
+}
+
 const esc = (s) => s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c])
 
 function page(lang, path, title, body) {
@@ -40,6 +62,7 @@ function page(lang, path, title, body) {
 <html lang="${lang}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>${esc(title)}</title>
 <meta name="description" content="${esc(t('いつもの claude のまま、全部のマシンと全部のアカウントの Claude Code を、ねこと一緒にスマホで。', 'Your Claude Code sessions on every machine and every account, on your phone — keep starting claude as usual.'))}">
+${ogTags(`${SITE}${path}`, title, t('いつもの claude のまま、全部のマシンと全部のアカウントの Claude Code を、ねこと一緒にスマホで。', 'Your Claude Code sessions on every machine and every account, on your phone — keep starting claude as usual.'), lang)}
 <link rel="icon" href="/favicon.png"><link rel="stylesheet" href="/style.css">
 </head><body>
 <header class="top"><a href="/"><img src="/icon.png" alt=""></a><a class="grow" href="/"><strong>nyan-remote</strong></a><a class="btn ghost" href="${ACCOUNT}">Account</a></header>
