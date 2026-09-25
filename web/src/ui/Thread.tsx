@@ -19,7 +19,7 @@ import { Composer } from './Composer.tsx'
 import { followAction } from './follow.ts'
 import { alreadyInTranscript, type InflightMessage } from '../../../shared/types.ts'
 import { formatTokens } from './tokens.ts'
-import { beginSend, consumeAfterReload, finishSend, noteArrivals, type PendingSend } from './pending.ts'
+import { beginSend, cancelAfterStop, consumeAfterReload, dismissPending, finishSend, noteArrivals, type PendingSend } from './pending.ts'
 import { Permissions } from './Permissions.tsx'
 import { neutralizedNote, sendMark } from './sendMark.ts'
 import {
@@ -636,6 +636,8 @@ export function Thread({
     try {
       const res = await transport.interrupt(sessionId)
       setNote({ bad: false, text: stopSentNote(res.cleared === true) })
+      // ★★ The input box was cleared ⇒ keystroke sends still waiting in the CLI queue were erased with it (pending.ts `cancelled`)
+      if (res.cleared === true) setPending(cancelAfterStop)
     } catch (err) {
       // ⚠️ Refusal reasons (approval card showing, session that cannot be stopped, etc.) are **shown next to the input box**.
       //    They used to go into the top `error`, so the text we most wanted seen was invisible
@@ -1087,8 +1089,23 @@ export function Thread({
           <div class="who">
             {t('スマホから', 'From phone')}{' '}
             <span class="chip">
-              {now - p.at > UNSURE_MS ? t('届いたか確認できません', 'Can’t confirm it arrived') : t('送信中…', 'Sending…')}
+              {p.cancelled
+                ? t('止めたときに消えました（届いていません）', 'Cleared by Stop (not delivered)')
+                : now - p.at > UNSURE_MS
+                  ? t('届いたか確認できません', 'Can’t confirm it arrived')
+                  : t('送信中…', 'Sending…')}
             </span>
+            {/* ★ A leftover bubble can be dismissed by hand (it is only a display; nothing is sent) */}
+            {p.cancelled || now - p.at > UNSURE_MS ? (
+              <button
+                type="button"
+                class="pendingx"
+                aria-label={t('この表示を消す', 'Dismiss')}
+                onClick={() => setPending((prev) => dismissPending(prev, p.id, p.at))}
+              >
+                ×
+              </button>
+            ) : null}
           </div>
           <div class="md">{p.text}</div>
         </div>

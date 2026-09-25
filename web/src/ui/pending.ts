@@ -36,6 +36,13 @@ export interface PendingSend {
    */
   sending?: boolean
   seen?: ArrivedEntry[]
+  /**
+   * ★★ "Stop" cleared the PC input box while this keystroke send had not arrived (2026-09-25 / seen on a real device).
+   *   ⚠️ While Claude is responding, the CLI **queues** what is typed; ESC puts the queue back into the input box
+   *   (`queue-operation` `popAll` in the transcript) and the automatic Ctrl-U then erases it ⇒ it never arrives.
+   *   ⇒ Say so instead of "Can't confirm it arrived" forever. ⚠️ Still cleared if a matching record turns up after all.
+   */
+  cancelled?: boolean
 }
 
 /** The minimal shape used for matching (just the needed part of `LogEntry`) */
@@ -63,7 +70,8 @@ export function consumePending(pending: PendingSend[], arrivals: ArrivedEntry[])
     // Even if the same text remains several times, drop **only the oldest one**.
     // ⚠️ Drop only route-compatible ones (keystrokes: no `via` / inbox: `via: 'inbox'`)
     // ⚠️ Awaiting reply (`sending`) has no route yet, so not dropped here (`noteArrivals` notes it)
-    const i = rest.findIndex((p) => !p.sending && p.text === a.text && matches(p.route, a.via))
+    const text = a.text
+    const i = rest.findIndex((p) => !p.sending && matches(p.route, a.via) && sameText(p.route, p.text, text))
     if (i >= 0) rest.splice(i, 1)
   }
   return rest.length === pending.length ? pending : rest
@@ -79,6 +87,37 @@ function matches(route: PendingSend['route'], via: string | undefined): boolean 
   if (route === 'keys') return via === undefined
   // `inbox`, and old agents that do not return `route` (versions without the keystroke route)
   return via === 'inbox'
+}
+
+/**
+ * ★★ Whether a record's text is this send (2026-09-25 / seen on a real device).
+ *   ⚠️⚠️ Keystrokes are **appended to the PC input box**, so a half-typed draft on the PC is joined in front
+ *   (`…修正。` + `Test` → the record is `…修正。Test`). Exact equality left "Can't confirm it arrived" behind for ever.
+ *   ⇒ keystrokes (and sends whose route is not known yet): the record **ends with** the sent text.
+ *   ⚠️ The inbox does not join anything ⇒ exact (after trimming, like the CLI).
+ *   ⚠️ Only records that arrived after the send are passed here, so the looser rule does not reach older ones.
+ */
+export function sameText(route: PendingSend['route'] | 'unknown', sent: string, record: string): boolean {
+  const a = sent.trim()
+  const b = record.trim()
+  if (a.length === 0) return false
+  return route === 'keys' || route === 'unknown' ? b.endsWith(a) : a === b
+}
+
+/**
+ * ★★ "Stop" also cleared the PC input box (`cleared`) ⇒ keystroke sends not yet seen were erased with it (see `cancelled`).
+ *   ⚠️ Only settled keystroke sends: the inbox does not go through the input box, and a send still awaiting its reply
+ *   has no route yet.
+ */
+export function cancelAfterStop(pending: PendingSend[]): PendingSend[] {
+  // ★ A send awaiting its reply has no `route` yet, so `route === 'keys'` already leaves it out
+  if (!pending.some((p) => p.route === 'keys' && !p.cancelled)) return pending
+  return pending.map((p) => (p.route === 'keys' ? { ...p, cancelled: true } : p))
+}
+
+/** ★ The user dismissed a leftover bubble (unconfirmed or cancelled) */
+export function dismissPending(pending: PendingSend[], id: number | undefined, at: number): PendingSend[] {
+  return pending.filter((p) => !(p.id === id && p.at === at))
 }
 
 /** ★ Key identifying a record (time, route, text). ⚠️ Used so that "one record is used only once" */
@@ -118,7 +157,8 @@ export function noteArrivals(pending: PendingSend[], arrivals: readonly ArrivedE
       if (key) used?.add(key)
       continue
     }
-    const j = rest.findIndex((p) => p.sending && p.text === a.text)
+    const text = a.text
+    const j = rest.findIndex((p) => p.sending && sameText('unknown', p.text, text))
     if (j >= 0) {
       rest = rest.map((p, k) => (k === j ? { ...p, seen: [...(p.seen ?? []), a] } : p))
       changed = true
@@ -161,9 +201,12 @@ export function consumeAfterReload(pending: PendingSend[], entries: readonly Arr
     const key = recordKey(e)
     if (used.has(key)) continue
     const t = Date.parse(e.at)
+    const text = e.text
     // ★ Only sends started before that record can match (per-send boundary). Only the oldest one
     const i = rest.findIndex(
-      (p) => t >= p.at - RELOAD_SLACK_MS && p.text === e.text && (p.sending || matches(p.route, e.via)),
+      (p) =>
+        t >= p.at - RELOAD_SLACK_MS &&
+        (p.sending ? sameText('unknown', p.text, text) : matches(p.route, e.via) && sameText(p.route, p.text, text)),
     )
     if (i < 0) continue
     used.add(key)

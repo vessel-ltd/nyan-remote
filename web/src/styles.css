@@ -1858,6 +1858,18 @@ input.urlinput {
   opacity: 0.6;
   border-style: dashed;
 }
+/* ★ Dismiss a leftover "sending" bubble (a display only) */
+.pendingx {
+  margin-left: 6px;
+  padding: 0 6px;
+  border: none;
+  background: none;
+  color: var(--dim);
+  font: inherit;
+  font-size: 1rem;
+  line-height: 1;
+  cursor: pointer;
+}
 
 /* Notice that slash commands don't get through (shown above the input box) */
 .composerhint {
