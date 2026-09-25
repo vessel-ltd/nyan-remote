@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import type { LogEntry } from '../../../shared/types.ts'
-import { anchoredScrollY, firstVisibleIndex, isMine, keepLoading, MAX_SCROLLBACK_PAGES, MINE_SLACK_PX, pickPrevMine } from './scrollback.ts'
+import { anchoredScrollY, firstVisibleIndex, isMine, keepLoading, MAX_SCROLLBACK_PAGES, MINE_SLACK_PX, pickPrevMine, showMineJump } from './scrollback.ts'
 
 const me: LogEntry = { kind: 'user', text: 'やって' }
 const fromPhone: LogEntry = { kind: 'user', text: 'スマホから', via: 'inbox' }
@@ -78,4 +78,18 @@ test('★★ background-task completion notices (<task-notification>) are not ow
   assert.equal(isMine({ kind: 'user', text: '<task-notification>\n<task-id>x</task-id>' }), false)
   assert.equal(isMine({ kind: 'user', text: '  <task-notification>' }), false)
   assert.equal(isMine({ kind: 'user', text: 'task-notification を調べて' }), true)
+})
+
+test('★★ "↑ My message" shows only away from the bottom, with a message of yours above (or more to load) (2026-09-25)', async () => {
+  const base = { loading: false, atBottom: false, hasPrevMine: true, moreToLoad: false }
+  assert.equal(showMineJump(base), true)
+  assert.equal(showMineJump({ ...base, atBottom: true }), false, '⚠️ covers the reply being read at the bottom')
+  assert.equal(showMineJump({ ...base, hasPrevMine: false }), false, '⚠️ nothing of yours above to jump to')
+  assert.equal(showMineJump({ ...base, hasPrevMine: false, moreToLoad: true }), true, '★ older pages may hold one')
+  assert.equal(showMineJump({ ...base, loading: true }), false)
+  // ★ Wiring: the thread uses this decision, recomputed on scroll and when the content changes
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync(new URL('./Thread.tsx', import.meta.url), 'utf8')
+  assert.match(src, /showMineJump\(\{ loading, atBottom, hasPrevMine, moreToLoad: cursor !== null \}\)/)
+  assert.equal(src.match(/setHasPrevMine\(findPrevMine\(\) !== undefined\)/g)?.length, 2)
 })

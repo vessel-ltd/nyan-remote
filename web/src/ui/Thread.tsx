@@ -36,7 +36,7 @@ import {
 import { Confirm } from './Confirm.tsx'
 import { autoApproveBanner, autoApproveError, autoApproveOnText, autoApproveView } from './autoApprove.ts'
 import { stopSentNote, stopView } from './stop.ts'
-import { anchoredScrollY, firstVisibleIndex, isMine, keepLoading, pickPrevMine } from './scrollback.ts'
+import { anchoredScrollY, firstVisibleIndex, isMine, keepLoading, pickPrevMine, showMineJump } from './scrollback.ts'
 import { ThreadBar, type ThreadBarAction } from './ThreadBar.tsx'
 import type { ThreadAlert } from './alerts.ts'
 import { armStale, showStale, type StaleGate } from './staleNotice.ts'
@@ -163,6 +163,8 @@ export function Thread({
   const [loading, setLoading] = useState(true)
   const [showThinking, setShowThinking] = useState(false)
   const [atBottom, setAtBottom] = useState(true)
+  /** ★ A message of yours is above the view (for when "↑ My message" is shown / `showMineJump`) */
+  const [hasPrevMine, setHasPrevMine] = useState(false)
   // ★★ -1 means "not loaded yet". **Never use 0 as the sentinel** (see below)
   const tailRef = useRef(-1)
   /**
@@ -406,12 +408,19 @@ export function Thread({
         window.innerHeight + window.scrollY >= document.body.scrollHeight - BOTTOM_SLACK
       atBottomRef.current = near
       setAtBottom(near)
+      setHasPrevMine(findPrevMine() !== undefined)
       measure()
     }
     onScroll()
     window.addEventListener('scroll', onScroll, { passive: true })
     return () => window.removeEventListener('scroll', onScroll)
   }, [])
+
+  // ★ Content changes without scrolling too (a reply grows, older pages are read) ⇒ look again after it is laid out
+  useEffect(() => {
+    const id = requestAnimationFrame(() => setHasPrevMine(findPrevMine() !== undefined))
+    return () => cancelAnimationFrame(id)
+  }, [entries])
 
   // ★ Re-read when the endpoint changes.
   //
@@ -1133,7 +1142,7 @@ export function Thread({
         </button>
       ) : null}
       {/* ★★ Scroll back by your own messages (2026-09-24 / `ui/scrollback.ts`). ⚠️ Stacked above "↓ Latest" (`.jump.mine`) */}
-      {!loading && (cursor !== null || entries.some(isMine)) ? (
+      {showMineJump({ loading, atBottom, hasPrevMine, moreToLoad: cursor !== null }) ? (
         <button
           class="jump mine"
           disabled={seeking}

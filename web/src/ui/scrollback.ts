@@ -59,3 +59,13 @@ export function anchoredScrollY(before: { scrollY: number; height: number }, hei
 export function firstVisibleIndex(bottoms: readonly number[], viewTop: number): number {
   return bottoms.findIndex((b) => b > viewTop)
 }
+
+/**
+ * ★★ When "↑ My message" is shown (2026-09-25 / user request).
+ *   ⚠️ **Not at the bottom** (like "↓ Latest"): reading a long reply at the bottom, the button sat over the text.
+ *   ⚠️ **And only with a message of yours above** the view — or older pages not loaded yet (one may be there; pressing reads them).
+ */
+export function showMineJump(o: { loading: boolean; atBottom: boolean; hasPrevMine: boolean; moreToLoad: boolean }): boolean {
+  return !o.loading && !o.atBottom && (o.hasPrevMine || o.moreToLoad)
+}
+
