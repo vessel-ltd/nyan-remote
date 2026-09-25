@@ -3,6 +3,7 @@
 //
 //   node scripts/publish-public.mjs            # build, check, commit and push
 //   node scripts/publish-public.mjs --dry-run  # build and check only (prints where the tree is)
+//   node scripts/publish-public.mjs --approve-new  # publish including files that were never public before (listed first)
 //
 // ★ The public history is one commit per release; the private history (work notes, machine names, old diffs)
 //   never leaves this repository.
@@ -61,6 +62,8 @@ export function forbiddenPatterns(root) {
     .map((l) => l.trim())
     .filter((l) => l && !l.startsWith('#'))
     .map((l) => new RegExp(l, 'i'))
+  // ⚠️⚠️ An empty list would silently turn the personal-value check off (codex round 34)
+  if (personal.length === 0) throw new Error('docs/publish-forbidden.txt has no patterns (the personal-value check would be off).')
   return [...personal, ...SECRET_SHAPES]
 }
 
@@ -86,6 +89,8 @@ export function scan(root, patterns) {
   const hits = []
   for (const f of files(root)) {
     const rel = relative(root, f)
+    // ★ The path itself is public too (a file named after a machine leaks it / codex round 34)
+    for (const re of patterns) if (re.test(rel)) hits.push(`${rel}: path matches ${re}`)
     const buf = readFileSync(f)
     const binary = BINARY_EXT.test(rel)
     if (!binary && buf.includes(0)) {
@@ -102,6 +107,7 @@ export function scan(root, patterns) {
 
 function main() {
   const dry = process.argv.includes('--dry-run')
+  const approveNew = process.argv.includes('--approve-new')
   const root = git(['rev-parse', '--show-toplevel'])
   if (git(['status', '--porcelain'], { cwd: root })) throw new Error('The working tree is not clean. Commit first.')
   git(['fetch', '-q', 'origin'], { cwd: root })
@@ -151,6 +157,14 @@ function main() {
     git(['clone', '-q', '--depth', '1', PUBLIC_URL, pub])
   } catch {
     throw new Error(`Cannot clone ${PUBLIC_URL} (create the public repository first).`)
+  }
+  // ★★ Files that were not public before must be approved by name (codex round 34: a private JSON/HTML in an allowed
+  //   folder would otherwise ship). ⇒ list them and stop unless --approve-new.
+  const before = new Set([...files(pub)].map((f) => relative(pub, f)))
+  const added = [...files(tree)].map((f) => relative(tree, f)).filter((f) => !before.has(f))
+  if (added.length && before.size > 0 && !approveNew) {
+    console.error(`✗ ${added.length} file(s) would be public for the first time. Check them, then run again with --approve-new:\n${added.map((f) => `  ${f}`).join('\n')}`)
+    process.exit(1)
   }
   for (const name of readdirSync(pub)) if (name !== '.git') rmSync(join(pub, name), { recursive: true, force: true })
   cpSync(tree, pub, { recursive: true })

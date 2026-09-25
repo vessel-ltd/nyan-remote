@@ -4,7 +4,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
-import { classify, scan, SECRET_SHAPES } from './publish-public.mjs'
+import { classify, forbiddenPatterns, scan, SECRET_SHAPES } from './publish-public.mjs'
 
 test('★★★ only listed places and file types are public; anything else stops the publish', () => {
   assert.equal(classify('agent/src/index.ts'), 'keep')
@@ -32,6 +32,22 @@ test('★★★ nothing is skipped by the scan: NUL in a text file stops, secret
     assert.ok(hits.some((h) => h.startsWith('a/y.png') && /whsec/.test(h)), '⚠️⚠️ a secret inside an image was not found')
     assert.ok(!hits.some((h) => h.startsWith('a/z.ts')))
     assert.ok(!hits.some((h) => h.startsWith('a/clean.png')), '⚠️ an ordinary image (NUL bytes, no secret) was refused')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('★★ the path is checked too, and an empty personal-value list stops (codex round 34)', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'nyan-publish-test-'))
+  try {
+    mkdirSync(join(dir, 'docs'))
+    writeFileSync(join(dir, 'docs', 'publish-forbidden.txt'), '# only comments\n\n')
+    assert.throws(() => forbiddenPatterns(dir), /no patterns/, '⚠️⚠️ an empty list turned the check off silently')
+    writeFileSync(join(dir, 'docs', 'publish-forbidden.txt'), 'secretbox\n')
+    mkdirSync(join(dir, 'agent'))
+    writeFileSync(join(dir, 'agent', 'secretbox.ts'), 'export const ok = true\n')
+    const hits = scan(join(dir, 'agent'), forbiddenPatterns(dir))
+    assert.ok(hits.some((h) => /path matches/.test(h)), '⚠️⚠️ a forbidden value in a file name was not caught')
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
