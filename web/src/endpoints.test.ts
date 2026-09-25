@@ -16,7 +16,7 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import {
   mergeAdded,
-  upsertEndpoint, canSwitchRoute, endpointRoute, hasRoute, loadEndpoints,
+  upsertEndpoint, canSwitchRoute, endpointRoute, hasRoute, loadEndpoints, mergeRoute,
   saveEndpoints, selfCandidate, setRouteIn, shouldOfferManualUrl, shouldOfferSelf,
   type AgentEndpoint
 } from './endpoints.ts'
@@ -317,4 +317,46 @@ test('★★ staleTwins: returns those with the same relay entrance and name but
   for (const state of ['ok', 'checking', undefined] as const) {
     assert.deepEqual(staleTwins(list, { machine: 'PC', relayUrl: R, agentPublicKey: 'NEW' }, () => state), [], String(state))
   }
+})
+
+test('★★ a local registration switches an existing relay endpoint back to local (Tailscale after the relay is turned off / codex)', () => {
+  const relay = { url: 'wss://relay.example', agentPublicKey: 'K' }
+  const list = [{ id: 'https://pc-b.example.ts.net', url: 'https://pc-b.example.ts.net', label: 'mine', relay, kind: 'relay' as const }]
+  const next = upsertEndpoint(list, { url: 'https://pc-b.example.ts.net', label: 'pc-b', kind: 'local' })
+  assert.ok(next)
+  assert.equal(endpointRoute(next[0]!), 'local', '⚠️⚠️ kept dialling the relay that was turned off')
+  assert.equal(next[0]!.label, 'mine', '★ the name the user gave stays')
+  // ★ Without a route, an existing endpoint keeps its route (as before)
+  assert.equal(upsertEndpoint(list, { url: 'https://pc-b.example.ts.net', label: 'pc-b' }), undefined)
+})
+
+test('★★ the open screen takes route changes made by pairing, and nothing else (codex round 2)', () => {
+  const relay = { url: 'wss://relay.example', agentPublicKey: 'K' }
+  const a = { id: 'a', url: 'https://a.example.ts.net', label: 'A', relay, kind: 'relay' as const }
+  const b = { id: 'b', url: 'https://b.example.ts.net', label: 'B', relay, kind: 'relay' as const }
+  // Pairing switched A to local in the parent; the user switched B to local on this screen
+  const editing = [a, { ...b, kind: 'local' as const }]
+  const got = mergeRoute(editing, [a, b], [{ ...a, kind: 'local' }, b])
+  assert.equal(got[0]!.kind, 'local', '⚠️⚠️ Save would restore the dead relay')
+  assert.equal(got[1]!.kind, 'local', '★ the user\'s own switch is kept')
+  // ★ Back to the default (no kind) is carried too
+  const { kind: _k, ...plain } = a
+  assert.equal(mergeRoute([a], [a], [plain])[0]!.kind, undefined)
+})
+
+test('★ wiring: the Endpoints screen merges route changes (mergeRoute) when the parent list changes', async () => {
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync(new URL('./ui/Endpoints.tsx', import.meta.url), 'utf8')
+  assert.match(src, /setList\(\(prev\) => \[\.\.\.mergeAdded\(mergeRoute\(mergeRelay\(prev, endpoints\), prevFresh, endpoints\), prevFresh, endpoints\)\]\)/)
+})
+
+test('★★ a new relay entry point from pairing survives Save on the open screen (moved to a self-hosted relay / codex round 3)', () => {
+  const ours = { url: 'wss://relay.nyan-remote.app', agentPublicKey: 'K' }
+  const mine = { url: 'wss://nyan-relay.someone.workers.dev', agentPublicKey: 'K' }
+  const a = { id: 'a', url: '', label: 'A', relay: ours, kind: 'relay' as const }
+  const got = mergeRoute([a], [a], [{ ...a, relay: mine }])
+  assert.deepEqual(got[0]!.relay, mine, '⚠️⚠️ Save would put our relay back')
+  assert.equal(got[0]!.kind, 'relay')
+  // ★ Unchanged in the parent ⇒ the edited row stays as it is
+  assert.equal(mergeRoute([a], [a], [a])[0], a)
 })

@@ -34,6 +34,8 @@ export interface Env {
    * ★ After this time (ISO), phones are not let into rooms without a license ticket. ⚠️ Missing or unreadable = not required (during the grace period, as before)
    */
   LICENSE_REQUIRED_FROM?: string
+  /** ★ `'1'` on a self-hosted relay (`wrangler.selfhost.jsonc`): no plans, no tickets */
+  SELF_HOSTED?: string
 }
 
 /** ★ License ticket public key (⚠️ if empty, no ticket passes = fail-closed / `shared/license.ts`) */
@@ -125,6 +127,7 @@ export class Rendezvous extends DurableObject<Env> {
       const from = Date.parse(this.env.LICENSE_REQUIRED_FROM ?? '')
       return Number.isFinite(from) && Date.now() >= from
     },
+    selfHosted: () => this.env.SELF_HOSTED === '1',
   })
 
   constructor(ctx: DurableObjectState, env: Env) {

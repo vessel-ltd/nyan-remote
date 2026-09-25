@@ -216,6 +216,12 @@ export interface RoomIo {
   claimMachine(acct: string, key: string, maxMachines: number, mid: string): Promise<ClaimResult>
   /** ★ Whether the date after which phones are not let into rooms without a ticket has passed (⚠️ default is "not passed" = as before during the grace period) */
   licenseRequired(): boolean
+  /**
+   * ★★ **Someone else's relay** (`SELF_HOSTED=1` in `wrangler.selfhost.jsonc` / 2026-09-25): no plans at all.
+   *   Tickets are never asked for (so no agent, old or new, sends one) and every room takes `MAX_DEVICES` phones.
+   *   ⚠️ Without it, a signed-in agent's ticket put our Free plan's 2-phone limit on the user's own relay (codex).
+   */
+  selfHosted(): boolean
 }
 
 /** ★ Reply from the ledger (⚠️ falls to `machine-limit` if unreachable) */
@@ -295,6 +301,7 @@ export class Room {
    * ⚠️ Never above `MAX_DEVICES` (even if a ticket carries a broken value, relay owns the room limit).
    */
   #deviceLimit(): number {
+    if (this.#io.selfHosted()) return MAX_DEVICES
     const lic = this.#agent()?.tag()?.lic
     if (lic && lic.exp > this.#io.now()) return Math.min(lic.maxDevices, MAX_DEVICES)
     return this.#io.licenseRequired() ? 0 : MAX_DEVICES
@@ -363,7 +370,8 @@ export class Room {
       side: 'agent',
       ...(control ? { control: true } : {}),
       // ⚠️ Tickets ride on top of `drop` / `ready` (`l=1` only together with `c=1`)
-      ...(control && licensing ? { licensing: true } : {}),
+      // ⚠️ A self-hosted relay does not take the ticket declaration (⇒ never sends `want` ⇒ never receives a ticket)
+      ...(control && licensing && !this.#io.selfHosted() ? { licensing: true } : {}),
       pending: {
         key,
         nonce: c.nonce,

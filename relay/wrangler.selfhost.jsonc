@@ -1,0 +1,35 @@
+{
+  // ★★ **Your own relay** (2026-09-25). Deploy with:  npx wrangler deploy -c wrangler.selfhost.jsonc
+  //   Then on each PC set "relayUrl" in ~/.nyan-remote/config.json to wss://<name>.<your-subdomain>.workers.dev
+  //   (or your own domain) and restart the agent.
+  //
+  // ⚠️ `wrangler.jsonc` next to this is **our production relay** (our account, our domain, sign-in required) — do not use it.
+  //   What this file leaves out on purpose:
+  //   - `account_id`  ⇒ wrangler uses the account you are logged in to
+  //   - `routes`      ⇒ served on workers.dev (add your own custom domain if you like)
+  //   - `LICENSE_REQUIRED_FROM` ⇒ **no sign-in**
+  //     (with it, phones without a ticket from our account service are refused with 402)
+  //   And it adds `SELF_HOSTED` ⇒ **no plans**: a signed-in PC's ticket is not asked for, rooms take up to 8 phones
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "nyan-relay",
+  "main": "src/worker.ts",
+  "compatibility_date": "2026-01-01",
+  // ⚠️ Per-version preview URLs would add public entry points running old code
+  "preview_urls": false,
+  "workers_dev": true,
+  "observability": { "enabled": true },
+  // ★★ No plans on your own relay: tickets are never asked for, every room takes up to 8 phones (`selfHosted` in src/room.ts)
+  "vars": { "SELF_HOSTED": "1" },
+  "durable_objects": {
+    "bindings": [
+      { "name": "RENDEZVOUS", "class_name": "Rendezvous" },
+      // ★ Only used with plan tickets (never on a self-hosted relay), but the class is exported by the worker, so it stays bound
+      { "name": "ACCOUNTS", "class_name": "Accounts" }
+    ]
+  },
+  // ⚠️ SQLite backend (the one available on the free plan)
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["Rendezvous"] },
+    { "tag": "v2", "new_sqlite_classes": ["Accounts"] }
+  ]
+}

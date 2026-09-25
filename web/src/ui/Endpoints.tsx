@@ -8,6 +8,7 @@ import {
   loadEndpoints,
   mergeAdded,
   mergeRelay,
+  mergeRoute,
   saveEndpoints,
   selfCandidate,
   setRouteIn,
@@ -132,7 +133,8 @@ export function Endpoints({
     if (!endpoints) return
     const prevFresh = seenFresh.current
     seenFresh.current = endpoints
-    setList((prev) => [...mergeAdded(mergeRelay(prev, endpoints), prevFresh, endpoints)])
+    // ★ Route changes from pairing too (codex / `mergeRoute`)
+    setList((prev) => [...mergeAdded(mergeRoute(mergeRelay(prev, endpoints), prevFresh, endpoints), prevFresh, endpoints)])
     // ★ Show status for the new ones (don't leave them stuck at "checking…")
     const before = new Set(prevFresh.map((e) => e.id))
     for (const e of endpoints) if (!before.has(e.id)) void probe(e)

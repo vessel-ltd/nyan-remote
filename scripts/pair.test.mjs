@@ -216,7 +216,9 @@ async function fakeAgentV2(states, { issueDelayMs = 0, expiresInMs = 300000 } = 
     if (req.method === 'POST' && path === '/pair/token' && issueDelayMs > 0) {
       await new Promise((r) => setTimeout(r, issueDelayMs))
     }
-    res.writeHead(200, { 'content-type': 'application/json' })
+    // ⚠️ Status first: unknown paths answer 404 (writing 200 before it threw ERR_HTTP_HEADERS_SENT)
+    const known = (req.method === 'POST' && (path === '/pair/token' || path === '/pair/token/ID123/cancel')) || (req.method === 'GET' && path === '/pair/token/ID123')
+    res.writeHead(known ? 200 : 404, { 'content-type': 'application/json' })
     if (req.method === 'POST' && path === '/pair/token') {
       res.end(
         JSON.stringify({
@@ -232,7 +234,6 @@ async function fakeAgentV2(states, { issueDelayMs = 0, expiresInMs = 300000 } = 
     } else if (req.method === 'POST' && path === '/pair/token/ID123/cancel') {
       res.end(JSON.stringify({ cancelled: true }))
     } else {
-      res.writeHead(404)
       res.end('{}')
     }
   })
@@ -419,6 +420,59 @@ test('★★★ expiry is decided by the agent\'s answer (succeeds if registered
     assert.match(out.stdout, /✅ 登録されました/)
   } finally {
     agent.server.close()
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+async function signInAgent(refreshed) {
+  const seen = []
+  const server = createServer((req, res) => {
+    const path = new URL(req.url, 'http://x').pathname
+    seen.push(`${req.method} ${path}`)
+    res.writeHead(200, { 'content-type': 'application/json' })
+    if (path === '/account/refresh') return res.end(JSON.stringify(refreshed))
+    // ⚠️ `/health` says signed out even when signed in (stale right after `nyan login`) ⇒ it must not be what decides
+    if (path === '/health') return res.end(JSON.stringify({ account: { signedIn: false } }))
+    if (path.endsWith('/cancel')) return res.end(JSON.stringify({ cancelled: true }))
+    if (req.method === 'GET' && path === '/pair/token/p1') return res.end(JSON.stringify({ state: 'registered', deviceId: 'abcd1234', label: 'phone', already: false }))
+    res.end(
+      JSON.stringify({
+        url: `nyan://pair?v=1&a=${'B'.repeat(87)}&t=${'T'.repeat(32)}&n=test&r=${encodeURIComponent('wss://relay.nyan-remote.app')}`,
+        expiresAt: new Date(Date.now() + 300000).toISOString(),
+        machine: 'test-machine',
+        id: 'p1',
+      }),
+    )
+  })
+  await new Promise((r) => server.listen(0, '127.0.0.1', r))
+  return { server, seen }
+}
+
+test('★★ signed out on our relay: stops before the QR, says `nyan login`, and gives the code back (2026-09-25)', async () => {
+  const { server, seen } = await signInAgent({ signedIn: false })
+  const dir = stateDir()
+  try {
+    const out = await run([], { NYAN_REMOTE_STATE_DIR: dir, NYAN_REMOTE_PORT: String(server.address().port) })
+    assert.equal(out.code, 4, `exit code: ${out.stderr}`)
+    assert.match(out.stderr, /nyan login/)
+    assert.doesNotMatch(out.stdout, /nyan:\/\/pair/, '⚠️ showed a QR the phone cannot use')
+    assert.ok(seen.includes('POST /pair/token/p1/cancel'), `⚠️ the one-time code was left valid: ${seen.join(', ')}`)
+  } finally {
+    server.close()
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('★★ right after `nyan login` (the agent re-reads it; `/health` is still stale): the QR is shown (codex)', async () => {
+  const { server, seen } = await signInAgent({ signedIn: true })
+  const dir = stateDir()
+  try {
+    const out = await run([], { NYAN_REMOTE_STATE_DIR: dir, NYAN_REMOTE_PORT: String(server.address().port) })
+    assert.ok(seen.includes('POST /account/refresh'), 'did not ask the agent to re-read the sign-in')
+    assert.ok(!seen.some((x) => x.endsWith('/cancel')), `⚠️ cancelled a signed-in pairing: ${seen.join(', ')}`)
+    assert.doesNotMatch(out.stderr, /nyan login/)
+  } finally {
+    server.close()
     rmSync(dir, { recursive: true, force: true })
   }
 })

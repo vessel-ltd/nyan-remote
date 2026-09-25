@@ -62,6 +62,25 @@ export const DISTRIBUTION_ORIGIN = 'https://app.nyan-remote.app'
 export const DEFAULT_RELAY_URL = 'wss://relay.nyan-remote.app'
 
 /**
+ * ★ Host names of **our** relay (the current one and the old workers.dev one kept alive above).
+ *   ⚠️ Our relay requires `nyan login` (2026-09-25 / `LICENSE_REQUIRED_FROM`); a self-hosted relay does not.
+ */
+export const OUR_RELAY_HOSTS: readonly string[] = ['relay.nyan-remote.app', 'nyan-relay.nyan-remote-relay.workers.dev']
+
+/** ★ Is this relay entry point ours? (⚠️ never throws; an unreadable value is "not ours") */
+export function isOurRelay(url: unknown): boolean {
+  if (typeof url !== 'string') return false
+  try {
+    const u = new URL(url)
+    // ⚠️ A terminal dot is the same DNS name (`relay.nyan-remote.app.`): classify it as ours too (codex — otherwise no ticket ⇒ 402)
+    const host = u.hostname.toLowerCase().replace(/\.$/, '')
+    return (u.protocol === 'wss:' || u.protocol === 'ws:') && OUR_RELAY_HOSTS.includes(host)
+  } catch {
+    return false
+  }
+}
+
+/**
  * ★ Entry point for accounts and billing (2026-09-24 / docs/BILLING.md). Used by `nyan login` and by the agent fetching tickets.
  * ⚠️ Only needed when using our relay (Tailscale or your own relay need no account).
  */

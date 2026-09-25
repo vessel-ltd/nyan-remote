@@ -50,7 +50,7 @@ installs it under `~/nyan-remote`, registers a background service (`systemd --us
 and wires up the Claude Code hooks. Then, in a new terminal:
 
 ```bash
-nyan login     # only if you use our hosted relay (GitHub sign-in; not needed for Tailscale or your own relay)
+nyan login     # our hosted relay (the default) requires it — GitHub sign-in
 nyan pair      # shows a QR code; scan it with https://app.nyan-remote.app on your phone
 ```
 
@@ -89,8 +89,8 @@ Three ways to connect, chosen **per machine**, so a mesh of several PCs can mix 
 | Route | What it needs | Notes |
 |---|---|---|
 | **`relay`** (default) | nothing | The agent only makes outbound connections. |
-| **`relay`, self-hosted** | a Cloudflare account | Deploy `relay/` yourself, then set `relayUrl` in `config.json`. |
-| **`local`** | Tailscale | Direct; nothing leaves your machines. |
+| **`relay`, self-hosted** | a Cloudflare account | Deploy `relay/` yourself, then set `relayUrl` in `config.json` ([steps](#run-the-relay-in-your-own-cloudflare-account)). |
+| **`local`** | Tailscale | Direct; nothing leaves your machines ([steps](#use-tailscale-local)). |
 
 > `local` needs the agent to have a **real HTTPS name**, not just a LAN address: this page is
 > served over HTTPS, so browsers refuse to talk to `http://192.168.x.x`, and a LAN address cannot
@@ -136,13 +136,55 @@ The default relay is operated by us:
 | **Plus** | $2.99/month or $24/year | 5 machines, 5 phones |
 
 Sign in with `nyan login`; manage your plan at <https://account.nyan-remote.app>. Every feature works
-on the free plan. If you would rather not depend on our relay, you have three alternatives, all free,
-without an account and without limits:
+on the free plan. If you would rather not depend on our relay, there are two alternatives, both free,
+without an account and without limits. Both are set **per machine** in `~/.nyan-remote/config.json`
+(`relayUrl`); restart the agent after changing it
+(`systemctl --user restart nyan-remote`, or `launchctl kickstart -k gui/$(id -u)/app.nyan-remote.agent` on macOS).
 
-1. **`local`** — give your machine an HTTPS name (Tailscale is the easy path) and skip the relay.
-2. **Run the relay in your own Cloudflare account** — it is a single Worker plus a Durable Object;
-   a personal deployment fits inside Cloudflare's free tier with room to spare.
-3. Set `"relayUrl": ""` in `~/.nyan-remote/config.json` to turn the relay off entirely.
+### Run the relay in your own Cloudflare account
+
+It is a single Worker plus a Durable Object; a personal deployment fits inside Cloudflare's free tier
+with room to spare.
+
+```bash
+git clone https://github.com/vessel-ltd/nyan-remote.git
+cd nyan-remote/relay
+npm install                                    # wrangler (only needed here)
+npx wrangler login
+npx wrangler deploy -c wrangler.selfhost.jsonc # ⚠️ not the plain `wrangler.jsonc` (that one is our production relay)
+```
+
+Wrangler prints the address, e.g. `https://nyan-relay.<your-subdomain>.workers.dev`. On each PC, set
+
+```json
+{ "relayUrl": "wss://nyan-relay.<your-subdomain>.workers.dev" }
+```
+
+in `~/.nyan-remote/config.json` (keep the other keys), restart the agent, then run `nyan pair`.
+No `nyan login` is needed: a self-hosted relay has no sign-in and no plans (up to 8 phones per machine).
+Phones already paired over our relay need to scan the new QR code.
+
+### Use Tailscale (`local`)
+
+The phone talks to the agent directly over your tailnet; nothing goes through a relay.
+
+1. Install Tailscale on the PC and on the phone, signed in to the same tailnet. In the admin console,
+   turn on **MagicDNS** and **HTTPS certificates**. (On WSL, use Tailscale on the Windows side.)
+2. Turn our relay off: `"relayUrl": ""` in `~/.nyan-remote/config.json`, then restart the agent.
+   ⚠️ While a relay is configured, the QR code carries it and the phone pairs only through it.
+3. Publish the agent on the tailnet (it listens on `127.0.0.1:7777` only):
+   ```bash
+   tailscale cert <machine>.<tailnet>.ts.net   # once, so the first visit does not time out waiting for the certificate
+   tailscale serve --bg 7777
+   ```
+   (On WSL run both with `tailscale.exe` from Windows; run `cert` from PowerShell.)
+4. On the phone, open **`https://<machine>.<tailnet>.ts.net/`** — the agent serves the app itself — and add it
+   to the Home Screen. ⚠️ Use this address, not `app.nyan-remote.app`: the public app cannot reach an agent
+   that has no relay.
+5. Run `nyan pair` on the PC and scan the QR code from that app.
+
+With several PCs, open the app from one of them and pair the others from it; machines on the same
+tailnet are allowed automatically.
 
 Measured on the author's setup (3 machines, a full working day): the Durable Object was awake for
 **69 seconds per day** — the hibernation design is what keeps self-hosting essentially free.

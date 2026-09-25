@@ -17,7 +17,7 @@ import { parsePairUrl } from '../../shared/pairing.ts'
 import { loadConfig } from './config.ts'
 import { loadAgentKey, resetAgentKey } from './deviceKey.ts'
 import { loadDevices, resetDevices } from './devices.ts'
-import { relayHealth, resetRelay, startRelay } from './relayRun.ts'
+import { relayHealth, resetRelay, startRelay, licensingFor } from './relayRun.ts'
 import { buildRouter } from './routes/index.ts'
 import { pairToken } from './routes/devices.ts'
 import { health } from './routes/health.ts'
@@ -157,4 +157,18 @@ test('★★★★ tests do not connect to the production relay (tests using the
   for (const m of src.matchAll(/await boot\(t(?:, \{ relayUrl: 42 \})?\)\s*\n[^\n]*startRelay\(buildRouter\(\)([^)]*)\)/g)) {
     assert.ok(m[1]!.includes('neverConnect'), `⚠️⚠️ a test really connects to the production relay: ${m[0].slice(0, 80)}`)
   }
+})
+
+test('★★ the license is handed only to our relay (a self-hosted relay would apply our plan limits / 2026-09-25)', () => {
+  assert.ok(licensingFor('wss://relay.nyan-remote.app').licensing)
+  assert.ok(licensingFor('wss://nyan-relay.nyan-remote-relay.workers.dev').licensing)
+  assert.deepEqual(licensingFor('wss://nyan-relay.someone.workers.dev'), {})
+  assert.deepEqual(licensingFor('ws://127.0.0.1:8787'), {})
+})
+
+test('★ wiring: startRelay passes the license through licensingFor only', async () => {
+  const { readFile } = await import('node:fs/promises')
+  const src = await readFile(new URL('./relayRun.ts', import.meta.url), 'utf8')
+  assert.match(src, /keepRelayConnected\(\{[\s\S]*?\.\.\.licensingFor\(base\),[\s\S]*?\}\)/)
+  assert.equal(src.match(/licensing: accountLicensing/g)?.length, 1, '⚠️ the license is handed over somewhere else too')
 })

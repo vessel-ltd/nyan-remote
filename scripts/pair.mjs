@@ -25,6 +25,7 @@ import { createInterface } from 'node:readline'
 import { makeQr, QR_QUIET, qrTerminal } from '../shared/qr.ts'
 import { qrPng } from './lib/qrPng.mjs'
 import { connectWithRetry, renderPair } from './lib/pairPrint.mjs'
+import { carriesOurRelay, mustSignIn } from './lib/pairCheck.mjs'
 import { artSize, chooseQrMode, imageOpeners, isWsl, modeNote, toWinPath } from './lib/qrMode.mjs'
 import { hints, serviceKind } from './lib/service.mjs'
 import { t } from '../shared/i18n.ts'
@@ -149,6 +150,23 @@ info = await res.json()
 issuing = false
 // ★ If Ctrl-C was pressed while issuing, cancel here and exit (now that the id is known, it can be cancelled)
 if (stopAsked > 0) await stopNow()
+
+// ★★ Our relay requires sign-in (2026-09-25). Without it the phone would fail with a vague message ⇒ stop here, and give the code back
+//   ⚠️ Only when certain (`mustSignIn`); anything unknown carries on as before
+//   ⚠️⚠️ Ask the agent to **re-read the sign-in now** (`POST /account/refresh`), not `/health`: right after `nyan login` the agent has not
+//      noticed yet (it looks every 60 seconds), and `/health` would still say signed out (codex). An old agent without it ⇒ carry on.
+if (carriesOurRelay(info.url) && mustSignIn({ pairUrl: info.url, account: await localCall('POST', '/account/refresh') })) {
+  console.error(t('✗ こちらの relay（既定）は、PC でログインしてからでないと繋がりません。先にこれを打ってください:', '✗ Our hosted relay (the default) needs this PC to be signed in first. Run:'))
+  console.error('    nyan login')
+  console.error(
+    t(
+      '  （Tailscale や自分の relay で使うなら、~/.nyan-remote/config.json の relayUrl を変えます。README の「Hosting the relay」）',
+      '  (With Tailscale or your own relay, change relayUrl in ~/.nyan-remote/config.json instead — see "Hosting the relay" in the README)',
+    ),
+  )
+  if (info?.id) await localCall('POST', `/pair/token/${encodeURIComponent(info.id)}/cancel`)
+  process.exit(4)
+}
 
 /**
  * Draw the QR. ⚠️ **`undefined` if it cannot be drawn** (do not fail here = fall back to pasting).

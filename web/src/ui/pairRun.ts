@@ -20,11 +20,14 @@ import {
   type PairCandidate,
   type PairOutcome,
 } from './pairing.ts'
+import { endpointRoute, type AgentEndpoint } from '../endpoints.ts'
 
 /**
  * ★ Only the ports these steps need (**no dependency on the whole `Transport`** = stubbable in tests).
  */
 export interface PairTransport {
+  /** ★ The endpoint it dials (⚠️ optional = test stubs; the real `Transport` always has it) */
+  readonly endpoint?: AgentEndpoint
   pairDevice(body: {
     key: string
     token: string
@@ -210,6 +213,8 @@ async function pairViaQr(
       ...(payload.relayUrl === undefined
         ? {}
         : { relay: { url: payload.relayUrl, agentPublicKey: payload.agentPublicKey } }),
+      // ★★ Registered over local (`connect(url)`) ⇒ save that route (an existing relay endpoint switches back / codex)
+      kind: 'local',
     })
     return {
       kind: 'done',
@@ -264,6 +269,12 @@ export async function runPairing(input: string, deps: PairDeps): Promise<PairOut
     return await pairViaQr(read.payload, deps, identity)
   }
   const tr = deps.transports[at]
+  // ★★ A QR without `r` means **that agent has no relay now** ⇒ an endpoint still routed via relay cannot reach it
+  //   (turned the relay off for Tailscale, codex round 2). ⇒ Register over the QR's `u` instead (and save the local route).
+  //   ⚠️ The health that matched may be a cached one from when the relay still worked.
+  if (read.payload.agentUrl !== undefined && tr?.endpoint && endpointRoute(tr.endpoint) === 'relay') {
+    return await pairViaQr(read.payload, deps, identity)
+  }
   if (!tr) return { kind: 'no-target', machine: read.payload.machine }
   try {
     const res = await sendPairing(tr, read.payload, identity, deps.ua)

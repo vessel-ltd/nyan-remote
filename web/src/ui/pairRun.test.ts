@@ -561,7 +561,8 @@ test('★★ an agent not in endpoints is added from the QR\'s `u` and registere
   assert.deepEqual(d.asked, [AGENT_URL], '⚠️ the QR\'s entry point was not verified')
   assert.equal(d.sent.length, 1, 'sends only to that one machine')
   // ⚠️ Added only after registration succeeds (⑪)
-  assert.deepEqual(d.added, [{ url: AGENT_URL, label: 'PC-B' }])
+  // ★ Saved with the route it was registered on (local)
+  assert.deepEqual(d.added, [{ url: AGENT_URL, label: 'PC-B', kind: 'local' }])
 })
 
 test('★★ a QR with both `u` and `r` but no `connectRelay` sends to `u` neither (round 9, high #1)', async () => {
@@ -792,7 +793,7 @@ test('★★ without relay in the QR, the `u` path as before (⑳ do not kill lo
   assert.equal(out.kind, 'done')
   assert.equal(r.state.opened, 0, '⚠️ went to relay without relay inputs')
   assert.equal(viaU.sent.length, 1, '★ must send via the `u` path')
-  assert.deepEqual(added, [{ url: 'https://pc-b.example.ts.net', label: 'pc-b' }])
+  assert.deepEqual(added, [{ url: 'https://pc-b.example.ts.net', label: 'pc-b', kind: 'local' }])
 })
 
 test('★★ with both relay and `u`, use relay (⚠️ the stronger first / codex high #1)', async () => {
@@ -1005,4 +1006,36 @@ test('★★ if the key cannot be read, revocation is not attempted (⑥ the end
   assert.equal(tried, 0, '⚠️ sends a revocation although there is no key')
   assert.equal(forgot, 1)
   assert.equal(out.kind, 'kept')
+})
+
+test('★★ a QR without relay for an endpoint still routed via relay goes through `u` and saves local (Tailscale after turning the relay off / codex round 2)', async () => {
+  const oldRelay = stub('old-relay')
+  const endpoint = { id: 'https://pc-b.example.ts.net', url: 'https://pc-b.example.ts.net', label: 'pc-b', relay: { url: 'wss://relay.example', agentPublicKey: KEY_B }, kind: 'relay' as const }
+  const viaU = stub('U')
+  const added: unknown[] = []
+  const url = buildPairUrl({ agentPublicKey: KEY_B, token: TOKEN, machine: 'pc-b', agentUrl: 'https://pc-b.example.ts.net' })
+  const out = await runPairing(url, {
+    transports: [{ ...oldRelay.t, endpoint }],
+    // ⚠️ A health cached from when the relay still worked (it matches the key)
+    healths: [{ agentPublicKey: KEY_B, machine: 'pc-b' }],
+    identity,
+    ua: 'Android',
+    addEndpoint: (e) => void added.push(e),
+    connect: () => ({ transport: viaU.t, health: async () => ({ agentPublicKey: KEY_B, machine: 'pc-b' }) }),
+  })
+  assert.equal(out.kind, 'done')
+  assert.deepEqual(oldRelay.sent, [], '⚠️⚠️ sent through the relay the agent turned off')
+  assert.equal(viaU.sent.length, 1)
+  assert.deepEqual(added, [{ url: 'https://pc-b.example.ts.net', label: 'pc-b', kind: 'local' }])
+  // ★ A local endpoint is used directly, as before
+  const local = stub('local')
+  const out2 = await runPairing(url, {
+    transports: [{ ...local.t, endpoint: { id: 'x', url: 'https://pc-b.example.ts.net', label: 'pc-b' } }],
+    healths: [{ agentPublicKey: KEY_B, machine: 'pc-b' }],
+    identity,
+    ua: 'Android',
+    connect: () => ({ transport: viaU.t, health: async () => ({ agentPublicKey: KEY_B, machine: 'pc-b' }) }),
+  })
+  assert.equal(out2.kind, 'done')
+  assert.equal(local.sent.length, 1)
 })

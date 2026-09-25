@@ -109,7 +109,9 @@ export function upsertEndpoint(
   // ⚠️ Don't add what can't be named (empty URL and no relay material = no way to connect)
   if (!id) return undefined
   const at = list.findIndex((x) => x.id === id || (e.url !== '' && x.url === e.url))
-  const route = e.kind === 'relay' && e.relay ? ({ kind: 'relay' } as const) : {}
+  // ★★ A registration confirmed over local also **switches an existing relay endpoint back to local** (2026-09-25 / codex):
+  //   after turning a PC's relay off for Tailscale, re-scanning its QR used to keep `kind: 'relay'` ⇒ it kept dialling the dead relay.
+  const route = e.kind === 'relay' && e.relay ? ({ kind: 'relay' } as const) : e.kind === 'local' ? ({ kind: 'local' } as const) : {}
   if (at < 0) {
     return [...list, { id, url: e.url, label: e.label, ...(e.relay ? { relay: e.relay } : {}), ...route }]
   }
@@ -156,6 +158,33 @@ export function mergeRelay(
     if (e.relay) return e
     const found = fresh.find((x) => x.id === e.id)
     return found?.relay ? { ...e, relay: found.relay } : e
+  })
+}
+
+/**
+ * ★★ Take **route and relay entry-point changes made by pairing** into the list being edited (2026-09-25 / codex).
+ *   ⚠️⚠️ Re-pairing over local saves `kind: 'local'`, but the open screen kept `relay`, and pressing Save **restored the dead relay**.
+ *   ⚠️ Only rows whose route **changed in the parent since last seen** (a route the user switched on this screen is left alone otherwise).
+ */
+export function mergeRoute(
+  editing: readonly AgentEndpoint[],
+  prevFresh: readonly AgentEndpoint[],
+  fresh: readonly AgentEndpoint[],
+): AgentEndpoint[] {
+  return editing.map((e) => {
+    const now = fresh.find((x) => x.id === e.id)
+    const before = prevFresh.find((x) => x.id === e.id)
+    if (!now || !before) return e
+    // ★ The relay entry point too (codex round 3: moved to a self-hosted relay, then Save restored our relay's URL)
+    const relayChanged = now.relay?.url !== before.relay?.url || now.relay?.agentPublicKey !== before.relay?.agentPublicKey
+    const kindChanged = now.kind !== before.kind
+    if (!relayChanged && !kindChanged) return e
+    let out: AgentEndpoint = relayChanged && now.relay ? { ...e, relay: now.relay } : e
+    if (kindChanged) {
+      const { kind: _drop, ...rest } = out
+      out = now.kind === undefined ? rest : { ...rest, kind: now.kind }
+    }
+    return out
   })
 }
 

@@ -18,6 +18,7 @@ import { config } from './config.ts'
 import { agentKeyProblem } from './deviceKey.ts'
 import { keepRelayConnected, type RelayKeeper } from './relayLink.ts'
 import { accountLicensing } from './account.ts'
+import { isOurRelay } from '../../shared/distribution.ts'
 import type { Router } from './router.ts'
 
 /** ⚠️ Only one (even in a symmetric mesh there is one agent / §7) */
@@ -73,7 +74,7 @@ export function startRelay(
     router,
     ...(connect ? { connect } : {}),
     // ★ hand the license to the relay (2026-09-24 / billing). ⚠️ without an account there is simply nothing to send (as before)
-    licensing: accountLicensing,
+    ...licensingFor(base),
     onStatus: (s) => {
       // ⚠️ **always log** that it dropped (silently not connecting is the worst)
       if (s.state === 'open') console.log(t(`[relay] 繋がりました: ${base}`, `[relay] Connected: ${base}`))
@@ -119,3 +120,13 @@ export function resetRelay(): void {
   stopRelaySync()
   problem = undefined
 }
+
+/**
+ * ★★ The license goes **only to our relay** (2026-09-25).
+ *   ⚠️⚠️ A signed-in PC on a self-hosted relay used to hand it over, and that relay (the same code) then applied our plan's
+ *      limits (Free = 2 phones) to the user's own relay. It also kept our tickets away from third-party relays.
+ */
+export function licensingFor(base: string): { licensing?: typeof accountLicensing } {
+  return isOurRelay(base) ? { licensing: accountLicensing } : {}
+}
+

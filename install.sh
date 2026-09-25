@@ -336,6 +336,9 @@ fi
 #      and the issued one-time token stayed **alive for 5 minutes**.
 #   ⇒ Only print instructions. People who want to register type `npm run pair` themselves (it exits once scanned).
 printf '\n%s\n\n' "$(tr2 '✅ 入りました。' '✅ Installed.')"
+# ★ Our hosted relay (the default) requires sign-in since 2026-09-25 ⇒ say it before pairing (Tailscale / your own relay do not need it)
+printf '%s\n' "$(tr2 '★ こちらの relay（既定）を使うなら、先にログイン（新しいシェルで）: nyan login' '★ Using our hosted relay (the default)? Sign in first (in a new shell): nyan login')"
+printf '%s\n' "$(tr2 '   （Tailscale や自分の relay で使うなら不要。README の「Hosting the relay」）' '   (Not needed with Tailscale or your own relay — see "Hosting the relay" in the README)')"
 # ★ 2026-09-24: point to `nyan`, which works from anywhere (`scripts/lib/cli.mjs`; from a new shell).
 #   ⚠️ For machines where `nyan` could not be placed (another tool uses the name), also list the form with the path
 if [ -z "$SERVICE" ]; then

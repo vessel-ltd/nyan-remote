@@ -57,7 +57,7 @@ interface Fake extends RoomSocket {
  * ⚠️⚠️ **Closed wires stay in `sockets()` too** (Cloudflare's `getWebSockets()` may
  *    return them even after `close()` = do not build a lenient fake / codex round 4, medium #3).
  */
-function rig(o: { licenses?: Record<string, LicenseCheck>; required?: boolean; duringClaim?: () => void; duringClaimAsync?: () => Promise<void> } = {}) {
+function rig(o: { licenses?: Record<string, LicenseCheck>; required?: boolean; selfHosted?: boolean; duringClaim?: () => void; duringClaimAsync?: () => Promise<void> } = {}) {
   const all: { side: 'agent' | 'device'; socket: Fake }[] = []
   let now = 1_000_000
   // ★ The ledger is real (`ledger.ts`). Kept in memory per account
@@ -95,6 +95,7 @@ function rig(o: { licenses?: Record<string, LicenseCheck>; required?: boolean; d
       return r.ok ? 'ok' : (r.reason ?? 'machine-limit')
     },
     licenseRequired: () => required,
+    selfHosted: () => o.selfHosted ?? false,
   })
   const open = (side: 'agent' | 'device'): Fake => {
     let tag: Tag | null = null
@@ -608,6 +609,21 @@ test('★★ after the grace period, phones are not let into rooms without a tic
   assert.equal(agent.closed, undefined, '⚠️ cut the agent wire (a ticket could not be handed over later)')
   await sendLicense(r, agent, 'FREE')
   assert.equal(r.room.admitDevice().ok, true, 'passes once a ticket is handed over')
+})
+
+test('★★ a self-hosted relay asks for no ticket, and every room takes MAX_DEVICES phones (2026-09-25 / codex)', async () => {
+  const r = rig({ licenses: { FREE: LIC_FREE }, selfHosted: true })
+  // A signed-in agent (old or new) announces tickets …
+  const agent = await becomeAgent(r, await generateDeviceKey(), { licensing: true })
+  // … but is never asked, so it never sends one
+  assert.deepEqual(licenseResults(agent), [], '⚠️⚠️ asked a self-hosted room for our ticket (our plan limits would apply)')
+  assert.equal(agent.tag()?.licensing, undefined)
+  for (let i = 0; i < MAX_DEVICES; i++) await agentReplies(r, agent, joinDevice(r).connId)
+  assert.equal(r.room.admitDevice().ok, false, 'still capped at MAX_DEVICES')
+  // ★ Even with the sign-in date set by mistake, no phone is refused with 402
+  const r2 = rig({ selfHosted: true, required: true })
+  await becomeAgent(r2, await generateDeviceKey(), { licensing: true })
+  assert.equal(r2.room.admitDevice().ok, true)
 })
 
 test('★★ a ticket from an agent that did not announce it is cut as "a type that cannot be sent", as before', async () => {
