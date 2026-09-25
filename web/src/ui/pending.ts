@@ -35,8 +35,14 @@ export interface PendingSend {
    *    records of the same text that arrive are noted in `seen` and matched once the reply reveals the route.
    */
   sending?: boolean
-  seen?: ArrivedEntry[]
+  seen?: Seen[]
 }
+
+/**
+ * ★ A record noted while awaiting the reply. `reload` = it came from a full reload, so the reload time rule
+ *   (`inTime`) still applies when it is offered to other sends (codex round 3, medium #1).
+ */
+export type Seen = ArrivedEntry & { reload?: true }
 
 /** The minimal shape used for matching (just the needed part of `LogEntry`) */
 export interface ArrivedEntry {
@@ -64,7 +70,7 @@ export function consumePending(pending: PendingSend[], arrivals: ArrivedEntry[])
     // ⚠️ Drop only route-compatible ones (keystrokes: no `via` / inbox: `via: 'inbox'`)
     // ⚠️ Awaiting reply (`sending`) has no route yet, so not dropped here (`noteArrivals` notes it)
     const text = a.text
-    const i = rest.findIndex((p) => !p.sending && matches(p.route, a.via) && sameText(p.route, p.text, text))
+    const i = pick(rest, (p) => (p.sending ? undefined : fit(p, a.via, text)))
     if (i >= 0) rest.splice(i, 1)
   }
   return rest.length === pending.length ? pending : rest
@@ -83,15 +89,41 @@ function matches(route: PendingSend['route'], via: string | undefined): boolean 
 }
 
 /**
- * ★★ Whether a record's text is this send (2026-09-25 / reproduced on a real device).
+ * ★★ How a record's text fits this send (2026-09-25 / reproduced on a real device).
  *   ⚠️⚠️ Keystrokes are **appended to the PC input box**, so a half-typed draft on the PC is joined in front
  *   (`あいう` + `Test` → the record is `あいうTest`). Exact equality left "Can't confirm it arrived" behind for ever.
- *   ⇒ keystrokes (and sends whose route is not known yet): the record **ends with** the sent text.
- *   ⚠️ The inbox joins nothing ⇒ exact.
- *   ⚠️ Only records that arrived after the send are passed here, so the looser rule does not reach older ones.
+ *   ⇒ keystrokes (and sends whose route is not known yet): a record that **ends with** the sent text fits as `suffix`.
+ *   ⚠️ The inbox joins nothing ⇒ `exact` only.
+ *   ★ The agent shows records with trailing whitespace removed (`clip` in agent/src/claude/log.ts) ⇒ compare without it.
+ *   ⚠️ A `suffix` fit is weaker: an exact fit anywhere wins over it (`pick` / codex, medium #1).
  */
-export function sameText(route: PendingSend['route'] | 'unknown', sent: string, record: string): boolean {
-  return route === 'keys' || route === 'unknown' ? record.endsWith(sent) : record === sent
+export type Fit = 'exact' | 'suffix' | undefined
+export function textFit(route: PendingSend['route'] | 'unknown', sent: string, record: string): Fit {
+  const s = sent.trimEnd()
+  // ⚠️ A blank send would be a suffix of every record
+  if (s.length === 0) return undefined
+  if (record === s) return 'exact'
+  return (route === 'keys' || route === 'unknown') && record.endsWith(s) ? 'suffix' : undefined
+}
+
+/** ★ Route and text together (a send awaiting its reply has no route yet, so only its text is judged) */
+function fit(p: PendingSend, via: string | undefined, text: string): Fit {
+  if (p.sending) return textFit('unknown', p.text, text)
+  return matches(p.route, via) ? textFit(p.route, p.text, text) : undefined
+}
+
+/**
+ * ★★ The oldest exact fit, else the oldest suffix fit (codex, medium #1: with `ok` and `looks ok` pending,
+ *   the record `looks ok` used to clear `ok` and leave the delivered `looks ok` behind).
+ */
+function pick(rest: readonly PendingSend[], f: (p: PendingSend) => Fit): number {
+  let weak = -1
+  for (let i = 0; i < rest.length; i++) {
+    const k = f(rest[i]!)
+    if (k === 'exact') return i
+    if (k === 'suffix' && weak < 0) weak = i
+  }
+  return weak
 }
 
 /** ★ Key identifying a record (time, route, text). ⚠️ Used so that "one record is used only once" */
@@ -124,20 +156,15 @@ export function noteArrivals(pending: PendingSend[], arrivals: readonly ArrivedE
     //    ⚠️ Records without a time cannot be told apart (two identical texts look like one), so they are not remembered
     const key = a.at ? recordKey(a) : undefined
     if (key && used?.has(key)) continue
-    const after = consumePending(rest, [a])
-    if (after !== rest) {
-      rest = after
-      changed = true
-      if (key) used?.add(key)
-      continue
-    }
+    // ★ Settled and awaiting-reply sends compete together (an exact fit wins either way / `pick`)
     const text = a.text
-    const j = rest.findIndex((p) => p.sending && sameText('unknown', p.text, text))
-    if (j >= 0) {
-      rest = rest.map((p, k) => (k === j ? { ...p, seen: [...(p.seen ?? []), a] } : p))
-      changed = true
-      if (key) used?.add(key)
-    }
+    const j = pick(rest, (p) => fit(p, a.via, text))
+    if (j < 0) continue
+    rest = rest[j]!.sending
+      ? rest.map((p, k) => (k === j ? { ...p, seen: [...(p.seen ?? []), a] } : p))
+      : rest.filter((_, k) => k !== j)
+    changed = true
+    if (key) used?.add(key)
   }
   return changed ? rest : pending
 }
@@ -150,10 +177,28 @@ export function finishSend(pending: PendingSend[], id: number, route: PendingSen
   const i = pending.findIndex((p) => p.id === id)
   if (i < 0) return pending
   const p = pending[i]!
-  if (route === null) return pending.filter((_, k) => k !== i)
   const settled: PendingSend = { text: p.text, at: p.at, id: p.id, ...(route ? { route } : {}) }
-  if (consumePending([settled], p.seen ?? []).length === 0) return pending.filter((_, k) => k !== i)
-  return pending.map((x, k) => (k === i ? settled : x))
+  // ★★ The noted records are **offered to every settled send**, not only this one (codex round 2, medium #1):
+  //   a record noted here by an exact fit may belong to an older keystroke send (`ok` joined to a PC draft `looks `)
+  //   while this reply says `inbox`; it is already marked `used`, so nothing else would ever offer it again.
+  //   ⚠️ Exact fits still win (`pick`), and each record clears at most one send.
+  //   ⚠️⚠️ A record from a full reload keeps the reload time rule for **each** candidate (codex round 3, medium #1:
+  //      a `looks ok` said before both sends was noted for the newer `looks ok` by the exact-fit slack, then offered
+  //      without the rule and cleared the older, undelivered `ok`).
+  //   ⚠️ A failed send (`null`) is dropped, but what it noted is offered back the same way (codex round 4, medium #1)
+  let list = route === null ? pending.filter((_, k) => k !== i) : pending.map((x, k) => (k === i ? settled : x))
+  for (const r of p.seen ?? []) {
+    if (r.kind !== 'user' || typeof r.text !== 'string') continue
+    const text = r.text
+    const t = r.reload ? Date.parse(r.at ?? '') : undefined
+    const j = pick(list, (q) => {
+      if (q.sending) return undefined
+      const k = fit(q, r.via, text)
+      return t === undefined ? k : inTime(k, t, q.at)
+    })
+    if (j >= 0) list = list.filter((_, k) => k !== j)
+  }
+  return list
 }
 
 /**
@@ -163,8 +208,16 @@ export function finishSend(pending: PendingSend[], id: number, route: PendingSen
  *   ⚠️⚠️ **One record is used only once** (remembered in `used` = reloading does not let the same record drop the next send / codex round 25, medium #1).
  *   ⚠️ Records without a time are not used (do not over-drop = leftovers vanish on reopening).
  *   ⚠️ Remaining limit: if the phone and PC clocks differ by more than the slack it can miss (rare path + clears on reopening).
+ *   ⚠️ A suffix fit (a send joined to a PC draft) gets no slack, so it can miss on reload whenever the PC clock is behind
+ *     (kept on purpose: slack there let an earlier record clear an undelivered send / codex, medium #2).
  */
 export const RELOAD_SLACK_MS = 5_000
+
+/** ★ The reload time rule: exact fits get the clock slack, suffix fits need a record at or after the send */
+function inTime(k: Fit, t: number, sentAt: number): Fit {
+  if (k === 'exact') return t >= sentAt - RELOAD_SLACK_MS ? k : undefined
+  return k === 'suffix' && t >= sentAt ? k : undefined
+}
 
 
 export function consumeAfterReload(pending: PendingSend[], entries: readonly ArrivedEntry[], used: Set<string>): PendingSend[] {
@@ -177,16 +230,14 @@ export function consumeAfterReload(pending: PendingSend[], entries: readonly Arr
     const t = Date.parse(e.at)
     const text = e.text
     // ★ Only sends started before that record can match (per-send boundary). Only the oldest one
-    const i = rest.findIndex(
-      (p) =>
-        t >= p.at - RELOAD_SLACK_MS &&
-        (p.sending ? sameText('unknown', p.text, text) : matches(p.route, e.via) && sameText(p.route, p.text, text)),
-    )
+    // ⚠️⚠️ The clock slack is for exact fits only; a suffix fit needs a record at or after the send
+    //    (codex, medium #2: `looks ok` said 4 seconds before sending `ok` cleared the undelivered `ok`)
+    const i = pick(rest, (p) => inTime(fit(p, e.via, text), t, p.at))
     if (i < 0) continue
     used.add(key)
     const p = rest[i]!
     rest = p.sending
-      ? rest.map((x, k) => (k === i ? { ...x, seen: [...(x.seen ?? []), e] } : x))
+      ? rest.map((x, k) => (k === i ? { ...x, seen: [...(x.seen ?? []), { ...e, reload: true as const }] } : x))
       : rest.filter((_, k) => k !== i)
   }
   return rest

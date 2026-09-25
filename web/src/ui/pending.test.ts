@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { beginSend, consumeAfterReload, consumePending, finishSend, noteArrivals, type PendingSend } from './pending.ts'
+import { beginSend, consumeAfterReload, consumePending, finishSend, noteArrivals, textFit, type PendingSend } from './pending.ts'
 
 const sent = (text: string, at = 1): PendingSend => ({ text, at, route: 'inbox' })
 const typed = (text: string, at = 1): PendingSend => ({ text, at, route: 'keys' })
@@ -165,5 +165,93 @@ test('★★ joined text also matches while awaiting the reply and on a full rel
   assert.deepEqual(finishSend(reloaded, 4, 'keys'), [])
   // ⚠️ A send awaiting its reply that turns out to be inbox is still exact
   const viaInbox = noteArrivals(beginSend([], 3, 'Test', 1000), [{ kind: 'user', text: 'xTest', via: 'inbox', at: '2026-01-01T00:00:03Z' }], new Set())
+  assert.equal(viaInbox[0]!.seen?.length, 1, 'the record was not even noted (the check below would pass for the wrong reason)')
   assert.equal(finishSend(viaInbox, 3, 'inbox').length, 1)
+})
+
+test('★★ an exact fit wins over a suffix fit (codex, medium #1: `looks ok` must not clear `ok`)', () => {
+  const p: PendingSend[] = [
+    { id: 1, text: 'ok', at: 1, route: 'keys' },
+    { id: 2, text: 'looks ok', at: 2, route: 'keys' },
+  ]
+  assert.deepEqual(consumePending(p, [{ kind: 'user', text: 'looks ok' }]).map((x) => x.id), [1])
+  // ★ Settled and awaiting-reply sends compete together
+  const mixed: PendingSend[] = [{ id: 1, text: 'ok', at: 1, route: 'keys' }, { id: 2, text: 'looks ok', at: 2, sending: true, seen: [] }]
+  const noted = noteArrivals(mixed, [{ kind: 'user', text: 'looks ok', at: '2026-01-01T00:00:01Z' }], new Set())
+  assert.deepEqual(noted.map((x) => x.id), [1, 2])
+  assert.equal(noted[1]!.seen?.length, 1, '⚠️ the exact fit went to the settled `ok` instead')
+  assert.deepEqual(finishSend(noted, 2, 'keys').map((x) => x.id), [1])
+  // ★ Same on a full reload
+  const T = Date.parse('2026-01-01T00:00:00Z')
+  const r: PendingSend[] = [{ id: 1, text: 'ok', at: T, route: 'keys' }, { id: 2, text: 'looks ok', at: T, route: 'keys' }]
+  assert.deepEqual(consumeAfterReload(r, [{ kind: 'user', text: 'looks ok', at: '2026-01-01T00:00:01Z' }], new Set()).map((x) => x.id), [1])
+})
+
+test('★★ full reload: a suffix fit needs a record at or after the send (codex, medium #2); exact keeps the clock slack', () => {
+  const T = Date.parse('2026-01-01T00:00:10Z')
+  const before = [{ kind: 'user', text: 'looks ok', at: '2026-01-01T00:00:06Z' }]
+  assert.equal(consumeAfterReload([{ id: 1, text: 'ok', at: T, route: 'keys' }], before, new Set()).length, 1)
+  assert.equal(consumeAfterReload(beginSend([], 2, 'ok', T), before, new Set())[0]!.seen?.length, 0, '⚠️ noted an older record by suffix')
+  assert.equal(consumeAfterReload([{ id: 3, text: 'ok', at: T, route: 'keys' }], [{ kind: 'user', text: 'looks ok', at: '2026-01-01T00:00:10Z' }], new Set()).length, 0)
+  assert.equal(consumeAfterReload([{ id: 4, text: 'ok', at: T, route: 'keys' }], [{ kind: 'user', text: 'ok', at: '2026-01-01T00:00:06Z' }], new Set()).length, 0)
+})
+
+test('★★ trailing whitespace of the send is ignored (the agent shows records trimmed / codex, medium #3)', () => {
+  assert.deepEqual(consumePending([{ text: 'Test \n', at: 1, route: 'keys' }], [{ kind: 'user', text: 'Test' }]), [])
+  assert.deepEqual(consumePending([{ text: 'Test ', at: 1, route: 'inbox' }], [{ kind: 'user', text: 'Test', via: 'inbox' }]), [])
+  assert.deepEqual(consumePending([{ text: 'Test\n', at: 1, route: 'keys' }], [{ kind: 'user', text: 'あいうTest' }]), [])
+  // ⚠️ A blank send never fits everything
+  assert.equal(textFit('keys', ' \n', 'anything'), undefined)
+})
+
+test('★★ a record noted by an awaiting-reply send that turns out inbox goes back to the other sends (codex round 2, medium #1)', () => {
+  const used = new Set<string>()
+  let p: PendingSend[] = [{ id: 1, text: 'ok', at: 1, route: 'keys' }, { id: 2, text: 'looks ok', at: 2, sending: true, seen: [] }]
+  // `ok` was typed after a PC draft `looks ` ⇒ the record `looks ok` (no via) is the delivery of send 1
+  p = noteArrivals(p, [{ kind: 'user', text: 'looks ok', at: '2026-01-01T00:00:01Z' }], used)
+  assert.deepEqual(p.map((x) => [x.id, x.seen?.length]), [[1, undefined], [2, 1]], 'the record must first be noted by the exact fit')
+  p = finishSend(p, 2, 'inbox')
+  assert.deepEqual(p.map((x) => x.id), [2], '⚠️ the keystroke send `ok` stayed although its record arrived')
+  p = noteArrivals(p, [{ kind: 'user', text: 'looks ok', via: 'inbox', at: '2026-01-01T00:00:02Z' }], used)
+  assert.deepEqual(p, [])
+  // ★ Same through a full reload
+  const T = Date.parse('2026-01-01T00:00:00Z')
+  const r = consumeAfterReload(
+    [{ id: 1, text: 'ok', at: T, route: 'keys' }, { id: 2, text: 'looks ok', at: T + 1, sending: true, seen: [] }],
+    [{ kind: 'user', text: 'looks ok', at: '2026-01-01T00:00:01Z' }],
+    new Set(),
+  )
+  assert.deepEqual(r.map((x) => [x.id, x.seen?.length]), [[1, undefined], [2, 1]], 'the record must first be noted by the exact fit')
+  assert.deepEqual(finishSend(r, 2, 'inbox').map((x) => x.id), [2])
+  // ⚠️ One record clears at most one send
+  const two: PendingSend[] = [
+    { id: 1, text: 'ok', at: 1, route: 'keys' },
+    { id: 2, text: 'ok', at: 2, sending: true, seen: [{ kind: 'user', text: 'ok', at: '2026-01-01T00:00:03Z' }] },
+  ]
+  assert.deepEqual(finishSend(two, 2, 'keys').map((x) => x.id), [2])
+})
+
+test('★★ a reloaded record offered back keeps the reload time rule (codex round 3, medium #1)', () => {
+  const at = (s: string) => Date.parse(`2026-01-01T10:00:${s}Z`)
+  // A `looks ok` said before both sends; `ok` (keys) has not arrived; `looks ok` awaits its reply
+  let p: PendingSend[] = [{ id: 1, text: 'ok', at: at('01'), route: 'keys' }, ...beginSend([], 2, 'looks ok', at('03'))]
+  p = consumeAfterReload(p, [{ kind: 'user', text: 'looks ok', at: '2026-01-01T10:00:00Z' }], new Set())
+  assert.equal(p[1]!.seen?.length, 1, 'noted for the awaiting send by the exact-fit slack')
+  assert.deepEqual(finishSend(p, 2, 'inbox').map((x) => x.id), [1, 2], '⚠️ an older record cleared the undelivered `ok`')
+  // ★ A reloaded record at or after the older send still goes back to it
+  let q: PendingSend[] = [{ id: 1, text: 'ok', at: at('01'), route: 'keys' }, ...beginSend([], 2, 'looks ok', at('03'))]
+  q = consumeAfterReload(q, [{ kind: 'user', text: 'looks ok', at: '2026-01-01T10:00:02Z' }], new Set())
+  assert.deepEqual(finishSend(q, 2, 'inbox').map((x) => x.id), [2])  // ⚠️ A live arrival is new by definition, so it is not held to the time rule (the PC clock may be behind)
+  let live: PendingSend[] = [{ id: 1, text: 'ok', at: at('10'), route: 'keys' }, ...beginSend([], 2, 'looks ok', at('12'))]
+  live = noteArrivals(live, [{ kind: 'user', text: 'looks ok', at: '2026-01-01T10:00:08Z' }], new Set())
+  assert.deepEqual(finishSend(live, 2, 'inbox').map((x) => x.id), [2])
+})
+
+test('★★ a failed send gives back what it noted (codex round 4, medium #1)', () => {
+  let p: PendingSend[] = [{ id: 1, text: 'ok', at: 1, route: 'keys' }, { id: 2, text: 'looks ok', at: 2, sending: true, seen: [] }]
+  p = noteArrivals(p, [{ kind: 'user', text: 'looks ok', at: '2026-01-01T00:00:01Z' }], new Set())
+  assert.equal(p[1]!.seen?.length, 1)
+  assert.deepEqual(finishSend(p, 2, null), [], '⚠️ the delivered `ok` stayed after the newer send failed')
+  // ★ A failure with nothing noted just drops the send
+  assert.deepEqual(finishSend([{ id: 1, text: 'a', at: 1, route: 'keys' }, ...beginSend([], 2, 'b', 2)], 2, null).map((x) => x.id), [1])
 })
