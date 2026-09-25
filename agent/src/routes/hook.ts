@@ -372,7 +372,12 @@ export function toPushPayload(
     //    the tag took raw values, so a long project name made **the payload exceed 4KB and
     //    not a single notification showed** (measured: a 5000-char `project` gave 15,334 bytes).
     //    ★ The point is that the same session always gets the same tag (= the cutting is deterministic).
-    tag: [event.machine, event.account, event.project, event.sessionId ?? '-']
+    // ⚠️⚠️ **No project name in the tag when the session id is known** (2026-09-25 / seen on Android: 3 notifications for one thread).
+    //    `project` is `basename(cwd)` **of each hook call**, and the cwd follows the session into subfolders
+    //    (measured: one session reported `nyan-remote` / `account` / `relay` / `web` / `icon-concepts`) ⇒ the tag changed
+    //    and the notification stopped replacing. The session id alone identifies the session; the project stays only as the
+    //    fallback when there is no id.
+    tag: (event.sessionId ? [event.machine, event.account, event.sessionId] : [event.machine, event.account, event.project, '-'])
       .map((part) => clipTagPart(part))
       .join('/'),
     // ⚠️ Do not write it by hand. Dropping the `/` makes the notification open the source of sw.js (see pushUrl.ts)

@@ -59,7 +59,7 @@ test('toPushPayload: carries only identifiers and state (never leaks conversatio
   // ★ The title fell back to the ID, so the project name is added as the 3rd line (prevents two indistinguishable cards)
   assert.equal(payload.body, '完了 · PC-A · claude-r\nanswer-analytics')
   assert.equal(payload.at, '2026-08-11T10:21:38.299Z')
-  assert.equal(payload.tag, 'PC-A/.claude-r/answer-analytics/abc-123')
+  assert.equal(payload.tag, 'PC-A/.claude-r/abc-123')
   assert.equal(payload.url, '/#/s/abc-123')
 
   // ★ No extra keys. Whenever this grows, always consider whether it violates §6.2
@@ -104,6 +104,11 @@ test('★★ toPushPayload: notifications for the same session collapse into one
   assert.equal(done.tag, failure.tag)
   // ★ The wording (= which state) stays separate. Only the slot is collapsed
   assert.notEqual(done.body, waiting.body)
+  // ★★ The same session keeps its tag when it works in a subfolder (the hook's cwd follows it / 2026-09-25, Android showed 3)
+  assert.equal(toPushPayload({ ...common, project: 'account', event: 'Stop' }).tag, done.tag)
+  // ★ Without a session id the project still separates sessions (fallback)
+  const noId = { ...common, sessionId: undefined }
+  assert.notEqual(toPushPayload({ ...noId, event: 'Stop' }).tag, toPushPayload({ ...noId, project: 'other', event: 'Stop' }).tag)
   // ⚠️⚠️ Do not put it in the same namespace as approval tags (starting with `perm-`).
   //    Otherwise it gets caught by the PWA's cleanup (pruneStaleNotifications in notifications.ts) and
   //    **state notifications get closed on their own**.
@@ -418,7 +423,7 @@ test('★ toPushPayload: swapping the wording does not change what is carried (�
   const payload = toPushPayload(STOP_EVENT, '背景で実行中')
   assert.equal(payload.body, '背景で実行中 · PC-A · claude-r\nnyan-remote')
   // ★ The tag does not depend on the wording. Building it from the wording would leave two notifications for the same turn
-  assert.equal(payload.tag, 'PC-A/.claude-r/nyan-remote/abc-123')
+  assert.equal(payload.tag, 'PC-A/.claude-r/abc-123')
   // ★★ "背景で実行中" (running in background) is **silent** (what rings: needs attention, done, abnormal exit, state unknown, awaiting approval)
   assert.equal(payload.silent, true)
   assert.deepEqual(

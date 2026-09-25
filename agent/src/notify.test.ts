@@ -5,7 +5,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
-import { readNotifyMetaFromTranscript } from './notify.ts'
+import { fieldsFrom, readNotifyMetaFromTranscript } from './notify.ts'
 
 /** A transcript whose conversation records have no timestamp (no user/assistant in the last 64KB) */
 const NO_TIMESTAMP = [
@@ -32,4 +32,23 @@ test('★★ lastActivity is "conversation record → mtime" in that order (same
 
 test('★ an unreadable transcript is null (no false title / fail-closed)', async () => {
   assert.equal(await readNotifyMetaFromTranscript('/does/not/exist.jsonl'), null)
+})
+
+test('★★ the project comes from where the session started (as the list shows it), not from the hook\'s current folder (2026-09-25)', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'nyan-remote-notify-'))
+  try {
+    const file = join(dir, '11111111-2222-3333-4444-555555555555.jsonl')
+    const rec = (cwd: string, text: string) =>
+      JSON.stringify({ type: 'user', cwd, timestamp: '2026-09-25T00:00:00.000Z', message: { role: 'user', content: text } })
+    await writeFile(file, `${rec('/home/user/nyan-remote', 'hi')}\n${rec('/home/user/nyan-remote/account', 'later')}\n`, 'utf8')
+    const meta = await readNotifyMetaFromTranscript(file)
+    assert.equal(meta?.project, 'nyan-remote')
+    // ★ It wins over the hook's `basename(cwd)` (`account` after the session cd'd there)
+    const base = { machine: 'pc-a', account: '.claude-r', project: 'account', sessionId: 's', label: '完了' as const }
+    assert.equal(fieldsFrom(base, meta).project, 'nyan-remote')
+    // ★ Without a known cwd the hook's value stays
+    assert.equal(fieldsFrom(base, { title: 't', titleSource: 'ai' }).project, 'account')
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
 })

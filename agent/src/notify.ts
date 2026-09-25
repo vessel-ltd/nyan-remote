@@ -7,6 +7,7 @@
 //    `notificationText` falls back to the 8-char ID and adds the project name on line 3.
 //    "ID only" is better than a false title.
 
+import { basename } from 'node:path'
 import type { NotifyFields, TitleSource } from '../../shared/types.ts'
 import { readTranscriptMeta } from './claude/transcript.ts'
 import { findTranscript } from './claude/sessions.ts'
@@ -48,6 +49,11 @@ export interface NotifyMeta {
   titleSource: TitleSource
   contextTokens?: number
   /**
+   * ★ The project **as the list shows it** (`basename` of the transcript's first cwd = where the session started).
+   *   ⚠️ The hook's own cwd follows the session into subfolders, so the notification said `account` for a `nyan-remote` session (2026-09-25)
+   */
+  project?: string
+  /**
    * ISO8601. From the transcript's conversation records, **or mtime if there are none**.
    *
    * ⚠️⚠️ **Decide it in the same order as the list** (`meta.lastActivity ?? mtimeMs` in `sessions.ts`).
@@ -68,6 +74,7 @@ export function fieldsFrom(base: NotifyBase, meta: NotifyMeta | null): NotifyFie
     titleSource: meta.titleSource,
     // ⚠️ omit when unknown (do not show 0 as "ctx 0")
     ...(meta.contextTokens === undefined ? {} : { contextTokens: meta.contextTokens }),
+    ...(meta.project ? { project: meta.project } : {}),
   }
 }
 
@@ -82,6 +89,8 @@ export async function readNotifyMetaFromTranscript(path: string): Promise<Notify
       titleSource: meta.titleSource,
       ...(meta.contextTokens === undefined ? {} : { contextTokens: meta.contextTokens }),
       ...(lastActivity ? { lastActivity } : {}),
+      // ⚠️ Same rule as the list (`sessions.ts`: `cwd ? basename(cwd) : '—'`)
+      ...(meta.cwd ? { project: basename(meta.cwd) } : {}),
     }
   } catch {
     return null
