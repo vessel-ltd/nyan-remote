@@ -86,17 +86,25 @@ if (!REMOVE) {
   }
 }
 
-/** Target ~/.claude* directories that have projects/ (same rule as the agent's configDirs.ts) */
+/**
+ * Target ~/.claude* directories that have projects/ (same rule as the agent's configDirs.ts).
+ * ★ When removing, also every one that has a settings.json (codex 2026-09-26: a directory whose projects/ was cleared
+ *   kept our hooks, and uninstall then deleted the files they call).
+ */
 function configDirs() {
   const out = []
   for (const name of readdirSync(home).sort()) {
     if (!NAME.test(name)) continue
     const dir = join(home, name)
-    try {
-      if (!statSync(join(dir, 'projects')).isDirectory()) continue
-    } catch {
-      continue
+    const has = (f, isDir) => {
+      try {
+        const st = statSync(join(dir, f))
+        return isDir ? st.isDirectory() : st.isFile()
+      } catch {
+        return false
+      }
     }
+    if (!has('projects', true) && !(REMOVE && has('settings.json', false))) continue
     out.push(dir)
   }
   return out
@@ -446,6 +454,7 @@ function smokeTest() {
 }
 
 let changed = 0
+let removeFailed = 0
 let msgReady = true
 if (!REMOVE) {
   const msgWarn = checkMsgCommand()
@@ -465,6 +474,11 @@ if (!REMOVE) {
 }
 const dirs = configDirs()
 if (dirs.length === 0) {
+  // ★ Removing from nowhere is done (`nyan uninstall` must not stop on a machine without Claude Code)
+  if (REMOVE) {
+    console.log(t('~/.claude* が無いので、外すフックはありません', 'No ~/.claude* directory, so there are no hooks to remove'))
+    process.exit(0)
+  }
   console.error(t('✗ ~/.claude* が見つかりません', '✗ No ~/.claude* directory found'))
   process.exit(1)
 }
@@ -486,6 +500,8 @@ for (const dir of dirs) {
     } catch (err) {
       // ⚠️ Never overwrite a broken file. Silently creating a new one would lose the settings
       console.error(t(`✗ ${path} が JSON として読めません（触りません）: ${err.message}`, `✗ ${path} is not valid JSON (leaving it untouched): ${err.message}`))
+      // ★ When removing, this is a failure (our hooks may still be in there / `nyan uninstall` must not go on to delete what they call)
+      if (REMOVE) removeFailed++
       continue
     }
   }
@@ -532,6 +548,10 @@ console.log(
     ? t('\n変更はありませんでした。', '\nNothing changed.')
     : t(`\n${changed} 件を更新しました。★ 動いているセッションもすぐ拾います（再起動は不要）。`, `\nUpdated ${changed}. ★ Running sessions pick it up right away (no restart needed).`),
 )
+if (REMOVE && removeFailed > 0) {
+  console.error(t(`✗ ${removeFailed} 件は外せませんでした（上を見てください）`, `✗ ${removeFailed} could not be removed (see above)`))
+  process.exitCode = 1
+}
 if (!REMOVE && changed > 0) {
   const h = TIMEOUT / 3600
   const hr = Math.round(h * 10) / 10

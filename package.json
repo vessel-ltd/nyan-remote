@@ -24,6 +24,7 @@
     "test:shared": "node --test 'shared/**/*.test.ts'",
     "test:relay": "node --test 'relay/src/**/*.test.ts'",
     "test:account": "node --test 'account/src/**/*.test.ts'",
+  "uninstall": "node scripts/uninstall.mjs",
   "test:scripts": "node --test 'scripts/**/*.test.mjs'",
     "typecheck": "npm run typecheck --workspace agent && npm run typecheck --workspace web",
     "dev:stop": "node scripts/dev-stop.mjs",

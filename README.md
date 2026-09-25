@@ -62,6 +62,7 @@ Everyday commands (`nyan help` lists them all):
 | `nyan status` / `nyan logs` | service state and logs |
 | `nyan devices` | registered phones (`--revoke` to remove one) |
 | `nyan account` | your plan and limits on the hosted relay |
+| `nyan uninstall` | remove it from this machine (see [Uninstall](#uninstall)) |
 
 > Your state directory (`~/.nyan-remote`) is never touched by an update, and the previous tree is
 > kept as `~/nyan-remote.old-<timestamp>` so you can go back.
@@ -71,6 +72,23 @@ Everyday commands (`nyan help` lists them all):
 Run the same installer and pair your phone with it. That is all — there is no key to copy and
 nothing to keep in sync. Each machine keeps its own notification key, and your phone holds a
 separate push subscription per machine.
+
+### Uninstall
+
+```bash
+nyan uninstall
+```
+
+This checks for pending approvals, signs the machine out of your account (freeing its slot), stops
+and removes the background service, removes the Claude Code hooks, `notify.sh`, the `claude` entry
+point on `PATH` and the `nyan` command, and deletes the installed tree (a git checkout is left in
+place). Your own settings and shell files are kept; only the parts we added are removed.
+
+The state directory (`~/.nyan-remote`: this machine's keys and registered phones) is **kept**, so
+reinstalling later needs no re-pairing. `nyan uninstall --purge` deletes it too.
+
+On the phone, remove the machine under **Connections**, and remove the app from the home screen if
+you no longer use it.
 
 ---
 

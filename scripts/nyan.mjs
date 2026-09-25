@@ -27,6 +27,7 @@ export const PASSTHROUGH = {
   devices: 'scripts/devices.mjs',
   pending: 'scripts/pending.mjs',
   keys: 'scripts/keys-status.mjs',
+  uninstall: 'scripts/uninstall.mjs',
 }
 
 /** ★ Account (2026-09-24 / billing). ⚠️ One script, given the command name (`scripts/account.mjs`) */
@@ -180,6 +181,28 @@ export function helpDetail() {
   Shows your plan, how many machines and phones you can use, and whether the relay accepts this machine.
 `,
     ),
+    uninstall: t(
+      `nyan uninstall [--purge] [--yes] [--force] — このマシンから外す
+
+  常駐・Claude Code のフック・notify.sh・claude の入口（PATH）・nyan コマンド・入れた木を外します
+  （git の作業ツリーは残します）。ログインしていれば、このマシンをアカウントから外します。
+  ★ 状態ディレクトリ（~/.nyan-remote: 鍵と登録）は残します。入れ直せばスマホはそのまま繋がります。
+
+  --purge   状態ディレクトリも消す（⚠️ 入れ直したらスマホの登録をやり直し）
+  --yes     確かめずに進む
+  --force   承認待ちを確かめられない・アカウントから外せないときも進む
+`,
+      `nyan uninstall [--purge] [--yes] [--force] — remove nyan-remote from this machine
+
+  Removes the background service, the Claude Code hooks, notify.sh, the claude entry point (PATH), the nyan command
+  and the installed tree (a git checkout is kept). If you are signed in, this machine is removed from your account.
+  ★ The state directory (~/.nyan-remote: keys and registrations) is kept. Reinstall and your phones still connect.
+
+  --purge   remove the state directory too (⚠️ after a reinstall you pair your phones again)
+  --yes     do not ask for confirmation
+  --force   continue even if pending approvals cannot be checked or the machine cannot be removed from the account
+`,
+    ),
     version: t(`nyan version — 版を出す
 `, `nyan version — print the version
 `),
@@ -204,6 +227,7 @@ export function helpText() {
   nyan login       こちらの relay を使うためにログインする（GitHub）
   nyan logout      ログアウトする（このマシンをアカウントから外す）
   nyan account     プランと上限
+  nyan uninstall   このマシンから外す（鍵と登録は残す。--purge で全部）
   nyan version     版
   nyan help <コマンド>  そのコマンドの詳しい使い方（nyan <コマンド> --help でも同じ）
 
@@ -222,6 +246,7 @@ export function helpText() {
   nyan login       sign in to use our relay (GitHub)
   nyan logout      sign out (removes this machine from the account)
   nyan account     plan and limits
+  nyan uninstall   remove from this machine (keeps keys and registrations; --purge removes all)
   nyan version     version
   nyan help <command>  detailed usage (same as nyan <command> --help)
 

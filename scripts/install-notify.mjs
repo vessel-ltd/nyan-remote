@@ -9,7 +9,9 @@
 // ⚠️ Leave machines that installed it as a link alone (that would write to its target = the tree itself).
 // ⚠️ Do not install without `~/.claude` (Claude Code has never been started). ⚠️ Temp file → verify → replace (CLAUDE.md §5).
 //
-// Exit code: 0 = installed / identical / left alone (with the reason) / 1 = could not write
+// `--remove` (for `nyan uninstall`): removes it only when it equals a version we shipped.
+//
+// Exit code: 0 = installed / identical / removed / left alone (with the reason) / 1 = could not write
 
 import { execFileSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
@@ -81,18 +83,60 @@ export function decide({ claudeExists, dest, src, known, force }) {
   return 'modified'
 }
 
+/**
+ * ★ Decide what `--remove` does (`nyan uninstall` / ⚠️ pure = tests can hit every branch).
+ * ⚠️ Remove only a copy that equals a version we shipped (a modified one is the user's = leave it and say so).
+ * @returns 'absent' | 'linked' | 'unreadable' | 'remove' | 'modified'
+ */
+export function decideRemove({ dest, known }) {
+  if (dest === undefined) return 'absent'
+  if (dest === 'link') return 'linked'
+  if (dest === 'unreadable') return 'unreadable'
+  return known.has(sha256(dest)) ? 'remove' : 'modified'
+}
+
+function readDest(target) {
+  try {
+    return lstatSync(target).isSymbolicLink() ? 'link' : readFileSync(target)
+  } catch (err) {
+    // ★ "Absent" only when absence is confirmed (⚠️ unreadable due to permissions etc. is different = leave it)
+    return err?.code === 'ENOENT' ? undefined : 'unreadable'
+  }
+}
+
+function remove(target, root) {
+  const what = decideRemove({ dest: readDest(target), known: knownHashes(root) })
+  switch (what) {
+    case 'absent':
+      console.log(t('notify.sh はありません', 'notify.sh is not installed'))
+      return 0
+    case 'linked':
+      console.log(t('notify.sh はリンクで置いてあるので触りません（要らなければ手で消してください）', 'notify.sh is a symlink, leaving it as is (delete it by hand if you no longer need it)'))
+      return 0
+    case 'unreadable':
+      console.error(t(`✗ notify.sh が在るのに読めません（権限を確かめてください）: ${target}`, `✗ notify.sh exists but cannot be read (check its permissions): ${target}`))
+      return 1
+    case 'modified':
+      console.log(t(`notify.sh に手が入っているので残しました（フックからは外してあります）: ${target}`, `notify.sh has local changes, so it was kept (no hook calls it any more): ${target}`))
+      return 0
+  }
+  try {
+    rmSync(target)
+  } catch (err) {
+    console.error(t(`✗ notify.sh を消せません: ${err.message}`, `✗ Cannot remove notify.sh: ${err.message}`))
+    return 1
+  }
+  console.log(t('notify.sh を消しました', 'Removed notify.sh'))
+  return 0
+}
+
 export function main(argv = process.argv.slice(2), home = process.env.HOME ?? homedir(), root = ROOT) {
   const force = argv.includes('--force')
   const claude = join(home, '.claude')
   const target = join(claude, 'hooks', 'notify.sh')
+  if (argv.includes('--remove')) return remove(target, root)
   const src = readFileSync(join(root, 'hooks', 'notify.sh'))
-  let dest
-  try {
-    dest = lstatSync(target).isSymbolicLink() ? 'link' : readFileSync(target)
-  } catch (err) {
-    // ★ "Absent" only when absence is confirmed (⚠️ unreadable due to permissions etc. is different = leave it)
-    dest = err?.code === 'ENOENT' ? undefined : 'unreadable'
-  }
+  const dest = readDest(target)
   const what = decide({ claudeExists: existsSync(claude), dest, src, known: knownHashes(root), force })
   switch (what) {
     case 'no-claude':

@@ -368,6 +368,12 @@ export function shellFor(shell, os) {
  * ⚠️ bash reads **only the first existing one** of `.bash_profile` → `.bash_login` → `.profile`.
  * ⚠️ zsh runs `.zprofile` → `.zshrc` (`.zshrc` is later), so **nothing needs adding** → undefined.
  */
+/** ★ Every rc file we may have written that exists (for `--uninstall`) */
+export function uninstallTargets(home, extra = [], exists = existsSync) {
+  const all = [...extra.filter(Boolean), ...['.bashrc', '.zshrc', '.bash_profile', '.bash_login', '.profile'].map((f) => join(home, f))]
+  return [...new Set(all)].filter((p) => exists(p))
+}
+
 export function loginProfileFor(shell, home, os, exists = existsSync) {
   const name = (shell ?? '').split('/').pop() ?? ''
   const isZsh = name === 'zsh' || (name === '' && os === 'darwin')
@@ -554,7 +560,11 @@ async function main() {
   const rcPath = rcPathFor(process.env['SHELL'], home, platform())
   // ★ Also place it in the file read at login (it runs **after** `.bashrc` and takes over PATH)
   const loginPath = loginProfileFor(process.env['SHELL'], home, platform())
-  const targets = [rcPath, ...(loginPath && loginPath !== rcPath ? [loginPath] : [])]
+  // ★ Removing looks at **every** rc we may have written, not only this shell's (codex 2026-09-26: installed under bash,
+  //   uninstalled with SHELL=zsh left the bash blocks). ⚠️ Only files that exist (never create one to remove from).
+  const targets = uninstall
+    ? uninstallTargets(home, [rcPath, loginPath])
+    : [rcPath, ...(loginPath && loginPath !== rcPath ? [loginPath] : [])]
   const binDir = binDirFor(home, process.env)
   // ★★ **Check the bin directory path first** (B2). If it is malformed, nothing written to the rc can fix it
   const dirProblem = stateDirProblem(binDir)
