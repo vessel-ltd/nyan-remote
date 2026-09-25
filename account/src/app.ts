@@ -570,7 +570,6 @@ export async function handle(req: Request, d: Deps): Promise<Response> {
         if (email && !EMAIL_RE.test(email)) return redirect('/?n=support-email#support')
         if (!d.ops?.sendAlert) return redirect('/?n=support-failed#support')
         const date = new Date(d.now()).toISOString().slice(0, 10)
-        if ((await d.store.supportCount(acct.id, date)) >= SUPPORT_PER_DAY) return redirect('/?n=support-limit#support')
         const lines = [
           `From: ${acct.githubLogin} (GitHub id ${acct.githubId}, account ${acct.id}, plan ${planOf(acct)})`,
           `Reply to: ${email || '(not given — reply through GitHub)'}`,
@@ -578,13 +577,16 @@ export async function handle(req: Request, d: Deps): Promise<Response> {
           '',
           message,
         ]
+        // ⚠️⚠️ Reserve the slot **before** sending, in one statement (codex round 33: 8 parallel sends all went through)
+        const slot = `support:${acct.id}:${date}:${toBase64Url(d.random(6))}`
+        if (!(await d.store.reserveSupport(acct.id, date, slot, SUPPORT_PER_DAY, d.now()))) return redirect('/?n=support-limit#support')
         try {
           await d.ops.sendAlert(`[nyan-remote support] ${acct.githubLogin}`, lines.join('\n'), email || undefined)
         } catch (err) {
           console.error('[support]', err instanceof Error ? err.message : String(err))
+          await d.store.releaseAlert(slot).catch(() => undefined)
           return redirect('/?n=support-failed#support')
         }
-        await d.store.markAlert(`support:${acct.id}:${date}:${toBase64Url(d.random(6))}`, d.now())
         return redirect('/?n=support-sent#support')
       }
       if (path === '/machines/revoke') {

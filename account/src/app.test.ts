@@ -724,7 +724,8 @@ test('★★ even if Stripe keeps returning the earlier 500, move on once enough
 
 // ── Ops watcher (ops.ts / 2026-09-25) ──────────────────────────────────
 
-const usageDay = (date: string, requests: number) => ({ date, workers: { 'nyan-relay': 1000 }, errors: 0, durableObjects: requests - 1000, activeSec: 60 })
+// ★ Most relay traffic is WebSocket messages (billed 20:1); `http` (1:1) is a small share, like production
+const usageDay = (date: string, requests: number, http = 0) => ({ date, workers: { 'nyan-relay': 1000 }, errors: 0, durableObjects: requests - 1000, doMessages: requests - 1000 - http, activeSec: 60 })
 
 test('★★ /admin: only allowed GitHub ids can view it (others and signed-out users get "does not exist")', async () => {
   const r = await rig()
@@ -757,7 +758,8 @@ test('★★ usage watcher (paid plan): kinds whose monthly projection exceeds t
   const date = new Date(T).toISOString().slice(0, 10)
   const month = date.slice(0, 7)
   let perDay = 20_000
-  const days = () => Array.from({ length: Number(date.slice(8, 10)) }, (_, i) => usageDay(`${month}-${String(i + 1).padStart(2, '0')}`, perDay))
+  // ⚠️ Plain (1:1) Durable Object requests here — WebSocket messages would bill at 20:1 and stay under the included amount
+  const days = () => Array.from({ length: Number(date.slice(8, 10)) }, (_, i) => usageDay(`${month}-${String(i + 1).padStart(2, '0')}`, perDay, perDay - 1000))
   r.d.ops = {
     usage: async () => days(),
     sendAlert: async (subject) => {
@@ -771,7 +773,7 @@ test('★★ usage watcher (paid plan): kinds whose monthly projection exceeds t
   await assert.rejects(runOps(r.d))
   fail = false
   assert.equal(await runOps(r.d), 1, '⚠️⚠️ remembered "alerted" although sending failed')
-  assert.match(sent[0]!, /Durable Object requests projected over the included amount/)
+  assert.match(sent[0]!, /Durable Object requests \(billed\) projected over the included amount/)
   assert.equal(await runOps(r.d), 0, '⚠️ sent several times in the same month')
   // ★ Spikes are reported separately
   perDay = 400_000
@@ -784,7 +786,12 @@ test('★★ usage watcher (paid plan): kinds whose monthly projection exceeds t
 test('★★ monthly projection and overage cost (a copy of public pricing)', async () => {
   const { monthUsage, PAID_INCLUDED } = await import('./ops.ts')
   const now = Date.UTC(2026, 8, 10, 12)
-  const days = Array.from({ length: 10 }, (_, i) => usageDay(`2026-09-${String(i + 1).padStart(2, '0')}`, 101_000))
+  // ★ WebSocket messages bill 20:1 (codex round 33): 100k messages a day = 5k billed requests a day
+  const ws = monthUsage(Array.from({ length: 10 }, (_, i) => usageDay(`2026-09-${String(i + 1).padStart(2, '0')}`, 101_000)), now)
+  assert.equal(ws.used.doRequests, 50_000, '⚠️⚠️ WebSocket messages counted as full requests')
+  assert.equal(ws.projectedOverageUsd, 0)
+  // plain requests bill 1:1
+  const days = Array.from({ length: 10 }, (_, i) => usageDay(`2026-09-${String(i + 1).padStart(2, '0')}`, 101_000, 100_000))
   const m = monthUsage(days, now)
   assert.equal(m.days, 10)
   assert.equal(m.daysInMonth, 30)
@@ -807,14 +814,17 @@ test('★ group the Cloudflare answer by day, and throw on a wrong shape', async
               { sum: { requests: 5, errors: 1 }, dimensions: { date: '2026-09-24', scriptName: 'nyan-relay' } },
               { sum: { requests: 3, errors: 0 }, dimensions: { date: '2026-09-24', scriptName: 'nyan-account' } },
             ],
-            d: [{ sum: { requests: 100 }, dimensions: { date: '2026-09-24' } }],
+            d: [
+              { sum: { requests: 100 }, dimensions: { date: '2026-09-24', type: 'hibernation' } },
+              { sum: { requests: 7 }, dimensions: { date: '2026-09-24', type: 'http' } },
+            ],
             p: [{ sum: { activeTime: 2_500_000 }, dimensions: { date: '2026-09-24' } }],
           },
         ],
       },
     },
   })
-  assert.deepEqual(days, [{ date: '2026-09-24', workers: { 'nyan-relay': 5, 'nyan-account': 3 }, errors: 1, durableObjects: 100, activeSec: 3 }])
+  assert.deepEqual(days, [{ date: '2026-09-24', workers: { 'nyan-relay': 5, 'nyan-account': 3 }, errors: 1, durableObjects: 107, doMessages: 100, activeSec: 3 }])
   assert.throws(() => parseUsage({ errors: [{}] }))
 })
 
@@ -861,4 +871,20 @@ test('★★ support: signed-in users only, operator address hidden, reply-to sh
   const page = await (await r.call('/', { headers: { cookie } })).text()
   assert.match(page, /action="\/support"/)
   assert.doesNotMatch(page, /operator@example\.com/, '⚠️⚠️ the operator address reached the page')
+})
+
+test('★★★ contact form: parallel sends cannot exceed 5 a day, and a failed send gives its slot back (codex round 33)', async () => {
+  const r = await rig()
+  const { body } = await login(r)
+  const cookie = await sessionCookie(r, body.account.id)
+  let sent = 0
+  let fail = false
+  r.d.ops = { usage: async () => [], sendAlert: async () => { if (fail) throw new Error('x'); await new Promise((ok) => setTimeout(ok, 5)); sent++ } }
+  const post = (m: string) => r.call('/support', { method: 'POST', body: new URLSearchParams({ message: m }), headers: { cookie, origin: ORIGIN } })
+  fail = true
+  assert.equal((await post('fails')).headers.get('location'), '/?n=support-failed#support')
+  fail = false
+  const all = await Promise.all(Array.from({ length: 8 }, (_, i) => post(`m${i}`)))
+  assert.equal(all.filter((x) => x.headers.get('location') === '/?n=support-sent#support').length, 5, '⚠️⚠️ parallel sends went over the daily limit (or a failed send used up a slot)')
+  assert.equal(sent, 5)
 })

@@ -203,6 +203,20 @@ function d1Store(db: D1Database): Store {
     alerted: async (key) => (await one('SELECT key FROM ops_alerts WHERE key = ?', key)) !== null,
     supportCount: async (acct, date) =>
       Number((await one("SELECT COUNT(*) AS n FROM ops_alerts WHERE key LIKE ? ESCAPE '\\'", `support:${acct.replace(/[\\%_]/g, '\\$&')}:${date}:%`))?.['n'] ?? 0),
+    // ⚠️⚠️ Count and insert in one statement (a count followed by an insert lets parallel requests through)
+    reserveSupport: async (acct, date, key, max, now) => {
+      const r = await run(
+        "INSERT INTO ops_alerts (key, at) SELECT ?, ? WHERE (SELECT COUNT(*) FROM ops_alerts WHERE key LIKE ? ESCAPE '\\') < ?",
+        key,
+        now,
+        `support:${acct.replace(/[\\%_]/g, '\\$&')}:${date}:%`,
+        max,
+      )
+      return (r.meta.changes ?? 0) > 0
+    },
+    releaseAlert: async (key) => {
+      await run('DELETE FROM ops_alerts WHERE key = ?', key)
+    },
     markAlert: async (key, now) => {
       const r = await run('INSERT OR IGNORE INTO ops_alerts (key, at) VALUES (?, ?)', key, now)
       return (r.meta.changes ?? 0) > 0

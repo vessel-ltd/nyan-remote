@@ -116,6 +116,12 @@ export interface Store {
   markAlert(key: string, now: number): Promise<boolean>
   /** ★ Number of support messages that day (counts `support:<acct>:<date>:` marks) */
   supportCount(accountId: string, date: string): Promise<number>
+  /**
+   * ★★ Reserve one of the day's contact slots **in one statement** (codex round 33: count-then-record let 8 parallel
+   *   sends all through). ⚠️ true only if a slot was taken; release it with `releaseAlert` when the send fails.
+   */
+  reserveSupport(accountId: string, date: string, key: string, max: number, now: number): Promise<boolean>
+  releaseAlert(key: string): Promise<void>
 }
 
 /**
@@ -255,6 +261,12 @@ export function memoryStore(): Store & { accounts: Map<string, AccountRow>; mach
     },
     alerted: async (key) => alerts.has(key),
     supportCount: async (acct, date) => [...alerts].filter((k) => k.startsWith(`support:${acct}:${date}:`)).length,
+    reserveSupport: async (acct, date, key, max) => {
+      if ([...alerts].filter((k) => k.startsWith(`support:${acct}:${date}:`)).length >= max) return false
+      alerts.add(key)
+      return true
+    },
+    releaseAlert: async (key) => void alerts.delete(key),
     markAlert: async (key) => {
       if (alerts.has(key)) return false
       alerts.add(key)

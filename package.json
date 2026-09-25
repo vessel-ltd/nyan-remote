@@ -34,6 +34,7 @@
     "site:stage": "node scripts/site-stage.mjs",
     "relay:smoke": "node scripts/relay-smoke.mjs",
     "cf": "node scripts/cf-usage.mjs",
+    "publish:public": "node scripts/publish-public.mjs",
     "traffic": "node scripts/traffic.mjs"
   },
   "devDependencies": {

@@ -17,6 +17,11 @@ export interface UsageDay {
   errors: number
   /** Durable Object requests */
   durableObjects: number
+  /**
+   * ★ Of those, WebSocket messages delivered to a hibernating object (`type: hibernation`).
+   *   ⚠️ Billed at **20 messages = 1 request** (codex round 33); `http` / `jsrpc` bill 1:1.
+   */
+  doMessages: number
   /** Seconds the Durable Objects were awake */
   activeSec: number
 }
@@ -41,8 +46,10 @@ export const PAID_INCLUDED = { workerRequests: 10_000_000, doRequests: 1_000_000
 export const OVERAGE_PER_MILLION = { workerRequests: 0.3, doRequests: 0.15, doGbSec: 12.5 } as const
 type Kind = keyof typeof PAID_INCLUDED
 const KINDS: Kind[] = ['workerRequests', 'doRequests', 'doGbSec']
-const LABEL: Record<Kind, string> = { workerRequests: 'Worker requests', doRequests: 'Durable Object requests', doGbSec: 'Durable Object duration (GB-s)' }
+const LABEL: Record<Kind, string> = { workerRequests: 'Worker requests', doRequests: 'Durable Object requests (billed)', doGbSec: 'Durable Object duration (GB-s)' }
 const DO_GB = 0.128
+/** ★ Incoming WebSocket messages are billed as 1 request per 20 (Durable Objects pricing) */
+export const WS_MESSAGES_PER_REQUEST = 20
 
 /** ★ Default daily spike threshold (requests = worker + DO). ⚠️ Currently just under 200k even on busy days */
 export const DEFAULT_SPIKE_DAILY = 300_000
@@ -71,7 +78,8 @@ export function monthUsage(days: UsageDay[], now: number): MonthUsage {
   const mine = days.filter((x) => x.date.startsWith(month))
   const used: Record<Kind, number> = {
     workerRequests: mine.reduce((a, x) => a + Object.values(x.workers).reduce((p, q) => p + q, 0), 0),
-    doRequests: mine.reduce((a, x) => a + x.durableObjects, 0),
+    // ⚠️ Billed requests: WebSocket messages at 20:1, everything else 1:1 (the raw count stays in the daily table)
+    doRequests: Math.round(mine.reduce((a, x) => a + (x.durableObjects - x.doMessages) + x.doMessages / WS_MESSAGES_PER_REQUEST, 0)),
     doGbSec: Math.round(mine.reduce((a, x) => a + x.activeSec, 0) * DO_GB),
   }
   // ⚠️ Today is still in progress ⇒ dividing by "days elapsed" reads low early in the month (alerts lean late, but spikes are caught by ②)
@@ -127,7 +135,7 @@ export function parseUsage(j: unknown): UsageDay[] {
   const a = (j as { data?: { viewer?: { accounts?: unknown[] } } })?.data?.viewer?.accounts?.[0] as
     | {
         w?: { sum: { requests: number; errors: number }; dimensions: { date: string; scriptName: string } }[]
-        d?: { sum: { requests: number }; dimensions: { date: string } }[]
+        d?: { sum: { requests: number }; dimensions: { date: string; type?: string } }[]
         p?: { sum: { activeTime: number }; dimensions: { date: string } }[]
       }
     | undefined
@@ -135,7 +143,7 @@ export function parseUsage(j: unknown): UsageDay[] {
   const days = new Map<string, UsageDay>()
   const day = (date: string) => {
     let d = days.get(date)
-    if (!d) days.set(date, (d = { date, workers: {}, errors: 0, durableObjects: 0, activeSec: 0 }))
+    if (!d) days.set(date, (d = { date, workers: {}, errors: 0, durableObjects: 0, doMessages: 0, activeSec: 0 }))
     return d
   }
   for (const x of a.w) {
@@ -143,14 +151,18 @@ export function parseUsage(j: unknown): UsageDay[] {
     d.workers[x.dimensions.scriptName] = (d.workers[x.dimensions.scriptName] ?? 0) + x.sum.requests
     d.errors += x.sum.errors
   }
-  for (const x of a.d) day(x.dimensions.date).durableObjects += x.sum.requests
+  for (const x of a.d) {
+    const d = day(x.dimensions.date)
+    d.durableObjects += x.sum.requests
+    if (x.dimensions.type === 'hibernation') d.doMessages += x.sum.requests
+  }
   for (const x of a.p) day(x.dimensions.date).activeSec += Math.round(x.sum.activeTime / 1e6)
   return [...days.values()].sort((x, y) => (x.date < y.date ? -1 : 1))
 }
 
 export const USAGE_QUERY = `query($a:String!,$s:Date!){viewer{accounts(filter:{accountTag:$a}){
  w: workersInvocationsAdaptive(limit:1000, filter:{date_geq:$s}){ sum{requests errors} dimensions{date scriptName} }
- d: durableObjectsInvocationsAdaptiveGroups(limit:1000, filter:{date_geq:$s}){ sum{requests} dimensions{date} }
+ d: durableObjectsInvocationsAdaptiveGroups(limit:1000, filter:{date_geq:$s}){ sum{requests} dimensions{date type} }
  p: durableObjectsPeriodicGroups(limit:1000, filter:{date_geq:$s}){ sum{activeTime} dimensions{date} }
 }}}`
 
@@ -217,6 +229,6 @@ function monthTable(m: MonthUsage): string {
   }
   return `<h3>This month (${esc(m.month)}, day ${m.days} of ${m.daysInMonth})</h3>
 <table><tr><th>Kind</th><th>So far</th><th>Projected</th><th>Included</th><th>Projected / included</th></tr>${KINDS.map(row).join('')}</table>
-<p class="dim">Projected overage: about $${m.projectedOverageUsd.toFixed(2)} on top of $5 (estimate from public prices; the Cloudflare billing page is authoritative).</p>
+<p class="dim">Projected overage: about $${m.projectedOverageUsd.toFixed(2)} on top of $5 (estimate from public prices; the Cloudflare billing page is authoritative). Durable Object requests are billed with WebSocket messages at 20 per request; the daily table below shows raw counts.</p>
 <h3>By day</h3>`
 }

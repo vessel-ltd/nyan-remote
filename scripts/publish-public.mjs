@@ -11,7 +11,7 @@
 // ⚠️ Author: Vessel Ltd. <noreply@nyan-remote.app> (an address that receives nothing — commit emails get harvested).
 
 import { execFileSync } from 'node:child_process'
-import { cpSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs'
+import { cpSync, existsSync, lstatSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, relative } from 'node:path'
 import { isMain } from './lib/isMain.mjs'
@@ -20,8 +20,26 @@ const PUBLIC_REPO = 'vessel-ltd/nyan-remote'
 const PUBLIC_URL = `https://github.com/${PUBLIC_REPO}.git`
 const AUTHOR = { name: 'Vessel Ltd.', email: 'noreply@nyan-remote.app' }
 
-/** ★ Kept private (work notes and internal design docs, mostly in Japanese). */
-export const EXCLUDE = ['CLAUDE.md', 'docs', 'relay/README.md', 'site/README.md', '.claude']
+/**
+ * ★★ What may be public is **listed**, not what must stay private (codex round 33: anything added later was published
+ *   automatically). A file outside these rules **stops** the publish — add it here on purpose, or move it under `docs/`.
+ *   ①top-level entries ②file types ③Markdown only as the root README ④binary files only as images/fonts.
+ */
+export const PUBLIC_TOP = ['.gitignore', 'LICENSE', 'README.md', 'account', 'agent', 'hooks', 'install.sh', 'landing', 'package-lock.json', 'package.json', 'relay', 'scripts', 'shared', 'site', 'web']
+/** ★ Kept private on purpose (dropped quietly — everything else not allowed stops the publish) */
+export const PRIVATE = ['CLAUDE.md', 'docs', '.claude']
+const TEXT_EXT = /\.(ts|tsx|mjs|cjs|js|json|jsonc|sql|sh|py|css|html|svg|webmanifest|gitignore)$|(^|\/)(LICENSE|\.gitignore)$/
+const BINARY_EXT = /\.(png|jpg|jpeg|gif|webp|ico|woff2?)$/
+
+/** ★ Decide each exported path: 'keep' / 'drop' (private) / a reason to stop. */
+export function classify(path) {
+  const top = path.split('/')[0]
+  if (PRIVATE.includes(top)) return 'drop'
+  if (!PUBLIC_TOP.includes(top)) return `not in the public list (${top})`
+  if (/\.md$/i.test(path)) return path === 'README.md' ? 'keep' : 'drop'
+  if (TEXT_EXT.test(path) || BINARY_EXT.test(path)) return 'keep'
+  return 'unknown file type'
+}
 
 /**
  * ⚠️ Values that must never appear in the public tree.
@@ -52,20 +70,31 @@ function* files(dir) {
   for (const name of readdirSync(dir)) {
     const p = join(dir, name)
     if (name === '.git') continue
-    if (statSync(p).isDirectory()) yield* files(p)
+    // ⚠️ lstat: a symlink is never followed (a link out of the tree could pull outside files in)
+    if (lstatSync(p).isDirectory()) yield* files(p)
     else yield p
   }
 }
 
-/** ★ Every forbidden hit as `path:line: pattern` (binary files are skipped). */
+/**
+ * ★ Every forbidden hit as `path:line: pattern`.
+ *   ⚠️⚠️ Nothing is skipped (codex round 33, high: one NUL byte made a file "binary" and let a secret through).
+ *   Text is read as UTF-8; image/font files are read byte for byte (latin1) so an embedded secret still matches.
+ *   ⚠️ A NUL in a text-type file stops the publish (UTF-16 and the like cannot be checked reliably).
+ */
 export function scan(root, patterns) {
   const hits = []
   for (const f of files(root)) {
+    const rel = relative(root, f)
     const buf = readFileSync(f)
-    if (buf.includes(0)) continue
-    const lines = buf.toString('utf8').split('\n')
+    const binary = BINARY_EXT.test(rel)
+    if (!binary && buf.includes(0)) {
+      hits.push(`${rel}: NUL byte in a text file (cannot be checked)`)
+      continue
+    }
+    const lines = buf.toString(binary ? 'latin1' : 'utf8').split('\n')
     lines.forEach((line, i) => {
-      for (const re of patterns) if (re.test(line)) hits.push(`${relative(root, f)}:${i + 1}: ${re}`)
+      for (const re of patterns) if (re.test(line)) hits.push(`${rel}:${i + 1}: ${re}`)
     })
   }
   return hits
@@ -82,7 +111,24 @@ function main() {
   const work = mkdtempSync(join(tmpdir(), 'nyan-publish-'))
   const tree = join(work, 'tree')
   execFileSync('bash', ['-c', `mkdir -p "${tree}" && git archive HEAD | tar -x -C "${tree}"`], { cwd: root })
-  for (const p of EXCLUDE) rmSync(join(tree, p), { recursive: true, force: true })
+  // ★ Apply the public list; anything it does not know stops here
+  const refused = []
+  for (const f of [...files(tree)]) {
+    const rel = relative(tree, f)
+    // ⚠️⚠️ No symlinks at all (codex round 33: cpSync rewrote relative links to absolute temp paths that do not exist)
+    if (lstatSync(f).isSymbolicLink()) {
+      refused.push(`${rel}: symlink`)
+      continue
+    }
+    const c = classify(rel)
+    if (c === 'drop') rmSync(f, { force: true })
+    else if (c !== 'keep') refused.push(`${rel}: ${c}`)
+  }
+  for (const p of PRIVATE) rmSync(join(tree, p), { recursive: true, force: true })
+  if (refused.length) {
+    console.error(`✗ ${refused.length} file(s) are not allowed in the public tree (edit PUBLIC_TOP / the file types in scripts/publish-public.mjs, or move them under docs/):\n${refused.slice(0, 50).join('\n')}`)
+    process.exit(1)
+  }
 
   const hits = scan(tree, forbiddenPatterns(root))
   if (hits.length) {
