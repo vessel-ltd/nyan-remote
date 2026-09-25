@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/vessel-ltd/nyan-remote/security/advisories/new
+    about: Please report security problems privately, not as an issue.
+  - name: Billing or account
+    url: https://account.nyan-remote.app/#support
+    about: Payments, plans and your account — sign in and use the contact form.
+  - name: Questions and ideas
+    url: https://github.com/vessel-ltd/nyan-remote/discussions
+    about: Ask how to do something or discuss an idea.

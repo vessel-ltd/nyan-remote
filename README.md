@@ -6,6 +6,12 @@
 phone-friendly web app that shows all of them at once — across several machines and several
 accounts — with push notifications when a session finishes, fails, or needs your approval.
 
+<p align="center">
+  <img src=".github/readme/list.png" width="260" alt="All sessions on every machine in one list">
+  <img src=".github/readme/approval.png" width="260" alt="Answering a permission prompt from the phone">
+  <img src=".github/readme/thread.png" width="260" alt="Following a running session">
+</p>
+
 > **Status: pre-release.** It runs every day on the author's machines, but interfaces and
 > defaults still change. Read [What it does not do](#what-it-does-not-do) before you rely on it.
 
@@ -149,7 +155,7 @@ Measured on the author's setup (3 machines, a full working day): the Durable Obj
   pile up instead of replacing each other. Android replaces them as intended.
 - **Serving the web app offline-first from the relay.** The app itself is served over HTTPS from a
   public origin; the relay only carries traffic once the app is already running.
-- **Multi-user.** One person, several machines. There are no accounts, roles, or sharing.
+- **Multi-user.** One person, several machines. There are no teams, roles, or sharing.
 
 ---
 
@@ -162,10 +168,18 @@ npm run typecheck
 NYAN_REMOTE_DEV=1 npm run dev
 ```
 
-The repository keeps its reasoning in `CLAUDE.md` (working rules), `docs/ARCHITECTURE.md` (the
-source of truth for design) and `docs/HANDOFF.md` (what happened and why). Several rules are
-enforced by tests rather than by convention — if `npm test` fails on a discipline test, the fix is
-to change the code, not the test.
+Several rules are enforced by tests rather than by convention — if `npm test` fails on a
+discipline test, the fix is to change the code, not the test. The comments next to each rule explain
+why it exists.
+
+`node scripts/demo-serve.mjs` serves the built app with sample data (used for the screenshots above).
+
+## Support
+
+- **Bugs and feature requests:** [open an issue](https://github.com/vessel-ltd/nyan-remote/issues/new/choose)
+- **Questions and ideas:** [Discussions](https://github.com/vessel-ltd/nyan-remote/discussions)
+- **Billing and your account:** the contact form on [your account page](https://account.nyan-remote.app/#support)
+- **Security problems:** please report privately — see [SECURITY.md](SECURITY.md)
 
 ## License
 

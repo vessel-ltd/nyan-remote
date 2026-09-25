@@ -10,6 +10,8 @@ test('★★★ only listed places and file types are public; anything else stop
   assert.equal(classify('agent/src/index.ts'), 'keep')
   assert.equal(classify('web/public/cats/mochi-cat.png'), 'keep')
   assert.equal(classify('README.md'), 'keep')
+  assert.equal(classify('SECURITY.md'), 'keep')
+  assert.equal(classify('.github/ISSUE_TEMPLATE/bug_report.yml'), 'keep')
   assert.equal(classify('docs/HANDOFF.md'), 'drop')
   assert.equal(classify('CLAUDE.md'), 'drop')
   assert.equal(classify('relay/README.md'), 'drop', '⚠️ only the root README is public')

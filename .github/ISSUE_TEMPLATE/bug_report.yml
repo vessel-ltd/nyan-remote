@@ -1,0 +1,55 @@
+name: Bug report
+description: Something does not work as described.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting! ⚠️ Do not paste pairing QR codes, `nyan://pair` links, tokens or the contents of `~/.nyan-remote/` — they are secrets.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you saw, and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Start `claude` on the PC
+        2. Open the session on the phone
+        3. ...
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `nyan version`, and the version at the bottom of the app's Endpoints screen.
+    validations:
+      required: true
+  - type: dropdown
+    id: pc
+    attributes:
+      label: Computer
+      options: [WSL (Windows), macOS, Linux]
+    validations:
+      required: true
+  - type: dropdown
+    id: phone
+    attributes:
+      label: Phone
+      options: [iPhone (Safari / home screen app), Android (Chrome), Other]
+  - type: dropdown
+    id: route
+    attributes:
+      label: Connection
+      options: [Our relay (nyan login), My own Cloudflare relay, Tailscale]
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: The relevant lines from `nyan logs` (check them for anything private first).
+      render: text

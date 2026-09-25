@@ -4,6 +4,7 @@
 //   node scripts/publish-public.mjs            # build, check, commit and push
 //   node scripts/publish-public.mjs --dry-run  # build and check only (prints where the tree is)
 //   node scripts/publish-public.mjs --approve-new  # publish including files that were never public before (listed first)
+//   node scripts/publish-public.mjs --closes 12,15 # the release commit says "Closes #12" etc. (GitHub closes them)
 //
 // ★ The public history is one commit per release; the private history (work notes, machine names, old diffs)
 //   never leaves this repository.
@@ -26,10 +27,10 @@ const AUTHOR = { name: 'Vessel Ltd.', email: 'noreply@nyan-remote.app' }
  *   automatically). A file outside these rules **stops** the publish — add it here on purpose, or move it under `docs/`.
  *   ①top-level entries ②file types ③Markdown only as the root README ④binary files only as images/fonts.
  */
-export const PUBLIC_TOP = ['.gitignore', 'LICENSE', 'README.md', 'account', 'agent', 'hooks', 'install.sh', 'landing', 'package-lock.json', 'package.json', 'relay', 'scripts', 'shared', 'site', 'web']
+export const PUBLIC_TOP = ['.github', '.gitignore', 'LICENSE', 'README.md', 'SECURITY.md', 'account', 'agent', 'hooks', 'install.sh', 'landing', 'package-lock.json', 'package.json', 'relay', 'scripts', 'shared', 'site', 'web']
 /** ★ Kept private on purpose (dropped quietly — everything else not allowed stops the publish) */
 export const PRIVATE = ['CLAUDE.md', 'docs', '.claude']
-const TEXT_EXT = /\.(ts|tsx|mjs|cjs|js|json|jsonc|sql|sh|py|css|html|svg|webmanifest|gitignore)$|(^|\/)(LICENSE|\.gitignore)$/
+const TEXT_EXT = /\.(ts|tsx|mjs|cjs|js|json|jsonc|sql|sh|py|css|html|svg|webmanifest|gitignore|ya?ml)$|(^|\/)(LICENSE|\.gitignore)$/
 const BINARY_EXT = /\.(png|jpg|jpeg|gif|webp|ico|woff2?)$/
 
 /** ★ Decide each exported path: 'keep' / 'drop' (private) / a reason to stop. */
@@ -37,7 +38,8 @@ export function classify(path) {
   const top = path.split('/')[0]
   if (PRIVATE.includes(top)) return 'drop'
   if (!PUBLIC_TOP.includes(top)) return `not in the public list (${top})`
-  if (/\.md$/i.test(path)) return path === 'README.md' ? 'keep' : 'drop'
+  // ★ Public Markdown: the root README and SECURITY, and GitHub's own files under .github/ (everything else is a work note)
+  if (/\.md$/i.test(path)) return path === 'README.md' || path === 'SECURITY.md' || path.startsWith('.github/') ? 'keep' : 'drop'
   if (TEXT_EXT.test(path) || BINARY_EXT.test(path)) return 'keep'
   return 'unknown file type'
 }
@@ -108,6 +110,10 @@ export function scan(root, patterns) {
 function main() {
   const dry = process.argv.includes('--dry-run')
   const approveNew = process.argv.includes('--approve-new')
+  // ★ `--closes 12,15`: put "Closes #12" lines in the release commit ⇒ GitHub closes those issues/PRs when it lands
+  const ci = process.argv.indexOf('--closes')
+  const closes = ci > 0 ? (process.argv[ci + 1] ?? '').split(',').map((x) => x.trim().replace(/^#/, '')) : []
+  if (closes.some((x) => !/^\d{1,7}$/.test(x))) throw new Error('--closes takes issue numbers, e.g. --closes 12,15')
   const root = git(['rev-parse', '--show-toplevel'])
   if (git(['status', '--porcelain'], { cwd: root })) throw new Error('The working tree is not clean. Commit first.')
   git(['fetch', '-q', 'origin'], { cwd: root })
@@ -181,7 +187,8 @@ function main() {
     GIT_COMMITTER_EMAIL: AUTHOR.email,
   }
   const date = new Date().toISOString().slice(0, 10)
-  git(['commit', '-q', '-m', `Release ${date} (${head.slice(0, 7)})`], { cwd: pub, env })
+  const message = [`Release ${date} (${head.slice(0, 7)})`, ...(closes.length ? ['', ...closes.map((n) => `Closes #${n}`)] : [])].join('\n')
+  git(['commit', '-q', '-m', message], { cwd: pub, env })
   git(['push', '-q', 'origin', 'HEAD:main'], { cwd: pub })
   console.log(`✓ Published to https://github.com/${PUBLIC_REPO}`)
   rmSync(work, { recursive: true, force: true })
