@@ -69,7 +69,8 @@ export function accountPage(
   o: { account: AccountRow; plan: Plan; machines: MachineRow[]; notice?: string; admin?: boolean },
 ): string {
   const lim = PLAN_LIMITS[o.plan]
-  const n = o.notice ? NOTICE[o.notice] : undefined
+  // ⚠️ Own keys only (`n=constructor` would otherwise print `function Object() …` / codex)
+  const n = o.notice && Object.hasOwn(NOTICE, o.notice) ? NOTICE[o.notice] : undefined
   // ★ Contact-form notices are shown by the form (not at the top), and an error opens the form again
   const forSupport = o.notice?.startsWith('support-') === true
   const top = n && !forSupport ? `<p class="card">${n}</p>` : ''

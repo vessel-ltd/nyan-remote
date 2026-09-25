@@ -880,6 +880,11 @@ test('★★ support: signed-in users only, operator address hidden, reply-to sh
   assert.match(page, /name="name"(?![^>]*required)/, '★ the name field is optional')
   const err = await (await r.call('/?n=support-empty', { headers: { cookie } })).text()
   assert.match(err, /<details id="support" open>[\s\S]*The message is empty\.[\s\S]*<\/details>/)
+  // ⚠️ Inherited properties are not notices (`constructor` printed the Object function / codex)
+  for (const n of ['constructor', '__proto__', 'toString']) {
+    const pg = await (await r.call(`/?n=${n}`, { headers: { cookie } })).text()
+    assert.doesNotMatch(pg, /native code|\[object Object\]|<p class="card">undefined/, `n=${n}`)
+  }
   const ok = await (await r.call('/?n=support-sent', { headers: { cookie } })).text()
   assert.match(ok, /<details id="support">[\s\S]*<\/details>\s*<p class="card">Sent\./)
   assert.equal(ok.match(/Sent\./g)?.length, 1, 'the sent notice shows once')

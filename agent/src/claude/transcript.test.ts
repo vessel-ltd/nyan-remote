@@ -117,6 +117,20 @@ test('derive: picks up cwd / gitBranch / version / permissionMode / lastActivity
   assert.equal(d.lastActivity, '2026-08-11T10:00:00.000Z')
 })
 
+test('★★ derive: cwd is where the session started, even when the tail was written from a subfolder (2026-09-25 / codex)', () => {
+  const d = derive({
+    sessionId: 's',
+    headRecords: [userMsg('やあ')],
+    tailRecords: [{ type: 'assistant', cwd: '/home/user/nyan-remote/account', gitBranch: 'feat', version: '9.9.9', timestamp: '2026-09-25T00:00:00.000Z' }],
+  })
+  assert.equal(d.cwd, '/home/user/nyan-remote')
+  // ⚠️ gitBranch / version still describe the current state (newest first)
+  assert.equal(d.gitBranch, 'feat')
+  assert.equal(d.cliVersion, '9.9.9')
+  // ★ A head without cwd falls back to the tail
+  assert.equal(derive({ sessionId: 's', headRecords: [{ type: 'summary' }], tailRecords: [{ type: 'assistant', cwd: '/x/y' }] }).cwd, '/x/y')
+})
+
 // ★★ Regression guard for the bug where "done" / "awaiting approval" vanished after 3 minutes (actually shipped on 2026-08-11).
 //
 //   Record order in the measured file:

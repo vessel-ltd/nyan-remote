@@ -230,14 +230,20 @@ function lastSystemContent(records: Rec[], subtype: string): string | undefined 
 /** A pure function with no file I/O. The target of unit tests. */
 export function derive({ sessionId, headRecords, tailRecords }: DeriveInput): Derived {
   // cwd / gitBranch / version are on almost every message record
+  // ★★ cwd = **where the session started** (head first / 2026-09-25): it names the project in the list and in notifications,
+  //    and the session `cd`s into subfolders (codex: a long transcript read tail-first named a `nyan-remote` session `account`).
+  //    ⚠️ gitBranch / version stay newest-first (they describe the current state).
   let cwd: string | undefined
   let gitBranch: string | undefined
   let cliVersion: string | undefined
+  for (const r of [...headRecords, ...tailRecords]) {
+    cwd = str(r['cwd'])
+    if (cwd) break
+  }
   for (const r of [...tailRecords, ...headRecords]) {
-    cwd ??= str(r['cwd'])
     gitBranch ??= str(r['gitBranch'])
     cliVersion ??= str(r['version'])
-    if (cwd && gitBranch && cliVersion) break
+    if (gitBranch && cliVersion) break
   }
 
   const permissionMode =
