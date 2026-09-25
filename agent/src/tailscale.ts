@@ -188,18 +188,11 @@ export function servesPort(raw: unknown, port: number): boolean {
       return false
     }
   }
-  // ⚠️⚠️ A raw forward counts by **its port alone**, however the host is spelt (`[::ffff:127.0.0.1]` reaches us too / codex)
-  const forwardsToPort = (v: string): boolean => Number(/:(\d+)$/.exec(v)?.[1]) === port
-  let proxy = false
   let proxies = 0
-  let rawForward = false
   // ★ Read it as Tailscale's ServeConfig: `TCP` (port → handler), `Web` ("host:port" → Handlers), `Foreground` (session → config)
   const visit = (cfg: unknown, depth: number): void => {
     if (!obj(cfg) || depth > 4) return
     const tcp = obj(cfg['TCP']) ? cfg['TCP'] : {}
-    for (const h of Object.values(tcp)) {
-      if (obj(h) && typeof h['TCPForward'] === 'string' && forwardsToPort(h['TCPForward'])) rawForward = true
-    }
     const web = obj(cfg['Web']) ? cfg['Web'] : {}
     for (const [hostPort, site] of Object.entries(web)) {
       // ⚠️ Only a listener that terminates **HTTPS** (`TCP[port].HTTPS`) — tailscale serve sets identity headers there (codex)
@@ -207,10 +200,7 @@ export function servesPort(raw: unknown, port: number): boolean {
       const https = obj(listener) && listener['HTTPS'] === true
       const handlers = obj(site) && obj(site['Handlers']) ? site['Handlers'] : {}
       for (const h of Object.values(handlers)) {
-        if (https && obj(h) && typeof h['Proxy'] === 'string' && loopbackTo(h['Proxy'])) {
-          proxy = true
-          proxies++
-        }
+        if (https && obj(h) && typeof h['Proxy'] === 'string' && loopbackTo(h['Proxy'])) proxies++
       }
     }
     for (const key of ['Foreground', 'Services']) {
@@ -219,9 +209,10 @@ export function servesPort(raw: unknown, port: number): boolean {
     }
   }
   visit(raw, 0)
-  // ★★★ **Every mention of our port anywhere must be one of the HTTPS proxies counted above** (codex, rounds 4–5:
-  //   raw forwards under `Services`, HTTP proxies next to HTTPS ones…). Listing shapes one by one never ends, so the rule is
-  //   inverted: any other place that points at our port — in a shape we know or one we do not — means "not trusted".
+  // ★★★ **Every mention of our port anywhere must be one of the HTTPS proxies counted above** (codex, rounds 3–5:
+  //   raw TCP forwards — however the host is spelt —, forwards under `Services`, HTTP proxies next to HTTPS ones…).
+  //   Listing shapes one by one never ends, so the rule is inverted: any other place that points at our port — in a shape
+  //   we know or one we do not — means "not trusted". ⚠️ Do not add per-shape vetoes back (this covers them; tests pin each).
   let mentions = 0
   const count = (v: unknown, depth: number): void => {
     if (depth > 16) return
@@ -233,7 +224,7 @@ export function servesPort(raw: unknown, port: number): boolean {
     }
   }
   count(raw, 0)
-  return proxy && !rawForward && mentions === proxies
+  return proxies > 0 && mentions === proxies
 }
 
 async function refreshServe(port: number): Promise<void> {
