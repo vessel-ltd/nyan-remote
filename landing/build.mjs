@@ -103,7 +103,7 @@ function home(lang) {
 <div class="card"><h3>Phone apps</h3><p class="dim">Native apps for iPhone and Android, alongside the web app you can use today.</p></div>
 <div class="card"><h3>Desktop</h3><p class="dim">A desktop layout for the web app, installable on Windows, macOS and Linux, so you can watch your sessions from another PC too.</p></div>
 <div class="card"><h3>Windows without WSL</h3><p class="dim">Run the agent on Windows directly, no WSL needed.</p></div>
-<div class="card"><h3>Homebrew</h3><p class="dim"><code>brew install nyan-remote</code> on macOS.</p></div>
+<div class="card"><h3>Homebrew</h3><p class="dim">Install and update with Homebrew on macOS.</p></div>
 </div>
 
 <h2 id="install">${t('はじめかた', 'Get started')}</h2>
