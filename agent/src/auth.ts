@@ -22,7 +22,7 @@ import {
   isLiveRegistration,
   oneTimeCount,
 } from './devices.ts'
-import { magicDnsSuffix } from './tailscale.ts'
+import { tailscaleServesUs } from './tailscale.ts'
 import { t } from '../../shared/i18n.ts'
 
 export interface Identity {
@@ -573,6 +573,15 @@ export function authenticate(
     return { ok: false, status: 403, message: t('身元ヘッダがありません', 'The identity header is missing.') }
   }
 
+  // ★★ Identity headers count only while tailscale serve forwards to us (`tailscaleServesUs` / codex security review, high #1)
+  //   ⚠️ Otherwise anyone who can open 127.0.0.1 could forge them (and pin their login below)
+  if (!tailscaleServesUs()) {
+    return {
+      ok: false,
+      status: 403,
+      message: t('tailscale serve がこの agent に転送していないので、Tailscale の身元は受け付けません', 'Tailscale identity is not accepted: tailscale serve does not forward to this agent.'),
+    }
+  }
   const allowed = config().allowedLogins
   if (allowed.length === 0) {
     // First access: record this login and pin it from then on (§8.2 pairing is just opening the URL)
@@ -615,32 +624,13 @@ export async function isAllowedOrigin(origin: string): Promise<boolean> {
   //  ★ Why it could be removed: pairing moved onto the relay (§14.1.4), so
   //    **the public-origin PWA does not talk HTTP to the agent** (all relay WebSocket).
   //  ⚠️ People who host their own write it in `config.json`'s `allowedOrigins` (= **they decide**).
-  if (config().allowedOrigins.includes(origin)) return true
-  return matchesTailnetOrigin(origin, await magicDnsSuffix())
+  // ★★★ **Only origins written in `allowedOrigins`** (2026-09-25 / codex security review, high #2).
+  //   ⚠️⚠️ Same-tailnet https origins used to be allowed wholesale ⇒ any page of any tailnet node could drive the agent with
+  //      the browser user's Tailscale identity. Probing "is it a nyan agent" was tried and rejected: a hostile node can answer
+  //      `/health` like an agent (identifying software is not authorisation). ⇒ The owner decides, per origin.
+  return config().allowedOrigins.includes(origin)
 }
 
-/**
- * Whether it's an https origin on the same tailnet. A pure function that spawns no process, so it can be tested.
- * ⚠️ Security-critical. If this loosens, any website can read /sessions.
- */
-export function matchesTailnetOrigin(origin: string, suffix: string | undefined): boolean {
-  if (!suffix) return false
-  let u: URL
-  try {
-    u = new URL(origin)
-  } catch {
-    return false
-  }
-  // No http (serve only attaches identity headers over https)
-  if (u.protocol !== 'https:') return false
-  // Reject ports: they can't occur in a serve setup
-  if (u.port) return false
-  const host = u.hostname.toLowerCase()
-  const suf = suffix.toLowerCase().replace(/^\.+|\.+$/g, '')
-  if (!suf) return false
-  // Reject names that merely end with the suffix, like `evil-example.ts.net`
-  return host === suf || host.endsWith(`.${suf}`)
-}
 
 /**
  * CORS. Same-origin needs no headers, so nothing is added.

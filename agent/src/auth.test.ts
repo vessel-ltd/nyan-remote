@@ -5,50 +5,11 @@ import {
   isAllowedOrigin,
   isSameOrigin,
   isUnsafeMethod,
-  matchesTailnetOrigin,
   rejectCrossOrigin,
   sameSecret,
 } from './auth.ts'
 
-const SUFFIX = 'tailabc123.ts.net'
 
-test('matchesTailnetOrigin: allows https origins on the same tailnet', () => {
-  assert.equal(matchesTailnetOrigin('https://pc-a.tailabc123.ts.net', SUFFIX), true)
-  assert.equal(matchesTailnetOrigin('https://pc-b.tailabc123.ts.net', SUFFIX), true)
-  // The suffix itself is allowed too (e.g. Tailscale Services VIP names)
-  assert.equal(matchesTailnetOrigin('https://tailabc123.ts.net', SUFFIX), true)
-  // Case-insensitive
-  assert.equal(matchesTailnetOrigin('https://PC-B.TailAbc123.TS.NET', SUFFIX), true)
-})
-
-test('★ matchesTailnetOrigin: rejects other domains (if this loosens, every conversation can be read)', () => {
-  assert.equal(matchesTailnetOrigin('https://evil.example.com', SUFFIX), false)
-  // Reject names that merely end with the suffix (check the dot boundary)
-  assert.equal(matchesTailnetOrigin('https://eviltailabc123.ts.net', SUFFIX), false)
-  assert.equal(matchesTailnetOrigin('https://evil-tailabc123.ts.net', SUFFIX), false)
-  // A different tailnet
-  assert.equal(matchesTailnetOrigin('https://host.other.ts.net', SUFFIX), false)
-  // Spoofing by embedding the suffix in the middle of the name
-  assert.equal(matchesTailnetOrigin('https://tailabc123.ts.net.evil.com', SUFFIX), false)
-})
-
-test('matchesTailnetOrigin: rejects non-https and origins with a port', () => {
-  assert.equal(matchesTailnetOrigin('http://pc-b.tailabc123.ts.net', SUFFIX), false)
-  assert.equal(matchesTailnetOrigin('https://pc-b.tailabc123.ts.net:8443', SUFFIX), false)
-  assert.equal(matchesTailnetOrigin('file:///etc/passwd', SUFFIX), false)
-})
-
-test('matchesTailnetOrigin: allows nothing when the suffix is unavailable', () => {
-  assert.equal(matchesTailnetOrigin('https://pc-b.tailabc123.ts.net', undefined), false)
-  assert.equal(matchesTailnetOrigin('https://pc-b.tailabc123.ts.net', ''), false)
-  assert.equal(matchesTailnetOrigin('https://pc-b.tailabc123.ts.net', '.'), false)
-})
-
-test('matchesTailnetOrigin: does not throw on malformed input', () => {
-  assert.equal(matchesTailnetOrigin('', SUFFIX), false)
-  assert.equal(matchesTailnetOrigin('null', SUFFIX), false)
-  assert.equal(matchesTailnetOrigin('not a url', SUFFIX), false)
-})
 
 // ── CSRF / hook token (pins the holes found in the 2026-08-12 review) ─────────
 
@@ -176,4 +137,22 @@ test('★★ even the official distribution origin is not allowed without config
   ]) {
     assert.equal(await isAllowedOrigin(bad), false, `⚠️⚠️ slipped through: ${bad}`)
   }
+})
+
+test('★★★ a same-tailnet origin is not allowed unless written in allowedOrigins (codex security review, high #2)', { timeout: 5000 }, async () => {
+  const { mkdtemp, readFile, writeFile } = await import('node:fs/promises')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const dir = await mkdtemp(join(tmpdir(), 'nyan-auth-tailnet-'))
+  process.env['NYAN_REMOTE_STATE_DIR'] = dir
+  const { loadConfig } = await import('./config.ts')
+  await loadConfig()
+  const other = 'https://pc-b.example.ts.net'
+  assert.equal(await isAllowedOrigin(other), false, '⚠️⚠️ a tailnet origin is allowed without being listed')
+  const stored = JSON.parse(await readFile(join(dir, 'config.json'), 'utf8'))
+  stored.allowedOrigins = [other]
+  await writeFile(join(dir, 'config.json'), JSON.stringify(stored))
+  await loadConfig()
+  assert.equal(await isAllowedOrigin(other), true)
+  assert.equal(await isAllowedOrigin('https://pc-c.example.ts.net'), false)
 })

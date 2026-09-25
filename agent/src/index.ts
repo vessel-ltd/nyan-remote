@@ -8,6 +8,7 @@ import { langFromEnv, setLang, t } from '../../shared/i18n.ts'
 import { reasonText } from './reasons.ts'
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import { hostAllowed } from './hostCheck.ts'
+import { watchServe } from './tailscale.ts'
 import { hostname } from 'node:os'
 import { devMode } from './auth.ts'
 import { autoApproveList, loadAutoApprove, setAutoApproveExpiryHandler } from './autoApprove.ts'
@@ -112,6 +113,9 @@ async function main(): Promise<void> {
     const msg = err instanceof Error ? err.message : String(err)
     console.warn(t(`[agent] セッション状態の監視を開始できません: ${msg}`, `[agent] Cannot start watching session state: ${msg}`))
   }
+
+  // ★ Whether tailscale serve forwards to us (Tailscale identity headers count only then / `tailscale.ts`)
+  await watchServe(cfg.port)
 
   const server = createServer((req, res) => {
     beginMeasure(req, res)

@@ -60,6 +60,7 @@ import {
 } from './devices.ts'
 import { config, loadConfig } from './config.ts'
 import { buildRouter } from './routes/index.ts'
+import { servesPort, setServingForTest } from './tailscale.ts'
 
 const req = (headers: Record<string, string> = {}, method = 'GET') =>
   ({ method, headers }) as unknown as IncomingMessage
@@ -447,6 +448,9 @@ const tailnetReq = () =>
   }) as unknown as IncomingMessage
 
 test('★★★ local-only endpoints do not pass with a tailscale identity even with "alternate spellings"', async (t) => {
+  // ★ With serve forwarding to us (otherwise every tailscale identity is refused and this checks nothing / codex)
+  setServingForTest(true)
+  t.after(() => setServingForTest(false))
   const dir = await boot(t)
   // ★ Add an allowed login (= a state where an ordinary user can get through)
   await writeFile(
@@ -478,6 +482,9 @@ test('★★★ local-only endpoints do not pass with a tailscale identity even 
 })
 
 test('★★★ one-time status and cancellation do not pass with a tailscale identity either (2026-09-23)', async (t) => {
+  // ★ With serve forwarding to us (otherwise every tailscale identity is refused and this checks nothing / codex)
+  setServingForTest(true)
+  t.after(() => setServingForTest(false))
   // ⚠️⚠️ If reachable from the network, a registered phone could **cancel someone else's pairing** / peek at issuance
   const dir = await boot(t)
   await writeFile(
@@ -527,6 +534,9 @@ test('★★★ alternate spellings pass with the hook token (= the refusal abov
 })
 
 test('★★ ordinary endpoints pass via tailscale even with alternate spellings (the bypass fix does not block everything)', async (t) => {
+  // ★ A machine where tailscale serve forwards to us (the only case identity headers count)
+  setServingForTest(true)
+  t.after(() => setServingForTest(false))
   const dir = await boot(t)
   await writeFile(
     join(dir, 'config.json'),
@@ -781,6 +791,9 @@ test('★★★ a wrong token does not pass (② and does not turn into another 
 })
 
 test('★★★ handling of requests that do not present a token is unchanged (③ do not break the tailnet)', async (t) => {
+  // ★ A machine where tailscale serve forwards to us (the only case identity headers count)
+  setServingForTest(true)
+  t.after(() => setServingForTest(false))
   await boot(t)
   // ⚠️ No identity header either = 403 as before (if this passed, anyone could list)
   const bare = authenticate(req(), { pattern: '/devices' })
@@ -842,4 +855,41 @@ test('★★ GET /health is readable with this machine\'s token; nothing but GET
   assert.ok(!post.ok || post.identity.via !== 'local-hook')
   // ⚠️ Without presenting one, it is refused as before
   assert.equal(authenticate(req(), { pattern: '/health' }).ok, false)
+})
+
+test('★★★ Tailscale identity headers count only while tailscale serve forwards to this agent (codex security review, high #1)', async (t) => {
+  const dir = await boot(t)
+  await writeFile(join(dir, 'config.json'), JSON.stringify({ allowedLogins: ['me@github'], hookToken: 'x'.repeat(40) }), 'utf8')
+  await loadConfig()
+  setServingForTest(false)
+  const forged = authenticate(req({ 'tailscale-user-login': 'me@github', 'x-forwarded-proto': 'https' }), { pattern: '/sessions' })
+  assert.equal(forged.ok, false, '⚠️⚠️ forged identity headers passed on a machine without tailscale serve')
+  assert.ok(!forged.ok && forged.status === 403)
+  // ⚠️⚠️ With no login pinned yet, a forged first login must not be remembered either
+  await writeFile(join(dir, 'config.json'), JSON.stringify({ allowedLogins: [], hookToken: 'x'.repeat(40) }), 'utf8')
+  await loadConfig()
+  const first = authenticate(req({ 'tailscale-user-login': 'evil@example.com', 'x-forwarded-proto': 'https' }), { pattern: '/sessions' })
+  assert.equal(first.ok, false)
+  assert.equal('rememberLogin' in first, false)
+  // ★ Once serve forwards to us, as before
+  setServingForTest(true)
+  t.after(() => setServingForTest(false))
+  assert.equal(authenticate(req({ 'tailscale-user-login': 'me@github', 'x-forwarded-proto': 'https' }), { pattern: '/sessions' }).ok, true)
+})
+
+test('★★ servesPort reads the real `tailscale serve status --json` shape', () => {
+  const bg = { TCP: { '443': { HTTPS: true } }, Web: { 'pc-a.example.ts.net:443': { Handlers: { '/': { Proxy: 'http://127.0.0.1:7777' } } } } }
+  assert.equal(servesPort(bg, 7777), true)
+  assert.equal(servesPort(bg, 7778), false, 'another port')
+  assert.equal(servesPort({}, 7777), false, 'nothing served (a relay-only machine)')
+  assert.equal(servesPort({ Foreground: { s1: { TCP: { '443': { HTTPS: true } }, Web: { 'x:443': { Handlers: { '/': { Proxy: 'http://localhost:7777' } } } } } } }, 7777), true, 'foreground session')
+  assert.equal(servesPort({ TCP: { '7000': { TCPForward: '127.0.0.1:7777' } } }, 7777), false, '⚠️ a TCP forward does not count (headers pass through)')
+  assert.equal(servesPort({ TCP: { '443': { HTTPS: true } }, Web: { 'x:443': { Handlers: { '/': { Proxy: 'http://192.168.1.5:7777' } } } } }, 7777), false, 'not this machine')
+  assert.equal(servesPort({ TCP: { '443': { HTTPS: true } }, Web: { 'x:443': { Handlers: { '/': { Text: 'http://127.0.0.1:7777' } } } } }, 7777), false, 'only Proxy counts')
+})
+
+test('★ wiring: the agent starts watching tailscale serve at startup', async () => {
+  const { readFile } = await import('node:fs/promises')
+  const src = await readFile(new URL('./index.ts', import.meta.url), 'utf8')
+  assert.match(src, /^\s*await watchServe\(cfg\.port\)$/m)
 })

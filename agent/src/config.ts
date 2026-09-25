@@ -23,10 +23,9 @@ export interface Config {
    * ⚠️ Never loosen this. tailscale serve adds the identity headers "on the server side", so
    * if a tailnet user has any website open, that site's JS could
    * fetch https://<host>.ts.net/sessions. CORS is the only thing stopping the read.
-   * Empty by default. However, **https origins on the same tailnet are allowed automatically** (auth.ts's
-   * isAllowedOrigin). Only pages served by nodes on the same tailnet can have such an origin,
-   * so there is no need to configure it by hand each time a second machine is added.
-   * Put here only distribution origins outside the tailnet (such as a future GitHub Pages).
+   * Empty by default, and **nothing is allowed automatically** (2026-09-25 / codex security review, high #2: any page of any
+   * tailnet node could drive the agent). With several PCs on Tailscale, list here the origin of the machine whose app you use
+   * (e.g. `https://pc-a.<tailnet>.ts.net`) on each of the other PCs.
    */
   allowedOrigins: string[]
   /** Maximum number of sessions listed per account (newest mtime first) */

@@ -170,21 +170,32 @@ The phone talks to the agent directly over your tailnet; nothing goes through a 
 
 1. Install Tailscale on the PC and on the phone, signed in to the same tailnet. In the admin console,
    turn on **MagicDNS** and **HTTPS certificates**. (On WSL, use Tailscale on the Windows side.)
-2. Turn our relay off: `"relayUrl": ""` in `~/.nyan-remote/config.json`, then restart the agent.
+2. Turn our relay off: `"relayUrl": ""` in `~/.nyan-remote/config.json` (restart after the next step).
    ⚠️ While a relay is configured, the QR code carries it and the phone pairs only through it.
 3. Publish the agent on the tailnet (it listens on `127.0.0.1:7777` only):
    ```bash
    tailscale cert <machine>.<tailnet>.ts.net   # once, so the first visit does not time out waiting for the certificate
    tailscale serve --bg 7777
    ```
-   (On WSL run both with `tailscale.exe` from Windows; run `cert` from PowerShell.)
+   (On WSL run both with `tailscale.exe` from Windows; run `cert` from PowerShell.) Then restart the agent: it accepts
+   Tailscale identities only while `tailscale serve` forwards to it (checked at start and every 30 seconds).
 4. On the phone, open **`https://<machine>.<tailnet>.ts.net/`** — the agent serves the app itself — and add it
    to the Home Screen. ⚠️ Use this address, not `app.nyan-remote.app`: the public app cannot reach an agent
    that has no relay.
 5. Run `nyan pair` on the PC and scan the QR code from that app.
 
-With several PCs, open the app from one of them and pair the others from it; machines on the same
-tailnet are allowed automatically.
+With several PCs, open the app from one of them (say `pc-a`) and pair the others from it. Each of the
+**other** PCs has to accept that app's origin — add it to their `~/.nyan-remote/config.json` and restart:
+
+```json
+{ "allowedOrigins": ["https://pc-a.<tailnet>.ts.net"] }
+```
+
+(Nothing is accepted automatically: any web page served from any machine of your tailnet would otherwise be able to
+use your Tailscale identity against the agent.)
+
+> ⚠️ On a PC shared with other OS users, anyone logged in there can reach `127.0.0.1:7777` and pose as Tailscale;
+> prefer the relay route on such machines.
 
 Measured on the author's setup (3 machines, a full working day): the Durable Object was awake for
 **69 seconds per day** — the hibernation design is what keeps self-hosting essentially free.

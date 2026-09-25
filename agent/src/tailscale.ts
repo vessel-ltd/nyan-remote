@@ -79,6 +79,7 @@ interface RawNode {
   Online?: boolean
 }
 
+
 /** Devices that cannot host an agent (phones) are not offered as candidates */
 const NOT_A_HOST = new Set(['android', 'ios'])
 
@@ -140,10 +141,6 @@ async function fetchStatus(): Promise<PeersResult> {
   }
 }
 
-/** MagicDNS suffix used for automatic CORS allowance (e.g. example.ts.net) */
-export async function magicDnsSuffix(): Promise<string | undefined> {
-  return (await tailnetStatus()).suffix
-}
 
 /**
  * ★★ This agent's own entry point (`https://<own MagicDNS name>`. 2026-09-16 / to move toward Y).
@@ -157,4 +154,119 @@ export async function selfAgentUrl(): Promise<string | undefined> {
   const status = await tailnetStatus()
   if (!status.available) return undefined
   return status.peers.find((p) => p.self)?.url
+}
+
+// ── Does `tailscale serve` forward to this agent? (2026-09-25 / codex security review, high #1) ─────────────────────
+//
+// ★★ The Tailscale identity headers (`Tailscale-User-Login`) are only trustworthy **when tailscale serve is the one sending
+//   them**. On a machine that does not use Tailscale (relay only, the default), anyone who can open 127.0.0.1:7777
+//   (another OS user, a DNS-rebinding page) could forge them, and with an empty `allowedLogins` the first forged login
+//   was even remembered. ⇒ Accept them only while the serve config forwards to our port.
+// ⚠️ `authenticate` is synchronous, so the answer is refreshed in the background (`watchServe`) and read here.
+//   Unknown (not checked yet, or the command failed) = **not forwarding** (fail-closed).
+// ⚠️ Residual: on a machine that does use tailscale serve, another OS user can still forge the headers (loopback cannot tell
+//   who connected). That needs device-key authentication on the local route too (not done).
+
+let serving = false
+
+/**
+ * ★ Pure: does a `tailscale serve status --json` value forward to 127.0.0.1/localhost:`port`?
+ *   Walks the whole value (background serve under `Web`, foreground sessions under `Foreground`). TCP forwards do not count.
+ */
+export function servesPort(raw: unknown, port: number): boolean {
+  // ⚠️ On a default web port a target without a port (`http://127.0.0.1`) also means us, and would escape the mention count
+  //    below (codex). The agent never needs them (7777 by default; 80/443 would need root) ⇒ simply not trusted
+  if (port === 80 || port === 443) return false
+  const obj = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
+  // ★ An HTTP proxy target must be this machine's loopback on our port (anything else: not ours = refuse)
+  const loopbackTo = (v: string): boolean => {
+    try {
+      const u = new URL(v)
+      const host = u.hostname.toLowerCase()
+      return (u.protocol === 'http:' || u.protocol === 'https:') && (host === '127.0.0.1' || host === 'localhost' || host === '[::1]') && Number(u.port) === port
+    } catch {
+      return false
+    }
+  }
+  // ⚠️⚠️ A raw forward counts by **its port alone**, however the host is spelt (`[::ffff:127.0.0.1]` reaches us too / codex)
+  const forwardsToPort = (v: string): boolean => Number(/:(\d+)$/.exec(v)?.[1]) === port
+  let proxy = false
+  let proxies = 0
+  let rawForward = false
+  // ★ Read it as Tailscale's ServeConfig: `TCP` (port → handler), `Web` ("host:port" → Handlers), `Foreground` (session → config)
+  const visit = (cfg: unknown, depth: number): void => {
+    if (!obj(cfg) || depth > 4) return
+    const tcp = obj(cfg['TCP']) ? cfg['TCP'] : {}
+    for (const h of Object.values(tcp)) {
+      if (obj(h) && typeof h['TCPForward'] === 'string' && forwardsToPort(h['TCPForward'])) rawForward = true
+    }
+    const web = obj(cfg['Web']) ? cfg['Web'] : {}
+    for (const [hostPort, site] of Object.entries(web)) {
+      // ⚠️ Only a listener that terminates **HTTPS** (`TCP[port].HTTPS`) — tailscale serve sets identity headers there (codex)
+      const listener = tcp[hostPort.slice(hostPort.lastIndexOf(':') + 1)]
+      const https = obj(listener) && listener['HTTPS'] === true
+      const handlers = obj(site) && obj(site['Handlers']) ? site['Handlers'] : {}
+      for (const h of Object.values(handlers)) {
+        if (https && obj(h) && typeof h['Proxy'] === 'string' && loopbackTo(h['Proxy'])) {
+          proxy = true
+          proxies++
+        }
+      }
+    }
+    for (const key of ['Foreground', 'Services']) {
+      const sub = cfg[key]
+      if (obj(sub)) for (const f of Object.values(sub)) visit(f, depth + 1)
+    }
+  }
+  visit(raw, 0)
+  // ★★★ **Every mention of our port anywhere must be one of the HTTPS proxies counted above** (codex, rounds 4–5:
+  //   raw forwards under `Services`, HTTP proxies next to HTTPS ones…). Listing shapes one by one never ends, so the rule is
+  //   inverted: any other place that points at our port — in a shape we know or one we do not — means "not trusted".
+  let mentions = 0
+  const count = (v: unknown, depth: number): void => {
+    if (depth > 16) return
+    if (typeof v === 'string') {
+      const m = /:(\d+)(?:[/?#]|$)/.exec(v)
+      if (m && Number(m[1]) === port) mentions++
+    } else if (typeof v === 'object' && v !== null) {
+      for (const x of Object.values(v as Record<string, unknown>)) count(x, depth + 1)
+    }
+  }
+  count(raw, 0)
+  return proxy && !rawForward && mentions === proxies
+}
+
+async function refreshServe(port: number): Promise<void> {
+  const bin = await findBin()
+  if (!bin) {
+    serving = false
+    return
+  }
+  try {
+    const { stdout } = await exec(bin, ['serve', 'status', '--json'], { timeout: TIMEOUT_MS, maxBuffer: 1024 * 1024 })
+    serving = servesPort(JSON.parse(stdout), port)
+  } catch {
+    serving = false
+  }
+}
+
+/** ★ Last known answer (⚠️ false until the first check finished) */
+export function tailscaleServesUs(): boolean {
+  return serving
+}
+
+/**
+ * ★ Check now and every 30 seconds. ⚠️ Resolves after the first check (so the first requests after a restart are not refused;
+ *   bounded by the command timeout). The timer does not keep the process alive.
+ */
+export async function watchServe(port: number): Promise<() => void> {
+  await refreshServe(port)
+  const timer = setInterval(() => void refreshServe(port), 30_000)
+  timer.unref?.()
+  return () => clearInterval(timer)
+}
+
+/** ⚠️ For tests */
+export function setServingForTest(v: boolean): void {
+  serving = v
 }
