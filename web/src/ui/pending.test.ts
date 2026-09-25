@@ -145,3 +145,25 @@ test('★★ full reload: not cleared by the same text sent earlier, nor by reco
   assert.deepEqual(consumeAfterReload(pending, [asKeys('こんにちは')], new Set()), pending)
   assert.deepEqual(consumeAfterReload(pending, [{ ...asKeys('こんにちは'), at: atIso(T0 + 121_000) }], new Set()), [])
 })
+
+test('★★ keystrokes joined to a half-typed PC draft still clear the send (2026-09-25 / reproduced on a real device)', () => {
+  const p: PendingSend[] = [{ text: 'Test', at: 1, route: 'keys' }]
+  assert.deepEqual(consumePending(p, [{ kind: 'user', text: 'あいうTest' }]), [])
+  // ⚠️ Not when the record only contains it in the middle
+  assert.equal(consumePending(p, [{ kind: 'user', text: 'Test the upload' }]).length, 1)
+  // ⚠️ The inbox joins nothing ⇒ still exact
+  assert.equal(consumePending([{ text: 'Test', at: 1, route: 'inbox' }], [{ kind: 'user', text: 'xTest', via: 'inbox' }]).length, 1)
+})
+
+test('★★ joined text also matches while awaiting the reply and on a full reload', () => {
+  const noted = noteArrivals(beginSend([], 1, 'Test', 1000), [{ kind: 'user', text: 'あいうTest', at: '2026-01-01T00:00:01Z' }], new Set())
+  assert.deepEqual(finishSend(noted, 1, 'keys'), [])
+  const settled: PendingSend[] = [{ id: 2, text: 'Test', at: Date.parse('2026-01-01T00:00:00Z'), route: 'keys' }]
+  assert.deepEqual(consumeAfterReload(settled, [{ kind: 'user', text: 'あいうTest', at: '2026-01-01T00:00:02Z' }], new Set()), [])
+  // ★ Full reload while still awaiting the reply: noted, then confirmed by the reply
+  const reloaded = consumeAfterReload(beginSend([], 4, 'Test', Date.parse('2026-01-01T00:00:00Z')), [{ kind: 'user', text: 'あいうTest', at: '2026-01-01T00:00:02Z' }], new Set())
+  assert.deepEqual(finishSend(reloaded, 4, 'keys'), [])
+  // ⚠️ A send awaiting its reply that turns out to be inbox is still exact
+  const viaInbox = noteArrivals(beginSend([], 3, 'Test', 1000), [{ kind: 'user', text: 'xTest', via: 'inbox', at: '2026-01-01T00:00:03Z' }], new Set())
+  assert.equal(finishSend(viaInbox, 3, 'inbox').length, 1)
+})
