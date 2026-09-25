@@ -16,7 +16,7 @@
 import { toBase64Url } from '../../shared/crypto.ts'
 import { licenseFor, PLAN_LIMITS, type License } from '../../shared/license.ts'
 import { adminPage, DEFAULT_SPIKE_DAILY, usageAlerts, type UsageDay } from './ops.ts'
-import { accountPage, landingPage, type Lang } from './pages.ts'
+import { accountPage, landingPage, SUPPORT_NAME_MAX, type Lang } from './pages.ts'
 import { cookieOf, makeSession, readSession, SESSION_COOKIE, SESSION_TTL_SEC, setCookie, STATE_COOKIE } from './session.ts'
 import { OPEN_STATUSES, planOf, summarize, type AccountRow, type Store } from './store.ts'
 import type { CheckoutParams, StripeApi } from './stripe.ts'
@@ -566,12 +566,15 @@ export async function handle(req: Request, d: Deps): Promise<Response> {
       if (path === '/support') {
         const message = String(form.get('message') ?? '').trim().slice(0, SUPPORT_MAX_CHARS)
         const email = String(form.get('email') ?? '').trim()
+        // ★ Optional name (2026-09-25). ⚠️ Control characters and newlines are flattened (it goes into the mail body as one line)
+        const name = String(form.get('name') ?? '').replace(/[\u0000-\u001f\u007f]+/g, ' ').trim().slice(0, SUPPORT_NAME_MAX)
         if (!message) return redirect('/?n=support-empty#support')
         if (email && !EMAIL_RE.test(email)) return redirect('/?n=support-email#support')
         if (!d.ops?.sendAlert) return redirect('/?n=support-failed#support')
         const date = new Date(d.now()).toISOString().slice(0, 10)
         const lines = [
           `From: ${acct.githubLogin} (GitHub id ${acct.githubId}, account ${acct.id}, plan ${planOf(acct)})`,
+          `Name: ${name || '(not given)'}`,
           `Reply to: ${email || '(not given — reply through GitHub)'}`,
           `Machines: ${(await d.store.machinesOf(acct.id)).length}`,
           '',

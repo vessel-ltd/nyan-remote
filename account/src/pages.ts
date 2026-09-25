@@ -7,6 +7,9 @@ import type { AccountRow, MachineRow } from './store.ts'
 
 export type Lang = 'ja' | 'en'
 
+/** ★ The optional name on the contact form (characters) */
+export const SUPPORT_NAME_MAX = 100
+
 export function esc(s: string): string {
   return s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]!)
 }
@@ -30,6 +33,8 @@ ul{list-style:none;padding:0;margin:0}li{display:flex;gap:8px;align-items:center
 .name{overflow-wrap:anywhere}
 h1 a.home{color:inherit;text-decoration:none}
 footer{margin-top:40px;color:var(--dim);font-size:.85rem}footer a{color:inherit}
+.field{box-sizing:border-box;width:100%;font:inherit;padding:10px;border-radius:10px;border:1px solid var(--line);background:var(--bg);color:var(--fg)}
+details>summary{cursor:pointer;font-weight:600;font-size:1.05rem;margin:28px 0 8px}
 </style></head><body><main>${body}
 <footer><a href="https://nyan-remote.app/">nyan-remote.app</a> · <a href="/#support">${lang === 'ja' ? 'お問い合わせ' : 'Support'}</a> · ${lang === 'ja'
     ? // ⚠️ The landing site is English only (the only Japanese page is the one for the Specified Commercial Transactions Act / landing/build.mjs)
@@ -61,7 +66,7 @@ const NOTICE: Record<string, [string, string]> = {
   ],
   revoked: ['マシンを外しました。', 'The machine was removed.'],
   'bad-price': ['その料金は選べません。', 'That price is not available.'],
-  'support-sent': ['送りました。返事はいただいたメールアドレスに届きます。', 'Sent. We will reply to the email address you gave.'],
+  'support-sent': ['送信しました。返事はいただいたメールアドレスに届きます（書かなかったときは GitHub でご連絡します）。', 'Sent. We will reply to the email address you gave (or on GitHub if you left none).'],
   'support-empty': ['本文が空です。', 'The message is empty.'],
   'support-email': ['メールアドレスの形が違います。', 'That email address does not look right.'],
   'support-limit': ['今日はこれ以上送れません（1日5通まで）。明日また送ってください。', 'You have reached today’s limit (5 messages). Please try again tomorrow.'],
@@ -76,6 +81,11 @@ export function accountPage(
 ): string {
   const lim = PLAN_LIMITS[o.plan]
   const n = o.notice ? NOTICE[o.notice] : undefined
+  // ★ Contact-form notices are shown by the form (not at the top), and an error opens the form again
+  const forSupport = o.notice?.startsWith('support-') === true
+  const top = n && !forSupport ? `<p class="card">${tr(lang, n[0], n[1])}</p>` : ''
+  const supportNote = n && forSupport ? `<p class="card">${tr(lang, n[0], n[1])}</p>` : ''
+  const supportOpen = forSupport && o.notice !== 'support-sent' ? ' open' : ''
   const date = (ms: number) => new Date(ms).toISOString().slice(0, 10)
   const machines = o.machines.length
     ? `<ul>${o.machines
@@ -111,19 +121,23 @@ ${[
     lang,
     `<div class="row"><h1 class="grow"><a class="home" href="https://nyan-remote.app/">nyan-remote</a></h1>${o.admin ? '<a class="btn" href="/admin">Admin</a>' : ''}<form method="post" action="/logout"><button>${tr(lang, 'ログアウト', 'Sign out')}</button></form></div>
 <p class="dim">GitHub: ${esc(o.account.githubLogin)}</p>
-${n ? `<p class="card">${tr(lang, n[0], n[1])}</p>` : ''}
+${top}
 <h2>${tr(lang, 'プラン', 'Plan')}</h2>
 <div class="card"><strong>${o.plan === 'plus' ? 'Plus' : 'Free'}</strong> · ${tr(lang, `マシン ${o.machines.length}/${lim.maxMachines}台・スマホ ${lim.maxDevices}台まで`, `Machines ${o.machines.length}/${lim.maxMachines} · up to ${lim.maxDevices} phones`)}
 ${upgrade}</div>
 <h2>${tr(lang, 'マシン', 'Machines')}</h2>
 <div class="card">${machines}</div>
 <p class="dim">${tr(lang, '使わなくなったマシンは「外す」で枠を空けられます（30日使わないと自動で外れます）。', 'Remove machines you no longer use to free a slot (unused for 30 days, they are removed automatically).')}</p>
-<h2 id="support">${tr(lang, 'お問い合わせ', 'Contact support')}</h2>
+<details id="support"${supportOpen}><summary>${tr(lang, 'お問い合わせ', 'Contact support')}</summary>
+${supportOpen ? supportNote : ''}
 <form class="card" method="post" action="/support">
 <p class="dim">${tr(lang, 'お支払い・アカウント・不具合のご相談はこちらから。返事をお送りするメールアドレスを書いてください（書かなければ GitHub でご連絡します）。', 'Questions about billing, your account or a problem. Leave an email address for our reply (otherwise we will reach you on GitHub).')}</p>
-<p><input name="email" type="email" maxlength="254" autocomplete="email" placeholder="${tr(lang, 'メールアドレス', 'Email address')}" style="width:100%;font:inherit;padding:10px;border-radius:10px;border:1px solid var(--line);background:var(--bg);color:var(--fg)"></p>
-<p><textarea name="message" required maxlength="3000" rows="6" placeholder="${tr(lang, 'ご用件', 'How can we help?')}" style="width:100%;font:inherit;padding:10px;border-radius:10px;border:1px solid var(--line);background:var(--bg);color:var(--fg)"></textarea></p>
+<p><input class="field" name="name" maxlength="${SUPPORT_NAME_MAX}" autocomplete="name" placeholder="${tr(lang, 'お名前（任意）', 'Name (optional)')}"></p>
+<p><input class="field" name="email" type="email" maxlength="254" autocomplete="email" placeholder="${tr(lang, 'メールアドレス', 'Email address')}"></p>
+<p><textarea class="field" name="message" required maxlength="3000" rows="6" placeholder="${tr(lang, 'ご用件', 'How can we help?')}"></textarea></p>
 <p><button class="primary">${tr(lang, '送る', 'Send')}</button></p>
-</form>`,
+</form>
+</details>
+${forSupport && !supportOpen ? supportNote : ''}`,
   )
 }

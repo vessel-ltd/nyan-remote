@@ -862,7 +862,11 @@ test('★★ support: signed-in users only, operator address hidden, reply-to sh
   assert.equal(sent[0]!.replyTo, 'user@example.com')
   assert.match(sent[0]!.text, /GitHub id 42/)
   assert.match(sent[0]!.text, /Help with billing/)
-  for (let i = 0; i < 4; i++) await post({ message: `m${i}` })
+  assert.match(sent[0]!.text, /^Name: \(not given\)$/m, '★ the name is optional')
+  // ★ An optional name goes into the body as one line (newlines and control characters flattened)
+  await post({ message: 'with a name', name: 'Taro\r\nBcc: x@y.z' })
+  assert.match(sent[1]!.text, /^Name: Taro Bcc: x@y\.z$/m)
+  for (let i = 0; i < 3; i++) await post({ message: `m${i}` })
   assert.equal((await post({ message: 'sixth' })).headers.get('location'), '/?n=support-limit#support', '⚠️ sent beyond the daily limit')
   assert.equal(sent.length, 5)
   r.advance(86400e3)
@@ -871,6 +875,14 @@ test('★★ support: signed-in users only, operator address hidden, reply-to sh
   const page = await (await r.call('/', { headers: { cookie } })).text()
   assert.match(page, /action="\/support"/)
   assert.doesNotMatch(page, /operator@example\.com/, '⚠️⚠️ the operator address reached the page')
+  // ★ Folded by default; an error opens it with the message inside; "sent" stays folded and says so below it
+  assert.match(page, /<details id="support">/)
+  assert.match(page, /name="name"(?![^>]*required)/, '★ the name field is optional')
+  const err = await (await r.call('/?n=support-empty', { headers: { cookie } })).text()
+  assert.match(err, /<details id="support" open>[\s\S]*The message is empty\.[\s\S]*<\/details>/)
+  const ok = await (await r.call('/?n=support-sent', { headers: { cookie } })).text()
+  assert.match(ok, /<details id="support">[\s\S]*<\/details>\s*<p class="card">Sent\./)
+  assert.equal(ok.match(/Sent\./g)?.length, 1, 'the sent notice shows once')
 })
 
 test('★★★ contact form: parallel sends cannot exceed 5 a day, and a failed send gives its slot back (codex round 33)', async () => {
