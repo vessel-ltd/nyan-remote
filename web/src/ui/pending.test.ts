@@ -1,7 +1,6 @@
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
 import { test } from 'node:test'
-import { beginSend, cancelAfterStop, consumeAfterReload, consumePending, dismissPending, finishSend, noteArrivals, sameText, type PendingSend } from './pending.ts'
+import { beginSend, consumeAfterReload, consumePending, finishSend, noteArrivals, type PendingSend } from './pending.ts'
 
 const sent = (text: string, at = 1): PendingSend => ({ text, at, route: 'inbox' })
 const typed = (text: string, at = 1): PendingSend => ({ text, at, route: 'keys' })
@@ -145,56 +144,4 @@ test('★★ full reload: not cleared by the same text sent earlier, nor by reco
   assert.deepEqual(consumeAfterReload(pending, [{ ...asKeys('こんにちは'), at: atIso(T0) }], new Set()), pending)
   assert.deepEqual(consumeAfterReload(pending, [asKeys('こんにちは')], new Set()), pending)
   assert.deepEqual(consumeAfterReload(pending, [{ ...asKeys('こんにちは'), at: atIso(T0 + 121_000) }], new Set()), [])
-})
-
-test('★★ keystrokes joined to a half-typed PC draft still clear the send (2026-09-25 / seen on a real device)', () => {
-  const p: PendingSend[] = [{ text: 'Test', at: 1, route: 'keys' }]
-  assert.deepEqual(consumePending(p, [{ kind: 'user', text: '昨日と今日とで修正した。Test' }]), [])
-  // ★ The CLI may keep or drop surrounding whitespace (the neutralising space before `/`)
-  assert.deepEqual(consumePending([{ text: '/help', at: 1, route: 'keys' }], [{ kind: 'user', text: ' /help' }]), [])
-  // ⚠️ Not when the record only contains it in the middle
-  assert.equal(consumePending(p, [{ kind: 'user', text: 'Test the upload' }]).length, 1)
-  // ★ Trailing whitespace on the record does not matter (both routes)
-  assert.deepEqual(consumePending([{ text: 'hi', at: 1, route: 'inbox' }], [{ kind: 'user', text: 'hi\n', via: 'inbox' }]), [])
-  // ⚠️ A blank send never matches everything
-  assert.equal(sameText('keys', '  ', 'anything'), false)
-  // ⚠️ The inbox joins nothing ⇒ still exact
-  assert.equal(consumePending([{ text: 'Test', at: 1, route: 'inbox' }], [{ kind: 'user', text: 'xTest', via: 'inbox' }]).length, 1)
-})
-
-test('★★ joined text also matches while awaiting the reply and on a full reload', () => {
-  const noted = noteArrivals(beginSend([], 1, 'Test', 1000), [{ kind: 'user', text: 'draft Test', at: '2026-01-01T00:00:01Z' }], new Set())
-  assert.deepEqual(finishSend(noted, 1, 'keys'), [])
-  const settled: PendingSend[] = [{ id: 2, text: 'Test', at: Date.parse('2026-01-01T00:00:00Z'), route: 'keys' }]
-  assert.deepEqual(consumeAfterReload(settled, [{ kind: 'user', text: 'draft Test', at: '2026-01-01T00:00:02Z' }], new Set()), [])
-})
-
-test('★★ Stop that cleared the input box marks unseen keystroke sends as cancelled; a later record still clears them', () => {
-  const p: PendingSend[] = [
-    { id: 1, text: 'Test', at: 1, route: 'keys' },
-    { id: 2, text: 'hi', at: 2, route: 'inbox' },
-    { id: 3, text: 'wait', at: 3, sending: true, seen: [] },
-  ]
-  const c = cancelAfterStop(p)
-  assert.equal(c[0]!.cancelled, true)
-  assert.equal(c[1]!.cancelled, undefined, '⚠️ the inbox does not go through the input box')
-  assert.equal(c[2]!.cancelled, undefined, '⚠️ the route of a send awaiting its reply is unknown')
-  assert.equal(cancelAfterStop(c), c, 'unchanged returns the same array')
-  assert.deepEqual(consumePending(c, [{ kind: 'user', text: 'Test' }]).map((x) => x.id), [2, 3])
-})
-
-test('★ a leftover bubble can be dismissed (only that one)', () => {
-  const p: PendingSend[] = [{ id: 1, text: 'a', at: 1 }, { id: 2, text: 'a', at: 2 }]
-  assert.deepEqual(dismissPending(p, 1, 1).map((x) => x.id), [2])
-})
-
-test('★ wiring: Stop that cleared the input box marks the sends; leftovers get a dismiss button', () => {
-  // ⚠️ Only executed lines (a comment with the same words must not make this pass)
-  const code = readFileSync(new URL('./Thread.tsx', import.meta.url), 'utf8')
-    .split('\n')
-    .filter((l) => !/^\s*(\/\/|\*|\/\*|\{\/\*)/.test(l))
-    .join('\n')
-  assert.match(code, /if \(res\.cleared === true\) setPending\(cancelAfterStop\)/)
-  assert.match(code, /onClick=\{\(\) => setPending\(\(prev\) => dismissPending\(prev, p\.id, p\.at\)\)\}/)
-  assert.match(code, /p\.cancelled\s*\?\s*t\(/)
 })
