@@ -16,7 +16,7 @@
 import { toBase64Url } from '../../shared/crypto.ts'
 import { licenseFor, PLAN_LIMITS, type License } from '../../shared/license.ts'
 import { adminPage, DEFAULT_SPIKE_DAILY, usageAlerts, type UsageDay } from './ops.ts'
-import { accountPage, landingPage, SUPPORT_NAME_MAX, type Lang } from './pages.ts'
+import { accountPage, landingPage, SUPPORT_NAME_MAX } from './pages.ts'
 import { cookieOf, makeSession, readSession, SESSION_COOKIE, SESSION_TTL_SEC, setCookie, STATE_COOKIE } from './session.ts'
 import { OPEN_STATUSES, planOf, summarize, type AccountRow, type Store } from './store.ts'
 import type { CheckoutParams, StripeApi } from './stripe.ts'
@@ -140,7 +140,6 @@ export async function sha256b64(s: string): Promise<string> {
   return toBase64Url(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s) as never)))
 }
 
-const langOf = (req: Request): Lang => (/^ja\b/i.test(req.headers.get('accept-language') ?? '') ? 'ja' : 'en')
 
 function bearer(req: Request): string | undefined {
   const m = /^Bearer ([A-Za-z0-9_-]{20,100})$/.exec(req.headers.get('authorization') ?? '')
@@ -489,7 +488,6 @@ export async function handle(req: Request, d: Deps): Promise<Response> {
     }
 
     // ── Pages ────────────────────────────────────────────────────────────
-    const lang = langOf(req)
     const acctId = await readSession(d.config.sessionSecret, cookieOf(req, SESSION_COOKIE), Math.floor(d.now() / 1000))
     const acct = acctId ? await d.store.accountById(acctId) : undefined
     // ★★ Ops page (ops.ts). ⚠️ Only allowed GitHub ids; everyone else is told it "does not exist" (do not reveal that it exists)
@@ -514,10 +512,10 @@ export async function handle(req: Request, d: Deps): Promise<Response> {
       )
     }
     if (method === 'GET' && path === '/') {
-      if (!acct) return html(landingPage(lang, url.searchParams.get('e') === 'login'))
+      if (!acct) return html(landingPage(url.searchParams.get('e') === 'login'))
       await d.store.pruneMachines(acct.id, d.now() - MACHINE_FORGET_MS)
       return html(
-        accountPage(lang, {
+        accountPage({
           account: acct,
           plan: planOf(acct),
           machines: await d.store.machinesOf(acct.id),

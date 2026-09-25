@@ -900,3 +900,18 @@ test('★★★ contact form: parallel sends cannot exceed 5 a day, and a failed
   assert.equal(all.filter((x) => x.headers.get('location') === '/?n=support-sent#support').length, 5, '⚠️⚠️ parallel sends went over the daily limit (or a failed send used up a slot)')
   assert.equal(sent, 5)
 })
+
+test('★ the account pages are English only, with the cat and the favicon from the PWA origin (2026-09-25)', async () => {
+  const r = await rig()
+  const { body } = await login(r)
+  const ja = { 'accept-language': 'ja-JP,ja;q=0.9' }
+  for (const res of [await r.call('/', { headers: ja }), await r.call('/', { headers: { ...ja, cookie: await sessionCookie(r, body.account.id) } })]) {
+    const page = await res.text()
+    assert.match(page, /<html lang="en">/)
+    assert.doesNotMatch(page, /[぀-ヿ一-鿿]/, '⚠️ Japanese text on the account page')
+    assert.match(page, /<link rel="icon" href="https:\/\/app\.nyan-remote\.app\/icons\/favicon-64\.png">/)
+    assert.match(page, /<img src="https:\/\/app\.nyan-remote\.app\/icons\/icon-any-192\.png"/)
+    // ⚠️ The images must stay inside what the CSP allows
+    assert.match(res.headers.get('content-security-policy') ?? '', /img-src https:\/\/app\.nyan-remote\.app[;\s]/)
+  }
+})
