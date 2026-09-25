@@ -1,0 +1,16 @@
+{
+  "name": "@nyan-remote/relay",
+  "private": true,
+  "type": "module",
+  "description": "③の段6 のランデブー（Cloudflare Workers + Durable Object）。⚠️ ルートの workspaces には入れない（agent と PWA の依存ゼロを保つため）",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.test.json"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0",
+    "@cloudflare/workers-types": "^5.20260911.1",
+    "typescript": "^5.7.0"
+  }
+}

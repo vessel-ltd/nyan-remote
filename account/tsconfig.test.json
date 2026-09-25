@@ -1,0 +1,18 @@
+{
+  "//": "★ テストは Node で走る（node --test）ので Node の型で見る。worker 本体は tsconfig.json（workers-types）",
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "noEmit": true,
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "verbatimModuleSyntax": true,
+    "skipLibCheck": true,
+    "typeRoots": ["../relay/node_modules/@types", "../node_modules/@types"],
+    "types": ["node"]
+  },
+  "include": ["src/**/*.test.ts", "src/app.ts", "src/store.ts", "src/stripe.ts", "src/session.ts", "src/pages.ts", "../shared/license.ts", "../shared/crypto.ts"]
+}

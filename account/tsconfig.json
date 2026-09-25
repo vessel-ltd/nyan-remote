@@ -1,0 +1,17 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "noEmit": true,
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "verbatimModuleSyntax": true,
+    "skipLibCheck": true,
+    "types": ["../relay/node_modules/@cloudflare/workers-types"]
+  },
+  "exclude": ["src/**/*.test.ts"],
+  "include": ["src/**/*.ts", "../shared/license.ts", "../shared/crypto.ts"]
+}

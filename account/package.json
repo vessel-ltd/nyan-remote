@@ -1,0 +1,11 @@
+{
+  "name": "@nyan-remote/account",
+  "private": true,
+  "type": "module",
+  "description": "アカウントと課金（Cloudflare Workers + D1 / docs/BILLING.md）。⚠️ ルートの workspaces には入れない（agent と PWA の依存ゼロを保つため）。wrangler と型は relay/ のものを使う",
+  "scripts": {
+    "dev": "../relay/node_modules/.bin/wrangler dev",
+    "deploy": "../relay/node_modules/.bin/wrangler deploy",
+    "typecheck": "../relay/node_modules/.bin/tsc -p tsconfig.json && ../relay/node_modules/.bin/tsc -p tsconfig.test.json"
+  }
+}

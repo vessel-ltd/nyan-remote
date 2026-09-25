@@ -1,0 +1,42 @@
+{
+  "name": "nyan-remote",
+  "license": "MIT",
+  "author": "Vessel Ltd.",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "agent",
+    "web"
+  ],
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "build": "npm run build --workspace web",
+    "start": "node agent/src/index.ts",
+    "pending": "node scripts/pending.mjs",
+    "pair": "node scripts/pair.mjs",
+    "devices": "node scripts/devices.mjs",
+    "test": "npm run test:guard && npm run test --workspace agent && npm run test --workspace web && npm run test:shared && npm run test:relay && npm run test:account && npm run test:scripts",
+    "test:guard": "node --test 'agent/src/testCoverage.test.ts'",
+    "test:shared": "node --test 'shared/**/*.test.ts'",
+    "test:relay": "node --test 'relay/src/**/*.test.ts'",
+    "test:account": "node --test 'account/src/**/*.test.ts'",
+  "test:scripts": "node --test 'scripts/**/*.test.mjs'",
+    "typecheck": "npm run typecheck --workspace agent && npm run typecheck --workspace web",
+    "dev:stop": "node scripts/dev-stop.mjs",
+    "notify:check": "node scripts/notify-check.mjs",
+    "keys": "node scripts/keys-status.mjs",
+    "site:deploy": "node scripts/site-stage.mjs && (cd relay && npx wrangler deploy -c ../site/wrangler.jsonc) && node scripts/site-verify.mjs",
+    "site:verify": "node scripts/site-verify.mjs",
+    "site:stage": "node scripts/site-stage.mjs",
+    "relay:smoke": "node scripts/relay-smoke.mjs",
+    "cf": "node scripts/cf-usage.mjs",
+    "traffic": "node scripts/traffic.mjs"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0"
+  }
+}

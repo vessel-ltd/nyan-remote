@@ -1,0 +1,17 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "noEmit": true,
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "verbatimModuleSyntax": true,
+    "skipLibCheck": true,
+    "types": ["@cloudflare/workers-types"]
+  },
+  "exclude": ["src/**/*.test.ts"],
+  "include": ["src/**/*.ts", "../shared/relayFrame.ts", "../shared/relayAuth.ts", "../shared/crypto.ts", "../shared/relayFrame.ts"]
+}

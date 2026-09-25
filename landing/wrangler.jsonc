@@ -1,0 +1,13 @@
+{
+  "$schema": "../relay/node_modules/wrangler/config-schema.json",
+  // ★ Landing, pricing and legal pages (apex / 2026-09-24). ⚠️ No PWA here (CLAUDE.md §1: on the apex the private key becomes readable)
+  //   Rebuild: `node landing/build.mjs` → `cd landing && ../relay/node_modules/.bin/wrangler deploy`
+  "name": "nyan-landing",
+  "account_id": "de3117b74037f67ec29c1db3c5b67213",
+  "compatibility_date": "2026-01-01",
+  "preview_urls": false,
+  "workers_dev": false,
+  "assets": { "directory": "./public", "html_handling": "auto-trailing-slash" },
+  "routes": [{ "pattern": "nyan-remote.app", "custom_domain": true }],
+  "observability": { "enabled": true }
+}

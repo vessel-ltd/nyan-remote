@@ -1,0 +1,23 @@
+{
+  "//": "★ relay のテストは **Node で走る**（`node --test`）ので、Workers の型ではなく Node の型で見る。⚠️ worker 本体は tsconfig.json（workers-types）。2つ在るのはそのため。",
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "noEmit": true,
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "verbatimModuleSyntax": true,
+    "skipLibCheck": true,
+    "types": ["node"]
+  },
+  "include": [
+    "src/**/*.test.ts",
+    "src/room.ts",
+    "../shared/relayAuth.ts",
+    "../shared/crypto.ts",
+    "../shared/relayFrame.ts"
+  ]
+}

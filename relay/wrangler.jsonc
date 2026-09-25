@@ -1,0 +1,54 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "nyan-relay",
+  // ★★ **Pin the account** (2026-09-15).
+  //   ⚠️⚠️ Without it, `wrangler deploy` goes to **whichever account is logged in** =
+  //      by accident it could land on **another production account** (a booking system, etc.).
+  //   ★ When pinned, deploying while logged in to a different account **fails instead of succeeding**.
+  //   ⚠️ This is not a secret (it is shown in the dashboard).
+  "account_id": "de3117b74037f67ec29c1db3c5b67213",
+  "main": "src/worker.ts",
+  // ★★ **Turn off per-version preview URLs** (2026-09-16).
+  //   ⚠️⚠️ The default (account-level) is on, and every deploy adds
+  //      `<version-id>-nyan-relay.<subdomain>.workers.dev` as **a public entry point**.
+  //   ⚠️ That means **more entry points still running old code**, so
+  //      **even after deploying a fix, the version before the fix may still be alive**
+  //      (= "fix it and it is fixed" stops holding. ⬜ filling up the slots is exactly the open item).
+  //   ⚠️⚠️ **We have not measured whether an old version can join the same room** (2026-09-16 / codex round 5).
+  //      The official docs also say **Workers that implement a DO do not support previews**.
+  //      ⇒ Do not assert it. Turning it off is **so we do not have to find out**, and that alone is the right call.
+  //   ★ Written here, it **does not come back on the next deploy** (turning it off in the dashboard may revert).
+  "preview_urls": false,
+  // ⚠️ Use a recent date (behaviour such as automatic WebSocket close replies changes)
+  "compatibility_date": "2026-01-01",
+  // ★★ **Custom domain** (2026-09-21 / we got `nyan-remote.app` / user decision).
+  //   ⚠️⚠️ **Do not turn off `*.workers.dev`.** The relay entry point in QR codes already handed out is
+  //      `wss://nyan-relay.nyan-remote-relay.workers.dev`, so turning it off means
+  //      **every paired phone stops connecting**.
+  //   ★ Why keeping both is fine: a room (Durable Object) is **looked up by the agent's public key**, so
+  //     **either host name lands in the same room** = old and new can meet even when mixed.
+  //     ⇒ The migration needs no moment where "every machine switches at once".
+  //   ⚠️ The distribution origin (site) is the opposite: **there must not be two origins** (`site/wrangler.jsonc`).
+  //   ⚠️⚠️ **Set `workers_dev` explicitly.** As soon as `routes` is written, wrangler
+  //      **turns workers.dev off by default** (actually hit on 2026-09-21. It warns, but deploy succeeds)
+  //      ⇒ **the old entry point dies silently and every paired phone stops connecting**.
+  //      ★ "Not writing it = same as before" is false. **State explicitly what you do not want removed.**
+  "workers_dev": true,
+  "routes": [{ "pattern": "relay.nyan-remote.app", "custom_domain": true }],
+  "observability": { "enabled": true },
+  // ★★ From this time on, phones are not let into rooms without a license ticket (2026-09-25 / user decision: our relay requires nyan login).
+  //   ⚠️ Set only after confirming in D1 that every machine (mac, machines A-C) had received a version-3 license ticket.
+  //   ⚠️ To revert, delete this line and deploy (back to the grace period = rooms without sign-in work as before).
+  "vars": { "LICENSE_REQUIRED_FROM": "2026-09-25T02:05:00Z" },
+  "durable_objects": {
+    "bindings": [
+      { "name": "RENDEZVOUS", "class_name": "Rendezvous" },
+      { "name": "ACCOUNTS", "class_name": "Accounts" }
+    ]
+  },
+  // ⚠️⚠️ **Use the SQLite backend** (the only one available on the free plan / confirmed 2026-09-15)
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["Rendezvous"] },
+    { "tag": "v2", "new_sqlite_classes": ["Accounts"] }
+  ]
+}

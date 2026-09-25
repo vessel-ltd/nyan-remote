@@ -1,0 +1,20 @@
+{
+  "name": "@nyan-remote/agent",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "各マシンに常駐し、自分のセッションだけを権威的に持つ。127.0.0.1 のみに bind する。",
+  "scripts": {
+    "start": "node src/index.ts",
+    "dev": "node --watch src/index.ts",
+    "test": "node --test 'src/**/*.test.ts'",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/web-push": "^3.6.4"
+  },
+  "dependencies": {
+    "web-push": "^3.6.7"
+  }
+}

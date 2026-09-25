@@ -1,0 +1,38 @@
+{
+  "$schema": "../relay/node_modules/wrangler/config-schema.json",
+  // ★★ **Distribution origin of the PWA** (Y in ③ / ARCHITECTURE §14.1.3).
+  //   ⚠️⚠️ **A separate worker from relay** (relay has exactly one job: pass ciphertext through as-is).
+  //   ⚠️ This **only serves static files**. It has no code (no `main`).
+  "name": "nyan-remote",
+  // ★★ Pin the account (⚠️ without it, deploy goes to **whichever account is logged in**)
+  "account_id": "de3117b74037f67ec29c1db3c5b67213",
+  "compatibility_date": "2026-01-01",
+  // ⚠️⚠️ **No per-version public URLs** (they add entry points still running old code / same call as relay)
+  "preview_urls": false,
+  "assets": {
+    // ★★ **`dist/site`, not `web/dist`** (changed 2026-09-20 / distribution D in ③).
+    //   ⚠️ Besides the PWA this holds **`install.sh`, `nyan-remote.tar.gz` and `RELEASE`**.
+    //   ⚠️⚠️ Staging happens in one place, `scripts/site-stage.mjs` (called by `npm run site:deploy`).
+    //      **Do not point this back at `web/dist` by hand** = that removes the `curl | bash` entry point.
+    "directory": "../dist/site",
+    // ★ Not an SPA, so `not_found_handling` stays at the default (404 is 404).
+    //   ⚠️ Screen routing lives in `web/src/route.ts` via `history.pushState`,
+    //      but nothing opens a deep URL directly (notifications also open `/` + state).
+    "html_handling": "auto-trailing-slash"
+  },
+  // ★★ **The custom domain is a single subdomain, `app.`** (2026-09-21 / user decision).
+  //
+  //   ⚠️⚠️ **Do not put the PWA on the apex (`nyan-remote.app`).** Same reason we did not pick
+  //      `<user>.github.io` (CLAUDE.md §1): the origin would cover "every page on that domain",
+  //      so **adding one landing page would be enough to read the device's private key in IndexedDB**.
+  //      ⇒ The apex is for the landing page, docs and billing. **The PWA is isolated on `app.`.**
+  //
+  //   ⚠️⚠️ **Turn `workers.dev` off** (the opposite of relay). Otherwise **the PWA has two origins**:
+  //      ① it is **treated as a different device** depending on where it was installed from (endpoints, private key and subscriptions are all per origin)
+  //      ② installing both to the home screen **stops notifications** (field experience in CLAUDE.md §3).
+  //      ⚠️ The moment it is off, `nyan-remote.nyan-remote-relay.workers.dev` is dead, so
+  //        **fix the TARBALL URL in `install.sh` and the README URL in the same commit**.
+  "workers_dev": false,
+  "routes": [{ "pattern": "app.nyan-remote.app", "custom_domain": true }],
+  "observability": { "enabled": true }
+}

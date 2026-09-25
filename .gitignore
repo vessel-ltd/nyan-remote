@@ -1,0 +1,29 @@
+node_modules/
+web/dist/
+# ★ 配る tarball の置き場（scripts/pack.mjs）
+dist/
+*.log
+*.tsbuildinfo
+
+# 秘密情報は絶対にコミットしない（docs/HANDOFF.md §7）
+# 実体は ~/.nyan-remote/ にあるが、うっかりリポジトリに持ち込んだときの保険
+notify.env
+vapid.json
+*.vapid.json
+hook-token
+subscriptions.json
+.env
+.env.*
+
+# Playwright MCP の出力
+.playwright-mcp/
+/*.png
+
+# npm run dev の PIDファイル
+.dev.pid
+
+# 実験用のローカル設定（コミットしない）
+.claude/settings.local.json
+
+# python の中間ファイル（scripts/relay.py を import するテストが作る）
+__pycache__/

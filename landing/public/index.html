@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>nyan-remote — Claude Code on your phone</title>
+<meta name="description" content="Your Claude Code sessions on every machine and every account, on your phone — keep starting claude as usual.">
+<link rel="icon" href="/favicon.png"><link rel="stylesheet" href="/style.css">
+</head><body>
+<header class="top"><a href="/"><img src="/icon.png" alt=""></a><a class="grow" href="/"><strong>nyan-remote</strong></a><a class="btn ghost" href="https://account.nyan-remote.app">Account</a></header>
+<main><section class="hero"><img class="cat" src="/icon.png" alt=""><div class="text">
+<h1>Keep running claude.<br>Use it from your phone.</h1>
+<p class="dim">Every session on every machine and every account in one list. Get notified when a turn ends, answer approvals from your phone. A cat runs while Claude is working.</p>
+<p><a class="btn" href="#install">Get started</a> <a class="btn ghost" href="#pricing">Pricing</a></p>
+</div></section>
+
+<h2>What it does</h2>
+<div class="grid">
+<div class="card"><h3>No new way to start</h3><p class="dim">Sessions you start with plain claude show up on your phone as they are, and you can type into them. No wrapper command to relaunch with.</p></div>
+<div class="card"><h3>All machines, all accounts</h3><p class="dim">Several machines (WSL, macOS, Linux) and several Claude accounts on one machine, merged into one list.</p></div>
+<div class="card"><h3>Notifications and approvals</h3><p class="dim">Push notifications (iPhone and Android) when a turn ends or an approval is waiting. Answer approvals and choices right there.</p></div>
+<div class="card"><h3>End-to-end encrypted, self-hostable</h3><p class="dim">Phone ↔ PC traffic is end-to-end encrypted; the relay cannot read it. With Tailscale or your own Cloudflare relay it is free and needs no account (open source, MIT).</p></div>
+</div>
+
+<h2 id="soon">Coming soon</h2>
+<div class="grid">
+<div class="card"><h3>Codex</h3><p class="dim">The same phone view and notifications for OpenAI Codex sessions, next to your Claude Code sessions.</p></div>
+<div class="card"><h3>Phone apps</h3><p class="dim">Native apps for iPhone and Android, alongside the web app you can use today.</p></div>
+</div>
+
+<h2 id="install">Get started</h2>
+<p>On your PC (WSL / macOS / Linux, Node 24):</p>
+<pre><code>curl -fsSL https://app.nyan-remote.app/install.sh | bash</code></pre>
+<p>In a new terminal, sign in if you use our relay, then register your phone:</p>
+<pre><code>nyan login
+nyan pair</code></pre>
+<p>On your phone, open <a href="https://app.nyan-remote.app">app.nyan-remote.app</a>, add it to your home screen, and scan the QR code.</p>
+
+<h2 id="pricing">Pricing</h2>
+<div class="grid">
+<div class="card"><h3>Free</h3><p class="price">$0</p><p>1 machine, 2 phones (our relay)</p><p class="dim">All features included</p></div>
+<div class="card"><h3>Plus</h3><p class="price">$24 / year</p><p class="dim">or $2.99 / month</p><p>5 machines, 5 phones</p><p><a class="btn" href="https://account.nyan-remote.app">Go to account</a></p></div>
+<div class="card"><h3>Self-hosted</h3><p class="price">$0</p><p>Tailscale or your own Cloudflare relay. No limits, no account</p><p><a href="https://github.com/vessel-ltd/nyan-remote">GitHub</a></p></div>
+</div>
+<p class="dim">Prices are in US dollars and include tax. Cancel anytime; you will not be charged from the next renewal.</p>
+<p class="dim">nyan-remote is not an official Anthropic product. Claude and Claude Code are trademarks of Anthropic.</p></main>
+<footer>
+<a href="/legal/terms/">Terms</a> ·
+<a href="/legal/privacy/">Privacy</a> ·
+<a href="/legal/law/">Legal notice</a> ·
+<a href="https://github.com/vessel-ltd/nyan-remote">GitHub</a> ·
+<a href="https://account.nyan-remote.app/#support">Support</a><br>© 2026 Vessel Ltd.
+</footer></body></html>

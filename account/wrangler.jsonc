@@ -1,0 +1,35 @@
+{
+  "$schema": "../relay/node_modules/wrangler/config-schema.json",
+  // ★ Accounts and billing (docs/BILLING.md). ⚠️ Secrets go through `wrangler secret put` (never here):
+  //   GITHUB_CLIENT_SECRET / STRIPE_SECRET_KEY / STRIPE_WEBHOOK_SECRET / SESSION_SECRET / LICENSE_PRIVATE_KEY
+  "name": "nyan-account",
+  "account_id": "de3117b74037f67ec29c1db3c5b67213",
+  "main": "src/worker.ts",
+  "compatibility_date": "2026-01-01",
+  "preview_urls": false,
+  "workers_dev": false,
+  "routes": [{ "pattern": "account.nyan-remote.app", "custom_domain": true }],
+  "observability": { "enabled": true },
+  "vars": {
+    "ORIGIN": "https://account.nyan-remote.app",
+    // ★ Values that may be public (Client ID)
+    "GITHUB_CLIENT_ID": "Ov23liR5gPIqJCohxOey",
+    // ★ Stripe Price IDs (⚠️ **test mode** values / 2026-09-24. Replace them when switching to live)
+    "PRICE_USD_MONTH": "price_1UJCf4FQRnbVQ6jcVeZ2Tbqz",
+    "PRICE_USD_YEAR": "price_1UJCgJFQRnbVQ6jcyfs7USZg",
+    // ★ Ops watcher (src/ops.ts / 2026-09-25). ⚠️ CF_ANALYTICS_TOKEN is a secret (read-only token)
+    "CF_ACCOUNT_ID": "de3117b74037f67ec29c1db3c5b67213",
+    "ADMIN_GITHUB_IDS": "15623109",
+    "SPIKE_DAILY_REQUESTS": "300000",
+    "ALERT_FROM": "alerts@nyan-remote.app"
+  },
+  // ★ Hourly watcher (monthly projection about to exceed the included amount, or a daily spike ⇒ one email each / src/ops.ts)
+  "triggers": { "crons": ["0 * * * *"] },
+  // ★ Sending via Email Routing (2026-09-25). ⚠️ The recipient is not written here (the repository will be public) ⇒ secret ALERT_TO.
+  //   No recipient restriction here = it can only send to **verified destinations** in Email Routing (Cloudflare refuses the rest)
+  "send_email": [{ "name": "ALERT_EMAIL" }],
+  // ★ D1 (created 2026-09-24)
+  "d1_databases": [{ "binding": "DB", "database_name": "nyan-account", "database_id": "0e9d4f4c-7a40-47ef-8487-ab23c8c8a2f4", "migrations_dir": "migrations" }],
+  // ★ relay's ledger (a removed machine is removed from the ledger too)
+  "durable_objects": { "bindings": [{ "name": "ACCOUNTS", "class_name": "Accounts", "script_name": "nyan-relay" }] }
+}

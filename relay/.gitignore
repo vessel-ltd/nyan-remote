@@ -1,0 +1,4 @@
+node_modules/
+.wrangler/
+# ★ `wrangler types` が作る生成物（@cloudflare/workers-types を使うので要らない）
+worker-configuration.d.ts

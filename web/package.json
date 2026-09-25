@@ -1,0 +1,19 @@
+{
+  "name": "@nyan-remote/web",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "スマホ向け PWA。複数マシンの agent を横断してマージ表示する。",
+  "scripts": {
+    "dev": "vite build --watch",
+    "build": "vite build",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test 'src/**/*.test.ts'"
+  },
+  "dependencies": {
+    "preact": "^10.25.0"
+  },
+  "devDependencies": {
+    "vite": "^6.0.0"
+  }
+}

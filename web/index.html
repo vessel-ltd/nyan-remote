@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <!-- ★ ブラウザの枠の色。既定は端末の設定に合わせる（手動で選んだときは下の script と theme.ts が1つに差し替える） -->
+    <meta name="theme-color" content="#f6f7f9" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#0b0d10" media="(prefers-color-scheme: dark)" />
+    <!-- ★★ 保存したテーマを**最初の描画の前に**当てる（2026-09-24 / codex 19周目 低4）。
+         ⚠️ JS の本体を待つと、端末と違うテーマを選んだ人に一瞬 反対の色が出る。
+         ⚠️ 名前と色は theme.ts / styles.css と同じ（theme.test.ts が照合している） -->
+    <script>
+      try {
+        var c = localStorage.getItem('tmux-agent.theme.v1')
+        if (c === 'light' || c === 'dark') {
+          document.documentElement.dataset.theme = c
+          var bg = c === 'light' ? '#f6f7f9' : '#0b0d10'
+          document.querySelectorAll('meta[name="theme-color"]').forEach(function (m) {
+            m.removeAttribute('media')
+            m.setAttribute('content', bg)
+          })
+        }
+      } catch (e) {}
+    </script>
+    <meta name="referrer" content="no-referrer" />
+    <title>nyan-remote</title>
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <!-- ★ アイコン（2026-09-24 / 三毛ねこが端末に乗る D・地は紺 / scripts/build-icons.cjs）。
+         ⚠️ iPhone は SVG のアイコンを使えない ⇒ PNG（180px。角丸は iOS がかける） -->
+    <link rel="icon" href="/icons/favicon-64.png" type="image/png" />
+    <link rel="apple-touch-icon" href="/icons/apple-touch-icon-180.png" />
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
