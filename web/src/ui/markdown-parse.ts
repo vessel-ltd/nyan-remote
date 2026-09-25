@@ -30,11 +30,34 @@ export type Block =
 export function safeHref(url: string): string | null {
   const s = url.trim()
   if (!s) return null
-  if (/^https?:\/\//i.test(s)) return s
-  // Protocol-relative (//evil.example) goes off-site, so reject
-  if (s.startsWith('//')) return null
-  // Reject any scheme (javascript: data: file: etc.)
-  if (/^[a-z][a-z0-9+.\-]*:/i.test(s)) return null
+  // ⚠️⚠️ **Decide on what the browser will parse, not on the raw string** (2026-09-25 / codex security review):
+  //    `\u0001javascript:…` passed the old scheme regex, and URL parsing strips leading C0 controls ⇒ `javascript:` in href.
+  //    ⇒ Parse it against a fixed base: a relative link must land on that same origin (so `javascript:`, `data:`, `//evil`,
+  //       `/\evil` — parsed as `//evil` — and hidden control characters all fall out). Tests cover each form.
+  // ⚠️ Control characters anywhere are refused (the parser drops them silently, so what we check would not be what runs)
+  if (/[\u0000-\u001f\u007f]/.test(s)) return null
+  // ★ A scheme is allowed only as written `http://` / `https://` (codex: `https:x`, `blob:…` resolve somewhere else in the real page)
+  if (/^[a-z][a-z0-9+.\-]*:/i.test(s)) {
+    if (!/^https?:\/\//i.test(s)) return null
+    // ⚠️ And it must actually parse (a broken host is not a link)
+    try {
+      new URL(s)
+    } catch {
+      return null
+    }
+    return s
+  }
+  // ⚠️ Two leading slashes (either kind) name another host (`//evil`, `/\evil`, `\\evil`)
+  if (/^[\\/]{2}/.test(s)) return null
+  // ★ What is left must be a relative link that stays on this site (checked with the browser's parser)
+  const BASE = 'https://base.invalid/'
+  let u: URL
+  try {
+    u = new URL(s, BASE)
+  } catch {
+    return null
+  }
+  if (u.origin !== new URL(BASE).origin) return null
   return s
 }
 

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { mkdtemp, readdir, rm, utimes, writeFile, mkdir } from 'node:fs/promises'
+import { mkdtemp, readdir, rm, symlink, utimes, writeFile, mkdir } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
@@ -267,16 +267,65 @@ test('★★ hook: does nothing if the escape hatch (.off) exists', async () => 
     const tmp = await mkdtemp(join(tmpdir(), 'nyan-remote-off-'))
     try {
       await writeFile(join(tmp, 'nyan-remote-inflight.off'), '')
-      fire({ session_id: SID, index: 0, delta: '止まっているべき' }, { TMPDIR: tmp })
+      fire({ session_id: SID, index: 0, delta: '止まっているべき' }, { TMPDIR: tmp, XDG_RUNTIME_DIR: tmp })
       assert.equal(await readInflight(SID), undefined)
     // Works again once removed
       await rm(join(tmp, 'nyan-remote-inflight.off'))
-      fire({ session_id: SID, index: 0, delta: '動く' }, { TMPDIR: tmp })
+      fire({ session_id: SID, index: 0, delta: '動く' }, { TMPDIR: tmp, XDG_RUNTIME_DIR: tmp })
       assert.equal((await readInflight(SID))?.text, '動く')
     } finally {
       await rm(tmp, { recursive: true, force: true })
     }
   })
+})
+
+test('★★ hook: the escape hatch counts only as our own regular file, not a symlink (shared /tmp / codex security review)', async () => {
+  await withState(async () => {
+    const tmp = await mkdtemp(join(tmpdir(), 'nyan-remote-off-link-'))
+    try {
+      // Someone points the name at a file (here: one of ours) ⇒ must not switch the hook off
+      await writeFile(join(tmp, 'target'), '')
+      await symlink(join(tmp, 'target'), join(tmp, 'nyan-remote-inflight.off'))
+      fire({ session_id: SID, index: 0, delta: 'リンクでは止まらない' }, { TMPDIR: tmp, XDG_RUNTIME_DIR: tmp })
+      assert.equal((await readInflight(SID))?.text, 'リンクでは止まらない', '⚠️⚠️ a symlink switched the hook off')
+    } finally {
+      await rm(tmp, { recursive: true, force: true })
+    }
+  })
+  // ★ With a per-user runtime directory, a switch left in the shared TMPDIR does not count
+  const priv = await mkdtemp(join(tmpdir(), 'nyan-remote-xdg-'))
+  const shared = await mkdtemp(join(tmpdir(), 'nyan-remote-shared-'))
+  try {
+    await withState(async () => {
+      await writeFile(join(shared, 'nyan-remote-inflight.off'), '')
+      fire({ session_id: SID, index: 0, delta: '共有の場所の印は効かない' }, { TMPDIR: shared, XDG_RUNTIME_DIR: priv })
+      assert.equal((await readInflight(SID))?.text, '共有の場所の印は効かない', '⚠️ a switch in the shared TMPDIR stopped the hook')
+    })
+  } finally {
+    await rm(priv, { recursive: true, force: true })
+    await rm(shared, { recursive: true, force: true })
+  }
+  // ★ Without a runtime directory, the switch lives in our state directory (never the shared temp directory)
+  await withState(async () => {
+    const shared2 = await mkdtemp(join(tmpdir(), 'nyan-remote-shared2-'))
+    try {
+      await writeFile(join(shared2, 'nyan-remote-inflight.off'), '')
+      fire({ session_id: SID, index: 0, delta: 'TMPDIR の印は効かない' }, { TMPDIR: shared2, XDG_RUNTIME_DIR: '' })
+      assert.equal((await readInflight(SID))?.text, 'TMPDIR の印は効かない')
+      await writeFile(join(process.env['NYAN_REMOTE_STATE_DIR']!, 'inflight.off'), '')
+      fire({ session_id: SID, index: 0, delta: '止まるべき' }, { TMPDIR: shared2, XDG_RUNTIME_DIR: '' })
+      assert.equal((await readInflight(SID))?.text, 'TMPDIR の印は効かない', '⚠️ the switch in the state directory did not work')
+    } finally {
+      await rm(shared2, { recursive: true, force: true })
+    }
+  })
+  // ★ Ownership is checked with bash's `-O` (a file of another user cannot be made in a test without root)
+  const { readFile: rf } = await import('node:fs/promises')
+  const sh = await rf(new URL('../../../hooks/message-display.sh', import.meta.url), 'utf8')
+  assert.match(sh, /if \[\[ -f \$off && ! -L \$off && -O \$off \]\]; then/)
+  assert.match(sh, /^  off=\$XDG_RUNTIME_DIR\/nyan-remote-inflight\.off$/m)
+  assert.match(sh, /^  off=\$\{NYAN_REMOTE_STATE_DIR:-\$HOME\/\.nyan-remote\}\/inflight\.off$/m)
+  assert.doesNotMatch(sh.split('\n').filter((l) => !l.trim().startsWith('#')).join('\n'), /\/tmp|TMPDIR/, '⚠️ the shared temp directory is used again')
 })
 
 test('★★★ hook: reads stdin to the end even with the escape hatch present (no EPIPE)', async () => {
@@ -292,7 +341,7 @@ test('★★★ hook: reads stdin to the end even with the escape hatch present 
       await writeFile(join(tmp, 'nyan-remote-inflight.off'), '')
       const big = { session_id: SID, index: 0, delta: 'あ'.repeat(120_000) }
       // ⚠️ A throw here means EPIPE (= not read to the end)
-      fire(big, { TMPDIR: tmp })
+      fire(big, { TMPDIR: tmp, XDG_RUNTIME_DIR: tmp })
       assert.equal(await readInflight(SID), undefined, 'the escape hatch did not work (it wrote)')
     } finally {
       await rm(tmp, { recursive: true, force: true })

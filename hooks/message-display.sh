@@ -18,8 +18,17 @@
 umask 077
 
 # ★ Escape hatch (`/code-review` 2026-08-21, medium #3). **Lets you stop it without editing settings by hand**.
-#   ⚠️ It lives on tmpfs (/tmp). If $HOME is on a hung FS, the stat itself would block
-if [[ -e ${TMPDIR:-/tmp}/nyan-remote-inflight.off ]]; then
+#   ⚠️⚠️ **Only a regular file of our own, not a link** (2026-09-25 / codex security review): /tmp is shared, so another user
+#      could create it and silently switch off the explanation before approvals. `-f` `-L` `-O` are bash builtins (no fork).
+#   ★ Only in places of our own: the per-user runtime directory (0700, tmpfs), else our state directory
+#     (codex: in a shared /tmp another user can create or race-swap the name). ⚠️ The state directory is written on every
+#     call anyway (below), so "keep it off $HOME in case $HOME hangs" did not hold.
+if [[ -n ${XDG_RUNTIME_DIR:-} ]]; then
+  off=$XDG_RUNTIME_DIR/nyan-remote-inflight.off
+else
+  off=${NYAN_REMOTE_STATE_DIR:-$HOME/.nyan-remote}/inflight.off
+fi
+if [[ -f $off && ! -L $off && -O $off ]]; then
   # ⚠️⚠️ **Drain stdin before exiting** (2026-08-23). Exiting without reading makes
   #    the writer (the CLI) hit **a broken pipe = EPIPE**. This hook is called every 0.7 s,
   #    so from the moment the escape hatch is used it would **error every single time**.

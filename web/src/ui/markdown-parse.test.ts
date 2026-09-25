@@ -128,3 +128,14 @@ test('parseBlocks: stops even without a closing fence (no infinite loop)', () =>
   const blocks = parseBlocks('```\nunterminated\n')
   assert.deepEqual(blocks, [{ t: 'pre', lang: '', code: 'unterminated\n' }])
 })
+
+test('★★ safeHref decides on what the browser parses: control characters, backslashes and hidden schemes are refused (codex security review)', () => {
+  for (const bad of ['blob:https://base.invalid/id', '//base.invalid/x', 'https:x', 'https:/x', 'HTTP:x', '\u0001https:x', '\\/evil.example', 'a\u007fb',
+    '\u0001javascript:alert(1)', '\u0000javascript:x', 'java\tscript:x', '/\\evil.example/x', '\\\\evil.example', 'https:\\\\evil.example', ' //evil.example', 'JAVASCRIPT:x', 'data:text/html,x', 'vbscript:x', 'file:///etc/passwd', 'https://a\u0085b.example']) {
+    assert.equal(safeHref(bad), null, JSON.stringify(bad))
+  }
+  // ★ codex's exact probe, through the parser
+  const node = parseInline('[open report](\u0001javascript:alert%281%29)').find((n) => n.t === 'link')
+  assert.ok(node && node.t === 'link' && node.href === null, '⚠️⚠️ javascript: reached href')
+  for (const ok of ['https://example.com/a?b=c#d', 'http://example.com', '/docs/x', 'docs/x', '#top', '?q=1', '../up']) assert.equal(safeHref(ok), ok, ok)
+})

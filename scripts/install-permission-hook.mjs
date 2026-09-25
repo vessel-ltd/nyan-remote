@@ -377,8 +377,10 @@ function smokeTest() {
   // ★ **If the off switch is present, say so** (2026-08-21 `/code-review` low #7).
   //   ⚠️ Otherwise it says "the hook ran but wrote no file" and
   //     **makes people chase permissions although it was turned off on purpose**.
-  const off = join(process.env.TMPDIR ?? '/tmp', 'nyan-remote-inflight.off')
-  if (existsSync(off)) return t(`逃げ道が置かれています（${off} を消すまで本文は出ません）`, `the off switch is present (message text will not show until you delete ${off})`)
+  // ⚠️ The same place the hook looks (`hooks/message-display.sh`: the per-user runtime directory first)
+  const off = process.env.XDG_RUNTIME_DIR ? join(process.env.XDG_RUNTIME_DIR, 'nyan-remote-inflight.off') : join(STATE_DIR, 'inflight.off')
+  // ⚠️ Same rule as the hook: a regular file of ours, not a link (someone else's file there does not stop the hook)
+  if (ownOffSwitch(off)) return t(`逃げ道が置かれています（${off} を消すまで本文は出ません）`, `the off switch is present (message text will not show until you delete ${off})`)
   const sid = randomUUID()
   const dir = join(STATE_DIR, 'inflight')
   const path = join(dir, `${sid}.jsonl`)
@@ -542,3 +544,14 @@ if (!REMOVE && changed > 0) {
   )
   console.log(t('⚠️ 承認は「スマホ」でも「PCの画面」でも答えられます。どちらでも構いません。', '⚠️ Approvals can be answered on the phone or on the PC screen, whichever you like.'))
 }
+
+/** ★ The hook's off switch counts only as a regular file owned by us, not a symlink (same rule as `hooks/message-display.sh`) */
+export function ownOffSwitch(path) {
+  try {
+    const st = lstatSync(path)
+    return st.isFile() && (typeof process.getuid !== 'function' || st.uid === process.getuid())
+  } catch {
+    return false
+  }
+}
+

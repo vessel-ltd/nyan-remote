@@ -19,7 +19,7 @@ import { join, relative } from 'node:path'
 import { isMain } from './lib/isMain.mjs'
 
 const PUBLIC_REPO = 'vessel-ltd/nyan-remote'
-const PUBLIC_URL = `https://github.com/${PUBLIC_REPO}.git`
+export const PUBLIC_URL = `https://github.com/${PUBLIC_REPO}.git`
 const AUTHOR = { name: 'Vessel Ltd.', email: 'noreply@nyan-remote.app' }
 
 /**
@@ -71,12 +71,38 @@ export function forbiddenPatterns(root) {
 
 const git = (args, o = {}) => execFileSync('git', args, { encoding: 'utf8', ...o }).trim()
 
-function* files(dir) {
+/**
+ * ★ The UTF-16 readings of a buffer: both byte orders, **from both byte alignments** (text embedded at an odd offset
+ *   was missed / codex). A trailing odd byte is ignored.
+ */
+function utf16Readings(buf) {
+  const out = []
+  for (const start of [0, 1]) {
+    const part = buf.subarray(start)
+    const even = part.subarray(0, part.length - (part.length % 2))
+    out.push(even.toString('utf16le'), Buffer.from(even).swap16().toString('utf16le'))
+  }
+  return out
+}
+
+function* dirs(dir, o = {}) {
   for (const name of readdirSync(dir)) {
     const p = join(dir, name)
-    if (name === '.git') continue
+    if (name === '.git' && !o.keepGit) continue
+    if (lstatSync(p).isDirectory()) {
+      yield p
+      yield* dirs(p, o)
+    }
+  }
+}
+
+function* files(dir, o = {}) {
+  for (const name of readdirSync(dir)) {
+    const p = join(dir, name)
+    // ⚠️ `.git` is skipped only at the top of the public checkout (`o.keepGit` = the package: scanned like anything else / codex)
+    if (name === '.git' && !o.keepGit) continue
     // ⚠️ lstat: a symlink is never followed (a link out of the tree could pull outside files in)
-    if (lstatSync(p).isDirectory()) yield* files(p)
+    if (lstatSync(p).isDirectory()) yield* files(p, o)
     else yield p
   }
 }
@@ -87,19 +113,28 @@ function* files(dir) {
  *   Text is read as UTF-8; image/font files are read byte for byte (latin1) so an embedded secret still matches.
  *   ⚠️ A NUL in a text-type file stops the publish (UTF-16 and the like cannot be checked reliably).
  */
-export function scan(root, patterns) {
+export function scan(root, patterns, o = {}) {
   const hits = []
-  for (const f of files(root)) {
+  // ★ Directory names are public too, even empty ones (a folder named after a machine / codex)
+  for (const d of dirs(root, { keepGit: o.keepGit === true })) {
+    const rel = relative(root, d)
+    for (const re of patterns) if (re.test(rel)) hits.push(`${rel}/: path matches ${re}`)
+  }
+  for (const f of files(root, { keepGit: o.keepGit === true })) {
     const rel = relative(root, f)
     // ★ The path itself is public too (a file named after a machine leaks it / codex round 34)
     for (const re of patterns) if (re.test(rel)) hits.push(`${rel}: path matches ${re}`)
     const buf = readFileSync(f)
-    const binary = BINARY_EXT.test(rel)
+    // ★ `lenient(rel)`: third-party files (bundled dependencies) may be binary with any name ⇒ scanned byte for byte instead of refused
+    const binary = BINARY_EXT.test(rel) || (o.lenient?.(rel) === true && buf.includes(0))
     if (!binary && buf.includes(0)) {
       hits.push(`${rel}: NUL byte in a text file (cannot be checked)`)
       continue
     }
-    const lines = buf.toString(binary ? 'latin1' : 'utf8').split('\n')
+    // ⚠️ A file with NULs is also **decoded as UTF-16** (little and big endian): UTF-16 text hides an ASCII secret between
+    //    NULs, and merely dropping the NULs turned other characters into ASCII that broke the patterns (codex)
+    const text = binary && buf.includes(0) ? [buf.toString('latin1'), ...utf16Readings(buf)].join('\n') : buf.toString(binary ? 'latin1' : 'utf8')
+    const lines = text.split('\n')
     lines.forEach((line, i) => {
       for (const re of patterns) if (re.test(line)) hits.push(`${rel}:${i + 1}: ${re}`)
     })

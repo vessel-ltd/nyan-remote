@@ -15,11 +15,12 @@
 //   node scripts/pack.mjs --out <path>
 
 import { execFileSync } from 'node:child_process'
-import { cpSync, existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
+import { cpSync, existsSync, lstatSync, mkdirSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { t } from '../shared/i18n.ts'
 import { formatRelease } from '../shared/release.ts'
 import { historyHashes } from './install-notify.mjs'
+import { classify, forbiddenPatterns, scan } from './publish-public.mjs'
 import { initCliLang } from './lib/lang.mjs'
 
 // ★ Language first (before any message is built)
@@ -66,24 +67,62 @@ if (runtime.length === 0) {
   process.exit(1)
 }
 
+// ★★ ②' Everything **on disk** in web/public goes into the site (the build copies ignored and untracked files too / codex):
+//   every file there must be tracked, public by the rules, and not a link
+{
+  const tracked = new Set(git('ls-files', 'web/public').split('\n').filter(Boolean))
+  const bad = []
+  for (const f of walk(join(ROOT, 'web/public'))) {
+    const rel = f.slice(ROOT.length + 1)
+    const st = lstatSync(f)
+    if (st.isDirectory()) continue
+    if (st.isSymbolicLink()) bad.push(`${rel}: symlink`)
+    else if (!tracked.has(rel)) bad.push(`${rel}: not in git (the build would publish it)`)
+  }
+  if (bad.length) {
+    console.error(t(`✗ web/public に git に無いファイルがあります（ビルドで公開されます）:\n${bad.join('\n')}`, `✗ web/public holds files that are not in git (the build would publish them):\n${bad.join('\n')}`))
+    process.exit(1)
+  }
+}
+
 // ★ ③ Stack it up
 const stage = join(ROOT, 'dist', '.pack', 'nyan-remote')
 rmSync(join(ROOT, 'dist', '.pack'), { recursive: true, force: true })
 mkdirSync(stage, { recursive: true })
 
-// ★★ Leave out only **heavy things not needed to run** (⚠️ never leave out a single line of code = keep transparency).
-//   ⚠️ Currently only "the cat source art" (about 12MB. PNG sketches; the package uses `web/dist/cats/`).
-//   ⚠️⚠️ **Before adding more, confirm it is "not needed to run"** (docs stay = better to be readable).
-const HEAVY = ['docs/cat-concepts/']
+// ★★★ **The same rules as the public repository** (`classify` in `publish-public.mjs` / 2026-09-25 / codex security review).
+//   ⚠️⚠️ This tarball is served publicly (`app.nyan-remote.app/nyan-remote.tar.gz`), and it used to copy **every tracked file**:
+//      CLAUDE.md, docs/HANDOFF.md and docs/publish-forbidden.txt (the list of personal values itself) were downloadable by anyone.
+//   ⇒ Only what the public repository may contain goes in; anything the rules do not know stops the pack (like publishing).
+const HEAVY = ['private files (CLAUDE.md, docs/, other Markdown)']
 let skipped = 0
+const refused = []
+// ⚠️ No symlinks at all (same as publishing: a link can carry an absolute build-machine target or pull outside files in)
+for (const line of git('ls-files', '-s').split('\n').filter(Boolean)) {
+  if (line.startsWith('120000 ')) refused.push(`${line.split('\t')[1]}: symlink`)
+}
 for (const rel of git('ls-files').split('\n').filter(Boolean)) {
-  if (HEAVY.some((h) => rel.startsWith(h))) {
+  const c = classify(rel)
+  // ⚠️⚠️ web/public is copied into web/dist by the build **whatever the rules say** (codex): everything there must be public
+  if (rel.startsWith('web/public/') && c !== 'keep') {
+    refused.push(`${rel}: ${c === 'drop' ? 'private file in web/public (the build would publish it)' : c}`)
+    continue
+  }
+  if (c === 'drop') {
     skipped++
+    continue
+  }
+  if (c !== 'keep') {
+    refused.push(`${rel}: ${c}`)
     continue
   }
   const to = join(stage, rel)
   mkdirSync(dirname(to), { recursive: true })
   cpSync(join(ROOT, rel), to)
+}
+if (refused.length) {
+  console.error(t(`✗ 公開してよいか分からないファイルがあります（scripts/publish-public.mjs の規則）:\n${refused.join('\n')}`, `✗ Files the public rules do not allow (scripts/publish-public.mjs):\n${refused.join('\n')}`))
+  process.exit(1)
 }
 cpSync(join(ROOT, 'web/dist'), join(stage, 'web/dist'), { recursive: true })
 for (const p of runtime) {
@@ -97,8 +136,22 @@ writeFileSync(join(stage, 'hooks', 'notify.known'), `${historyHashes(ROOT).join(
 // ★ Commit date on line 3 (2026-09-24) ⇒ the screen compares "which machine is behind" (`isBehind` in `shared/release.ts`)
 writeFileSync(join(stage, 'RELEASE'), formatRelease({ commit: rev, builtAt: new Date().toISOString(), committedAt: git('log', '-1', '--format=%cI') }))
 
+// ★★ Scan **the finished package** for personal values and secret shapes (⚠️ the same scan as publishing), dependencies included
+//   (codex: they used to go in after the scan, copied with links followed)
+{
+  const hits = scan(stage, forbiddenPatterns(ROOT), { lenient: (rel) => rel.startsWith('node_modules/'), keepGit: true })
+  // ⚠️ No repository metadata of any kind (a git-installed dependency brings its `.git`, remotes and tokens included / codex)
+  //   ⚠️ Case-insensitively (`.GIT` is `.git` on macOS's default filesystem / codex)
+  for (const f of walk(stage)) if (f.split('/').some((seg) => seg.toLowerCase() === '.git')) hits.push(`${f.slice(stage.length + 1)}: .git in the package`)
+  if (hits.length) {
+    console.error(t(`✗ 出してはいけない値があります:\n${hits.slice(0, 50).join('\n')}`, `✗ Forbidden values in the tarball:\n${hits.slice(0, 50).join('\n')}`))
+    process.exit(1)
+  }
+}
+
 mkdirSync(dirname(out), { recursive: true })
-execFileSync('tar', ['czf', out, '-C', join(ROOT, 'dist', '.pack'), 'nyan-remote'], { stdio: 'inherit' })
+// ⚠️ Ownership is not ours to publish (the build account's name was in every header / codex) ⇒ root, numeric
+execFileSync('tar', ['czf', out, '--owner=0', '--group=0', '--numeric-owner', '-C', join(ROOT, 'dist', '.pack'), 'nyan-remote'], { stdio: 'inherit' })
 rmSync(join(ROOT, 'dist', '.pack'), { recursive: true, force: true })
 
 const bytes = execFileSync('wc', ['-c', out], { encoding: 'utf8' }).trim().split(/\s+/)[0]
@@ -111,3 +164,15 @@ console.log(
     `  ⚠️ Left out as not needed to run: ${skipped} files (${HEAVY.join(', ')})`,
   ),
 )
+
+/** Every file and link under `dir` (links are not followed) */
+function walk(dir) {
+  const out = []
+  for (const name of readdirSync(dir)) {
+    const p = join(dir, name)
+    const st = lstatSync(p)
+    if (st.isDirectory()) out.push(p, ...walk(p))
+    else out.push(p)
+  }
+  return out
+}

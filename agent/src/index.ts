@@ -7,6 +7,7 @@
 import { langFromEnv, setLang, t } from '../../shared/i18n.ts'
 import { reasonText } from './reasons.ts'
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
+import { hostAllowed } from './hostCheck.ts'
 import { hostname } from 'node:os'
 import { devMode } from './auth.ts'
 import { autoApproveList, loadAutoApprove, setAutoApproveExpiryHandler } from './autoApprove.ts'
@@ -114,6 +115,12 @@ async function main(): Promise<void> {
 
   const server = createServer((req, res) => {
     beginMeasure(req, res)
+    // ★★ Refuse Host names that are not ours (DNS rebinding / `hostCheck.ts`). ⚠️ TCP only: the tunnel never comes through here
+    if (!hostAllowed(req.headers.host)) {
+      res.writeHead(403, { 'content-type': 'application/json; charset=utf-8' })
+      res.end(JSON.stringify({ error: 'host not allowed' }))
+      return
+    }
     // ★★ There is only one pipeline, `serve.ts` (the tunnel goes through the same one / §14.1.2.22).
     //   ⚠️ HTTP may fall through to static serving (= route X, where the agent serves the PWA).
     handleRequest({ router, req, res, allowStatic: true }).catch((err: unknown) => {
