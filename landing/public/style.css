@@ -1,37 +1,78 @@
-:root{color-scheme:light dark;--bg:#0b0d10;--fg:#e8edf2;--dim:#9aa4af;--card:#151a20;--line:#27303a;--acc:#7ab8ff}
-@media (prefers-color-scheme:light){:root{--bg:#f6f7f9;--fg:#15191e;--dim:#5b6570;--card:#fff;--line:#dfe3e8;--acc:#1f6fd1}}
+:root{color-scheme:light dark;--bg:#0b0d10;--fg:#e8edf2;--dim:#a3adb8;--card:#151a20;--line:#27303a;--acc:#7ab8ff;--on-acc:#0b0d10;--chip:#1c2530}
+@media (prefers-color-scheme:light){:root{--bg:#f6f7f9;--fg:#15191e;--dim:#4f5964;--card:#fff;--line:#dfe3e8;--acc:#1f6fd1;--on-acc:#fff;--chip:#e8eef6}}
 *{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.7 system-ui,-apple-system,"Segoe UI",sans-serif}
-main{max-width:760px;margin:0 auto;padding:32px 16px 64px}
-header.top{display:flex;align-items:center;gap:12px;max-width:760px;margin:0 auto;padding:16px 16px 0}
+body{margin:0;background:var(--bg);color:var(--fg);font:17px/1.7 system-ui,-apple-system,"Segoe UI",sans-serif}
+main{max-width:1040px;margin:0 auto;padding:24px 16px 64px}
+/* ★ Text-only pages (legal) keep a readable line length */
+body:not(:has(.hero)) :is(main,header.top,footer){max-width:760px}
+header.top{display:flex;align-items:center;gap:12px;max-width:1040px;margin:0 auto;padding:16px 16px 0}
 header.top a{color:inherit;text-decoration:none}
 header.top .grow{flex:1}
+header.top .navlink{color:var(--dim);font-weight:600;margin-right:6px}
+header.top strong{white-space:nowrap}
+/* ★ On a phone the header has no room for it; the hero's "Open source (MIT)" links to GitHub right below */
+@media (max-width:480px){header.top .navlink{display:none}}
+@media (max-width:360px){header.top{gap:8px}header.top .btn{padding:8px 12px}}
+.small a,.card p a{color:inherit}
 header.top img{width:36px;height:36px;border-radius:8px}
-h1{font-size:2rem;line-height:1.25;margin:24px 0 8px}
-h2{font-size:1.3rem;margin:40px 0 12px}
-h3{font-size:1.05rem;margin:24px 0 6px}
+h1{font-size:clamp(2rem,4.5vw,2.75rem);line-height:1.15;margin:16px 0 14px;letter-spacing:-.01em}
+h2{font-size:1.5rem;margin:40px 0 12px}
+.hero ~ h2{margin-top:64px}
+h3{font-size:1.1rem;margin:24px 0 6px}
 p,li{overflow-wrap:anywhere}
 .dim{color:var(--dim)}
-.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px 18px;margin:12px 0}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}
-.btn{display:inline-block;padding:10px 16px;border-radius:10px;border:1px solid var(--acc);background:var(--acc);color:#fff;text-decoration:none;font-weight:600}
+.small{font-size:.9rem}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:18px 20px;margin:0}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:14px}
+.btn{display:inline-block;padding:11px 18px;border-radius:10px;border:1px solid var(--acc);background:var(--acc);color:var(--on-acc);text-decoration:none;font-weight:600}
 .btn.ghost{background:transparent;color:var(--acc)}
 pre{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 14px;overflow-x:auto;white-space:pre}
 code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.92em}
 /* ★ 文中の code は本文と同じ字体（等幅に切り替わると浮いて見えた / 2026-09-25）。等幅はコマンドの枠（pre）だけ */
 p code,li code,td code{font-family:inherit;font-size:inherit;font-weight:600}
 .card p code{white-space:nowrap}
-.hero .nope{font-weight:600;margin:4px 0 10px}
-h3 code{font-family:inherit;font-size:inherit}
+h3 code,strong code{font-family:inherit;font-size:inherit}
 table{width:100%;border-collapse:collapse;margin:12px 0}
 th,td{text-align:left;vertical-align:top;padding:10px 8px;border-top:1px solid var(--line)}
 th{width:34%;font-weight:600}
-.hero{display:flex;gap:20px;align-items:center;flex-wrap:wrap}
-.hero img.cat{width:140px;height:auto}
-.hero .text{flex:1;min-width:240px}
-footer{max-width:760px;margin:0 auto;padding:24px 16px 48px;color:var(--dim);font-size:.9rem}
+footer{max-width:1040px;margin:0 auto;padding:24px 16px 48px;color:var(--dim);font-size:.9rem}
 footer a{color:inherit}
 .price{font-size:1.6rem;font-weight:700}
 .card h3{margin-top:0}
 .card p:last-child{margin-bottom:0}
-.hero img.cat{border-radius:28px}
+
+/* ★ Hero: one promise (left) and one proof (the app's list, right). Stacks on a phone */
+.hero{display:grid;grid-template-columns:1fr auto;gap:40px;align-items:center;margin-top:16px}
+.hero .lead{font-size:1.25rem;line-height:1.5;margin:0 0 16px}
+.chips{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 22px}
+.chips span{background:var(--chip);border-radius:999px;padding:4px 12px;font-weight:600;font-size:.95rem}
+.phone{margin:0}
+/* ★ The cat peeks over the top-left corner of the phone (the brand, big again) */
+.hero-shot{position:relative;padding:0 0 28px 92px}
+.hero-shot .peek{position:absolute;left:0;bottom:0;width:124px;height:auto;border-radius:26px;z-index:1;box-shadow:0 8px 24px rgb(0 0 0 / .25);transform:rotate(-8deg)}
+.phone img:not(.peek){display:block;width:260px;height:auto;border-radius:28px;border:6px solid #1b2027;box-shadow:0 12px 40px rgb(0 0 0 / .25)}
+@media (max-width:760px){.hero{grid-template-columns:1fr;gap:24px}.hero .phone{justify-self:center}}
+
+/* ★ How it works: three numbered steps side by side */
+.steps{list-style:none;counter-reset:step;padding:0;margin:0;display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px}
+.steps li{counter-increment:step;background:var(--card);border:1px solid var(--line);border-radius:14px;padding:18px 20px}
+.steps li::before{content:counter(step);display:inline-grid;place-items:center;width:30px;height:30px;border-radius:50%;background:var(--acc);color:var(--on-acc);font-weight:700;margin-bottom:10px}
+.steps strong{display:block;font-size:1.1rem}
+.steps span{color:var(--dim)}
+
+/* ★ Why it is different: only three, a little larger */
+.pillars{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:14px}
+.pillars h3{font-size:1.2rem}
+
+/* ★ On your phone: picture + a plain list (not boxes) */
+.split{display:grid;grid-template-columns:auto 1fr;gap:48px;align-items:center;margin-top:64px}
+.split h2{margin-top:0}
+.also{list-style:none;padding:0;margin:0}
+.also li{padding:10px 0;border-top:1px solid var(--line)}
+.also li:first-child{border-top:0}
+.also strong{display:block}
+@media (max-width:760px){.split{grid-template-columns:1fr;gap:24px}.split .phone{justify-self:center;order:2}}
+
+/* ★ Roadmap: a short list, deliberately lighter than the features */
+.roadmap{padding-left:1.2em;color:var(--dim)}
+.roadmap strong{color:var(--fg)}

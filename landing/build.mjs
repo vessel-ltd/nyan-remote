@@ -65,7 +65,7 @@ function page(lang, path, title, body) {
 ${ogTags(`${SITE}${path}`, title, t('いつもの claude のまま、全部のマシンと全部のアカウントの Claude Code を、ねこと一緒にスマホで。', 'Your Claude Code sessions on every machine and every account, on your phone — keep starting claude as usual.'), lang)}
 <link rel="icon" href="/favicon.png"><link rel="stylesheet" href="/style.css">
 </head><body>
-<header class="top"><a href="/"><img src="/icon.png" alt=""></a><a class="grow" href="/"><strong>nyan-remote</strong></a><a class="btn ghost" href="${ACCOUNT}">Account</a></header>
+<header class="top"><a href="/"><img src="/icon.png" alt=""></a><a class="grow" href="/"><strong>nyan-remote</strong></a><a class="navlink" href="${REPO}">GitHub</a><a class="btn ghost" href="${ACCOUNT}">Account</a></header>
 <main>${body}</main>
 <footer>
 <a href="/legal/terms/">Terms</a> ·
@@ -83,32 +83,44 @@ function home(lang) {
     lang,
     lang === 'ja' ? '/ja/' : '/',
     t('nyan-remote — Claude Code をスマホで', 'nyan-remote — Claude Code on your phone'),
-    `<section class="hero"><img class="cat" src="/icon.png" alt=""><div class="text">
-<h1>${t('いつもの claude のまま、<br>Claude Code をスマホで。', 'Keep running claude.<br>Use it from your phone.')}</h1>
-<p class="nope">${t('tmux なし。SSH なし。起動し直しなし。出かける前の準備なし。', 'No tmux. No SSH. No relaunching. No setup before you leave.')}</p>
-<p class="dim">${t('アカウント2つ、PC 2台、朝いつもの <code>claude</code> で始めたセッションが3つ。スマホを開けば3つとも並んでいて、どれにでも返事ができます。無料から始められて、オープンソースです。', 'Two accounts, two PCs, three sessions you started this morning with plain <code>claude</code>. On your phone, all three are there, and you can reply to any of them. Free to start, open source.')}</p>
+    `<section class="hero">
+<div class="text">
+<h1>${t('いつもの claude のまま、<br>スマホから。', 'Keep running claude.<br>Use it from your phone.')}</h1>
+<p class="lead">${t('もう始めてあるセッションを、全部のアカウント・全部のマシンから、1つの画面に。', 'The sessions you already started, from every account and every machine, in one place.')}</p>
+<p class="chips"><span>${t('tmux なし', 'No tmux')}</span><span>${t('SSH なし', 'No SSH')}</span><span>${t('起動し直しなし', 'No relaunching')}</span></p>
 <p><a class="btn" href="#install">${t('はじめる', 'Get started')}</a> <a class="btn ghost" href="#pricing">${t('料金', 'Pricing')}</a></p>
-</div></section>
+<p class="small dim">${t(`無料から始められます・<a href="${REPO}">オープンソース（MIT）</a>・E2E で暗号化`, `Free to start · <a href="${REPO}">Open source (MIT)</a> · End-to-end encrypted`)}</p>
+</div>
+<figure class="phone hero-shot"><img class="peek" src="/icon.png" width="512" height="512" alt=""><img src="/shots/list.png" width="390" height="780" alt="${t('2台のマシンと2つのアカウントのセッションが1つの一覧に', 'Sessions from two machines and two accounts in one list')}"></figure>
+</section>
 
-<h2>${t('できること', 'What it does')}</h2>
-<div class="grid">
-<div class="card"><h3>${t('いつもの <code>claude</code> のまま', 'Keep typing <code>claude</code>')}</h3><p class="dim">${t('もう始めてあるセッションを、そのまま。起動し直しも、tmux も、SSH も、ポートを開けることも要りません。', 'The sessions you already started, as they are. Nothing to relaunch, no tmux, no SSH, no port to open.')}</p></div>
-<div class="card"><h3>${t('全部のアカウント・全部のマシン', 'Every account, every machine')}</h3><p class="dim">${t('どの PC の <code>~/.claude</code> も <code>~/.claude-*</code> も自動で見つけて、1つの一覧にまとめます。承認待ちが先頭に来ます。', '<code>~/.claude</code> and every <code>~/.claude-*</code> on every PC, found automatically and merged into one list. Waiting approvals come first.')}</p></div>
-<div class="card"><h3>${t('通知と承認', 'Notifications and approvals')}</h3><p class="dim">${t('ターンが終わったとき、Claude が呼んでいるときに通知（iPhone・Android）。承認・質問への回答・止める、をスマホから。', 'A push when a turn ends or Claude needs you, on iPhone and Android. Approve, answer Claude\'s questions, or stop a running turn, right from your phone.')}</p></div>
-<div class="card"><h3>${t('自動承認は、条件つきで', 'Auto-approve, on your terms')}</h3><p class="dim">${t('1つのセッションを3時間か24時間だけ任せきりに。オンの間はずっと画面に出ていて、1タップで止まります。', 'Let one session run unattended for 3 or 24 hours. It stays on screen the whole time, and one tap turns it off.')}</p></div>
-<div class="card"><h3>${t('E2E で暗号化', 'End-to-end encrypted')}</h3><p class="dim">${t('コードとプロンプトはスマホと PC の間で暗号化。relay が運ぶのは暗号文と接続のメタデータだけです。', 'Your code and prompts are encrypted between your phone and your PC. The relay only passes ciphertext and connection metadata.')}</p></div>
-<div class="card"><h3>${t('オープンソース・自分で建てられる', 'Open source, self-hostable')}</h3><p class="dim">${t('MIT。Tailscale か、自分の Cloudflare に建てた relay なら、無料でアカウントも要りません。', 'MIT licensed. Use it over Tailscale or run the relay in your own Cloudflare account: free, no account needed.')}</p></div>
-<div class="card"><h3>${t('ストアは要らない', 'No app store needed')}</h3><p class="dim">${t('ホーム画面に追加する Web アプリ。今日から iPhone でも Android でも使えます。', 'A web app you add to your home screen. Works on iPhone and Android today.')}</p></div>
-<div class="card"><h3>${t('ねこがいます', 'A cat for company')}</h3><p class="dim">${t('7匹から選べます。Claude が動いている間だけ走ります。', 'Pick one of seven cats. It runs while Claude is working.')}</p></div>
+<h2>${t('しくみ', 'How it works')}</h2>
+<ol class="steps">
+<li><strong>${t('PC に入れる', 'Install on your PC')}</strong><span>${t('1行のコマンドで。WSL・macOS・Linux。', 'One command. WSL, macOS or Linux.')}</span></li>
+<li><strong>${t('いつもどおり <code>claude</code>', 'Use <code>claude</code> as usual')}</strong><span>${t('起動のしかたも、アカウントの分け方もそのまま。', 'Same command, same accounts, nothing to relaunch.')}</span></li>
+<li><strong>${t('スマホを開く', 'Open your phone')}</strong><span>${t('リンクを開いてホーム画面に追加するだけ（ストアは要りません）。全部のセッションが並び、どれにでも返事ができます。', 'Open a link and add it to your home screen, no app store. Every session is there, and you can reply to any of them.')}</span></li>
+</ol>
+
+<h2>${t('ほかと違うところ', 'Why it is different')}</h2>
+<div class="pillars">
+<div class="card"><h3>${t('始めてあるセッションのまま', 'Your sessions, as they are')}</h3><p>${t('専用のコマンドで起動し直したり、tmux の中で動かしたりする必要はありません。出かける前に何も準備しなくていい。', 'No wrapper command to start under, no tmux, no SSH. Nothing to prepare before you leave.')}</p></div>
+<div class="card"><h3>${t('全部のアカウント・全部のマシン', 'Every account, every machine')}</h3><p>${t('どの PC の <code>~/.claude</code> も <code>~/.claude-*</code> も自動で見つけて、1つの一覧に。承認待ちが先頭に来ます。', '<code>~/.claude</code> and every <code>~/.claude-*</code> on every PC, found automatically and merged into one list. Waiting approvals come first.')}</p></div>
+<div class="card"><h3>${t('オープンソースで、中身は見せない', 'Open source and private')}</h3><p>${t(`PC で動く agent も、Web アプリも、relay も、全部 MIT のオープンソースで <a href="${REPO}">GitHub</a> で読めます。スマホと PC の間は E2E で暗号化され、relay が運ぶのは暗号文だけ。Tailscale や自分の relay でも使えます。`, `The agent on your PC, the web app and the relay are all open source (MIT) — <a href="${REPO}">read them on GitHub</a>. End-to-end encrypted between your phone and your PC; the relay only passes ciphertext. Or run it over Tailscale or your own relay.`)}</p></div>
 </div>
 
-<h2 id="soon">Coming soon</h2>
-<div class="grid">
-<div class="card"><h3>Codex</h3><p class="dim">The same phone view and notifications for OpenAI Codex sessions, next to your Claude Code sessions.</p></div>
-<div class="card"><h3>Phone apps</h3><p class="dim">Native apps for iPhone and Android, alongside the web app you can use today.</p></div>
-<div class="card"><h3>Desktop</h3><p class="dim">A desktop layout for the web app, installable on Windows, macOS and Linux, so you can watch your sessions from another PC too.</p></div>
-<div class="card"><h3>Windows without WSL</h3><p class="dim">Run the agent on Windows directly, no WSL needed.</p></div>
-<div class="card"><h3>Homebrew</h3><p class="dim">Install and update with Homebrew on macOS.</p></div>
+<div class="split">
+<figure class="phone"><img src="/shots/thread.png" width="390" height="780" loading="lazy" alt="${t('スマホからセッションに返事をしている画面', 'Replying to a running session from the phone')}"></figure>
+<div>
+<h2>${t('スマホでできること', 'On your phone')}</h2>
+<ul class="also">
+<li><strong>${t('通知', 'Notifications')}</strong> ${t('ターンが終わったとき、Claude が呼んでいるとき（iPhone・Android）。', 'When a turn ends or Claude needs you, on iPhone and Android.')}</li>
+<li><strong>${t('承認と質問', 'Approvals and questions')}</strong> ${t('許可も、選択肢への回答も、その場で。', 'Allow, deny, or pick an answer right there.')}</li>
+<li><strong>${t('返事と停止', 'Reply and stop')}</strong> ${t('動いているセッションに打ち込んだり、止めたり。', 'Type into a running session, or stop it.')}</li>
+<li><strong>${t('条件つきの自動承認', 'Auto-approve, on your terms')}</strong> ${t('1つのセッションを3時間か24時間だけ。オンの間はずっと見えていて、1タップで止まります。', 'One session, for 3 or 24 hours. Always visible, one tap to turn off.')}</li>
+<li><strong>${t('ストアは要らない', 'No app store')}</strong> ${t('ホーム画面に追加する Web アプリ。', 'A web app you add to your home screen.')}</li>
+<li><strong>${t('ねこ', 'A cat')}</strong> ${t('7匹から選べて、Claude が動いている間だけ走ります。', 'Pick one of seven. It runs while Claude is working.')}</li>
+</ul>
+</div>
 </div>
 
 <h2 id="install">${t('はじめかた', 'Get started')}</h2>
@@ -126,6 +138,14 @@ nyan pair</code></pre>
 <div class="card"><h3>${t('自分で運用', 'Self-hosted')}</h3><p class="price">$0</p><p>${t('Tailscale か、自分の Cloudflare の relay。台数の制限なし・アカウント不要', 'Tailscale or your own Cloudflare relay. No limits, no account')}</p><p><a href="${REPO}">GitHub</a></p></div>
 </div>
 <p class="dim">${t('価格は税込み・米ドルです（日本円のカードでは、カード会社の換算レートが適用されます）。いつでも解約でき、次の更新日から請求されません。', 'Prices are in US dollars and include tax. Cancel anytime; you will not be charged from the next renewal.')}</p>
+<h2 id="soon">${t('これから', 'Roadmap')}</h2>
+<ul class="roadmap">
+<li><strong>Codex</strong> ${t('OpenAI Codex のセッションも同じ画面に。', 'OpenAI Codex sessions in the same view.')}</li>
+<li><strong>${t('スマホのアプリ', 'Phone apps')}</strong> ${t('iPhone と Android のネイティブアプリ。', 'Native apps for iPhone and Android.')}</li>
+<li><strong>${t('デスクトップ', 'Desktop')}</strong> ${t('PC 向けの画面。Windows・macOS・Linux にインストールできる形で。', 'A desktop layout, installable on Windows, macOS and Linux.')}</li>
+<li><strong>${t('WSL なしの Windows', 'Windows without WSL')}</strong> ${t('Windows の上で直接 agent を動かす。', 'Run the agent on Windows directly.')}</li>
+<li><strong>Homebrew</strong> ${t('macOS で Homebrew から入れて更新。', 'Install and update with Homebrew on macOS.')}</li>
+</ul>
 <p class="dim">${t('nyan-remote は Anthropic の公式製品ではありません。Claude と Claude Code は Anthropic の商標です。', 'nyan-remote is not an official Anthropic product. Claude and Claude Code are trademarks of Anthropic.')}</p>`,
   )
 }
