@@ -307,3 +307,27 @@ test('★★ SessionEnd (/exit) turns that session\'s auto-approve off; a turn\'
   await hook(hookCtx({ hook_event_name: 'SessionEnd', transcript_path: TRANSCRIPT, cwd: '/home/x/proj', reason: 'prompt_input_exit' }).ctx)
   assert.equal(autoApproveFor(SESSION), undefined, '⚠️⚠️ auto-approve survived the session\'s end')
 })
+
+test('★★ SessionEnd catches an "on" that is still saving (the check is inside the serial chain / codex)', async (t) => {
+  await withState(t)
+  // ⚠️ Not awaited: the save is in flight when SessionEnd arrives (memory is filled only after the save)
+  const on = setAutoApprove(SESSION, true)
+  await hook(hookCtx({ hook_event_name: 'SessionEnd', transcript_path: TRANSCRIPT, cwd: '/home/x/proj', reason: 'prompt_input_exit' }).ctx)
+  assert.equal((await on).ok, true)
+  assert.equal(autoApproveFor(SESSION), undefined, '⚠️⚠️ an "on" that landed during SessionEnd survived the session\'s end')
+})
+
+test('★ SessionEnd uses the payload session_id when the transcript path is not under ~/.claude* (as approvals do / codex)', async (t) => {
+  await withState(t)
+  assert.equal((await setAutoApprove(SESSION, true)).ok, true)
+  await hook(hookCtx({ hook_event_name: 'SessionEnd', transcript_path: `/srv/claude-work/projects/-p/${SESSION}.jsonl`, session_id: SESSION, cwd: '/home/x/proj' }).ctx)
+  assert.equal(autoApproveFor(SESSION), undefined)
+})
+
+test('★ SessionEnd ignores a malformed session_id and leaves other sessions alone', async (t) => {
+  await withState(t)
+  assert.equal((await setAutoApprove(SESSION, true)).ok, true)
+  await hook(hookCtx({ hook_event_name: 'SessionEnd', session_id: '../x', cwd: '/home/x/proj' }).ctx)
+  await hook(hookCtx({ hook_event_name: 'SessionEnd', session_id: '00000000-0000-0000-0000-000000000000', cwd: '/home/x/proj' }).ctx)
+  assert.ok(autoApproveFor(SESSION))
+})

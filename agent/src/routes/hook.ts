@@ -8,7 +8,7 @@
 // Each machine pushes only its own events, so duplicates structurally cannot occur (§6.3).
 
 import { currentLang, localizeNotificationBody, t } from '../../../shared/i18n.ts'
-import { autoApproveFor, setAutoApprove } from '../autoApprove.ts'
+import { endSessionAutoApprove } from '../autoApprove.ts'
 
 /**
  * ★ Status words for the log (`完了` done / `要対応（…）` needs attention). ⚠️ Decisions, dedup and storage use **the original Japanese**; translate only right before output
@@ -52,6 +52,11 @@ export function parseTranscriptPath(path: string | undefined): {
   const m = /\/(\.claude(?:-[A-Za-z0-9._-]+)?)\/projects\/[^/]+\/([^/]+)\.jsonl$/.exec(path)
   if (!m) return {}
   return { account: m[1], sessionId: m[2] }
+}
+
+/** ★ A payload `session_id` accepted as a session id (the shape of a transcript file name; anything else is ignored) */
+export function sessionIdOf(x: unknown): string | undefined {
+  return typeof x === 'string' && /^[A-Za-z0-9-]{8,128}$/.test(x) ? x : undefined
 }
 
 /**
@@ -468,13 +473,17 @@ export async function hook(ctx: Ctx): Promise<{ ok: true; pushed: number }> {
   //   ⚠️ Without this the entry lived until its expiry (3 or 24 hours), and the phone kept a row for the ended session
   //      (`applyAutoApprove` shows every live entry, on purpose: hiding marks by the index is forbidden / CLAUDE.md §2).
   //   ★ Turning off is the safe direction. A later `--resume` of the same session starts without auto-approve.
-  if (event.event === 'SessionEnd' && sessionId && autoApproveFor(sessionId)) {
-    const r = await setAutoApprove(sessionId, false)
-    console.log(
-      r.ok
-        ? t(`[auto] セッション終了で自動承認を切った（${sessionId.slice(0, 8)}）`, `[auto] Session ended; auto-approve turned off (${sessionId.slice(0, 8)})`)
-        : t(`[auto] セッション終了で自動承認を切れなかった（${sessionId.slice(0, 8)}）: ${r.reason}`, `[auto] Session ended, but auto-approve could not be turned off (${sessionId.slice(0, 8)}): ${r.reason}`),
-    )
+  //   ⚠️ The id falls back to the payload's `session_id` like approvals do (`buildPermissionInfo`): a config directory outside
+  //      `~/.claude*` makes the transcript path unparseable, yet auto-approve still works there (codex).
+  //   ⚠️ Queued unconditionally; whether there is an entry is decided inside the chain (an "on" still saving must not be missed / codex).
+  const endedId = event.event === 'SessionEnd' ? (sessionId ?? sessionIdOf(payload['session_id'])) : undefined
+  if (endedId) {
+    const r = await endSessionAutoApprove(endedId)
+    if (!r.ok) {
+      console.log(t(`[auto] セッション終了で自動承認を切れなかった（${endedId.slice(0, 8)}）: ${r.reason}`, `[auto] Session ended, but auto-approve could not be turned off (${endedId.slice(0, 8)}): ${r.reason}`))
+    } else if (r.had) {
+      console.log(t(`[auto] セッション終了で自動承認を切った（${endedId.slice(0, 8)}）`, `[auto] Session ended; auto-approve turned off (${endedId.slice(0, 8)})`))
+    }
   }
   await appendJsonl('hooks.jsonl', event)
   broadcast({ type: 'hook', hook: event })

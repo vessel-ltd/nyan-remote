@@ -359,6 +359,22 @@ export async function setAutoApprove(
 }
 
 /**
+ * ★ The session ended (SessionEnd) ⇒ drop its entry, if any (2026-09-26).
+ * ⚠️⚠️ The "is there an entry" check is made **inside** the serial chain (codex): checking before queueing missed an "on" that was
+ *    still waiting for its save, which then landed after the session had ended and stayed until expiry.
+ * ★ Writes only when there was an entry (SessionEnd comes for every session; most never had auto-approve).
+ */
+export async function endSessionAutoApprove(sessionId: string): Promise<{ had: boolean } & ({ ok: true } | { ok: false; reason: string })> {
+  return await enqueue(async () => {
+    if (state.kind !== 'ok' || !state.active.has(sessionId)) return { ok: true, had: false }
+    state.active.delete(sessionId)
+    clearTimer(sessionId)
+    const saved = await writeState([...state.active.values()].map((a) => a.entry))
+    return saved.ok ? { ok: true, had: true } : { ok: false, had: true, reason: saved.reason }
+  })
+}
+
+/**
  * ★★ **Serialize** toggles and cleanup **into one chain**.
  *
  * ⚠️⚠️ **Serializing only the writes is not enough** (see the notes on `setAutoApprove` above).
