@@ -1,19 +1,17 @@
 # nyan-remote
 
-**Run Claude Code on your PCs. Watch and answer it from your phone.**
+**Keep running `claude`. Use it from your phone.**
 
-`nyan-remote` puts a small agent next to each of your Claude Code sessions and gives you a
-phone-friendly web app that shows all of them at once — across several machines and several
-accounts — with push notifications when a session finishes, fails, or needs your approval.
+The sessions you already started — on every machine, in every account — in one list on your
+phone. No tmux, no SSH, no relaunching under another command. `nyan-remote` runs one small agent
+on each PC and gives you a phone web app with push notifications when a session finishes, fails,
+or needs your approval, and lets you answer, reply, or stop it from there.
 
 <p align="center">
   <img src=".github/readme/list.png" width="260" alt="All sessions on every machine in one list">
   <img src=".github/readme/approval.png" width="260" alt="Answering a permission prompt from the phone">
   <img src=".github/readme/thread.png" width="260" alt="Following a running session">
 </p>
-
-> **Status: pre-release.** It runs every day on the author's machines, but interfaces and
-> defaults still change. Read [What it does not do](#what-it-does-not-do) before you rely on it.
 
 ---
 
@@ -24,6 +22,7 @@ hits an error, or asks for permission to run a command, you only find out when y
 
 nyan-remote makes those moments reach your phone, and lets you answer:
 
+- **Keep typing `claude`.** Nothing to prepare before you leave: no wrapper command, no tmux, no SSH.
 - **See every session** across machines and accounts in one list, with its current state.
 - **Get notified** when a turn ends, a run fails, or a tool needs approval.
 - **Approve or deny** permission prompts from your phone — including ones that would otherwise
@@ -220,13 +219,31 @@ Measured on the author's setup (3 machines, a full working day): the Durable Obj
 
 ---
 
-## What it does not do
+## Limits worth knowing
 
+- **Accounts are `~/.claude` and `~/.claude-<name>`.** Those are found automatically on every PC.
+  Claude Code config directories kept elsewhere are not set up for you.
+- **Notifications and approvals work right away; typing into a session needs a fresh start.**
+  The hooks apply to sessions that are already running. Typing goes through the `claude` entry point
+  that the installer puts on `PATH`, so it works for sessions started in a new shell after installing.
+  Messages to older sessions are delivered through Claude Code's inbox instead, where Claude sees them
+  with a short English note saying they came from another process.
+- **Closing the terminal ends the session**, just like plain `claude`. nyan-remote keeps nothing
+  alive on its own; if you want that, you can still run `claude` inside tmux yourself.
+- **Windows needs WSL** for now.
 - **iOS notification stacking.** iOS ignores notification `tag` replacement, so repeated updates
   pile up instead of replacing each other. Android replaces them as intended.
-- **Serving the web app offline-first from the relay.** The app itself is served over HTTPS from a
-  public origin; the relay only carries traffic once the app is already running.
-- **Multi-user.** One person, several machines. There are no teams, roles, or sharing.
+- **The web app is not served from the relay.** It is served over HTTPS from a public origin; the relay
+  only carries traffic once the app is running.
+- **One person, several machines.** There are no teams, roles, or sharing.
+
+## Roadmap
+
+- **Codex** — OpenAI Codex sessions in the same view.
+- **Phone apps** — native apps for iPhone and Android.
+- **Desktop** — a desktop layout, installable on Windows, macOS and Linux.
+- **Windows without WSL** — run the agent on Windows directly.
+- **Homebrew** — install and update with Homebrew on macOS.
 
 ---
 
