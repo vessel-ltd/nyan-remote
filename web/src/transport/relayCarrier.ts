@@ -37,6 +37,7 @@ import { RELAY_PING, RELAY_PING_MS, relayUrl } from '../../../shared/relayFrame.
 import { relayWire, type RelayWire } from './relay.ts'
 import type { Wire } from './wire.ts'
 import { pickBilingual, t } from '../../../shared/i18n.ts'
+import { UnreachableError } from './unreachable.ts'
 
 /** A line carrying one envelope at a time (⚠️ **must preserve order**. The real one is a WebSocket) */
 export interface CarrierSocket {
@@ -76,8 +77,11 @@ export interface RelayCarrier {
   readonly ready: Promise<Wire>
   /** Hand over one byte sequence received by the line (⚠️⚠️ **doesn't throw**; no exceptions inside the receiver) */
   receive(bytes: Uint8Array): void
-  /** The line dropped (⚠️ we don't close it). ★ Ends pending requests **with the reason** */
-  down(reason: string): void
+  /**
+   * The line dropped (⚠️ we don't close it). ★ Ends pending requests **with the reason**.
+   * ★ `unreachable`: never got through to the relay/agent (the list shows it as "offline", not as an error / `unreachable.ts`)
+   */
+  down(reason: string, unreachable?: boolean): void
   /**
    * ★ Wait until received envelopes **have been processed**.
    *
@@ -137,14 +141,14 @@ export function openRelayCarrier(o: {
     )
   }, o.timeoutMs ?? TIMEOUT_MS)
 
-  function down(reason: string): void {
+  function down(reason: string, unreachable = false): void {
     if (phase === 'dead') return
     const wasOpen = phase === 'open'
     phase = 'dead'
     clearTimeout(timer)
     // ★ If open, tell the route (pending requests end **with the reason** = no 10s wait)
     if (wasOpen) wire?.fail(reason)
-    else breakReady(new Error(reason))
+    else breakReady(unreachable ? new UnreachableError(reason) : new Error(reason))
     o.onDown?.(reason)
   }
 
@@ -288,13 +292,9 @@ export async function connectRelayCarrier(o: {
     }, o.pingMs ?? RELAY_PING_MS)
   })
   ws.addEventListener('error', () => {
-    // ⚠️ The browser hides the reason for refusals before the upgrade (503 / 429 / 402) ⇒ list the possible reasons (billing / 2026-09-24)
-    carrier.down(
-      t(
-        'relay に繋がりません（agent が繋がっていない・スマホの台数の上限・PC で nyan login が要る、のどれかかもしれません）',
-        'Cannot reach the relay (the agent may not be connected, the phone limit may be reached, or the PC may need nyan login)',
-      ),
-    )
+    // ★ Most often the PC is simply off (the relay refuses with 503 when its agent is not connected) ⇒ "unreachable", shown as a
+    //   quiet offline line. ⚠️ The browser hides the refusal's reason (503 / 429 / 402), so the line's details list the other checks.
+    carrier.down(t('relay 経由で繋がりません', 'Cannot reach it through the relay'), true)
   })
   ws.addEventListener('close', (ev) => {
     if (beat !== undefined) clearInterval(beat)

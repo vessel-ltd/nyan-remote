@@ -8,6 +8,8 @@
 import { parseRelease, type BuildInfo } from '../../../shared/release.ts'
 import type { AgentEvent } from '../../../shared/types.ts'
 import type { Wire, WireRequest, WireResponse } from './wire.ts'
+import { UnreachableError } from './unreachable.ts'
+import { t } from '../../../shared/i18n.ts'
 
 const TIMEOUT_MS = 10_000
 /** Keep the reachability check short; waiting on it doesn't help */
@@ -20,6 +22,8 @@ export interface ProbeResult {
   accounts?: number
   /** Reason for failure (shown on screen) */
   detail?: string
+  /** ★ Could not reach it at all (off / asleep): shown as a grey "Offline", not a red error (`unreachable.ts`) */
+  unreachable?: boolean
 }
 
 /**
@@ -47,7 +51,9 @@ export async function probeUrl(url: string): Promise<ProbeResult> {
       accounts: Array.isArray(body.accounts) ? body.accounts.length : undefined,
     }
   } catch (err) {
-    return { ok: false, detail: err instanceof Error ? err.message : String(err) }
+    // ★ A network error or our timeout = nothing answered (an HTTP error status above = something answered)
+    const unreachable = err instanceof TypeError || (err instanceof DOMException && err.name === 'AbortError')
+    return { ok: false, detail: err instanceof Error ? err.message : String(err), ...(unreachable ? { unreachable } : {}) }
   } finally {
     clearTimeout(timer)
   }
@@ -108,6 +114,13 @@ export function httpWire(baseUrl: string, now: () => number = Date.now): Wire {
           ...(r.body === undefined ? {} : { body: JSON.stringify(r.body) }),
         })
         return { status: res.status, body: await readBody(res) }
+      } catch (err) {
+        // ★ No response at all (network error, or our timeout: on WSL a dead port hangs instead of refusing) = the machine is
+        //   unreachable, shown as "offline" rather than as an error (`unreachable.ts`)
+        if (err instanceof TypeError || (err instanceof DOMException && err.name === 'AbortError')) {
+          throw new UnreachableError(t('繋がりません', 'Cannot reach it'))
+        }
+        throw err
       } finally {
         clearTimeout(timer)
       }

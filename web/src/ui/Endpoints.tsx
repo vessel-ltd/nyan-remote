@@ -43,7 +43,7 @@ function rawEndpoints(): string {
 }
 
 interface Probe {
-  state: 'checking' | 'ok' | 'ng'
+  state: 'checking' | 'ok' | 'ng' | 'offline'
   detail?: string
   /** Machine name of the agent that responded. Used to absorb label spelling variations */
   machine?: string
@@ -180,7 +180,9 @@ export function Endpoints({
       ...p,
       [e.id]: res.ok
         ? { state: 'ok', machine: res.machine, detail: res.machine }
-        : { state: 'ng', detail: res.detail },
+        : res.unreachable
+          ? { state: 'offline', detail: res.detail }
+          : { state: 'ng', detail: res.detail },
     }))
   }
 
@@ -343,6 +345,26 @@ export function Endpoints({
                 </button>
                 {open ? (
                   <div class="machinedetail">
+                    {/* ★ Offline is usually just an off PC; the checks are for when it should be on (2026-09-26) */}
+                    {p?.state === 'offline' ? (
+                      <div class="pushmsg first offlinehelp">
+                        {t(
+                          'PC が落ちている・寝ているなら、このままで大丈夫です。起きているはずなのに繋がらないときは、その PC で確かめてください:',
+                          'If the PC is off or asleep, nothing is wrong. If it should be on, check on that PC:',
+                        )}
+                        <ul>
+                          <li>
+                            <code>nyan status</code> {t('— 動いているか・relay に繋がっているか', '— is it running and connected to the relay')}
+                          </li>
+                          <li>
+                            <code>nyan login</code> {t('— こちらの relay にはログインが要ります', '— our relay needs a sign-in')}
+                          </li>
+                          <li>
+                            <code>nyan devices</code> {t('— スマホの台数の上限に達していないか', '— has the phone limit been reached')}
+                          </li>
+                        </ul>
+                      </div>
+                    ) : null}
                     {e.relay ? (
                       <div class="pushmsg first">
                         relay: <code>{e.relay.url}</code>

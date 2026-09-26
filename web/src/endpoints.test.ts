@@ -313,6 +313,12 @@ test('★★ staleTwins: returns those with the same relay entrance and name but
     staleTwins(list, { machine: 'PC', relayUrl: R, agentPublicKey: 'NEW' }, ng).map((e) => e.id),
     ['relay:OLD'],
   )
+  // ★ An old key's relay room has no agent, so since 2026-09-26 its probe is "offline" (unreachable) rather than "ng"
+  assert.deepEqual(
+    staleTwins(list, { machine: 'PC', relayUrl: R, agentPublicKey: 'NEW' }, () => 'offline' as const).map((e) => e.id),
+    ['relay:OLD'],
+    '⚠️⚠️ the "remove the old connection" offer disappeared',
+  )
   // ⚠️⚠️ Rows that are connected now, checking, or unchecked aren't shown (might be another same-named machine / codex round 18, medium #4)
   for (const state of ['ok', 'checking', undefined] as const) {
     assert.deepEqual(staleTwins(list, { machine: 'PC', relayUrl: R, agentPublicKey: 'NEW' }, () => state), [], String(state))

@@ -222,7 +222,7 @@ export function mergeAdded(
 export function staleTwins(
   list: readonly AgentEndpoint[],
   paired: { machine: string; relayUrl: string; agentPublicKey: string },
-  probe: (e: AgentEndpoint) => 'ok' | 'ng' | 'checking' | undefined,
+  probe: (e: AgentEndpoint) => 'ok' | 'ng' | 'offline' | 'checking' | undefined,
 ): AgentEndpoint[] {
   return list.filter(
     (e) =>
@@ -230,7 +230,8 @@ export function staleTwins(
       e.relay.url === paired.relayUrl &&
       e.label === paired.machine &&
       e.relay.agentPublicKey !== paired.agentPublicKey &&
-      probe(e) === 'ng',
+      // ⚠️ `offline` too: an old key's relay room has no agent, so its probe is "unreachable" since 2026-09-26
+      (probe(e) === 'ng' || probe(e) === 'offline'),
   )
 }
 

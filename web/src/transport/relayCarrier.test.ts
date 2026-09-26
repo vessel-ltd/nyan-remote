@@ -23,6 +23,7 @@ import { hostname, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import { exportPublicKey, generateDeviceKey, toBase64Url } from '../../../shared/crypto.ts'
+import { isUnreachable } from './unreachable.ts'
 import {
   RELAY_FRAME,
   decodeRelayFrame,
@@ -385,6 +386,22 @@ test('★★ lines that failed the handshake are closed (⑧ don\'t eat the 8 sl
   f.lines[0]!.emit('open')
   await assert.rejects(opened, /時間切れ/)
   assert.equal(f.lines[0]!.closes, 1, '⚠️⚠️ a line that failed the handshake is still open')
+})
+
+test('★★ a line refused before it opens (the PC is off) is "unreachable"; a handshake that times out is not (2026-09-26)', { timeout: 5000 }, async (t) => {
+  await boot(t)
+  const identity = await generateDeviceKey()
+  const f = fakeLine()
+  const refused = connectRelayCarrier({ base: 'ws://relay.test', agentPublicKey: toBase64Url(agentPublicRaw()), identity, timeoutMs: 300, pingMs: 10, openLine: f.open })
+  // ★ The relay refuses the upgrade (503 when the agent is not connected): the browser only fires `error` then `close`
+  f.lines[0]!.emit('error')
+  f.lines[0]!.emit('close', { code: 1006 })
+  await assert.rejects(refused, (e) => isUnreachable(e), 'an off PC must show as offline, not as a red error')
+  // ⚠️ A handshake that never finishes reached the relay (e.g. an unregistered phone) ⇒ stays an error
+  const g = fakeLine()
+  const silent = connectRelayCarrier({ base: 'ws://relay.test', agentPublicKey: toBase64Url(agentPublicRaw()), identity, timeoutMs: 60, pingMs: 10, openLine: g.open })
+  g.lines[0]!.emit('open')
+  await assert.rejects(silent, (e) => !isUnreachable(e))
 })
 
 test('★★ sends before open are buffered and flushed on open; the heartbeat is emitted too (⑨)', { timeout: 5000 }, async (t) => {

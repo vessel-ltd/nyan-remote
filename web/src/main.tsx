@@ -47,6 +47,8 @@ import { SessionList } from './ui/SessionList.tsx'
 import { Thread } from './ui/Thread.tsx'
 import { UpdateBanner } from './ui/UpdateBanner.tsx'
 import { syncEndpointStates, syncSubscriptions } from './ui/endpointStates.ts'
+import { machineCount, splitTrouble } from './ui/offline.ts'
+import { isUnreachable } from './transport/unreachable.ts'
 import './styles.css'
 
 /** Key remembering whether history is open (display settings live on the PWA side / CLAUDE.md) */
@@ -95,6 +97,10 @@ interface EndpointState {
   /** ★ Sessions in auto-approve mode (from `/permissions`; used to mark synthetic rows) */
   autoApprove?: { id: string; until: string }[]
   error?: string
+  /** ★ The last failure could not reach the machine at all (shown as a quiet "offline" line, not an error / `ui/offline.ts`) */
+  offline?: boolean
+  /** ★ When it first became unreachable (kept across repeated failures, cleared on success) */
+  offlineSince?: number
   /** Number of subagent approvals not yet shown (the agent's `/permissions` `quiet`) */
   quietPermissions?: number
   /**
@@ -342,9 +348,9 @@ function App() {
    *    indefinitely** (found in the external review on 2026-08-12).
    *    They're worth reading as history, so don't remove them; **drop live and set the state to idle**
    *    (= out of "waiting for you" / "running", into history).
-   *    Which machines are down is shown by the red notice at the top.
+   *    Unreachable machines lower the "🖥 reachable/all" count on the Settings button; other failures show as a red line (`ui/offline.ts`).
    */
-  const markOffline = (id: string, error: string) =>
+  const markOffline = (id: string, error: string, unreachable: boolean) =>
     setStates((prev) => {
       const cur = prev[id]
       if (!cur) return prev
@@ -353,6 +359,8 @@ function App() {
         [id]: {
           ...cur,
           error,
+          offline: unreachable,
+          offlineSince: unreachable ? (cur.offlineSince ?? Date.now()) : undefined,
           connected: false,
           // ★ Sessions of a dropped machine move to history (the counting place moves too / ui/history.ts)
           ...markOfflineList(cur),
@@ -447,6 +455,8 @@ function App() {
             permissionsKnown: perms.known,
             autoApprove: perms.autoApprove,
             error: undefined,
+            offline: false,
+            offlineSince: undefined,
           })
           // ⚠️⚠️ If only approvals failed, don't count it as "success" (codex round 17, medium #3): the approval card would stay empty
           //    and wait 60s ⇒ back to 15s via `partial` (not counted as a failure = don't widen old agents without the endpoint to 5 min)
@@ -455,7 +465,7 @@ function App() {
           if (stale()) return
           // ★ Count failures (if they continue, widen the fallback polling interval)
           pollRef.current[id] = notePoll(pollRef.current[id], false, startedAt)
-          markOffline(t.endpoint.id, err instanceof Error ? err.message : String(err))
+          markOffline(t.endpoint.id, err instanceof Error ? err.message : String(err), isUnreachable(err))
         }
       }),
     )
@@ -573,7 +583,8 @@ function App() {
   const merged = applyAutoApprove(all.flatMap((s) => combineRows(s)), autoApproveMarks)
   /** ★ **Total** history count. ⚠️ While collapsed `groups.history.length` is 0, so show this instead */
   const historyTotal = all.reduce((n, s) => n + s.historyCount, 0)
-  const errors = all.filter((s) => s.error)
+  // ★ Red only for errors after reaching a machine; an unreachable machine is a quiet line at the bottom (`ui/offline.ts`)
+  const { errors, offline } = splitTrouble(all.map((s) => ({ ...s, label: s.machine ?? s.endpoint.label })), now)
 
   // ★ Not split by machine. Split into "waiting for you" → "running" → "history", ordered by state priority.
   //   Splitting by machine always pushes the second machine down, and its pending approvals go unnoticed (web/src/ui/order.ts)
@@ -804,10 +815,7 @@ function App() {
       <header class="top">
         <h1>nyan-remote</h1>
         <span class="grow" />
-        <span class="meta">
-          {/* ★ 2026-09-24: removed "SSE ♥ N" (relay doesn't carry heartbeats, so it was always 0 = showed nothing meaningful) */}
-          {t(`${merged.length} セッション`, `${merged.length} sessions`)}
-        </span>
+        {/* ★ 2026-09-26: removed the session count (the sections already show "Waiting for you N" / "Running N" / user decision) */}
         <button class="plain" onClick={() => void refresh()}>
           {t('更新', 'Refresh')}
         </button>
@@ -823,6 +831,8 @@ function App() {
           {pushInfo && pushBadge(pushInfo.kind, pushInfo.registered, pushInfo.total) ? (
             <span class="pushbadge"> {pushBadge(pushInfo.kind, pushInfo.registered, pushInfo.total)}</span>
           ) : null}
+          {/* ★ Machines reachable / all, always shown (2026-09-26 / user decision). Details on the connections page this opens */}
+          {all.length ? <span class="machinecount"> {machineCount(all.length, offline.length)}</span> : null}
         </button>
       </header>
 
@@ -891,7 +901,8 @@ function App() {
       ) : null}
 
       {/* ★ 2026-09-24: removed the machine list at the bottom (connected (♥0) · last event) (user decision).
-          ⚠️ Down machines show in the red banner at the top (`errors`); per-machine state is under "⚙ Settings" → connections */}
+          ⚠️ Errors after reaching a machine show in the red line at the top (`errors`); unreachable machines lower the "🖥 n/m" count on the
+          Settings button (details on the connections page) */}
     </>
   )
 }

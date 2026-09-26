@@ -32,6 +32,7 @@ import { idbKeyStore, loadIdentity } from '../identity.ts'
 import { AgentTransport } from './agent.ts'
 import { relayRoute } from './relayRoute.ts'
 import { probeUrl, type ProbeResult } from './http.ts'
+import { isUnreachable } from './unreachable.ts'
 
 // Reachability checks also go through this layer (discipline 2). In ③ the implementation is chosen by kind
 export { fetchLatestRelease, probeUrl, type ProbeResult } from './http.ts'
@@ -61,7 +62,7 @@ export async function probeEndpoint(
         ...(Array.isArray(h.accounts) ? { accounts: h.accounts.length } : {}),
       }
     } catch (err) {
-      return { ok: false, detail: err instanceof Error ? err.message : String(err) }
+      return { ok: false, detail: err instanceof Error ? err.message : String(err), ...(isUnreachable(err) ? { unreachable: true } : {}) }
     }
   }
   return probeUrl(e.url)
