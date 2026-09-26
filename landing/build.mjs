@@ -98,14 +98,14 @@ function home(lang) {
 <ol class="steps">
 <li><strong>${t('PC に入れる', 'Install on your PC')}</strong><span>${t('1行のコマンドで。WSL・macOS・Linux。', 'One command. WSL, macOS or Linux.')}</span></li>
 <li><strong>${t('いつもどおり <code>claude</code>', 'Use <code>claude</code> as usual')}</strong><span>${t('起動のしかたも、アカウントの分け方もそのまま。', 'Same command, same accounts, nothing to relaunch.')}</span></li>
-<li><strong>${t('スマホを開く', 'Open your phone')}</strong><span>${t('リンクを開いてホーム画面に追加するだけ（ストアは要りません）。全部のセッションが並び、どれにでも返事ができます。', 'Open a link and add it to your home screen, no app store. Every session is there, and you can reply to any of them.')}</span></li>
+<li><strong>${t('スマホを開く', 'Open your phone')}</strong><span>${t('リンクを開いてホーム画面に追加するだけ（ストアは要りません）。始めたセッションが全部並び、承認も返事もそこから。', 'Open a link and add it to your home screen, no app store. The sessions you start are all there, ready for you to answer and reply.')}</span></li>
 </ol>
 
 <h2>${t('ほかと違うところ', 'Why it is different')}</h2>
 <div class="pillars">
 <div class="card"><h3>${t('始めてあるセッションのまま', 'Your sessions, as they are')}</h3><p>${t('専用のコマンドで起動し直したり、tmux の中で動かしたりする必要はありません。出かける前に何も準備しなくていい。', 'No wrapper command to start under, no tmux, no SSH. Nothing to prepare before you leave.')}</p></div>
-<div class="card"><h3>${t('全部のアカウント・全部のマシン', 'Every account, every machine')}</h3><p>${t('どの PC の <code>~/.claude</code> も <code>~/.claude-*</code> も自動で見つけて、1つの一覧に。承認待ちが先頭に来ます。', '<code>~/.claude</code> and every <code>~/.claude-*</code> on every PC, found automatically and merged into one list. Waiting approvals come first.')}</p></div>
-<div class="card"><h3>${t('オープンソースで、中身は見せない', 'Open source and private')}</h3><p>${t(`PC で動く agent も、Web アプリも、relay も、全部 MIT のオープンソースで <a href="${REPO}">GitHub</a> で読めます。スマホと PC の間は E2E で暗号化され、relay が運ぶのは暗号文だけ。Tailscale や自分の relay でも使えます。`, `The agent on your PC, the web app and the relay are all open source (MIT) — <a href="${REPO}">read them on GitHub</a>. End-to-end encrypted between your phone and your PC; the relay only passes ciphertext. Or run it over Tailscale or your own relay.`)}</p></div>
+<div class="card"><h3>${t('全部のアカウント・全部のマシン', 'Every account, every machine')}</h3><p>${t('どの PC の <code>~/.claude</code> と <code>~/.claude-&lt;名前&gt;</code> のアカウントも自動で見つけて、1つの一覧に。承認待ちが先頭に来ます。', '<code>~/.claude</code> and <code>~/.claude-&lt;name&gt;</code> accounts on every PC, found automatically and merged into one list. Waiting approvals come first.')}</p></div>
+<div class="card"><h3>${t('オープンソースで、中身は見せない', 'Open source and private')}</h3><p>${t(`PC で動く agent も、Web アプリも、relay も、全部 MIT のオープンソースで <a href="${REPO}">GitHub</a> で読めます。セッションの中身はスマホと PC の間で E2E で暗号化され、relay には読めません。Tailscale や自分の relay でも使えます。`, `The agent on your PC, the web app and the relay are all open source (MIT) — <a href="${REPO}">read them on GitHub</a>. Session content is end-to-end encrypted between your phone and your PC; the relay cannot read it. Or run it over Tailscale or your own relay.`)}</p></div>
 </div>
 
 <div class="split">

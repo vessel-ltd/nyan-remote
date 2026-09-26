@@ -4,6 +4,7 @@
 //   node scripts/publish-public.mjs            # build, check, commit and push
 //   node scripts/publish-public.mjs --dry-run  # build and check only (prints where the tree is)
 //   node scripts/publish-public.mjs --approve-new  # publish including files that were never public before (listed first)
+//   node scripts/publish-public.mjs --skip-audit   # only when the npm registry is down and the release cannot wait
 //   node scripts/publish-public.mjs --closes 12,15 # the release commit says "Closes #12" etc. (GitHub closes them)
 //
 // ★ The public history is one commit per release; the private history (work notes, machine names, old diffs)
@@ -17,6 +18,7 @@ import { cpSync, existsSync, lstatSync, mkdtempSync, readdirSync, readFileSync, 
 import { tmpdir } from 'node:os'
 import { join, relative } from 'node:path'
 import { isMain } from './lib/isMain.mjs'
+import { requireAudit } from './lib/audit.mjs'
 
 const PUBLIC_REPO = 'vessel-ltd/nyan-remote'
 export const PUBLIC_URL = `https://github.com/${PUBLIC_REPO}.git`
@@ -154,6 +156,9 @@ function main() {
   git(['fetch', '-q', 'origin'], { cwd: root })
   const head = git(['rev-parse', 'HEAD'], { cwd: root })
   if (head !== git(['rev-parse', 'origin/main'], { cwd: root })) throw new Error('HEAD is not pushed to origin/main.')
+  // ★ Never publish (and then ship) a runtime dependency with a known vulnerability (`scripts/lib/audit.mjs`)
+  //   ⚠️ `installed: false`: publishing ships the git tree, not node_modules (the installed-tree check belongs to site:stage)
+  requireAudit(root, { skip: process.argv.includes('--skip-audit'), installed: false })
 
   const work = mkdtempSync(join(tmpdir(), 'nyan-publish-'))
   const tree = join(work, 'tree')

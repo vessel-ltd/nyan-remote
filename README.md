@@ -221,13 +221,14 @@ Measured on the author's setup (3 machines, a full working day): the Durable Obj
 
 ## Limits worth knowing
 
-- **Accounts are `~/.claude` and `~/.claude-<name>`.** Those are found automatically on every PC.
-  Claude Code config directories kept elsewhere are not set up for you.
+- **Accounts are `~/.claude` and `~/.claude-<name>`** (letters, digits, `.`, `_` and `-` in the name), once Claude Code
+  has used them. Those are found automatically on every PC; config directories kept elsewhere are not set up for you.
 - **Notifications and approvals work right away; typing into a session needs a fresh start.**
-  The hooks apply to sessions that are already running. Typing goes through the `claude` entry point
-  that the installer puts on `PATH`, so it works for sessions started in a new shell after installing.
-  Messages to older sessions are delivered through Claude Code's inbox instead, where Claude sees them
-  with a short English note saying they came from another process.
+  The hooks apply to sessions that are already running. Typing, stopping and slash commands go through the
+  `claude` entry point that the installer puts on `PATH`, so they work for sessions started in a new shell after
+  installing. For older sessions, a reply is handed to Claude Code's inbox when that (experimental) CLI feature is
+  available: Claude sees it with a short English note saying it came from another process, and messages that start
+  with `/` or `!` are not sent that way.
 - **Closing the terminal ends the session**, just like plain `claude`. nyan-remote keeps nothing
   alive on its own; if you want that, you can still run `claude` inside tmux yourself.
 - **Windows needs WSL** for now.

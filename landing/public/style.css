@@ -51,7 +51,9 @@ footer a{color:inherit}
 .hero-shot{position:relative;padding:0 0 28px 92px}
 .hero-shot .peek{position:absolute;left:0;bottom:0;width:124px;height:auto;border-radius:26px;z-index:1;box-shadow:0 8px 24px rgb(0 0 0 / .25);transform:rotate(-8deg)}
 .phone img:not(.peek){display:block;width:260px;height:auto;border-radius:28px;border:6px solid #1b2027;box-shadow:0 12px 40px rgb(0 0 0 / .25)}
-@media (max-width:760px){.hero{grid-template-columns:1fr;gap:24px}.hero .phone{justify-self:center}}
+@media (max-width:760px){.hero{grid-template-columns:minmax(0,1fr);gap:24px}.hero .phone{justify-self:center}}
+/* ★ Narrow phones: a smaller cat and a phone that fits the column (320px: 288px of room / codex) */
+@media (max-width:420px){.hero-shot{padding:0 0 20px 52px;max-width:100%}.hero-shot .peek{width:88px;border-radius:20px}.hero-shot img:not(.peek){width:min(260px,calc(100vw - 32px - 52px))}}
 
 /* ★ How it works: three numbered steps side by side */
 .steps{list-style:none;counter-reset:step;padding:0;margin:0;display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px}

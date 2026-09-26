@@ -26,6 +26,7 @@ import { t } from '../shared/i18n.ts'
 import { initCliLang } from './lib/lang.mjs'
 import { linkEntries, privateEntries, unpublishedEntries } from './lib/tarPolicy.mjs'
 import { PUBLIC_URL } from './publish-public.mjs'
+import { requireAudit } from './lib/audit.mjs'
 import { tmpdir } from 'node:os'
 
 // ★ Language first (before any message is built)
@@ -36,6 +37,9 @@ const SITE = join(ROOT, 'dist', 'site')
 const TAR = join(ROOT, 'dist', 'site.tar.gz')
 
 // ★ ① Build the product (⚠️ runs `npm run build` inside = the PWA is always rebuilt)
+// ★ Same gate as publish:public (the tarball ships web-push and its dependencies to users)
+requireAudit(ROOT, { skip: process.argv.includes('--skip-audit') })
+
 execFileSync('node', [join(ROOT, 'scripts/pack.mjs'), '--out', TAR], {
   cwd: ROOT,
   stdio: 'inherit',
