@@ -236,7 +236,16 @@ export function relayUrl(
    * ★★ The agent announces it understands `ready` / `drop` (`c=1` / 2026-09-24).
    * ⚠️ Old relays ignore unknown queries = announcing is harmless (conversely, sending `drop` without checking gets you cut).
    */
-  o: { control?: boolean; license?: boolean } = {},
+  o: {
+    control?: boolean
+    license?: boolean
+    /**
+     * ★★ The phone announces it answers relay's key challenge (`p=1` / 2026-09-27 / `shared/relayAuth.ts`).
+     * ⚠️ Old relays ignore unknown queries. Our relay challenges only phones that announced it (an old phone would read the
+     *    challenge as a broken handshake reply), and refuses old phones in rooms without a ticket ("update the app").
+     */
+    proof?: boolean
+  } = {},
 ): string {
   const u = new URL(base)
   // ⚠️ Do not double the trailing slash (leave it to how `new URL` interprets it)
@@ -248,5 +257,6 @@ export function relayUrl(
     u.searchParams.set('c', '1')
     if (o.license) u.searchParams.set('l', '1')
   }
+  if (o.proof && side === 'device') u.searchParams.set('p', '1')
   return u.toString()
 }

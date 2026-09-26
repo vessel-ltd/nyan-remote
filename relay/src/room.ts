@@ -8,11 +8,13 @@
 //
 // ⚠️ Only "decisions" live here. Accepting sockets, storing tags and key generation are on the other side of `RoomIo`.
 
-import { relayProof, sameBytes, type Jwk, type Key } from '../../shared/crypto.ts'
+import { relayProof, sameBytes, toBase64Url, type Jwk, type Key } from '../../shared/crypto.ts'
 import {
   RELAY_NONCE_BYTES,
+  decodeDeviceProof,
   decodeProof,
   encodeChallenge,
+  encodeDeviceChallenge,
 } from '../../shared/relayAuth.ts'
 import {
   MAX_RELAY_BYTES,
@@ -21,14 +23,29 @@ import {
   encodeRelayFrame,
   type LicenseStatus,
 } from '../../shared/relayFrame.ts'
-import type { LicenseCheck } from '../../shared/license.ts'
+import { PLAN_LIMITS, type LicenseCheck } from '../../shared/license.ts'
 
 /**
  * ★★ How many phones can hang off one agent (the basis of the device limit in §14.1.1.5).
  *
  * ⚠️⚠️ **The limit lives on the relay side** (on the agent side it would be removed in the OSS).
+ * ★ On our relay a room takes its plan's value (Free 2 / Plus 5, from a ticket or the free tier); this is the ceiling, and the
+ *   whole allowance on a self-hosted relay.
  */
 export const MAX_DEVICES = 8
+
+/**
+ * ★★ The free tier without sign-in (2026-09-27 / docs/BILLING.md): a room without a plan ticket takes this many phones,
+ *   and each phone may use **one** such room (counted per phone key in `phoneLedger.ts`, after the phone proved its key).
+ */
+export const FREE_ROOM_DEVICES = PLAN_LIMITS.free.maxDevices
+
+/**
+ * ★ A phone's first tunnel message may cross relay's challenge in flight (both are sent right after the wire opens),
+ *   so relay holds **one** such message until the proof is in, then forwards it. ⚠️ Bounded (hostile input): the real
+ *   handshake message is 196 bytes; anything larger, or a second one, cuts the wire.
+ */
+export const HELD_MAX_BYTES = 256
 
 /**
  * ★★ Limit and deadline for phone wires **the agent has not yet accepted** (2026-09-24 / the slot hole).
@@ -82,6 +99,14 @@ export const CLOSE = {
   badProof: 4005,
   /** ★ The deadline passed without the agent accepting it / evicted to make room (2026-09-24) */
   notAdmitted: 4006,
+  /** ★ An old app (no key proof) in a room without a plan ticket (2026-09-27) */
+  updateApp: 4007,
+  /** ★ This phone already uses another machine on the free tier (2026-09-27) */
+  freeUsed: 4008,
+  /** ★ The room's plan changed (ticket gone) ⇒ reconnect and claim the free tier (2026-09-27) */
+  planChanged: 4009,
+  /** ★ The free-tier ledger could not be reached (2026-09-27) */
+  unavailable: 4010,
 } as const
 
 /**
@@ -99,8 +124,11 @@ export const REASON = {
   // ⚠️ Right at the limit (118 bytes). Do not lengthen the English
   notAdmitted: 'Not accepted by the agent / agent が認めませんでした（登録されていない端末かもしれません）',
   tooMany: 'Device limit for this agent reached / この agent に繋げる台数の上限です',
-  // ★ Billing (2026-09-24). ⚠️ Includes the fix (`nyan login`)
-  licenseRequired: 'Sign in on the PC: nyan login / PC で nyan login してください',
+  // ★ The free tier without sign-in (2026-09-27). ⚠️ Each includes the fix
+  updateApp: 'Update the app to connect without sign-in / アプリを更新してください',
+  freeUsed: 'Free: one machine per phone. Plus for more / 無料はマシン1台まで。2台目からは Plus',
+  planChanged: 'The machine plan changed; reconnect / マシンのプランが変わりました。繋ぎ直してください',
+  ledgerDown: 'Could not check the free slot; try again / 無料の枠を確かめられません。やり直してください',
   displaced: 'Closed to make room for a newer connection / 後から来た接続のために閉じました',
   noText: 'Text frames not accepted / 文字は受け取りません',
   tooLarge: 'Too large / 大きすぎます',
@@ -131,11 +159,35 @@ export interface Tag {
   /** ★ `device`: evicted (⚠️ closing wires are not counted and not used as targets = same practice as `retired`) */
   evicted?: boolean
   /**
+   * ★★ `device`: waiting for the phone's key proof (2026-09-27 / `shared/relayAuth.ts`). Deleted once the proof and the
+   *   free-tier check are done; until then nothing from this wire reaches the agent and the agent has not been told `opened`.
+   *   ⚠️ The ephemeral private key is on the tag to survive hibernation (a per-connection value).
+   */
+  dpending?: { nonce: Uint8Array; jwk: Jwk; until: number }
+  /** ★ `device`: the proof passed and the free-tier check is in flight (⚠️ a second proof is not accepted meanwhile) */
+  dproof?: boolean
+  /**
+   * ★ `device`: while this wire's ledger check was in flight, another wire of the same phone **released** this room from the
+   *   phone's ledger (a licensed connect) ⇒ the answer in flight is stale and the check is redone under the current state
+   */
+  dstale?: boolean
+  /** ★ `device`: one message that crossed the challenge in flight, forwarded after the proof (`HELD_MAX_BYTES`) */
+  held?: Uint8Array
+  /** ★ `device`: the phone's public key (base64url), known only after its proof passed */
+  dkey?: string
+  /**
+   * ★★ `device`: admitted on the free tier (this phone's free slot is this room / `phoneLedger.ts`).
+   * ⚠️ In a room without a ticket every admitted phone must carry it (`#enforce` evicts the others so they reconnect and claim).
+   */
+  free?: boolean
+  /**
    * ★★ agent: **whether proof of ownership is done** (④a of ③b / §14.1.2.30).
    *
    * ⚠️⚠️ Not treated as "agent" until done = **old wires are not cut and phones are not accepted**.
    */
   proven?: boolean
+  /** ★ agent: a proof is being verified on this wire (⚠️ one per wire / codex 2026-09-27, round 4) */
+  proving?: boolean
   /**
    * ★★ An old wire that was replaced (2026-09-15 / codex round 4, medium #3).
    *
@@ -214,8 +266,13 @@ export interface RoomIo {
    * @param mid number of the passphrase that issued the ticket
    */
   claimMachine(acct: string, key: string, maxMachines: number, mid: string): Promise<ClaimResult>
-  /** ★ Whether the date after which phones are not let into rooms without a ticket has passed (⚠️ default is "not passed" = as before during the grace period) */
-  licenseRequired(): boolean
+  /**
+   * ★★ May this phone use this room? (`phoneLedger.ts` / 2026-09-27). ⚠️ Never throws
+   * @param dkey the phone's public key (⚠️ only after its proof passed)
+   * @param licensed the room has a plan ticket right now (⇒ the ledger releases the room instead of counting it)
+   * @returns `unavailable` when the ledger cannot be reached (⚠️ refuses a free-tier phone = fail-closed; a licensed room carries on)
+   */
+  claimPhone(dkey: string, agentKey: string, licensed: boolean): Promise<PhoneClaimResult>
   /**
    * ★★ **Someone else's relay** (`SELF_HOSTED=1` in `wrangler.selfhost.jsonc` / 2026-09-25): no plans at all.
    *   Tickets are never asked for (so no agent, old or new, sends one) and every room takes `MAX_DEVICES` phones.
@@ -226,6 +283,8 @@ export interface RoomIo {
 
 /** ★ Reply from the ledger (⚠️ falls to `machine-limit` if unreachable) */
 export type ClaimResult = 'ok' | 'machine-limit' | 'revoked'
+/** ★ Reply from the phone ledger (`phoneLedger.ts`) */
+export type PhoneClaimResult = 'ok' | 'machine-limit' | 'unavailable'
 
 /** Whether to accept (⚠️ a refusal reason becomes **the HTTP status code as-is**) */
 export type Admit = { ok: true } | { ok: false; status: number; text: string }
@@ -267,6 +326,26 @@ export class Room {
     d.socket.close(code, reason)
   }
 
+  /**
+   * ★★ Close a wire for breaking the contract — **marking it first** (codex 2026-09-27, round 5).
+   *
+   * ⚠️⚠️ `close()` alone is not "closed": the `close` event arrives later, and a proof check awaiting crypto or the ledger
+   *    re-reads the tag in between. Unmarked, that continuation went on to announce a closing phone (`opened`) or to let a
+   *    closing agent wire replace the live agent. ⇒ Every relay-initiated close of a tagged wire goes through here:
+   *    a phone gets `evicted`, an agent wire gets `retired` (and, if it was the live agent, its phones are cut now, as `onClose` would).
+   */
+  #drop(socket: RoomSocket, reason: string, code: number): void {
+    const tag = socket.tag()
+    if (tag?.side === 'device') {
+      if (tag.evicted !== true) socket.setTag({ ...tag, evicted: true })
+    } else if (tag?.side === 'agent') {
+      const live = isLiveAgent(tag)
+      if (tag.retired !== true) socket.setTag({ ...tag, retired: true })
+      if (live) for (const d of this.#devices()) this.#evict(d, REASON.agentGone, CLOSE.agentGone)
+    }
+    socket.close(code, reason)
+  }
+
   /** ⚠️ Wires whose proof is not done yet (= anyone can make them. Do not let them pile up; give them a deadline) */
   #pending(): RoomSocket[] {
     return this.#io.sockets('agent').filter((s) => {
@@ -287,31 +366,39 @@ export class Room {
       const until = s.tag()?.pending?.until
       // ⚠️ Tags without a deadline (= old versions, broken tags) are evicted too (fail-closed)
       if (until === undefined || until <= now) {
-        s.setTag({ side: 'agent', retired: true })
-        s.close(CLOSE.badProof, REASON.noProof)
+        this.#drop(s, REASON.noProof, CLOSE.badProof)
         swept += 1
       }
     }
     return swept
   }
 
+  /** ★ The room has a valid plan ticket right now (⚠️ an expired one counts as absent) */
+  #licensed(): boolean {
+    const lic = this.#agent()?.tag()?.lic
+    return lic !== undefined && lic.exp > this.#io.now()
+  }
+
   /**
    * ★★ Number of phones this room accepts (2026-09-24 / billing).
-   *   With a valid ticket, its value (Free 2, Plus 5). Without one, as before during the grace period (`MAX_DEVICES`), 0 after it.
+   *   With a valid ticket, its value (Free 2, Plus 5). Without one, the free tier (`FREE_ROOM_DEVICES` / 2026-09-27).
    * ⚠️ Never above `MAX_DEVICES` (even if a ticket carries a broken value, relay owns the room limit).
    */
   #deviceLimit(): number {
     if (this.#io.selfHosted()) return MAX_DEVICES
     const lic = this.#agent()?.tag()?.lic
     if (lic && lic.exp > this.#io.now()) return Math.min(lic.maxDevices, MAX_DEVICES)
-    return this.#io.licenseRequired() ? 0 : MAX_DEVICES
+    return Math.min(FREE_ROOM_DEVICES, MAX_DEVICES)
   }
 
   /**
    * ★★ Enforce the limit **now** (2026-09-24 / codex round 26, high #2).
-   *   ⚠️⚠️ Checking only on accept meant that after a ticket expired, a return to Free, or `LICENSE_REQUIRED_FROM` passing,
+   *   ⚠️⚠️ Checking only on accept meant that after a ticket expired or a return to Free,
    *      **connected wires kept being carried** (reproduced). ⇒ Go through this every time before carrying anything.
    *   ★ Remove an expired ticket from the tag and tell the agent. Wires over the limit are closed **latest first**.
+   * ★★ A room without a ticket is the free tier (2026-09-27): every admitted phone must hold this room as its free slot
+   *   (`free`). Phones admitted under a ticket that is now gone are closed so they reconnect and claim (or get refused there).
+   *   ⚠️ Not on a self-hosted relay (no plans there).
    */
   #enforce(): void {
     const agent = this.#agent()
@@ -322,10 +409,14 @@ export class Room {
       if (tag.licensing) this.#licenseResult(agent, 'expired')
     }
     const limit = this.#deviceLimit()
-    const admitted = this.#devices()
+    let admitted = this.#devices()
       .filter((d) => d.tag.until === undefined || d.tag.admitted === true)
       .sort((a, b) => a.connId - b.connId)
-    for (const d of admitted.slice(limit)) this.#evict(d, limit === 0 ? REASON.licenseRequired : REASON.tooMany, CLOSE.tooMany)
+    if (!this.#io.selfHosted() && !this.#licensed()) {
+      for (const d of admitted.filter((d) => d.tag.free !== true)) this.#evict(d, REASON.planChanged, CLOSE.planChanged)
+      admitted = admitted.filter((d) => d.tag.free === true)
+    }
+    for (const d of admitted.slice(limit)) this.#evict(d, REASON.tooMany, CLOSE.tooMany)
   }
 
   /**
@@ -402,8 +493,6 @@ export class Room {
       }
     }
     const limit = this.#deviceLimit()
-    // ★ Past the date tickets are required, and there is none (⚠️ the agent wire is kept = a ticket can be handed over later)
-    if (limit === 0) return { ok: false, status: 402, text: REASON.licenseRequired }
     if (admitted >= limit) {
       return { ok: false, status: 429, text: REASON.tooMany }
     }
@@ -420,17 +509,41 @@ export class Room {
    *
    * ⚠️⚠️ Numbers are **increased monotonically on the agent's tag** (reuse would deliver an in-flight frame
    *    to an unrelated device / codex round 4, medium #2).
+   * ★★ A phone that announced the key proof (`p=1`) is **challenged first** (2026-09-27): the agent is told `opened` only
+   *   after the proof and the free-tier check pass (`#checkDeviceProof`). ⚠️ Not on a self-hosted relay (no plans, no ledger).
+   * ⚠️ An old app (no `p=1`) in a room without a ticket is closed **with a reason** right after accepting (a refusal before the
+   *    upgrade would be invisible to the browser = it would show as "offline" instead of "update the app").
+   * @param proving the phone announced `p=1`
    */
-  startDevice(socket: RoomSocket): number {
+  async startDevice(socket: RoomSocket, proving = false): Promise<number> {
     const agent = this.#agent()
     const tag = agent?.tag()
     const last = tag?.lastConnId ?? 0
     // ⚠️ Wrap back to 1 on 4-byte overflow (by the time it gets that far, nobody from then remains)
     const connId = last >= MAX_CONN_ID ? 1 : last + 1
     if (agent && tag) agent.setTag({ ...tag, lastConnId: connId })
-    // ★ Deadline until the agent accepts it (see `MAX_PENDING_DEVICES`)
-    socket.setTag({ side: 'device', connId, until: this.#io.now() + DEVICE_ADMIT_DEADLINE_MS })
-    this.#toAgent({ type: RELAY_FRAME.opened, connId })
+    // ★ Deadline until the agent accepts it (see `MAX_PENDING_DEVICES`). ⚠️ Tagged **before** any await (an untagged wire is nobody)
+    const until = this.#io.now() + DEVICE_ADMIT_DEADLINE_MS
+    const base: Tag = { side: 'device', connId, until }
+    socket.setTag(base)
+    if (this.#io.selfHosted()) {
+      this.#toAgent({ type: RELAY_FRAME.opened, connId })
+      return connId
+    }
+    if (!proving) {
+      if (!this.#licensed()) {
+        this.#evict({ socket, tag: base }, REASON.updateApp, CLOSE.updateApp)
+        return connId
+      }
+      this.#toAgent({ type: RELAY_FRAME.opened, connId })
+      return connId
+    }
+    const c = await this.#io.newChallenge()
+    // ⚠️ The wire may already be gone (evicted to make room while the key was made)
+    const now = socket.tag()
+    if (!now || now.evicted === true) return connId
+    socket.setTag({ ...now, dpending: { nonce: c.nonce, jwk: c.jwk, until } })
+    socket.send(encodeDeviceChallenge({ relayPublicRaw: c.publicRaw, nonce: c.nonce }))
     return connId
   }
 
@@ -440,12 +553,12 @@ export class Room {
     //   ★ The only exception is `RELAY_PING`, and it **never gets here** (the auto-response answers first).
     //   ⚠️⚠️ So if the signal text differs by a single character it is **cut on the spot** = a mismatch shows up in measurement.
     if (typeof message === 'string') {
-      socket.close(CLOSE.badFrame, REASON.noText)
+      this.#drop(socket, REASON.noText, CLOSE.badFrame)
       return
     }
     if (message.byteLength > MAX_RELAY_BYTES) {
       // ⚠️⚠️ The ToS measure itself (§14.1.1.4). **Large things are not carried**
-      socket.close(CLOSE.badFrame, REASON.tooLarge)
+      this.#drop(socket, REASON.tooLarge, CLOSE.badFrame)
       return
     }
     const tag = socket.tag()
@@ -453,12 +566,144 @@ export class Room {
     if (tag?.side === 'agent' && tag.proven !== true) {
       return await this.#checkProof(socket, tag, new Uint8Array(message))
     }
+    // ★★ A phone that has not proved its key yet: only the proof (or one held message) is accepted (2026-09-27)
+    if (tag?.side === 'device' && tag.dpending && tag.evicted !== true) {
+      return await this.#checkDeviceProof(socket, tag, new Uint8Array(message))
+    }
     // ★★ Enforce the limit before carrying (⚠️ nothing from a closed wire is carried / codex round 26, high #2)
     this.#enforce()
     if (socket.tag()?.evicted === true) return
     if (tag?.side === 'agent') return await this.#fromAgent(socket, new Uint8Array(message))
     if (tag?.side === 'device' && tag.connId) return this.#fromDevice(tag.connId, message)
-    socket.close(CLOSE.badFrame, REASON.unknownSocket)
+    this.#drop(socket, REASON.unknownSocket, CLOSE.badFrame)
+  }
+
+  /**
+   * ★★ Check the phone is the owner of the key it names, then whether it may use this room (2026-09-27 / docs/BILLING.md §2.2).
+   *
+   * ⚠️⚠️ The free tier is counted **per phone key**, so the key must be proven: otherwise anyone who saw a phone's public key
+   *    (its own agent does) could name it from another room and fill that phone's free slot. Same proof as the agent's
+   *    (`relayProof` in `shared/crypto.ts`, one place), with relay's own ephemeral key and nonce per wire.
+   * ★ Order: proof → ledger (async) → tell the agent `opened` → forward the one held message. The agent never learns of
+   *   a phone that did not get this far (a refused phone costs it nothing).
+   * ⚠️ While the ledger answers, the wire may be evicted (deadline, agent gone) ⇒ re-read the tag after the await and stop.
+   */
+  async #checkDeviceProof(socket: RoomSocket, tag: Tag, bytes: Uint8Array): Promise<void> {
+    const d = tag.dpending as NonNullable<Tag['dpending']>
+    const decoded = decodeDeviceProof(bytes)
+    if (!decoded.ok) {
+      // ★ Not a proof (the handshake's first message crossed the challenge in flight) ⇒ hold exactly one small message
+      if (tag.held === undefined && bytes.length <= HELD_MAX_BYTES && bytes.length > 0) {
+        socket.setTag({ ...tag, held: bytes })
+        return
+      }
+      this.#evict({ socket, tag }, REASON.badProof, CLOSE.badProof)
+      return
+    }
+    // ⚠️⚠️ One proof per wire, latched **before the first await** (codex round 3): two valid copies arriving back to back used to
+    //    run two checks at once, and their interleaved ledger answers could leave `free` on the wire with nothing in the ledger.
+    //    A second proof is never held either (it is not a handshake message)
+    if (tag.dproof === true) {
+      this.#evict({ socket, tag }, REASON.badProof, CLOSE.badProof)
+      return
+    }
+    // ⚠️ Proofs past the deadline do not pass (accepting late ones would make the deadline meaningless)
+    if (d.until <= this.#io.now()) {
+      this.#evict({ socket, tag }, REASON.lateProof, CLOSE.badProof)
+      return
+    }
+    socket.setTag({ ...tag, dproof: true })
+    let ok = false
+    try {
+      const priv = await this.#io.importPrivate(d.jwk)
+      // ⚠️ Compare with `sameBytes` (no timing leak)
+      ok = sameBytes(await relayProof(priv, decoded.value.devicePublicRaw, new Uint8Array(d.nonce)), decoded.value.tag)
+    } catch {
+      // ⚠️ Broken key, broken tag. **Do not pass**
+      ok = false
+    }
+    const afterProof = socket.tag()
+    if (!afterProof || afterProof.evicted === true) return
+    if (!ok) {
+      this.#evict({ socket, tag: afterProof }, REASON.notOwner, CLOSE.badProof)
+      return
+    }
+    const agentKey = this.#agent()?.tag()?.key
+    if (!agentKey) {
+      this.#evict({ socket, tag: afterProof }, REASON.noAgent, CLOSE.noAgent)
+      return
+    }
+    const dkey = toBase64Url(decoded.value.devicePublicRaw)
+    // ★ The key is on the tag **before** the ledger is asked (so a release by another wire of this phone can mark this one stale)
+    socket.setTag({ ...afterProof, dkey })
+    // ★★ Ask the ledger under the room's plan **as of the request**. The answer can go stale while it travels (codex 2026-09-27):
+    //   the ticket arrives or goes, or another wire of this phone releases this room. ⇒ If the world changed, ask **once more**
+    //   under the current state (a stale answer must neither grant a slot the ledger no longer holds nor refuse a room that is
+    //   licensed now). If it changed again, close the wire so the phone reconnects (fail-closed).
+    let licensed = this.#licensed()
+    let claimed: PhoneClaimResult = 'unavailable'
+    for (let attempt = 0; ; attempt++) {
+      const agentKey = this.#agent()?.tag()?.key
+      const before = socket.tag()
+      if (!before || before.evicted === true || before.dpending === undefined) return
+      if (!agentKey) {
+        this.#evict({ socket, tag: before }, REASON.noAgent, CLOSE.noAgent)
+        return
+      }
+      claimed = await this.#io.claimPhone(dkey, agentKey, licensed)
+      // ★★ A licensed request is a release. It may have reached the ledger **even when the answer was lost** (`unavailable`), so
+      //   **whatever became of this wire or its answer**, no other wire of this phone in this room holds the room as its free slot
+      //   any more (its `free` was a cache of the ledger; a check in flight is redone / codex rounds 2-3)
+      if (licensed) this.#releasedHere(dkey, socket)
+      const now = socket.tag()
+      if (!now || now.evicted === true || now.dpending === undefined) return
+      const changed = this.#licensed() !== licensed || now.dstale === true
+      if (!changed) break
+      if (attempt >= 1) {
+        this.#evict({ socket, tag: now }, REASON.planChanged, CLOSE.planChanged)
+        return
+      }
+      const { dstale: _seen, ...fresh } = now
+      socket.setTag(fresh)
+      licensed = this.#licensed()
+    }
+    const after = socket.tag()
+    if (!after || after.evicted === true || after.dpending === undefined) return
+    if (claimed === 'machine-limit') {
+      this.#evict({ socket, tag: after }, REASON.freeUsed, CLOSE.freeUsed)
+      return
+    }
+    // ⚠️ The ledger could not be reached: a free-tier phone is refused (fail-closed); a licensed room only lost a release
+    if (claimed === 'unavailable' && !licensed) {
+      this.#evict({ socket, tag: after }, REASON.ledgerDown, CLOSE.unavailable)
+      return
+    }
+    // ⚠️ The agent may have gone while waiting (its close evicts the phones, caught above); if it was replaced, the new one is told
+    if (!this.#agent()) {
+      this.#evict({ socket, tag: after }, REASON.noAgent, CLOSE.noAgent)
+      return
+    }
+    const { dpending: _p, dproof: _q, dstale: _s, held, ...rest } = after
+    socket.setTag({ ...rest, dkey, ...(licensed ? {} : { free: true }) })
+    this.#toAgent({ type: RELAY_FRAME.opened, connId: rest.connId as number })
+    if (held !== undefined) this.#toAgent({ type: RELAY_FRAME.data, connId: rest.connId as number, payload: new Uint8Array(held) })
+  }
+
+  /**
+   * ★ This room was released from phone `dkey`'s ledger (a licensed connect / 2026-09-27 / codex rounds 1-2): every other wire of
+   *   that phone here drops its `free` mark, and a wire whose ledger check is in flight is marked stale (it asks again).
+   * ⚠️ Applied by the wire that made the release **even if it was evicted meanwhile** (the ledger changed regardless).
+   */
+  #releasedHere(dkey: string, except: RoomSocket): void {
+    for (const d of this.#devices()) {
+      if (d.socket === except || d.tag.dkey !== dkey) continue
+      if (d.tag.dpending !== undefined) {
+        d.socket.setTag({ ...d.tag, dstale: true })
+      } else if (d.tag.free === true) {
+        const { free: _stale, ...kept } = d.tag
+        d.socket.setTag(kept)
+      }
+    }
   }
 
   /**
@@ -471,15 +716,21 @@ export class Room {
     const decoded = decodeProof(bytes)
     const pending = tag.pending
     if (!decoded.ok || !pending) {
-      socket.close(CLOSE.badProof, REASON.badProof)
+      this.#drop(socket, REASON.badProof, CLOSE.badProof)
       return
     }
     // ⚠️ Proofs past the deadline do not pass (accepting late ones would make the deadline meaningless)
     if (pending.until <= this.#io.now()) {
-      socket.setTag({ side: 'agent', retired: true })
-      socket.close(CLOSE.badProof, REASON.lateProof)
+      this.#drop(socket, REASON.lateProof, CLOSE.badProof)
       return
     }
+    // ⚠️ One proof per wire, latched **before the first await** (codex 2026-09-27, round 4): a second copy arriving while the
+    //    first is being verified used to run a second check, which then "replaced" the wire that had just become the agent
+    if (tag.proving === true) {
+      this.#drop(socket, REASON.badProof, CLOSE.badProof)
+      return
+    }
+    socket.setTag({ ...tag, proving: true })
     let ok = false
     try {
       const priv = await this.#io.importPrivate(pending.jwk)
@@ -493,9 +744,13 @@ export class Room {
       ok = false
     }
     if (!ok) {
-      socket.close(CLOSE.badProof, REASON.notOwner)
+      this.#drop(socket, REASON.notOwner, CLOSE.badProof)
       return
     }
+    // ⚠️⚠️ The wire may have closed while the proof was verified (codex round 4): `onClose` retires it, and a retired wire must not
+    //    replace the live agent (it would cut the live agent and its phones for a wire that is already gone = 503 until it returns)
+    const verified = socket.tag()
+    if (!verified || verified.retired === true || verified.pending === undefined) return
     // ★ Only here does it become "the agent". ⚠️ The previous wire is dropped (a disconnected agent **can come back**)
     const previous = this.#agent()
     const previousTag = previous?.tag()
@@ -508,16 +763,25 @@ export class Room {
       //   ⚠️⚠️ The tunnel (session keys) lives inside the agent, so once the wire is swapped
       //      **nobody can answer for that number**. Without cutting, the phone stays connected while
       //      **nobody answers** (requests just time out and it never reconnects) = the nastiest outcome.
-      for (const d of this.#devices()) d.socket.close(CLOSE.agentGone, REASON.agentReconnected)
+      for (const d of this.#devices()) this.#evict(d, REASON.agentReconnected, CLOSE.agentGone)
     }
-    // ★ Numbers are **carried over** (⚠️ going back to 1 would collide with frames in flight)
+    // ★ Numbers are **carried over** (⚠️ going back to 1 would collide with frames in flight).
+    //   ⚠️⚠️ Not only from the live predecessor (codex 2026-09-27, round 6): an agent wire retired by `#drop` or gone through
+    //      `onClose` is no longer "live", yet its phones may still be closing — their delayed `closed(n)` would reach the new agent
+    //      and discard the tunnel of a **new** phone that got the same `n`. ⇒ Start above every number still present in the room:
+    //      the counters of all agent wires (retired ones included) and the numbers of all phone wires (closing ones included)
+    const carried = Math.max(
+      previousTag?.lastConnId ?? 0,
+      ...this.#io.sockets('agent').map((s) => s.tag()?.lastConnId ?? 0),
+      ...this.#io.sockets('device').map((s) => s.tag()?.connId ?? 0),
+    )
     socket.setTag({
       side: 'agent',
       proven: true,
       key: pending.key,
       ...(tag.control ? { control: true } : {}),
       ...(tag.licensing ? { licensing: true } : {}),
-      ...(previousTag?.lastConnId === undefined ? {} : { lastConnId: previousTag.lastConnId }),
+      ...(carried > 0 ? { lastConnId: carried } : {}),
     })
     // ★★ Tell only agents that announced it that "drop is accepted" (⚠️ **after** the proof passed = only the key owner)
     if (tag.control) {
@@ -573,7 +837,10 @@ export class Room {
     }
     const seq = (tagNow.claimSeq ?? 0) + 1
     const mark = `${seq}|${l.acct} ${l.mid}`
-    socket.setTag({ ...without, claimSeq: seq, claiming: [...claiming, mark] })
+    // ★★ Keep the current ticket while the ledger answers (2026-09-27 / codex): dropping it here made the room look unlicensed
+    //   during every hourly renewal, and a message arriving meanwhile closed the licensed phones (`#enforce`). A failure below
+    //   still removes it (`base` has no `lic`); revocation meanwhile removes it in `revokeLicense`.
+    socket.setTag({ ...tagNow, claimSeq: seq, claiming: [...claiming, mark] })
     const claimed = await this.#io.claimMachine(l.acct, tagNow.key, l.maxMachines, l.mid)
     // ⚠️ If the wire changed while waiting, do nothing (never tag a retired wire)
     const tagAfter = socket.tag()
@@ -607,7 +874,7 @@ export class Room {
     const decoded = decodeRelayFrame(bytes)
     if (!decoded.ok) {
       // ⚠️ The inner reason is built by `shared/relayFrame.ts` (Japanese on relay) ⇒ prefix an English heading
-      socket.close(CLOSE.badFrame, `${REASON.malformed} / ${decoded.reason}`)
+      this.#drop(socket, `${REASON.malformed} / ${decoded.reason}`, CLOSE.badFrame)
       return
     }
     // ★★ "Close the wire of the phone with this number" (2026-09-24 / codex round 18, high #1).
@@ -625,10 +892,12 @@ export class Room {
     }
     // ⚠️ `opened` / `closed` / `ready` / `licenseResult` are produced by relay (never come from the agent)
     if (decoded.value.type !== RELAY_FRAME.data) {
-      socket.close(CLOSE.badFrame, REASON.agentBadType)
+      this.#drop(socket, REASON.agentBadType, CLOSE.badFrame)
       return
     }
     const target = this.#devices().find((d) => d.connId === decoded.value.connId)
+    // ⚠️⚠️ A phone that has not proved its key was never announced to the agent (no `opened`) ⇒ nothing reaches it, and it is not promoted
+    if (target?.tag.dpending) return
     // ★★ The agent replied = accepted it (⚠️ the tag is written only the first time = not on every frame after)
     if (target && target.tag.until !== undefined && target.tag.admitted !== true) {
       // ⚠️⚠️ **Check the limit at the moment of promotion too** (codex round 18, medium #2): checking only on accept,
@@ -637,7 +906,15 @@ export class Room {
         this.#evict(target, REASON.tooMany)
         return
       }
-      target.socket.setTag({ side: 'device', connId: target.connId, admitted: true })
+      // ★ A room without a ticket admits only phones holding it as their free slot (the ticket may have gone between the
+      //   phone's check and the agent's reply; `#enforce` only looks at admitted wires, so it is checked here too / 2026-09-27)
+      if (!this.#io.selfHosted() && !this.#licensed() && target.tag.free !== true) {
+        this.#evict(target, REASON.planChanged, CLOSE.planChanged)
+        return
+      }
+      // ★ Keep `dkey` / `free` (the free-tier marks / 2026-09-27); the deadline has served
+      const { until: _served, ...rest } = target.tag
+      target.socket.setTag({ ...rest, admitted: true })
     }
     // ⚠️ Unknown numbers are **silently dropped** (crossing right after a disconnect is normal)
     if (decoded.value.payload) target?.socket.send(decoded.value.payload)
@@ -662,16 +939,33 @@ export class Room {
   onClose(socket: RoomSocket): void {
     const tag = socket.tag()
     if (tag?.side === 'device' && tag.connId) {
+      // ★★ Mark it gone **before** telling the agent (2026-09-27 / codex round 3): a proof check awaiting the ledger re-reads the tag
+      //   and must stop here, or it would send `opened` (and the held message) for a phone that no longer exists = an orphan slot
+      //   on the agent with no `closed` ever coming. ⚠️ Writing to a closed wire may fail; the notice still goes out
+      try {
+        socket.setTag({ ...tag, evicted: true })
+      } catch {
+        // ⚠️ Already unreachable (the continuation then sees no tag at all and stops too)
+      }
       // ★ Tell the agent it "disconnected" (the agent discards that tunnel)
       this.#toAgent({ type: RELAY_FRAME.closed, connId: tag.connId })
       return
     }
     // ⚠️⚠️ An unproven wire or **a retired wire** closing does not concern the phones
     //    (it was not "the agent" / is no longer current / codex round 4, medium #3)
+    // ★ An unproven agent wire closing is retired here, so a proof check still verifying on it stops (codex 2026-09-27, round 4)
+    if (tag?.side === 'agent' && tag.proven !== true && tag.retired !== true) {
+      try {
+        socket.setTag({ ...tag, retired: true })
+      } catch {
+        // ⚠️ Already unreachable (the continuation then sees no tag and stops too)
+      }
+      return
+    }
     if (isLiveAgent(tag)) {
       // ⚠️ Once the agent is gone, the phones hanging off it **have no purpose**
       //    (do not keep them waiting silently = the UI shows a reason)
-      for (const d of this.#devices()) d.socket.close(CLOSE.agentGone, REASON.agentGone)
+      for (const d of this.#devices()) this.#evict(d, REASON.agentGone, CLOSE.agentGone)
     }
   }
 }

@@ -13,27 +13,24 @@
 //   ⚠️ All it uses is "hang two or more WebSockets and forward between them".
 //     The Hibernation API is used **for billing**, but **it could be written the same way without it**.
 //
-// ⬜ **Not there yet (think about it before deploying)**:
-//   ⬜ ⚠️ **Filling up the phone-side slots**: knowing the key lets anyone connect up to 8 as a device.
-//      The agent refuses them at the handshake, but **the slots fill up** (⇒ real phones cannot connect).
-//   ⬜ Daily bandwidth per key (the other half of the ToS measure in §14.1.1.4. The per-message limit is in)
-//   ⬜ Three billing tiers (§14.1.1.5)
+// ★ Three Durable Objects: `Rendezvous` (one per agent key = the room), `Accounts` (one per account = machines of a plan /
+//   `ledger.ts`) and `Phones` (one per phone key = machines used on the free tier without sign-in / `phoneLedger.ts` / 2026-09-27).
+// ⬜ **Not there yet**: daily bandwidth per key (the other half of the ToS measure in §14.1.1.4. The per-message limit is in)
 
 import { DurableObject } from 'cloudflare:workers'
 import { ECDH_PARAMS, fromBase64Url, type Jwk } from '../../shared/crypto.ts'
 import { RELAY_PING, RELAY_PONG, RELAY_V } from '../../shared/relayFrame.ts'
-import { CHALLENGE_NONCE_BYTES, KEY_RE, Room, type ClaimResult, type RoomSocket, type Tag } from './room.ts'
+import { CHALLENGE_NONCE_BYTES, KEY_RE, Room, type ClaimResult, type PhoneClaimResult, type RoomSocket, type Tag } from './room.ts'
 import { importLicensePublicKey, LICENSE_PUBLIC_KEY, verifyLicense, type LicenseCheck } from '../../shared/license.ts'
 import { claimMachine, readLedger, releaseCredential, type Ledger } from './ledger.ts'
+import { claimRoom, readPhoneLedger } from './phoneLedger.ts'
 
 export interface Env {
   RENDEZVOUS: DurableObjectNamespace<Rendezvous>
   /** ★ Per-account ledger of "machines in use" (2026-09-24 / billing / `ledger.ts`) */
   ACCOUNTS: DurableObjectNamespace<Accounts>
-  /**
-   * ★ After this time (ISO), phones are not let into rooms without a license ticket. ⚠️ Missing or unreadable = not required (during the grace period, as before)
-   */
-  LICENSE_REQUIRED_FROM?: string
+  /** ★ Per-phone ledger of "machines used on the free tier" (2026-09-27 / `phoneLedger.ts`) */
+  PHONES: DurableObjectNamespace<Phones>
   /** ★ `'1'` on a self-hosted relay (`wrangler.selfhost.jsonc`): no plans, no tickets */
   SELF_HOSTED?: string
 }
@@ -88,6 +85,18 @@ export class Accounts extends DurableObject<Env> {
   }
 }
 
+/**
+ * ★★ Per-phone ledger (one per phone public key / 2026-09-27). ⚠️ Decisions are in `phoneLedger.ts` (this only wires reads and writes).
+ */
+export class Phones extends DurableObject<Env> {
+  /** @param licensed the room has a plan ticket (⇒ released from this ledger instead of counted) */
+  async claim(agentKey: string, licensed: boolean): Promise<PhoneClaimResult> {
+    const r = claimRoom(readPhoneLedger(await this.ctx.storage.get('rooms')), agentKey, licensed, Date.now())
+    await this.ctx.storage.put('rooms', r.ledger)
+    return r.ok ? 'ok' : 'machine-limit'
+  }
+}
+
 export class Rendezvous extends DurableObject<Env> {
   /** ⚠️ Return **the same holder** for the same socket (so `Room` can tell them apart by identity) */
   #wrapped = new WeakMap<WebSocket, RoomSocket>()
@@ -123,9 +132,13 @@ export class Rendezvous extends DurableObject<Env> {
         return 'machine-limit'
       }
     },
-    licenseRequired: () => {
-      const from = Date.parse(this.env.LICENSE_REQUIRED_FROM ?? '')
-      return Number.isFinite(from) && Date.now() >= from
+    claimPhone: async (dkey, agentKey, licensed) => {
+      try {
+        return await this.env.PHONES.getByName(dkey).claim(agentKey, licensed)
+      } catch {
+        // ⚠️ Cannot reach the ledger ⇒ `room.ts` refuses a free-tier phone (fail-closed) and lets a licensed room carry on
+        return 'unavailable'
+      }
     },
     selfHosted: () => this.env.SELF_HOSTED === '1',
   })
@@ -177,7 +190,8 @@ export class Rendezvous extends DurableObject<Env> {
       const licensing = c === '2' || (c === '1' && url.searchParams.get('l') === '1')
       await this.#room.startAgent(this.#wrap(server), url.searchParams.get('a') ?? '', control, licensing)
     } else {
-      this.#room.startDevice(this.#wrap(server))
+      // ★ `p=1` = the phone answers the key proof (2026-09-27 / `relayUrl` in `shared/relayFrame.ts`)
+      await this.#room.startDevice(this.#wrap(server), url.searchParams.get('p') === '1')
     }
     return new Response(null, { status: 101, webSocket: client })
   }

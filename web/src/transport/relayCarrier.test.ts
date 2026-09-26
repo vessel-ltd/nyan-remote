@@ -22,7 +22,8 @@ import { chmod, mkdtemp, rm } from 'node:fs/promises'
 import { hostname, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
-import { exportPublicKey, generateDeviceKey, toBase64Url } from '../../../shared/crypto.ts'
+import { ECDH_PARAMS, exportPublicKey, generateDeviceKey, relayProof, sameBytes, toBase64Url, type KeyPair } from '../../../shared/crypto.ts'
+import { decodeDeviceProof, encodeChallenge, encodeDeviceChallenge } from '../../../shared/relayAuth.ts'
 import { isUnreachable } from './unreachable.ts'
 import {
   RELAY_FRAME,
@@ -434,4 +435,78 @@ test('★★ sends before open are buffered and flushed on open; the heartbeat i
   // ⚠️ Text (pong) isn't treated as an envelope (= the handshake doesn't break)
   f.lines[0]!.emit('message', { data: 'nyan-pong' })
   await assert.rejects(opened, /時間切れ/)
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ★★ **The relay's key challenge to the phone** (2026-09-27 / the free tier without sign-in / `shared/relayAuth.ts`).
+//
+// ★★ Mutations killed by name here:
+//   ⑩ not answering the challenge (the relay never opens the tunnel) / answering with another key or without the nonce
+//   ⑪ answering twice (a relay that keeps asking is not keeping the contract) / answering after the handshake
+//   ⑫ not announcing `p=1` (the relay would not challenge, and would refuse the phone in a room without a ticket)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** A carrier over a recording socket, plus a "relay" ephemeral key to verify the answer with */
+async function challenged(identity: KeyPair, timeoutMs = 300) {
+  const sent: Uint8Array[] = []
+  const carrier = openRelayCarrier({
+    socket: { send: (b) => sent.push(b), close: () => undefined },
+    identity,
+    agentPublicKey: toBase64Url(agentPublicRaw()),
+    timeoutMs,
+  })
+  const relay = (await crypto.subtle.generateKey(ECDH_PARAMS, true, ['deriveBits'])) as KeyPair
+  const nonce = crypto.getRandomValues(new Uint8Array(32))
+  return { carrier, sent, relay, nonce, challenge: encodeDeviceChallenge({ relayPublicRaw: await exportPublicKey(relay.publicKey), nonce }) }
+}
+
+test('★★ the phone answers the relay\'s challenge with a proof only its key can make, whether it arrives before or after the first message (⑩)', { timeout: 5000 }, async (t) => {
+  await boot(t)
+  const identity = await generateDeviceKey()
+  const c = await challenged(identity)
+  await c.carrier.flush()
+  assert.equal(c.sent.length, 1, 'the handshake\'s first message did not go out')
+  c.carrier.receive(c.challenge)
+  await c.carrier.flush()
+  assert.equal(c.sent.length, 2, '⚠️⚠️ the challenge was not answered')
+  const proof = decodeDeviceProof(c.sent[1] as Uint8Array)
+  assert.ok(proof.ok, 'the answer is not a device proof')
+  assert.ok(sameBytes(proof.value.devicePublicRaw, await exportPublicKey(identity.publicKey)), '⚠️ named another key')
+  // ★ Verified the way the relay does: its own ephemeral private key × the key inside the message
+  assert.ok(sameBytes(proof.value.tag, await relayProof(c.relay.privateKey, proof.value.devicePublicRaw, c.nonce)), '⚠️⚠️ the proof does not verify')
+  // ⚠️ The handshake is still waiting for the agent (the challenge did not break it)
+  await assert.rejects(c.carrier.ready, /時間切れ/)
+})
+
+test('★★ a second challenge, or a challenge after the handshake, ends the line with a reason (⑪)', { timeout: 5000 }, async (t) => {
+  await boot(t)
+  const identity = await generateDeviceKey()
+  const c = await challenged(identity)
+  c.carrier.receive(c.challenge)
+  c.carrier.receive(c.challenge)
+  await assert.rejects(c.carrier.ready, /2回/)
+  assert.equal(c.sent.length, 2, '⚠️ answered twice')
+  // ⚠️ The agent's challenge shape is not answered (it is not addressed to phones)
+  const d = await challenged(identity, 80)
+  d.carrier.receive(encodeChallenge({ relayPublicRaw: await exportPublicKey(d.relay.publicKey), nonce: d.nonce }))
+  await assert.rejects(d.carrier.ready, /握手できませんでした/)
+  assert.equal(d.sent.length, 1, '⚠️ answered a challenge meant for agents')
+  // ⚠️ After the handshake, bytes are envelopes: a challenge then is a broken envelope, not a proof
+  const r = await joined(t)
+  await r.ready
+  const before = r.closed
+  r.carrier.receive(c.challenge)
+  await r.carrier.flush()
+  assert.ok(r.closed > before, '⚠️ a challenge after the handshake was not treated as a broken envelope')
+})
+
+test('★★ the real line announces p=1 (⑫) and a close with a relay reason shows that reason alone', { timeout: 5000 }, async (t) => {
+  await boot(t)
+  const identity = await generateDeviceKey()
+  const f = fakeLine()
+  const opened = connectRelayCarrier({ base: 'ws://relay.test', agentPublicKey: toBase64Url(agentPublicRaw()), identity, timeoutMs: 300, pingMs: 10, openLine: f.open })
+  assert.equal(new URL(f.urls[0] ?? '').searchParams.get('p'), '1', '⚠️⚠️ the phone did not announce the key proof')
+  f.lines[0]!.emit('open')
+  f.lines[0]!.emit('close', { code: 4008, reason: 'Free: one machine per phone. Plus for more / 無料はマシン1台まで。2台目からは Plus' } as { code: number })
+  await assert.rejects(opened, (e: Error) => /4008/.test(e.message) && /Plus/.test(e.message) && !/台数の上限かもしれません|device limit may be reached/.test(e.message))
 })

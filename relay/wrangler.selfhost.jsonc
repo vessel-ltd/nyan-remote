@@ -3,13 +3,12 @@
   //   Then on each PC set "relayUrl" in ~/.nyan-remote/config.json to wss://<name>.<your-subdomain>.workers.dev
   //   (or your own domain) and restart the agent.
   //
-  // ⚠️ `wrangler.jsonc` next to this is **our production relay** (our account, our domain, sign-in required) — do not use it.
+  // ⚠️ `wrangler.jsonc` next to this is **our production relay** (our account, our domain, our plans) — do not use it.
   //   What this file leaves out on purpose:
   //   - `account_id`  ⇒ wrangler uses the account you are logged in to
   //   - `routes`      ⇒ served on workers.dev (add your own custom domain if you like)
-  //   - `LICENSE_REQUIRED_FROM` ⇒ **no sign-in**
-  //     (with it, phones without a ticket from our account service are refused with 402)
-  //   And it adds `SELF_HOSTED` ⇒ **no plans**: a signed-in PC's ticket is not asked for, rooms take up to 8 phones
+  //   And it adds `SELF_HOSTED` ⇒ **no plans**: a signed-in PC's ticket is not asked for, phones are not asked to prove
+  //   their key, rooms take up to 8 phones and no free-tier count is kept
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "nyan-relay",
   "main": "src/worker.ts",
@@ -23,13 +22,15 @@
   "durable_objects": {
     "bindings": [
       { "name": "RENDEZVOUS", "class_name": "Rendezvous" },
-      // ★ Only used with plan tickets (never on a self-hosted relay), but the class is exported by the worker, so it stays bound
-      { "name": "ACCOUNTS", "class_name": "Accounts" }
+      // ★ Only used with plans (never on a self-hosted relay), but the classes are exported by the worker, so they stay bound
+      { "name": "ACCOUNTS", "class_name": "Accounts" },
+      { "name": "PHONES", "class_name": "Phones" }
     ]
   },
   // ⚠️ SQLite backend (the one available on the free plan)
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["Rendezvous"] },
-    { "tag": "v2", "new_sqlite_classes": ["Accounts"] }
+    { "tag": "v2", "new_sqlite_classes": ["Accounts"] },
+    { "tag": "v3", "new_sqlite_classes": ["Phones"] }
   ]
 }

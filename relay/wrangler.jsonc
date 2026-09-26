@@ -36,19 +36,19 @@
   "workers_dev": true,
   "routes": [{ "pattern": "relay.nyan-remote.app", "custom_domain": true }],
   "observability": { "enabled": true },
-  // ★★ From this time on, phones are not let into rooms without a license ticket (2026-09-25 / user decision: our relay requires nyan login).
-  //   ⚠️ Set only after confirming in D1 that every machine (mac, machines A-C) had received a version-3 license ticket.
-  //   ⚠️ To revert, delete this line and deploy (back to the grace period = rooms without sign-in work as before).
-  "vars": { "LICENSE_REQUIRED_FROM": "2026-09-25T02:05:00Z" },
+  // ★★ No sign-in date any more (2026-09-27 / user decision): a room without a plan ticket is the free tier
+  //   (2 phones, one such machine per phone / `phoneLedger.ts`). `LICENSE_REQUIRED_FROM` (2026-09-25 → 2026-09-27) is gone.
   "durable_objects": {
     "bindings": [
       { "name": "RENDEZVOUS", "class_name": "Rendezvous" },
-      { "name": "ACCOUNTS", "class_name": "Accounts" }
+      { "name": "ACCOUNTS", "class_name": "Accounts" },
+      { "name": "PHONES", "class_name": "Phones" }
     ]
   },
   // ⚠️⚠️ **Use the SQLite backend** (the only one available on the free plan / confirmed 2026-09-15)
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["Rendezvous"] },
-    { "tag": "v2", "new_sqlite_classes": ["Accounts"] }
+    { "tag": "v2", "new_sqlite_classes": ["Accounts"] },
+    { "tag": "v3", "new_sqlite_classes": ["Phones"] }
   ]
 }

@@ -336,9 +336,7 @@ fi
 #      and the issued one-time token stayed **alive for 5 minutes**.
 #   ⇒ Only print instructions. People who want to register type `npm run pair` themselves (it exits once scanned).
 printf '\n%s\n\n' "$(tr2 '✅ 入りました。' '✅ Installed.')"
-# ★ Our hosted relay (the default) requires sign-in since 2026-09-25 ⇒ say it before pairing (Tailscale / your own relay do not need it)
-printf '%s\n' "$(tr2 '★ こちらの relay（既定）を使うなら、先にログイン（新しいシェルで）: nyan login' '★ Using our hosted relay (the default)? Sign in first (in a new shell): nyan login')"
-printf '%s\n' "$(tr2 '   （Tailscale や自分の relay で使うなら不要。README の「Hosting the relay」）' '   (Not needed with Tailscale or your own relay — see "Hosting the relay" in the README)')"
+# ★ Our hosted relay (the default) needs no account for one machine per phone (2026-09-27); `nyan login` is for Plus ⇒ say so, after pairing
 # ★ 2026-09-24: point to `nyan`, which works from anywhere (`scripts/lib/cli.mjs`; from a new shell).
 #   ⚠️ For machines where `nyan` could not be placed (another tool uses the name), also list the form with the path
 if [ -z "$SERVICE" ]; then
@@ -346,6 +344,7 @@ if [ -z "$SERVICE" ]; then
 else
   printf '%s\n' "$(tr2 '★ スマホを登録するには（新しいシェルで）: nyan pair' '★ To register a phone (in a new shell): nyan pair')"
 fi
+printf '%s\n' "$(tr2 '   （アカウントは要りません。こちらの relay で複数の PC を使うなら Plus: nyan login）' '   (No account needed. For several PCs on our relay, Plus: nyan login)')"
 printf '%s\n' "$(tr2 "   （nyan が使えないときは: cd ${HOME_DIR} && npm run pair）" "   (if nyan is not available: cd ${HOME_DIR} && npm run pair)")"
 printf '%s\n' "$(tr2 '★ 更新は: nyan update ／ 様子は: nyan status' '★ To update: nyan update / status: nyan status')"
 # ⚠️ mac uses zsh (`install-relay.mjs` also detects zsh and writes `.zshrc`), so

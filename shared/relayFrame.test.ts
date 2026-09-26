@@ -246,3 +246,11 @@ test('★★ license support is announced with l=1 (⚠️ not c=2 = old relays 
   assert.equal(a.searchParams.get('l'), '1')
   assert.equal(new URL(relayUrl('wss://r.example', 'agent', 'KEY', { control: true })).searchParams.get('l'), null)
 })
+
+test('★★ p=1 (the phone answers the key proof / 2026-09-27) goes only on the device side', () => {
+  const d = new URL(relayUrl('wss://r.example', 'device', 'KEY', { proof: true }))
+  assert.equal(d.searchParams.get('p'), '1')
+  assert.equal(d.searchParams.get('c'), null)
+  assert.equal(new URL(relayUrl('wss://r.example', 'device', 'KEY')).searchParams.get('p'), null)
+  assert.equal(new URL(relayUrl('wss://r.example', 'agent', 'KEY', { proof: true, control: true })).searchParams.get('p'), null)
+})

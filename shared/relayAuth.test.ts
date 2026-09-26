@@ -25,8 +25,12 @@ import {
   RELAY_NONCE_BYTES,
   RELAY_TAG_BYTES,
   decodeChallenge,
+  decodeDeviceChallenge,
+  decodeDeviceProof,
   decodeProof,
   encodeChallenge,
+  encodeDeviceChallenge,
+  encodeDeviceProof,
   encodeProof,
 } from './relayAuth.ts'
 
@@ -172,4 +176,51 @@ test('★★ reject messages with the same length and version but "only the type
     badV[0] = RELAY_AUTH_V + 1
     assert.equal(decode(badV).ok, false, 'version is not checked')
   }
+})
+
+// ─── ★★ The phone's proof (2026-09-27 / the free tier without sign-in) ───────────────────────────
+
+test('★★ the phone challenge and proof have their own types: never read as the agent\'s, nor as each other', async () => {
+  const relay = await generateDeviceKey()
+  const relayRaw = await exportPublicKey(relay.publicKey)
+  const n = nonce(3)
+  const dc = encodeDeviceChallenge({ relayPublicRaw: relayRaw, nonce: n })
+  assert.deepEqual([dc[0], dc[1]], [RELAY_AUTH_V, RELAY_AUTH.deviceChallenge])
+  assert.equal(dc.length, 2 + PUBKEY_BYTES + RELAY_NONCE_BYTES)
+  const back = decodeDeviceChallenge(dc)
+  assert.ok(back.ok)
+  assert.ok(sameBytes(back.value.relayPublicRaw, relayRaw) && sameBytes(back.value.nonce, n))
+  // ⚠️⚠️ The same bytes with the agent's type do not decode as a phone challenge (and vice versa): the type byte is the only difference,
+  //    so the phone can tell the challenge from the agent's handshake reply (type 1) by that byte alone
+  assert.equal(decodeDeviceChallenge(encodeChallenge({ relayPublicRaw: relayRaw, nonce: n })).ok, false)
+  assert.equal(decodeChallenge(dc).ok, false)
+  assert.notEqual(RELAY_AUTH.deviceChallenge, 1, '⚠️ type 1 is the tunnel\'s handshake reply on the phone wire')
+  assert.notEqual(RELAY_AUTH.deviceProof, 0, '⚠️ type 0 is the tunnel\'s handshake init on the phone wire')
+
+  const phone = await generateDeviceKey()
+  const phoneRaw = await exportPublicKey(phone.publicKey)
+  const tag = await relayProof(phone.privateKey, relayRaw, n)
+  const dp = encodeDeviceProof({ devicePublicRaw: phoneRaw, tag })
+  assert.deepEqual([dp[0], dp[1]], [RELAY_AUTH_V, RELAY_AUTH.deviceProof])
+  assert.equal(dp.length, 2 + PUBKEY_BYTES + RELAY_TAG_BYTES)
+  const proof = decodeDeviceProof(dp)
+  assert.ok(proof.ok)
+  assert.ok(sameBytes(proof.value.devicePublicRaw, phoneRaw) && sameBytes(proof.value.tag, tag))
+  // ★ relay verifies with the key **inside** the message and its own ephemeral private key
+  assert.ok(sameBytes(await relayProof(relay.privateKey, proof.value.devicePublicRaw, n), proof.value.tag))
+  assert.equal(decodeProof(dp).ok, false)
+  assert.equal(decodeDeviceProof(encodeProof(tag)).ok, false)
+})
+
+test('★★ phone frames: wrong length, version or type are refused without throwing; wrong lengths cannot be encoded', () => {
+  const good = encodeDeviceProof({ devicePublicRaw: new Uint8Array(PUBKEY_BYTES).fill(4), tag: new Uint8Array(RELAY_TAG_BYTES).fill(5) })
+  assert.equal(decodeDeviceProof(good.slice(0, -1)).ok, false)
+  const badV = new Uint8Array(good)
+  badV[0] = 9
+  assert.equal(decodeDeviceProof(badV).ok, false)
+  assert.equal(decodeDeviceProof(new Uint8Array(0)).ok, false)
+  assert.equal(decodeDeviceChallenge(new Uint8Array(0)).ok, false)
+  assert.throws(() => encodeDeviceProof({ devicePublicRaw: new Uint8Array(64), tag: new Uint8Array(RELAY_TAG_BYTES) }))
+  assert.throws(() => encodeDeviceProof({ devicePublicRaw: new Uint8Array(PUBKEY_BYTES), tag: new Uint8Array(31) }))
+  assert.throws(() => encodeDeviceChallenge({ relayPublicRaw: new Uint8Array(64), nonce: nonce() }))
 })

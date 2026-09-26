@@ -49,9 +49,10 @@ installs it under `~/nyan-remote`, registers a background service (`systemd --us
 and wires up the Claude Code hooks. Then, in a new terminal:
 
 ```bash
-nyan login     # our hosted relay (the default) requires it — GitHub sign-in
 nyan pair      # shows a QR code; scan it with https://app.nyan-remote.app on your phone
 ```
+
+No account is needed: the hosted relay is free for one machine per phone (see [Hosting the relay](#hosting-the-relay)).
 
 On iPhone, add the app to the Home Screen first and scan from the Home Screen app: it keeps its data apart
 from Safari, so a pairing done in a Safari tab does not carry over. (The app shows these steps on first launch.)
@@ -152,11 +153,13 @@ The default relay is operated by us:
 
 | Plan | Price | Limits |
 |---|---|---|
-| **Free** | $0 | 1 machine, 2 phones |
+| **Free** | $0, no account | 1 machine per phone, 2 phones per machine |
 | **Plus** | $2.99/month or $24/year | 5 machines, 5 phones |
 
-Sign in with `nyan login`; manage your plan at <https://account.nyan-remote.app>. Every feature works
-on the free plan. If you would rather not depend on our relay, there are two alternatives, both free,
+Free is counted per phone: each phone can use one machine through our relay without signing in (the phone proves its
+key to the relay; nothing else is stored about it). For more machines on one phone, sign in on each PC with `nyan login`
+and manage your plan at <https://account.nyan-remote.app>. Every feature works on the free plan.
+If you would rather not depend on our relay, there are two alternatives, both free,
 without an account and without limits. Both are set **per machine** in `~/.nyan-remote/config.json`
 (`relayUrl`); restart the agent after changing it
 (`systemctl --user restart nyan-remote`, or `launchctl kickstart -k gui/$(id -u)/app.nyan-remote.agent` on macOS).
@@ -181,7 +184,7 @@ Wrangler prints the address, e.g. `https://nyan-relay.<your-subdomain>.workers.d
 ```
 
 in `~/.nyan-remote/config.json` (keep the other keys), restart the agent, then run `nyan pair`.
-No `nyan login` is needed: a self-hosted relay has no sign-in and no plans (up to 8 phones per machine).
+A self-hosted relay has no plans at all (up to 8 phones per machine, any number of machines).
 Phones already paired over our relay need to scan the new QR code.
 
 ### Use Tailscale (`local`)

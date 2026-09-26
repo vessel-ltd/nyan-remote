@@ -257,7 +257,7 @@ export async function account(f = fetch) {
     if (readAccount()) {
       console.log(t('ログインは済んでいます。agent が拾うまで最大1分です（少し待ってから、もう一度 nyan account）', 'You are signed in. The agent picks it up within a minute (wait a moment, then run nyan account again)'))
     } else {
-      console.log(t('ログインしていません（こちらの relay を使うなら: nyan login）', 'Not signed in (to use our relay: nyan login)'))
+      console.log(t('ログインしていません（無料: スマホ1台につきマシン1台。マシンを増やすなら Plus: nyan login）', 'Not signed in (Free: one machine per phone. For more machines, Plus: nyan login)'))
     }
     if (a.problem) console.log(`  ${a.problem}`)
     return 0

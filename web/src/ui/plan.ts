@@ -22,7 +22,7 @@ export function planRows(machines: readonly { name: string; account: unknown }[]
     if (typeof a !== 'object' || a === null) continue
     const o = a as Record<string, unknown>
     if (o['signedIn'] !== true) {
-      out.push({ machine: m.name, text: t('ログインしていません（こちらの relay を使うなら PC で nyan login）', 'Not signed in (to use our relay, run nyan login on the PC)'), warn: false })
+      out.push({ machine: m.name, text: t('Free（ログインなし）· スマホ1台につきマシン1台まで。増やすなら PC で nyan login（Plus）', 'Free (not signed in) · one machine per phone. For more, run nyan login on the PC (Plus)'), warn: false })
       continue
     }
     const plan = o['plan'] === 'plus' ? 'Plus' : o['plan'] === 'free' ? 'Free' : t('プラン不明', 'Unknown plan')

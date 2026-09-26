@@ -357,7 +357,7 @@ export function Endpoints({
                             <code>nyan status</code> {t('— 動いているか・relay に繋がっているか', '— is it running and connected to the relay')}
                           </li>
                           <li>
-                            <code>nyan login</code> {t('— こちらの relay にはログインが要ります', '— our relay needs a sign-in')}
+                            <code>nyan account</code> {t('— Plus のマシンの台数の上限に当たっていないか', '— is the machine limit of the plan in the way')}
                           </li>
                           <li>
                             <code>nyan devices</code> {t('— スマホの台数の上限に達していないか', '— has the phone limit been reached')}

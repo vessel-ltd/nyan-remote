@@ -63,7 +63,7 @@ export const DEFAULT_RELAY_URL = 'wss://relay.nyan-remote.app'
 
 /**
  * ★ Host names of **our** relay (the current one and the old workers.dev one kept alive above).
- *   ⚠️ Our relay requires `nyan login` (2026-09-25 / `LICENSE_REQUIRED_FROM`); a self-hosted relay does not.
+ *   ★ Our relay has plans (a free tier without sign-in, counted per phone; Plus with `nyan login`); a self-hosted relay has none.
  */
 export const OUR_RELAY_HOSTS: readonly string[] = ['relay.nyan-remote.app', 'nyan-relay.nyan-remote-relay.workers.dev']
 

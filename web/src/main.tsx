@@ -892,9 +892,7 @@ function App() {
             <li>
               {t('PC で ', 'On your PC, run ')}
               <code>nyan pair</code>
-              {t('（こちらの relay を使うなら先に ', ' (after ')}
-              <code>nyan login</code>
-              {t('）を打ち、出た QR をここで読む', ' if you use our relay), then scan the QR code here.')}
+              {t(' を打ち、出た QR をここで読む（アカウントは要りません）', ', then scan the QR code here (no account needed).')}
             </li>
           </ol>
           {guide.install === 'ios' ? (

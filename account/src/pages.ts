@@ -48,7 +48,7 @@ export function landingPage(loginFailed: boolean): string {
 ${loginFailed ? `<p class="card">Sign-in failed. Please try again.</p>` : ''}
 <p><a class="btn primary" href="/auth/github">Sign in with GitHub</a></p>
 <p class="dim">To contact support, sign in and use the form on your account page.</p>
-<p class="dim">On your PC, sign in with <code>nyan login</code>. No account is needed with Tailscale or your own relay.</p>`,
+<p class="dim">No account is needed for the free tier (one machine per phone on our relay), nor with Tailscale or your own relay. To use several machines from one phone (Plus), sign in here and on each PC with <code>nyan login</code>.</p>`,
   )
 }
 

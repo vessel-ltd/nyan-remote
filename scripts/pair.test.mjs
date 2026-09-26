@@ -448,29 +448,16 @@ async function signInAgent(refreshed) {
   return { server, seen }
 }
 
-test('★★ signed out on our relay: stops before the QR, says `nyan login`, and gives the code back (2026-09-25)', async () => {
+test('★★ signed out on our relay: the QR is still shown and the code is not cancelled (2026-09-27: the free tier needs no sign-in)', async () => {
+  // ⚠️⚠️ Until 2026-09-27 this stopped with exit 4 and cancelled the code; putting that gate back would lock the free tier out
   const { server, seen } = await signInAgent({ signedIn: false })
   const dir = stateDir()
   try {
     const out = await run([], { NYAN_REMOTE_STATE_DIR: dir, NYAN_REMOTE_PORT: String(server.address().port) })
-    assert.equal(out.code, 4, `exit code: ${out.stderr}`)
-    assert.match(out.stderr, /nyan login/)
-    assert.doesNotMatch(out.stdout, /nyan:\/\/pair/, '⚠️ showed a QR the phone cannot use')
-    assert.ok(seen.includes('POST /pair/token/p1/cancel'), `⚠️ the one-time code was left valid: ${seen.join(', ')}`)
-  } finally {
-    server.close()
-    rmSync(dir, { recursive: true, force: true })
-  }
-})
-
-test('★★ right after `nyan login` (the agent re-reads it; `/health` is still stale): the QR is shown (codex)', async () => {
-  const { server, seen } = await signInAgent({ signedIn: true })
-  const dir = stateDir()
-  try {
-    const out = await run([], { NYAN_REMOTE_STATE_DIR: dir, NYAN_REMOTE_PORT: String(server.address().port) })
-    assert.ok(seen.includes('POST /account/refresh'), 'did not ask the agent to re-read the sign-in')
-    assert.ok(!seen.some((x) => x.endsWith('/cancel')), `⚠️ cancelled a signed-in pairing: ${seen.join(', ')}`)
+    assert.equal(out.code, 0, `exit code: ${out.stderr}`)
+    assert.match(out.stdout, /nyan:\/\/pair/, '⚠️⚠️ no QR for a signed-out machine')
     assert.doesNotMatch(out.stderr, /nyan login/)
+    assert.ok(!seen.some((x) => x.endsWith('/cancel')), `⚠️⚠️ cancelled a pairing for want of a sign-in: ${seen.join(', ')}`)
   } finally {
     server.close()
     rmSync(dir, { recursive: true, force: true })

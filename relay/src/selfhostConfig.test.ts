@@ -16,9 +16,7 @@ const jsonc = (name: string): Record<string, unknown> =>
 test('★★ the self-hosted relay config carries none of our production settings and matches its Durable Objects', () => {
   const self = jsonc('wrangler.selfhost.jsonc')
   const prod = jsonc('wrangler.jsonc')
-  // ⚠️⚠️ With LICENSE_REQUIRED_FROM, phones on a self-hosted relay are refused (402): tickets only come from our account service
-  assert.equal((self['vars'] as Record<string, unknown> | undefined)?.['LICENSE_REQUIRED_FROM'], undefined)
-  // ★★ …and it runs without plans (a signed-in PC's ticket would otherwise put our Free limits on it)
+  // ★★ It runs without plans (a signed-in PC's ticket would otherwise put our Free limits on it, and phones would be asked to prove their key)
   assert.equal((self['vars'] as Record<string, unknown> | undefined)?.['SELF_HOSTED'], '1')
   assert.equal((prod['vars'] as Record<string, unknown> | undefined)?.['SELF_HOSTED'], undefined, '⚠️⚠️ our production relay would drop plans')
   assert.equal(self['account_id'], undefined, '⚠️ pins our account (deploy fails for anyone else)')

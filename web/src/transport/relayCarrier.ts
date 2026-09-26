@@ -19,20 +19,30 @@
 // ⚠️⚠️ **Agent impersonation can't happen in principle** (the agent public key passed to `startHandshake` was
 //    exchanged directly via QR / §14.1.2.5). ⇒ The relay only knows "from which key to which key".
 //
+// ★★ **The relay may ask this phone to prove its key** (2026-09-27 / the free tier without sign-in / `shared/relayAuth.ts`):
+//   our relay counts "one machine per phone" by the phone's public key, so it challenges the phone once, right after the wire
+//   opens. The challenge can cross the handshake's first message in flight; the type byte tells it from the agent's reply, and
+//   the relay holds the crossing message until the proof is in. A phone on a self-hosted relay is never challenged.
+//   ⚠️ Answered only during the handshake phase and only once; the answer uses `relayProof` (the same one the agent uses:
+//      HKDF over ECDH with a relay-chosen ephemeral key = no session key can be derived from it / `shared/crypto.ts`).
+//
 // ⚠️ Not yet present (stated honestly / **not written ahead of time**):
 //   ⬜ reconnection (④ of ③b; for now, on drop it shows the reason and ends)
 //   ⬜ a `probeUrl` equivalent (reachability via relay is decided when `kind` is added in ④)
 //   ⬜ backpressure (`bufferedAmount` isn't checked)
 
 import {
+  exportPublicKey,
   finishHandshake,
   fromBase64Url,
+  relayProof,
   startHandshake,
   type Handshake,
   type KeyPair,
   type PendingSession,
   type Session,
 } from '../../../shared/crypto.ts'
+import { decodeDeviceChallenge, encodeDeviceProof } from '../../../shared/relayAuth.ts'
 import { RELAY_PING, RELAY_PING_MS, relayUrl } from '../../../shared/relayFrame.ts'
 import { relayWire, type RelayWire } from './relay.ts'
 import type { Wire } from './wire.ts'
@@ -116,6 +126,8 @@ export function openRelayCarrier(o: {
 }): RelayCarrier {
   /** ★ Where we are (⚠️ once `dead`, never comes back) */
   let phase: 'reply' | 'confirm' | 'open' | 'dead' = 'reply'
+  /** ★ The relay's key challenge was answered (⚠️ once per wire: a second one is not a relay keeping the contract) */
+  let proved = false
   let handshake: Handshake | undefined
   let pending: PendingSession | undefined
   let wire: RelayWire | undefined
@@ -176,6 +188,19 @@ export function openRelayCarrier(o: {
   async function handle(bytes: Uint8Array): Promise<void> {
     if (phase === 'dead') return
     if (phase === 'reply') {
+      // ★★ The relay's key challenge (2026-09-27). ⚠️ Only here (before the agent's reply) and only once
+      const challenge = decodeDeviceChallenge(bytes)
+      if (challenge.ok) {
+        if (proved) return down(t('relay が証明を2回 求めました', 'The relay asked for the key proof twice'))
+        proved = true
+        try {
+          const tag = await relayProof(o.identity.privateKey, challenge.value.relayPublicRaw, challenge.value.nonce)
+          o.socket.send(encodeDeviceProof({ devicePublicRaw: await exportPublicKey(o.identity.publicKey), tag }))
+        } catch (err) {
+          return down(t(`鍵の証明を作れません: ${text(err)}`, `Could not produce the key proof: ${text(err)}`))
+        }
+        return
+      }
       try {
         pending = await finishHandshake(handshake as Handshake, bytes)
       } catch (err) {
@@ -254,7 +279,8 @@ export async function connectRelayCarrier(o: {
   /** ⚠️ For tests (default is a real WebSocket) */
   openLine?: (url: string) => CarrierLine
 }): Promise<{ wire: Wire; close(reason?: string): void }> {
-  const ws = (o.openLine ?? realLine)(relayUrl(o.base, 'device', o.agentPublicKey))
+  // ★ `p=1` = this phone answers the relay's key proof (2026-09-27). ⚠️ Old and self-hosted relays ignore it
+  const ws = (o.openLine ?? realLine)(relayUrl(o.base, 'device', o.agentPublicKey, { proof: true }))
 
   // ★★ Buffer anything sent before open (⚠️ the handshake's first message may be ready before `open`)
   let live = false
@@ -298,15 +324,17 @@ export async function connectRelayCarrier(o: {
   })
   ws.addEventListener('close', (ev) => {
     if (beat !== undefined) clearInterval(beat)
-    // ★ The relay sends "English / Japanese", so show only the current language's side
+    // ★ The relay sends "English / Japanese", so show only the current language's side.
+    //   ⚠️ The guesses are for a close **without** a reason (the browser hides a refusal before the upgrade); a reason from the
+    //      relay (device limit, free tier, update the app) already says what to do, so it is shown alone
     const why = ev.reason ? `: ${pickBilingual(ev.reason)}` : ''
     carrier.down(
-      t(
-        `relay の線が切れました（${ev.code ?? ''}${why}）` +
-          '。agent が繋がっていないか、台数の上限かもしれません',
-        `The relay connection dropped (${ev.code ?? ''}${why})` +
-          '. The agent may not be connected, or the device limit may be reached',
-      ),
+      ev.reason
+        ? t(`relay の線が切れました（${ev.code ?? ''}${why}）`, `The relay connection dropped (${ev.code ?? ''}${why})`)
+        : t(
+            `relay の線が切れました（${ev.code ?? ''}）。agent が繋がっていないか、台数の上限かもしれません`,
+            `The relay connection dropped (${ev.code ?? ''}). The agent may not be connected, or the device limit may be reached`,
+          ),
     )
   })
   try {

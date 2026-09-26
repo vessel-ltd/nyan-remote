@@ -144,16 +144,18 @@ export function helpDetail() {
 `,
     ),
     login: t(
-      `nyan login — こちらの relay を使うためにログインする
+      `nyan login — Plus のためにログインする（こちらの relay でマシンを増やす）
 
   GitHub でログインし、このマシンをアカウントに登録します（ブラウザでコードを入れます）。
-  無料: マシン1台・スマホ2台。Plus（$2.99/月・$24/年）: マシン5台・スマホ5台。
+  無料（アカウント不要）: スマホ1台につきマシン1台・マシン1台につきスマホ2台。
+  Plus（$2.99/月・$24/年）: マシン5台・スマホ5台。
   ⚠️ Tailscale や自分の relay で使うなら要りません。
 `,
-      `nyan login — sign in to use our relay
+      `nyan login — sign in for Plus (more machines on our relay)
 
   Signs in with GitHub and registers this machine to your account (you enter a code in the browser).
-  Free: 1 machine, 2 phones. Plus ($2.99/month or $24/year): 5 machines, 5 phones.
+  Free (no account): one machine per phone, 2 phones per machine.
+  Plus ($2.99/month or $24/year): 5 machines, 5 phones.
   ⚠️ Not needed with Tailscale or your own relay.
 `,
     ),
@@ -224,7 +226,7 @@ export function helpText() {
   nyan logs        ログを見る（-f で追いかける）
   nyan pending     承認待ちがあるか
   nyan keys        打鍵の入口の確認
-  nyan login       こちらの relay を使うためにログインする（GitHub）
+  nyan login       Plus のためにログインする（GitHub・マシンを増やす）
   nyan logout      ログアウトする（このマシンをアカウントから外す）
   nyan account     プランと上限
   nyan uninstall   このマシンから外す（鍵と登録は残す。--purge で全部）
@@ -243,7 +245,7 @@ export function helpText() {
   nyan logs        show logs (-f to follow)
   nyan pending     whether an approval is pending
   nyan keys        check the keystroke path
-  nyan login       sign in to use our relay (GitHub)
+  nyan login       sign in for Plus (GitHub; more machines)
   nyan logout      sign out (removes this machine from the account)
   nyan account     plan and limits
   nyan uninstall   remove from this machine (keeps keys and registrations; --purge removes all)

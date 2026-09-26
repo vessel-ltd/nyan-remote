@@ -126,15 +126,14 @@ function home(lang) {
 <h2 id="install">${t('はじめかた', 'Get started')}</h2>
 <p>${t('PC（WSL / macOS / Linux・Node 24）で:', 'On your PC (WSL / macOS / Linux, Node 24):')}</p>
 <pre><code>curl -fsSL ${APP}/install.sh | bash</code></pre>
-<p>${t('新しい端末で、こちらの relay を使うならログインしてから、スマホを登録します:', 'In a new terminal, sign in if you use our relay, then register your phone:')}</p>
-<pre><code>nyan login
-nyan pair</code></pre>
+<p>${t('新しい端末で、スマホを登録します（アカウントは要りません）:', 'In a new terminal, register your phone (no account needed):')}</p>
+<pre><code>nyan pair</code></pre>
 <p>${t(`スマホで <a href="${APP}">${APP.replace('https://', '')}</a> を開いてホーム画面に追加し、<strong>ホーム画面から開いてから</strong> QR を読みます。`, `On your phone, open <a href="${APP}">${APP.replace('https://', '')}</a> and add it to your home screen, then <strong>open it from there</strong> and scan the QR code.`)}</p>
 <p class="dim">${t('iPhone ではこの順番が大事です（ホーム画面のアプリは Safari とデータが別なので、Safari のタブでペアリングしても引き継がれません）。ブラウザのまま使うなら、そのままペアリングして構いません。', 'On iPhone the order matters: the Home Screen app keeps its data apart from Safari, so a pairing done in a Safari tab does not carry over. To use it in the browser instead, just pair there.')}</p>
 
 <h2 id="pricing">${t('料金', 'Pricing')}</h2>
 <div class="grid">
-<div class="card"><h3>Free</h3><p class="price">$0</p><p>${t(`マシン ${FREE.maxMachines}台・スマホ ${FREE.maxDevices}台（こちらの relay）`, `${FREE.maxMachines} machine, ${FREE.maxDevices} phones (our relay)`)}</p><p class="dim">${t('機能は全部使えます', 'All features included')}</p></div>
+<div class="card"><h3>Free</h3><p class="price">$0</p><p>${t(`スマホ1台につきマシン ${FREE.maxMachines}台・マシン1台につきスマホ ${FREE.maxDevices}台（こちらの relay）`, `${FREE.maxMachines} machine per phone, ${FREE.maxDevices} phones per machine (our relay)`)}</p><p class="dim">${t('アカウント不要・機能は全部使えます', 'No account · all features included')}</p></div>
 <div class="card"><h3>Plus</h3><p class="price">$24 / ${t('年', 'year')}</p><p class="dim">${t('または $2.99 / 月', 'or $2.99 / month')}</p><p>${t(`マシン ${PLUS.maxMachines}台・スマホ ${PLUS.maxDevices}台`, `${PLUS.maxMachines} machines, ${PLUS.maxDevices} phones`)}</p><p><a class="btn" href="${ACCOUNT}">${t('アカウントへ', 'Go to account')}</a></p></div>
 <div class="card"><h3>${t('自分で運用', 'Self-hosted')}</h3><p class="price">$0</p><p>${t('Tailscale か、自分の Cloudflare の relay。台数の制限なし・アカウント不要', 'Tailscale or your own Cloudflare relay. No limits, no account')}</p><p><a href="${REPO}">GitHub</a></p></div>
 </div>
