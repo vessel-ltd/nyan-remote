@@ -19,6 +19,7 @@
 //   ⬜ a `probeUrl` equivalent (reachability via relay is decided when `kind` is added in ④)
 
 import type { Session } from '../../../shared/crypto.ts'
+import { errorOfKind, type DownKind } from './unreachable.ts'
 import { FRAME } from '../../../shared/crypto.ts'
 import {
   decodeClose,
@@ -61,7 +62,7 @@ export interface RelayWire extends Wire {
    * ⚠️⚠️ Without calling it the screen waits until the timeout (10s) = **no reason is shown**.
    *    ★ For disconnects **with a reason** such as revocation, that text is shown on screen as-is.
    */
-  fail(reason: string): void
+  fail(reason: string, kind?: DownKind): void
 }
 
 /** ⚠️ Same as `http.ts` (if the wait time varied by route, behavior would look different to the user) */
@@ -139,11 +140,12 @@ export function relayWire(o: {
    *    adding cleanup would have **no observable difference** (= an unkillable guard).
    *    ★ A dead route is thrown away with its carrier (the containers' lifetime ends there).
    */
-  function fail(reason: string): void {
+  function fail(reason: string, kind?: DownKind): void {
     // ⚠️ Second time does nothing (⚠️⚠️ calling `onDead` twice makes the carrier close again)
     if (dead !== undefined) return
     dead = reason
-    for (const id of [...pending.keys()]) settle(id, (p) => p.reject(new Error(reason)))
+    // ★ Pending requests carry the kind (a 4011 "the slot moved" on an open line must reach the list as `FreeSlotError`, not a red error)
+    for (const id of [...pending.keys()]) settle(id, (p) => p.reject(errorOfKind(reason, kind)))
     // ★ **Always** tell the carrier (closing the line is the carrier's job / see above)
     o.onDead?.(reason)
   }

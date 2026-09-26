@@ -295,6 +295,10 @@ export class AgentTransport implements Transport {
     return this.#wire.eventsLive?.() ?? false
   }
 
+  takeoverFreeSlot(): void {
+    this.#wire.takeoverNext?.()
+  }
+
   followLog(sessionId: string, on: (event: AgentEvent) => void): () => void {
     return this.#wire.subscribe(on, `/sessions/${encodeURIComponent(sessionId)}/follow`)
   }

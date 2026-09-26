@@ -254,3 +254,11 @@ test('★★ p=1 (the phone answers the key proof / 2026-09-27) goes only on the
   assert.equal(new URL(relayUrl('wss://r.example', 'device', 'KEY')).searchParams.get('p'), null)
   assert.equal(new URL(relayUrl('wss://r.example', 'agent', 'KEY', { proof: true, control: true })).searchParams.get('p'), null)
 })
+
+test('★★ f=1 (move the free slot here / 2026-09-27) rides only with p=1 on the device side', () => {
+  const d = new URL(relayUrl('wss://r.example', 'device', 'KEY', { proof: true, takeover: true }))
+  assert.equal(d.searchParams.get('f'), '1')
+  assert.equal(d.searchParams.get('p'), '1')
+  assert.equal(new URL(relayUrl('wss://r.example', 'device', 'KEY', { takeover: true })).searchParams.get('f'), null, 'f without p')
+  assert.equal(new URL(relayUrl('wss://r.example', 'agent', 'KEY', { proof: true, takeover: true, control: true })).searchParams.get('f'), null)
+})

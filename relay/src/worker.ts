@@ -89,11 +89,21 @@ export class Accounts extends DurableObject<Env> {
  * ★★ Per-phone ledger (one per phone public key / 2026-09-27). ⚠️ Decisions are in `phoneLedger.ts` (this only wires reads and writes).
  */
 export class Phones extends DurableObject<Env> {
-  /** @param licensed the room has a plan ticket (⇒ released from this ledger instead of counted) */
-  async claim(agentKey: string, licensed: boolean): Promise<PhoneClaimResult> {
-    const r = claimRoom(readPhoneLedger(await this.ctx.storage.get('rooms')), agentKey, licensed, Date.now())
-    await this.ctx.storage.put('rooms', r.ledger)
-    return r.ok ? 'ok' : 'machine-limit'
+  /**
+   * @param dkey this phone's key (= this object's name; the room it moved away from is told which phone)
+   * @param licensed the room has a plan ticket (⇒ released from this ledger instead of counted)
+   * @param takeover move the free slot here (⇒ the rooms it leaves are told **before** the ledger is written, like `Accounts.release`)
+   * ⚠️⚠️ The whole step is under `blockConcurrencyWhile`: the notification is an RPC (not a storage op), so without it a second claim
+   *    of the same phone could read the ledger in between and the last write would win (two machines on the free tier).
+   */
+  async claim(dkey: string, agentKey: string, licensed: boolean, takeover: boolean): Promise<PhoneClaimResult> {
+    return await this.ctx.blockConcurrencyWhile(async () => {
+      const r = claimRoom(readPhoneLedger(await this.ctx.storage.get('rooms')), agentKey, licensed, Date.now(), undefined, takeover)
+      // ⚠️ If a room cannot be told, throw (the caller answers `unavailable` and the phone tries again; the ledger stays as it was)
+      for (const room of r.moved) await this.env.RENDEZVOUS.getByName(room).phoneFreeMoved(dkey)
+      await this.ctx.storage.put('rooms', r.ledger)
+      return r.ok ? 'ok' : 'machine-limit'
+    })
   }
 }
 
@@ -132,9 +142,9 @@ export class Rendezvous extends DurableObject<Env> {
         return 'machine-limit'
       }
     },
-    claimPhone: async (dkey, agentKey, licensed) => {
+    claimPhone: async (dkey, agentKey, licensed, takeover) => {
       try {
-        return await this.env.PHONES.getByName(dkey).claim(agentKey, licensed)
+        return await this.env.PHONES.getByName(dkey).claim(dkey, agentKey, licensed, takeover)
       } catch {
         // ⚠️ Cannot reach the ledger ⇒ `room.ts` refuses a free-tier phone (fail-closed) and lets a licensed room carry on
         return 'unavailable'
@@ -172,6 +182,11 @@ export class Rendezvous extends DurableObject<Env> {
     this.#room.revokeLicense(acct, mid)
   }
 
+  /** ★ A phone moved its free slot to another machine (from `Phones.claim` / `phoneFreeMoved` in `room.ts`) */
+  async phoneFreeMoved(dkey: string): Promise<void> {
+    this.#room.phoneFreeMoved(dkey)
+  }
+
   override async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url)
     const side = url.pathname.endsWith('/agent') ? 'agent' : 'device'
@@ -190,8 +205,8 @@ export class Rendezvous extends DurableObject<Env> {
       const licensing = c === '2' || (c === '1' && url.searchParams.get('l') === '1')
       await this.#room.startAgent(this.#wrap(server), url.searchParams.get('a') ?? '', control, licensing)
     } else {
-      // ★ `p=1` = the phone answers the key proof (2026-09-27 / `relayUrl` in `shared/relayFrame.ts`)
-      await this.#room.startDevice(this.#wrap(server), url.searchParams.get('p') === '1')
+      // ★ `p=1` = the phone answers the key proof; `f=1` = it asks to move its free slot here (2026-09-27 / `relayUrl` in `shared/relayFrame.ts`)
+      await this.#room.startDevice(this.#wrap(server), url.searchParams.get('p') === '1', url.searchParams.get('f') === '1')
     }
     return new Response(null, { status: 101, webSocket: client })
   }

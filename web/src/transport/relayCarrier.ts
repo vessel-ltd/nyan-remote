@@ -47,7 +47,7 @@ import { RELAY_PING, RELAY_PING_MS, relayUrl } from '../../../shared/relayFrame.
 import { relayWire, type RelayWire } from './relay.ts'
 import type { Wire } from './wire.ts'
 import { pickBilingual, t } from '../../../shared/i18n.ts'
-import { UnreachableError } from './unreachable.ts'
+import { errorOfKind, type DownKind } from './unreachable.ts'
 
 /** A line carrying one envelope at a time (⚠️ **must preserve order**. The real one is a WebSocket) */
 export interface CarrierSocket {
@@ -89,9 +89,10 @@ export interface RelayCarrier {
   receive(bytes: Uint8Array): void
   /**
    * The line dropped (⚠️ we don't close it). ★ Ends pending requests **with the reason**.
-   * ★ `unreachable`: never got through to the relay/agent (the list shows it as "offline", not as an error / `unreachable.ts`)
+   * ★ `kind`: `unreachable` = never got through to the relay/agent (the list shows it as "offline", not as an error);
+   *   `free-slot` = the relay refused because this phone's free slot is another machine (`unreachable.ts`)
    */
-  down(reason: string, unreachable?: boolean): void
+  down(reason: string, kind?: DownKind): void
   /**
    * ★ Wait until received envelopes **have been processed**.
    *
@@ -105,6 +106,11 @@ export interface RelayCarrier {
 
 /** ⚠️ Same as `http.ts` (if the wait time varied by route, behavior would look different to the user) */
 const TIMEOUT_MS = 10_000
+
+export type { DownKind }
+
+/** ★ Relay close codes that mean "this phone's free slot is elsewhere" (`CLOSE.freeUsed` / `CLOSE.freeMoved` in `relay/src/room.ts`) */
+const FREE_SLOT_CLOSE_CODES: readonly number[] = [4008, 4011]
 
 function text(err: unknown): string {
   return err instanceof Error ? err.message : String(err)
@@ -153,14 +159,14 @@ export function openRelayCarrier(o: {
     )
   }, o.timeoutMs ?? TIMEOUT_MS)
 
-  function down(reason: string, unreachable = false): void {
+  function down(reason: string, kind?: DownKind): void {
     if (phase === 'dead') return
     const wasOpen = phase === 'open'
     phase = 'dead'
     clearTimeout(timer)
     // ★ If open, tell the route (pending requests end **with the reason** = no 10s wait)
-    if (wasOpen) wire?.fail(reason)
-    else breakReady(unreachable ? new UnreachableError(reason) : new Error(reason))
+    if (wasOpen) wire?.fail(reason, kind)
+    else breakReady(errorOfKind(reason, kind))
     o.onDown?.(reason)
   }
 
@@ -278,9 +284,11 @@ export async function connectRelayCarrier(o: {
   pingMs?: number
   /** ⚠️ For tests (default is a real WebSocket) */
   openLine?: (url: string) => CarrierLine
+  /** ★ Ask the relay to move this phone's free slot to this machine (`f=1` / pairing and the "use this machine for free" button) */
+  takeover?: boolean
 }): Promise<{ wire: Wire; close(reason?: string): void }> {
   // ★ `p=1` = this phone answers the relay's key proof (2026-09-27). ⚠️ Old and self-hosted relays ignore it
-  const ws = (o.openLine ?? realLine)(relayUrl(o.base, 'device', o.agentPublicKey, { proof: true }))
+  const ws = (o.openLine ?? realLine)(relayUrl(o.base, 'device', o.agentPublicKey, { proof: true, ...(o.takeover ? { takeover: true } : {}) }))
 
   // ★★ Buffer anything sent before open (⚠️ the handshake's first message may be ready before `open`)
   let live = false
@@ -320,7 +328,7 @@ export async function connectRelayCarrier(o: {
   ws.addEventListener('error', () => {
     // ★ Most often the PC is simply off (the relay refuses with 503 when its agent is not connected) ⇒ "unreachable", shown as a
     //   quiet offline line. ⚠️ The browser hides the refusal's reason (503 / 429 / 402), so the line's details list the other checks.
-    carrier.down(t('relay 経由で繋がりません', 'Cannot reach it through the relay'), true)
+    carrier.down(t('relay 経由で繋がりません', 'Cannot reach it through the relay'), 'unreachable')
   })
   ws.addEventListener('close', (ev) => {
     if (beat !== undefined) clearInterval(beat)
@@ -328,6 +336,8 @@ export async function connectRelayCarrier(o: {
     //   ⚠️ The guesses are for a close **without** a reason (the browser hides a refusal before the upgrade); a reason from the
     //      relay (device limit, free tier, update the app) already says what to do, so it is shown alone
     const why = ev.reason ? `: ${pickBilingual(ev.reason)}` : ''
+    // ★ "This phone's free slot is another machine" is a state with its own screen (the connections page offers to move it)
+    const kind: DownKind | undefined = typeof ev.code === 'number' && FREE_SLOT_CLOSE_CODES.includes(ev.code) ? 'free-slot' : undefined
     carrier.down(
       ev.reason
         ? t(`relay の線が切れました（${ev.code ?? ''}${why}）`, `The relay connection dropped (${ev.code ?? ''}${why})`)
@@ -335,6 +345,7 @@ export async function connectRelayCarrier(o: {
             `relay の線が切れました（${ev.code ?? ''}）。agent が繋がっていないか、台数の上限かもしれません`,
             `The relay connection dropped (${ev.code ?? ''}). The agent may not be connected, or the device limit may be reached`,
           ),
+      kind,
     )
   })
   try {

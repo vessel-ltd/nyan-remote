@@ -24,6 +24,8 @@ export interface ProbeResult {
   detail?: string
   /** ★ Could not reach it at all (off / asleep): shown as a grey "Offline", not a red error (`unreachable.ts`) */
   unreachable?: boolean
+  /** ★ The relay refused because this phone's free slot is another machine (relay routes only / `unreachable.ts`) */
+  freeSlot?: boolean
 }
 
 /**

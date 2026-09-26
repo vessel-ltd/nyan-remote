@@ -2,7 +2,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { httpWire, probeUrl } from './http.ts'
-import { isUnreachable, UnreachableError } from './unreachable.ts'
+import { FreeSlotError, isFreeSlot, isUnreachable, UnreachableError } from './unreachable.ts'
 
 test('★ the type decides, not the text', () => {
   assert.equal(isUnreachable(new UnreachableError('x')), true)
@@ -50,4 +50,12 @@ test('★★ something that answered is never "offline", even with a broken body
   } finally {
     globalThis.fetch = real
   }
+})
+
+test('★ "the free slot is another machine" is its own kind, and a kind of unreachable for the list (2026-09-27)', () => {
+  const e = new FreeSlotError('x')
+  assert.equal(isFreeSlot(e), true)
+  assert.equal(isUnreachable(e), true, 'the list must show it quietly, not as a red error')
+  assert.equal(isFreeSlot(new UnreachableError('x')), false)
+  assert.equal(isFreeSlot(new Error('Free: one machine per phone')), false, 'decided by type, never by text')
 })

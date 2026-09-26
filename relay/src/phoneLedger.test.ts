@@ -69,3 +69,21 @@ test('★★ broken input is dropped, never throws, and the ledger is capped (�
   for (let i = 0; i < PHONE_ROOMS_MAX; i++) big.rooms[`k${i}`] = { first: T0, last: T0 }
   assert.equal(claimRoom(big, 'new', false, T0, 1000).ok, false)
 })
+
+test('★★ takeover moves the free slot here and names the rooms it left (the DO tells them first); a licensed room ignores it', () => {
+  const a = claimRoom(EMPTY, 'A', false, T0)
+  const b = claimRoom(a.ledger, 'B', false, T0 + 1, undefined, true)
+  assert.equal(b.ok, true, '⚠️⚠️ the takeover was refused')
+  assert.deepEqual(b.moved, ['A'])
+  assert.deepEqual(b.ledger.rooms, { B: { first: T0 + 1, last: T0 + 1 } })
+  // ★ Taking over the room already held keeps its first claim and moves nothing
+  const again = claimRoom(b.ledger, 'B', false, T0 + 2, undefined, true)
+  assert.deepEqual(again.moved, [])
+  assert.deepEqual(again.ledger.rooms, { B: { first: T0 + 1, last: T0 + 2 } })
+  // ★ A licensed room is released as usual, never a takeover
+  const lic = claimRoom(again.ledger, 'C', true, T0 + 3, undefined, true)
+  assert.deepEqual(lic.moved, [])
+  assert.deepEqual(lic.ledger.rooms, { B: { first: T0 + 1, last: T0 + 2 } })
+  // ⚠️ Without takeover, B is refused while A holds the slot (the mutation "takeover by default" must fail here)
+  assert.equal(claimRoom(a.ledger, 'B', false, T0 + 1).ok, false)
+})

@@ -36,9 +36,12 @@ interface FakeLine {
 }
 
 /** `connect` that hands out fake lines (★ counts how many were connected) */
-function fakeConnect(): { connect: RelayConnect; lines: FakeLine[] } {
+function fakeConnect(): { connect: RelayConnect; lines: FakeLine[]; takeovers: boolean[] } {
   const lines: FakeLine[] = []
-  const connect: RelayConnect = async ({ onDown }) => {
+  /** ★ What each connect asked the relay (`takeover` = move the free slot here) */
+  const takeovers: boolean[] = []
+  const connect: RelayConnect = async ({ onDown, takeover }) => {
+    takeovers.push(takeover === true)
     const listeners = new Set<(e: AgentEvent) => void>()
     /** ⚠️ Pending requests (★ like the real `relayWire`, on drop they **fail with a reason**) */
     const waiting = new Set<(err: Error) => void>()
@@ -78,7 +81,7 @@ function fakeConnect(): { connect: RelayConnect; lines: FakeLine[] } {
     lines.push(line)
     return { wire, close: (reason) => line.closes.push(reason ?? '') }
   }
-  return { connect, lines }
+  return { connect, lines, takeovers }
 }
 
 async function okIdentity(): Promise<Identity> {
@@ -354,4 +357,35 @@ test('★★ eventsLive: only when a line is open and the line side says it is a
   lines[0]!.eventsOk = true
   lines[0]!.fall('切れました')
   assert.equal(route.eventsLive?.(), false, '⚠️⚠️ claims a dropped line is alive (60s stale)')
+})
+
+test('★★ takeoverNext asks the relay to move the free slot on the next connect only (never on the automatic reconnects / 2026-09-27)', { timeout: 5000 }, async () => {
+  const { connect, lines, takeovers } = fakeConnect()
+  const route = relayRoute({ base: 'wss://relay.test', agentPublicKey: 'A', identity: okIdentity, connect })
+  await route.request({ method: 'GET', path: '/health' })
+  assert.deepEqual(takeovers, [false], 'the first connect must not move the slot by itself')
+  lines[0]!.fall('dropped')
+  route.takeoverNext()
+  await route.request({ method: 'GET', path: '/health' })
+  assert.deepEqual(takeovers, [false, true], '⚠️⚠️ takeoverNext did not reach the connect')
+  lines[1]!.fall('dropped again')
+  await route.request({ method: 'GET', path: '/health' })
+  assert.deepEqual(takeovers, [false, true, false], '⚠️⚠️ the flag survived the connect (the list would steal the slot on every reconnect)')
+})
+
+test('★★ the takeover flag never leaks into an automatic reconnect: consumed by a failed attempt, ignored while a line is live (codex)', { timeout: 5000 }, async () => {
+  const { connect, lines, takeovers } = fakeConnect()
+  let broken = true
+  const identity = async (): Promise<Identity> => (broken ? { kind: 'broken', reason: 'test' } : okIdentity())
+  const route = relayRoute({ base: 'wss://relay.test', agentPublicKey: 'A', identity, connect })
+  route.takeoverNext()
+  await assert.rejects(route.request({ method: 'GET', path: '/health' }), /鍵が使えません/)
+  broken = false
+  await route.request({ method: 'GET', path: '/health' })
+  assert.deepEqual(takeovers, [false], '⚠️⚠️ a failed attempt left the flag armed for the next (automatic) connect')
+  // ⚠️ Pressing the button while the line is live changes nothing (the room is already held), and the next reconnect is plain
+  route.takeoverNext()
+  lines[0]!.fall('dropped')
+  await route.request({ method: 'GET', path: '/health' })
+  assert.deepEqual(takeovers, [false, false], '⚠️⚠️ armed while live, fired on the automatic reconnect')
 })

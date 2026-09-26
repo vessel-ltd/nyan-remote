@@ -20,6 +20,7 @@ test('★★★ route names are relay / Tailscale (⚠️ never shown as local)'
 test('★★★ line 2 is "route · state" (checking while unknown = never reads as healthy)', () => {
   assert.deepEqual(machineSummary(relayEp, undefined), { text: 'relay 経由 ・ 確認中…', tone: 'wait' })
   assert.deepEqual(machineSummary(relayEp, { state: 'ok' }), { text: 'relay 経由 ・ 応答あり', tone: 'ok' })
+  assert.deepEqual(machineSummary(relayEp, { state: 'free-used' }), { text: 'relay 経由 ・ 無料枠は別のマシン', tone: 'off' })
   assert.deepEqual(machineSummary(localEp, { state: 'ng', detail: '時間切れ' }), {
     text: 'Tailscale 経由 ・ 応答なし（時間切れ）',
     tone: 'ng',

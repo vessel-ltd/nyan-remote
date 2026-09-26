@@ -34,6 +34,8 @@ export interface RelayRoute extends Wire {
   readonly lastError: string | undefined
   /** Close when switching endpoints (⚠️ no reconnection after this) */
   close(reason?: string): void
+  /** ★ The next connect asks the relay to move this phone's free slot here (one-shot / `Wire.takeoverNext`) */
+  takeoverNext(): void
 }
 
 /** ⚠️ Hook swapped by tests (default is a real WebSocket) */
@@ -43,6 +45,8 @@ export interface RelayConnect {
     agentPublicKey: string
     identity: KeyPair
     onDown: (reason: string) => void
+    /** ★ Move this phone's free slot to this machine (`f=1` / one-shot from `takeoverNext`) */
+    takeover?: boolean
   }): Promise<{ wire: Wire; close(reason?: string): void }>
 }
 
@@ -85,6 +89,8 @@ export function relayRoute(o: {
   let state: RelayRouteState = 'idle'
   let lastError: string | undefined
   let closed = false
+  /** ★ The next connect asks the relay to move the free slot here (consumed by that connect, whatever its outcome) */
+  let takeover = false
   /** ★ Subscriptions made by the screen (⚠️ **outlive the line**) */
   const subs = new Map<number, Sub>()
   let nextSub = 1
@@ -106,6 +112,10 @@ export function relayRoute(o: {
     if (closed) throw new Error(t('この接続先は閉じています', 'This connection is closed'))
     if (live) return live.wire
     if (opening) return await opening
+    // ★ The one-shot flag is consumed by **this attempt, whatever its outcome** (codex 2026-09-27: consumed only after the key
+    //   loaded, a failed key load left it armed for the list's next automatic reconnect = `f=1` on a reconnect)
+    const take = takeover
+    takeover = false
     const run = (async (): Promise<Wire> => {
       setState('connecting')
       // ⚠️⚠️ Key missing / broken / can't be saved = **must not connect** (show the reason as-is)
@@ -116,6 +126,7 @@ export function relayRoute(o: {
         agentPublicKey,
         identity: id.pair,
         onDown: (reason) => down(reason),
+        ...(take ? { takeover: true } : {}),
       })
       // ⚠️ If closed while connecting, discard the opened line (don't keep it)
       if (closed) {
@@ -178,6 +189,12 @@ export function relayRoute(o: {
   }
 
   return {
+    takeoverNext: () => {
+      // ⚠️ Only while there is no line and none is being opened: a live line already holds this room (nothing to move), and an
+      //    attempt in flight has passed the point where the flag is read (arming now would leak into the next automatic reconnect)
+      if (live || opening || closed) return
+      takeover = true
+    },
     // ★★ **The peer this line is bound to** (= the handshake binds to this key via `z2`/`z4`).
     //   ⚠️⚠️ `pairDevice` looks at this. **Don't let it be guessed from settings** (codex round 8, low #7).
     boundAgentPublicKey: agentPublicKey,

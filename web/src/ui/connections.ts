@@ -10,8 +10,12 @@ import { endpointRoute, type AgentEndpoint } from '../endpoints.ts'
 import { t } from '../../../shared/i18n.ts'
 
 export interface ProbeView {
-  /** ★ `offline` = nothing answered (off / asleep): a state, not an error (2026-09-26) */
-  state: 'checking' | 'ok' | 'ng' | 'offline'
+  /**
+   * ★ `offline` = nothing answered (off / asleep): a state, not an error (2026-09-26).
+   * ★ `free-used` = the relay refused because this phone's free slot is another machine (2026-09-27): a state with a way out
+   *   (the "use this machine for free" button, or `nyan login` on the PC)
+   */
+  state: 'checking' | 'ok' | 'ng' | 'offline' | 'free-used'
   detail?: string
 }
 
@@ -28,6 +32,7 @@ export function machineSummary(e: AgentEndpoint, p: ProbeView | undefined): { te
   if (p === undefined || p.state === 'checking') return { text: t(`${route} ・ 確認中…`, `${route} · Checking…`), tone: 'wait' }
   if (p.state === 'ok') return { text: t(`${route} ・ 応答あり`, `${route} · Responding`), tone: 'ok' }
   if (p.state === 'offline') return { text: t(`${route} ・ オフライン`, `${route} · Offline`), tone: 'off' }
+  if (p.state === 'free-used') return { text: t(`${route} ・ 無料枠は別のマシン`, `${route} · Free slot: another machine`), tone: 'off' }
   return { text: t(`${route} ・ 応答なし（${p.detail ?? '理由不明'}）`, `${route} · No response (${p.detail ?? 'unknown reason'})`), tone: 'ng' }
 }
 

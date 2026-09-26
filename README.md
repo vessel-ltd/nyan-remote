@@ -157,7 +157,8 @@ The default relay is operated by us:
 | **Plus** | $2.99/month or $24/year | 5 machines, 5 phones |
 
 Free is counted per phone: each phone can use one machine through our relay without signing in (the phone proves its
-key to the relay; nothing else is stored about it). For more machines on one phone, sign in on each PC with `nyan login`
+key to the relay; nothing else is stored about it). Pairing another machine moves your free machine to it, and the
+connections page can move it back with one tap. For several machines on one phone, sign in on each PC with `nyan login`
 and manage your plan at <https://account.nyan-remote.app>. Every feature works on the free plan.
 If you would rather not depend on our relay, there are two alternatives, both free,
 without an account and without limits. Both are set **per machine** in `~/.nyan-remote/config.json`

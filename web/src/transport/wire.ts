@@ -34,6 +34,11 @@ export interface WireResponse {
 
 export interface Wire {
   /**
+   * ★ Ask the relay to move this phone's free slot to this machine **on the next connect** (2026-09-27 / relay routes only).
+   * ⚠️ One-shot: never on the automatic reconnects of the list (two machines would steal the slot from each other on every poll).
+   */
+  takeoverNext?(): void
+  /**
    * Send one request and wait for the response.
    *
    * ⚠️⚠️ **Don't throw on status codes** (`AgentTransport` builds the reason = text lives in one place).

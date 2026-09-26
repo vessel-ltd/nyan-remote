@@ -245,6 +245,12 @@ export function relayUrl(
      *    challenge as a broken handshake reply), and refuses old phones in rooms without a ticket ("update the app").
      */
     proof?: boolean
+    /**
+     * ★★ The phone asks to **move its free slot** to this machine (`f=1` / 2026-09-27): set when pairing a machine and when the
+     * user presses "use this machine for free" on a refused one. ⚠️ Never on the automatic reconnects of the list (two machines
+     * would otherwise steal the slot from each other on every poll).
+     */
+    takeover?: boolean
   } = {},
 ): string {
   const u = new URL(base)
@@ -257,6 +263,9 @@ export function relayUrl(
     u.searchParams.set('c', '1')
     if (o.license) u.searchParams.set('l', '1')
   }
-  if (o.proof && side === 'device') u.searchParams.set('p', '1')
+  if (o.proof && side === 'device') {
+    u.searchParams.set('p', '1')
+    if (o.takeover) u.searchParams.set('f', '1')
+  }
   return u.toString()
 }

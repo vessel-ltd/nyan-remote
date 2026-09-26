@@ -133,7 +133,7 @@ function home(lang) {
 
 <h2 id="pricing">${t('料金', 'Pricing')}</h2>
 <div class="grid">
-<div class="card"><h3>Free</h3><p class="price">$0</p><p>${t(`スマホ1台につきマシン ${FREE.maxMachines}台・マシン1台につきスマホ ${FREE.maxDevices}台（こちらの relay）`, `${FREE.maxMachines} machine per phone, ${FREE.maxDevices} phones per machine (our relay)`)}</p><p class="dim">${t('アカウント不要・機能は全部使えます', 'No account · all features included')}</p></div>
+<div class="card"><h3>Free</h3><p class="price">$0</p><p>${t(`スマホ1台につきマシン ${FREE.maxMachines}台・マシン1台につきスマホ ${FREE.maxDevices}台（こちらの relay）`, `${FREE.maxMachines} machine per phone, ${FREE.maxDevices} phones per machine (our relay)`)}</p><p class="dim">${t('アカウント不要・機能は全部使えます。QR を読んだマシンが無料の1台になります', 'No account · all features included. The machine you pair last is your free one')}</p></div>
 <div class="card"><h3>Plus</h3><p class="price">$24 / ${t('年', 'year')}</p><p class="dim">${t('または $2.99 / 月', 'or $2.99 / month')}</p><p>${t(`マシン ${PLUS.maxMachines}台・スマホ ${PLUS.maxDevices}台`, `${PLUS.maxMachines} machines, ${PLUS.maxDevices} phones`)}</p><p><a class="btn" href="${ACCOUNT}">${t('アカウントへ', 'Go to account')}</a></p></div>
 <div class="card"><h3>${t('自分で運用', 'Self-hosted')}</h3><p class="price">$0</p><p>${t('Tailscale か、自分の Cloudflare の relay。台数の制限なし・アカウント不要', 'Tailscale or your own Cloudflare relay. No limits, no account')}</p><p><a href="${REPO}">GitHub</a></p></div>
 </div>

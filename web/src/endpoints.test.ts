@@ -313,6 +313,8 @@ test('★★ staleTwins: returns those with the same relay entrance and name but
     staleTwins(list, { machine: 'PC', relayUrl: R, agentPublicKey: 'NEW' }, ng).map((e) => e.id),
     ['relay:OLD'],
   )
+  // ⚠️ A machine refused over the free slot has a live agent = not an old key (codex 2026-09-27)
+  assert.deepEqual(staleTwins(list, { machine: 'PC', relayUrl: R, agentPublicKey: 'NEW' }, () => 'free-used' as const), [])
   // ★ An old key's relay room has no agent, so since 2026-09-26 its probe is "offline" (unreachable) rather than "ng"
   assert.deepEqual(
     staleTwins(list, { machine: 'PC', relayUrl: R, agentPublicKey: 'NEW' }, () => 'offline' as const).map((e) => e.id),

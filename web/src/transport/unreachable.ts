@@ -13,3 +13,23 @@ export class UnreachableError extends Error {
 export function isUnreachable(err: unknown): boolean {
   return err instanceof UnreachableError
 }
+
+/**
+ * ★ The relay refused this phone because its free slot is another machine (close 4008), or the slot was just moved away (4011)
+ *   (2026-09-27). A kind of "unreachable" for the list (quiet), and its own state on the connections page (with the button that
+ *   moves the slot here / `ui/connections.ts`).
+ */
+export class FreeSlotError extends UnreachableError {
+  readonly freeSlot = true as const
+}
+
+export function isFreeSlot(err: unknown): boolean {
+  return err instanceof FreeSlotError
+}
+
+/** ★ How a line went down (the carrier decides; the route and pending requests carry it as the error's type) */
+export type DownKind = 'unreachable' | 'free-slot'
+
+export function errorOfKind(reason: string, kind: DownKind | undefined): Error {
+  return kind === 'unreachable' ? new UnreachableError(reason) : kind === 'free-slot' ? new FreeSlotError(reason) : new Error(reason)
+}

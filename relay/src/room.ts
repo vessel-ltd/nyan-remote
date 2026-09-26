@@ -107,6 +107,8 @@ export const CLOSE = {
   planChanged: 4009,
   /** ★ The free-tier ledger could not be reached (2026-09-27) */
   unavailable: 4010,
+  /** ★ This phone moved its free slot to another machine (pairing / "use this machine for free" / 2026-09-27) */
+  freeMoved: 4011,
 } as const
 
 /**
@@ -129,6 +131,7 @@ export const REASON = {
   freeUsed: 'Free: one machine per phone. Plus for more / 無料はマシン1台まで。2台目からは Plus',
   planChanged: 'The machine plan changed; reconnect / マシンのプランが変わりました。繋ぎ直してください',
   ledgerDown: 'Could not check the free slot; try again / 無料の枠を確かめられません。やり直してください',
+  freeMoved: 'This phone now uses another machine for free / この端末は別のマシンを無料で使うことにしました',
   displaced: 'Closed to make room for a newer connection / 後から来た接続のために閉じました',
   noText: 'Text frames not accepted / 文字は受け取りません',
   tooLarge: 'Too large / 大きすぎます',
@@ -175,6 +178,8 @@ export interface Tag {
   held?: Uint8Array
   /** ★ `device`: the phone's public key (base64url), known only after its proof passed */
   dkey?: string
+  /** ★ `device`: the phone asked to move its free slot here (`f=1` / passed to the ledger with its proof) */
+  dtake?: boolean
   /**
    * ★★ `device`: admitted on the free tier (this phone's free slot is this room / `phoneLedger.ts`).
    * ⚠️ In a room without a ticket every admitted phone must carry it (`#enforce` evicts the others so they reconnect and claim).
@@ -270,9 +275,10 @@ export interface RoomIo {
    * ★★ May this phone use this room? (`phoneLedger.ts` / 2026-09-27). ⚠️ Never throws
    * @param dkey the phone's public key (⚠️ only after its proof passed)
    * @param licensed the room has a plan ticket right now (⇒ the ledger releases the room instead of counting it)
+   * @param takeover the phone asked to move its free slot here (⇒ the ledger drops its other rooms and tells them first)
    * @returns `unavailable` when the ledger cannot be reached (⚠️ refuses a free-tier phone = fail-closed; a licensed room carries on)
    */
-  claimPhone(dkey: string, agentKey: string, licensed: boolean): Promise<PhoneClaimResult>
+  claimPhone(dkey: string, agentKey: string, licensed: boolean, takeover: boolean): Promise<PhoneClaimResult>
   /**
    * ★★ **Someone else's relay** (`SELF_HOSTED=1` in `wrangler.selfhost.jsonc` / 2026-09-25): no plans at all.
    *   Tickets are never asked for (so no agent, old or new, sends one) and every room takes `MAX_DEVICES` phones.
@@ -514,8 +520,9 @@ export class Room {
    * ⚠️ An old app (no `p=1`) in a room without a ticket is closed **with a reason** right after accepting (a refusal before the
    *    upgrade would be invisible to the browser = it would show as "offline" instead of "update the app").
    * @param proving the phone announced `p=1`
+   * @param takeover the phone announced `f=1` (move its free slot here / only meaningful with `proving`)
    */
-  async startDevice(socket: RoomSocket, proving = false): Promise<number> {
+  async startDevice(socket: RoomSocket, proving = false, takeover = false): Promise<number> {
     const agent = this.#agent()
     const tag = agent?.tag()
     const last = tag?.lastConnId ?? 0
@@ -542,9 +549,29 @@ export class Room {
     // ⚠️ The wire may already be gone (evicted to make room while the key was made)
     const now = socket.tag()
     if (!now || now.evicted === true) return connId
-    socket.setTag({ ...now, dpending: { nonce: c.nonce, jwk: c.jwk, until } })
+    socket.setTag({ ...now, dpending: { nonce: c.nonce, jwk: c.jwk, until }, ...(takeover ? { dtake: true } : {}) })
     socket.send(encodeDeviceChallenge({ relayPublicRaw: c.publicRaw, nonce: c.nonce }))
     return connId
+  }
+
+  /**
+   * ★★ This phone moved its free slot to another machine (called by the Phones DO **before** it writes the ledger / 2026-09-27).
+   *   Wires of that phone holding this room as their free slot are closed with the reason (the app shows it and offers to move it
+   *   back); a check in flight is marked stale (it asks again and gets refused). ⚠️ Wires admitted under a ticket are not touched.
+   */
+  phoneFreeMoved(dkey: string): void {
+    // ⚠️ A room that got a ticket after the wire was admitted keeps that wire (it is licensed now); only the stale mark goes
+    const licensed = this.#licensed()
+    for (const d of this.#devices()) {
+      if (d.tag.dkey !== dkey) continue
+      if (d.tag.dpending !== undefined) d.socket.setTag({ ...d.tag, dstale: true })
+      else if (d.tag.free === true) {
+        if (licensed) {
+          const { free: _gone, ...kept } = d.tag
+          d.socket.setTag(kept)
+        } else this.#evict(d, REASON.freeMoved, CLOSE.freeMoved)
+      }
+    }
   }
 
   /** Handle one byte array from a wire (⚠️ **never throws**) */
@@ -634,8 +661,12 @@ export class Room {
       return
     }
     const dkey = toBase64Url(decoded.value.devicePublicRaw)
-    // ★ The key is on the tag **before** the ledger is asked (so a release by another wire of this phone can mark this one stale)
-    socket.setTag({ ...afterProof, dkey })
+    // ★ The key is on the tag **before** the ledger is asked (so a release by another wire of this phone can mark this one stale).
+    //   ⚠️ The takeover flag is read **once** here and dropped from the tag: a stale retry must be a plain claim (codex 2026-09-27:
+    //      a delayed takeover answer, retried with the flag, took the slot back from a newer takeover)
+    const { dtake: _once, ...withKey } = afterProof
+    const take = afterProof.dtake === true
+    socket.setTag({ ...withKey, dkey })
     // ★★ Ask the ledger under the room's plan **as of the request**. The answer can go stale while it travels (codex 2026-09-27):
     //   the ticket arrives or goes, or another wire of this phone releases this room. ⇒ If the world changed, ask **once more**
     //   under the current state (a stale answer must neither grant a slot the ledger no longer holds nor refuse a room that is
@@ -650,7 +681,7 @@ export class Room {
         this.#evict({ socket, tag: before }, REASON.noAgent, CLOSE.noAgent)
         return
       }
-      claimed = await this.#io.claimPhone(dkey, agentKey, licensed)
+      claimed = await this.#io.claimPhone(dkey, agentKey, licensed, take && attempt === 0)
       // ★★ A licensed request is a release. It may have reached the ledger **even when the answer was lost** (`unavailable`), so
       //   **whatever became of this wire or its answer**, no other wire of this phone in this room holds the room as its free slot
       //   any more (its `free` was a cache of the ledger; a check in flight is redone / codex rounds 2-3)

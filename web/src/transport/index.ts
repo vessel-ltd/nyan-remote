@@ -32,7 +32,7 @@ import { idbKeyStore, loadIdentity } from '../identity.ts'
 import { AgentTransport } from './agent.ts'
 import { relayRoute } from './relayRoute.ts'
 import { probeUrl, type ProbeResult } from './http.ts'
-import { isUnreachable } from './unreachable.ts'
+import { isFreeSlot, isUnreachable } from './unreachable.ts'
 
 // Reachability checks also go through this layer (discipline 2). In ③ the implementation is chosen by kind
 export { fetchLatestRelease, probeUrl, type ProbeResult } from './http.ts'
@@ -62,7 +62,12 @@ export async function probeEndpoint(
         ...(Array.isArray(h.accounts) ? { accounts: h.accounts.length } : {}),
       }
     } catch (err) {
-      return { ok: false, detail: err instanceof Error ? err.message : String(err), ...(isUnreachable(err) ? { unreachable: true } : {}) }
+      return {
+        ok: false,
+        detail: err instanceof Error ? err.message : String(err),
+        ...(isUnreachable(err) ? { unreachable: true } : {}),
+        ...(isFreeSlot(err) ? { freeSlot: true } : {}),
+      }
     }
   }
   return probeUrl(e.url)
@@ -133,6 +138,11 @@ export interface Transport {
   subscribe(on: (event: AgentEvent) => void): () => void
   /** ★ Whether the state-signal line is alive now (⚠️ `false` if unknown / `Wire.eventsLive`) */
   eventsLive(): boolean
+  /**
+   * ★ Ask the relay to move this phone's free slot to this machine on the next connect (2026-09-27 / relay routes only; no-op on local).
+   * ⚠️ Only from the user's own act (the "use this machine for free" button; pairing does it through `connectForRelayPairing`).
+   */
+  takeoverFreeSlot(): void
   /**
    * ★★ Thread following (2026-09-23). `log-appended` arrives when that session's record or in-progress text grows.
    * ⚠️⚠️ Subscribe **only while viewing that thread** (don't stream to devices not looking / relay's daily limit).
@@ -226,7 +236,13 @@ export interface Transport {
  *
  * ⚠️ `local` is fetch + SSE as before. `relay` is a line with a handshake (`relayRoute`).
  */
-export function buildTransport(endpoint: AgentEndpoint): {
+export function buildTransport(
+  endpoint: AgentEndpoint,
+  o: {
+    /** ★ The first connect asks the relay to move this phone's free slot to this machine (pairing / 2026-09-27) */
+    takeover?: boolean
+  } = {},
+): {
   transport: Transport
   /** ⚠️ Only for `relay` (it holds a line, so close it when discarding) */
   close?: () => void
@@ -238,6 +254,7 @@ export function buildTransport(endpoint: AgentEndpoint): {
       // ⚠️ This device's key is **read on every connect** (it can disappear / identity.ts)
       identity: () => loadIdentity(identityStore()),
     })
+    if (o.takeover) route.takeoverNext()
     return { transport: new AgentTransport(endpoint, route), close: () => route.close() }
   }
   return { transport: new AgentTransport(endpoint) }
@@ -349,7 +366,10 @@ export function connectForRelayPairing(relay: { url: string; agentPublicKey: str
     relay,
     kind: 'relay',
   }
-  const built = buildTransport(endpoint)
+  // ★★ Pairing a machine makes it this phone's free machine (`f=1` / 2026-09-27 / user decision): the QR was scanned for this one,
+  //   so the previous free machine (if any) is told and its wires close with a reason. ⚠️ Only here and on the explicit button,
+  //   never on the list's automatic reconnects.
+  const built = buildTransport(endpoint, { takeover: true })
   return { transport: built.transport, close: () => built.close?.() }
 }
 

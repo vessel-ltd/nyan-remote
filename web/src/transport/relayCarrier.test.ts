@@ -24,7 +24,7 @@ import { join } from 'node:path'
 import { test } from 'node:test'
 import { ECDH_PARAMS, exportPublicKey, generateDeviceKey, relayProof, sameBytes, toBase64Url, type KeyPair } from '../../../shared/crypto.ts'
 import { decodeDeviceProof, encodeChallenge, encodeDeviceChallenge } from '../../../shared/relayAuth.ts'
-import { isUnreachable } from './unreachable.ts'
+import { isFreeSlot, isUnreachable } from './unreachable.ts'
 import {
   RELAY_FRAME,
   decodeRelayFrame,
@@ -509,4 +509,40 @@ test('★★ the real line announces p=1 (⑫) and a close with a relay reason s
   f.lines[0]!.emit('open')
   f.lines[0]!.emit('close', { code: 4008, reason: 'Free: one machine per phone. Plus for more / 無料はマシン1台まで。2台目からは Plus' } as { code: number })
   await assert.rejects(opened, (e: Error) => /4008/.test(e.message) && /Plus/.test(e.message) && !/台数の上限かもしれません|device limit may be reached/.test(e.message))
+})
+
+test('★★ takeover puts f=1 on the line, and a 4008 / 4011 close is "the free slot is another machine" (2026-09-27)', { timeout: 5000 }, async (t) => {
+  await boot(t)
+  const identity = await generateDeviceKey()
+  const f = fakeLine()
+  const opened = connectRelayCarrier({ base: 'ws://relay.test', agentPublicKey: toBase64Url(agentPublicRaw()), identity, timeoutMs: 300, pingMs: 10, openLine: f.open, takeover: true })
+  const u = new URL(f.urls[0] ?? '')
+  assert.equal(u.searchParams.get('f'), '1', '⚠️⚠️ the takeover did not reach the URL')
+  assert.equal(u.searchParams.get('p'), '1')
+  f.lines[0]!.emit('open')
+  f.lines[0]!.emit('close', { code: 4008, reason: 'Free: one machine per phone. Plus for more / 無料はマシン1台まで。2台目からは Plus' } as { code: number })
+  await assert.rejects(opened, (e) => isFreeSlot(e) && isUnreachable(e), 'a free-slot refusal must be its own kind (and quiet in the list)')
+  // ⚠️ Without takeover, no f
+  const g = fakeLine()
+  const plain = connectRelayCarrier({ base: 'ws://relay.test', agentPublicKey: toBase64Url(agentPublicRaw()), identity, timeoutMs: 60, pingMs: 10, openLine: g.open })
+  assert.equal(new URL(g.urls[0] ?? '').searchParams.get('f'), null, '⚠️⚠️ an ordinary connect asked to move the slot')
+  g.lines[0]!.emit('open')
+  g.lines[0]!.emit('close', { code: 4011, reason: 'This phone now uses another machine for free / この端末は別のマシンを無料で使うことにしました' } as { code: number })
+  await assert.rejects(plain, (e) => isFreeSlot(e))
+  // ⚠️ Other relay closes stay plain errors
+  const h = fakeLine()
+  const other = connectRelayCarrier({ base: 'ws://relay.test', agentPublicKey: toBase64Url(agentPublicRaw()), identity, timeoutMs: 60, pingMs: 10, openLine: h.open })
+  h.lines[0]!.emit('open')
+  h.lines[0]!.emit('close', { code: 4002, reason: 'Device limit for this agent reached / この agent に繋げる台数の上限です' } as { code: number })
+  await assert.rejects(other, (e) => !isFreeSlot(e) && !isUnreachable(e))
+})
+
+test('★★ "the slot moved" on an open line reaches pending requests as FreeSlotError (not a red error / codex)', { timeout: 5000 }, async (t) => {
+  await boot(t)
+  const r = await joined(t)
+  const { transport } = await r.ready
+  r.stalled = true
+  const pending = transport.health()
+  r.carrier.down('relay の線が切れました（4011: This phone now uses another machine for free）', 'free-slot')
+  await assert.rejects(pending, (e) => isFreeSlot(e), '⚠️⚠️ the kind was lost on the open-line path')
 })

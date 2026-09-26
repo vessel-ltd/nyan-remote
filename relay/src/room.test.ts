@@ -76,6 +76,8 @@ function rig(
     duringPhoneClaim?: () => void
     duringPhoneClaimAsync?: (n: number) => Promise<void>
     duringProof?: () => void
+    /** ★ Rooms by agent key (shared between rigs = the Phones DO can tell the room a phone moved away from) */
+    rooms?: Map<string, Room>
   } = {},
 ) {
   const all: { side: 'agent' | 'device'; socket: Fake }[] = []
@@ -83,6 +85,7 @@ function rig(
   // ★ The ledger is real (`ledger.ts`). Kept in memory per account
   const ledgers = new Map<string, Ledger>()
   const phones = o.phones ?? new Map<string, PhoneLedger>()
+  const rooms = o.rooms ?? new Map<string, Room>()
   let phoneCalls = 0
   const room = new Room({
     sockets: (side) => all.filter((s) => s.side === side).map((s) => s.socket),
@@ -118,11 +121,14 @@ function rig(
       await o.duringClaimAsync?.()
       return r.ok ? 'ok' : (r.reason ?? 'machine-limit')
     },
-    claimPhone: async (dkey, agentKey, licensed) => {
+    claimPhone: async (dkey, agentKey, licensed, takeover) => {
       o.duringPhoneClaim?.()
       if (typeof o.phoneLedgerDown === 'function' ? o.phoneLedgerDown() : o.phoneLedgerDown) return 'unavailable'
+      rooms.set(agentKey, room)
       // ★ The ledger commits at once (a Durable Object does), the **answer** may travel slowly (the hook holds it)
-      const r = claimRoom(phones.get(dkey) ?? { rooms: {} }, agentKey, licensed, now)
+      const r = claimRoom(phones.get(dkey) ?? { rooms: {} }, agentKey, licensed, now, undefined, takeover)
+      // ★ Same order as the Phones DO: the rooms left are told **before** the ledger is written
+      for (const left of r.moved) rooms.get(left)?.phoneFreeMoved(dkey)
       phones.set(dkey, r.ledger)
       phoneCalls += 1
       await o.duringPhoneClaimAsync?.(phoneCalls)
@@ -193,10 +199,10 @@ async function pendingAgent(r: ReturnType<typeof rig>, key: string): Promise<Fak
  * ★ A phone connects (⚠️ by default a current app = it announces the key proof; `{ old: true }` = an app from before 2026-09-27).
  *   On our relay the wire then holds a challenge in `socket.sent` and nothing has reached the agent yet (see `prove`).
  */
-async function joinDevice(r: ReturnType<typeof rig>, o: { old?: boolean } = {}): Promise<{ socket: Fake; connId: number }> {
+async function joinDevice(r: ReturnType<typeof rig>, o: { old?: boolean; takeover?: boolean } = {}): Promise<{ socket: Fake; connId: number }> {
   assert.equal(r.room.admitDevice().ok, true, 'the phone is not accepted')
   const socket = r.open('device')
-  return { socket, connId: await r.room.startDevice(socket, o.old !== true) }
+  return { socket, connId: await r.room.startDevice(socket, o.old !== true, o.takeover === true) }
 }
 
 /** ★ Answer the relay's challenge with a real proof for `identity` (⚠️ `naming` = claim to be another key: the impostor case) */
@@ -208,10 +214,10 @@ async function prove(r: ReturnType<typeof rig>, d: { socket: Fake }, identity: K
   await r.room.onMessage(d.socket, bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer)
 }
 
-/** ★ A phone that connected and proved its key (a fresh phone unless `identity` is given) */
-async function freePhone(r: ReturnType<typeof rig>, identity?: KeyPair): Promise<{ socket: Fake; connId: number; identity: KeyPair }> {
+/** ★ A phone that connected and proved its key (a fresh phone unless `identity` is given). `takeover` = it asked to move its free slot here */
+async function freePhone(r: ReturnType<typeof rig>, identity?: KeyPair, o: { takeover?: boolean } = {}): Promise<{ socket: Fake; connId: number; identity: KeyPair }> {
   const id = identity ?? (await generateDeviceKey())
-  const d = await joinDevice(r)
+  const d = await joinDevice(r, o)
   await prove(r, d, id)
   assert.equal(d.socket.closed, undefined, `the phone was cut after a real proof: ${d.socket.closed?.reason ?? ''}`)
   return { ...d, identity: id }
@@ -1378,4 +1384,129 @@ test('★★ after the agent is dropped or gone, a reconnect does not reuse the 
   const q2 = await joinDevice(r2)
   assert.notEqual(q2.connId, p2.connId, '⚠️⚠️ reused a number after the agent came back from a plain disconnect')
   void a2
+})
+
+// ─── ★★ Moving the free slot (`f=1` / 2026-09-27 / user decision) ───────────────────────────────
+
+test('★★ pairing or "use this machine for free" moves the slot: the previous machine\'s wires close with the reason, the ledger follows', async () => {
+  const phones = new Map<string, PhoneLedger>()
+  const rooms = new Map<string, Room>()
+  const a = rig({ phones, rooms })
+  const agentA = await becomeAgent(a, await generateDeviceKey())
+  const b = rig({ phones, rooms })
+  const agentB = await becomeAgent(b, await generateDeviceKey())
+  const phone = await generateDeviceKey()
+  const dkey = toBase64Url(await exportPublicKey(phone.publicKey))
+  const onA = await freePhone(a, phone)
+  await agentReplies(a, agentA, onA.connId)
+  // Without the flag, B is refused (as before)
+  const plain = await joinDevice(b)
+  await prove(b, plain, phone)
+  assert.equal(plain.socket.closed?.code, CLOSE.freeUsed)
+  // With the flag, B takes the slot: A's wire is told first, then the ledger says B
+  const onB = await freePhone(b, phone, { takeover: true })
+  await agentReplies(b, agentB, onB.connId)
+  assert.equal(onB.socket.tag()?.free, true)
+  assert.deepEqual(onA.socket.closed, { code: CLOSE.freeMoved, reason: REASON.freeMoved }, '⚠️⚠️ the previous machine kept a free wire')
+  assert.deepEqual(Object.keys(phones.get(dkey)?.rooms ?? {}), [agentB.tag()!.key!])
+  // A reconnecting now is refused (the slot is B\'s), and A can take it back the same way
+  const backPlain = await joinDevice(a)
+  await prove(a, backPlain, phone)
+  assert.equal(backPlain.socket.closed?.code, CLOSE.freeUsed)
+  const back = await freePhone(a, phone, { takeover: true })
+  assert.equal(back.socket.tag()?.free, true)
+  assert.equal(onB.socket.closed?.code, CLOSE.freeMoved)
+})
+
+test('★★ moving the slot does not touch wires admitted under a ticket, and a licensed room never takes over', async () => {
+  const phones = new Map<string, PhoneLedger>()
+  const rooms = new Map<string, Room>()
+  const a = rig({ phones, rooms, licenses: { FREE: LIC_FREE } })
+  const agentA = await becomeAgent(a, await generateDeviceKey(), { licensing: true })
+  await sendLicense(a, agentA, 'FREE')
+  const b = rig({ phones, rooms })
+  await becomeAgent(b, await generateDeviceKey())
+  const c = rig({ phones, rooms })
+  const agentC = await becomeAgent(c, await generateDeviceKey())
+  const phone = await generateDeviceKey()
+  const dkey = toBase64Url(await exportPublicKey(phone.publicKey))
+  const onA = await freePhone(a, phone)
+  await agentReplies(a, agentA, onA.connId)
+  const onB = await freePhone(b, phone)
+  // C takes the slot from B; A (licensed) is untouched
+  await freePhone(c, phone, { takeover: true })
+  assert.equal(onB.socket.closed?.code, CLOSE.freeMoved)
+  assert.equal(onA.socket.closed, undefined, '⚠️⚠️ a wire admitted under a ticket was closed by a takeover')
+  // A licensed connect with the flag releases as usual (C keeps the slot)
+  await freePhone(a, phone, { takeover: true })
+  assert.deepEqual(Object.keys(phones.get(dkey)?.rooms ?? {}), [agentC.tag()!.key!], '⚠️ a licensed connect took the slot')
+})
+
+test('★★ a check in flight in the machine the slot moved away from is marked stale and ends refused', async () => {
+  const phones = new Map<string, PhoneLedger>()
+  const rooms = new Map<string, Room>()
+  const gates: (() => void)[] = []
+  let hold = 0
+  const a = rig({ phones, rooms, duringPhoneClaimAsync: (n) => (n === hold ? new Promise<void>((ok) => gates.push(ok)) : Promise.resolve()) })
+  await becomeAgent(a, await generateDeviceKey())
+  const b = rig({ phones, rooms })
+  await becomeAgent(b, await generateDeviceKey())
+  const phone = await generateDeviceKey()
+  // A's claim commits (ledger = A) but its answer is held
+  hold = 1
+  const onA = await joinDevice(a)
+  const proving = prove(a, onA, phone)
+  for (let i = 0; i < 200 && gates.length === 0; i++) await new Promise((ok) => setTimeout(ok, 1))
+  assert.equal(gates.length, 1)
+  // B takes the slot meanwhile ⇒ A's pending wire is marked stale
+  await freePhone(b, phone, { takeover: true })
+  assert.equal(onA.socket.tag()?.dstale, true)
+  gates.shift()!()
+  await proving
+  assert.equal(onA.socket.closed?.code, CLOSE.freeUsed, '⚠️⚠️ a stale answer admitted A after the slot had moved to B')
+})
+
+test('★★ a stale takeover retry is a plain claim: it cannot take the slot back from a newer takeover (codex)', async () => {
+  const phones = new Map<string, PhoneLedger>()
+  const rooms = new Map<string, Room>()
+  const gates: (() => void)[] = []
+  let hold = 0
+  const a = rig({ phones, rooms, duringPhoneClaimAsync: (n) => (n === hold ? new Promise<void>((ok) => gates.push(ok)) : Promise.resolve()) })
+  const agentA = await becomeAgent(a, await generateDeviceKey())
+  const b = rig({ phones, rooms })
+  const agentB = await becomeAgent(b, await generateDeviceKey())
+  const phone = await generateDeviceKey()
+  const dkey = toBase64Url(await exportPublicKey(phone.publicKey))
+  // A's takeover commits (ledger = A) but its answer is held
+  hold = 1
+  const onA = await joinDevice(a, { takeover: true })
+  const proving = prove(a, onA, phone)
+  for (let i = 0; i < 200 && gates.length === 0; i++) await new Promise((ok) => setTimeout(ok, 1))
+  assert.equal(gates.length, 1)
+  // B takes over meanwhile (the user's newer choice)
+  const onB = await freePhone(b, phone, { takeover: true })
+  await agentReplies(b, agentB, onB.connId)
+  gates.shift()!()
+  await proving
+  assert.equal(onA.socket.closed?.code, CLOSE.freeUsed, '⚠️⚠️ the stale retry took the slot back')
+  assert.equal(onB.socket.closed, undefined, '⚠️⚠️ the newer choice was closed')
+  assert.deepEqual(Object.keys(phones.get(dkey)?.rooms ?? {}), [agentB.tag()!.key!])
+  void agentA
+})
+
+test('★★ moving the slot away from a room that got a ticket meanwhile clears the mark but keeps the wire (codex)', async () => {
+  const phones = new Map<string, PhoneLedger>()
+  const rooms = new Map<string, Room>()
+  const a = rig({ phones, rooms, licenses: { FREE: LIC_FREE } })
+  const agentA = await becomeAgent(a, await generateDeviceKey(), { licensing: true })
+  const b = rig({ phones, rooms })
+  await becomeAgent(b, await generateDeviceKey())
+  const phone = await generateDeviceKey()
+  const onA = await freePhone(a, phone)
+  await agentReplies(a, agentA, onA.connId)
+  assert.equal(onA.socket.tag()?.free, true)
+  await sendLicense(a, agentA, 'FREE')
+  await freePhone(b, phone, { takeover: true })
+  assert.equal(onA.socket.closed, undefined, '⚠️⚠️ closed a wire in a room that is licensed now')
+  assert.equal(onA.socket.tag()?.free, undefined, 'the stale free mark remained')
 })

@@ -32,7 +32,12 @@ export const PHONE_ROOMS_MAX = 20
 /** ★ How many machines one phone may use for free (⚠️ from the plan table, never written by hand) */
 export const FREE_MACHINES_PER_PHONE = PLAN_LIMITS.free.maxMachines
 
-export type PhoneClaim = { ok: boolean; ledger: PhoneLedger }
+export type PhoneClaim = {
+  ok: boolean
+  ledger: PhoneLedger
+  /** ★ Rooms this claim took the free slot away from (`takeover`). ⚠️ The DO tells those rooms **before** writing the ledger */
+  moved: string[]
+}
 
 const finite = (t: unknown): t is number => typeof t === 'number' && Number.isFinite(t)
 
@@ -62,27 +67,36 @@ export function prunePhoneLedger(prev: PhoneLedger, now: number): PhoneLedger {
 /**
  * ★ May this phone use this machine (`agentKey`) on the free tier?
  *   - `licensed` (the room has a plan ticket) ⇒ pass, and **release** the room from this ledger (it is counted by the account instead)
+ *   - `takeover` ⇒ the free slot **moves** here: every other room is dropped (returned in `moved`) and this one is claimed
+ *     (★ the user's own act — pairing a machine, or "use this machine for free" — decides which machine is the free one / 2026-09-27)
  *   - already claimed ⇒ pass if within the `max` oldest claims (update the time). Otherwise refuse (time unchanged)
  *   - not claimed with a free slot ⇒ add and pass
  *   - not claimed with all slots full ⇒ refuse (ledger unchanged apart from pruning)
  */
-export function claimRoom(prev: PhoneLedger, agentKey: string, licensed: boolean, now: number, max: number = FREE_MACHINES_PER_PHONE): PhoneClaim {
+export function claimRoom(prev: PhoneLedger, agentKey: string, licensed: boolean, now: number, max: number = FREE_MACHINES_PER_PHONE, takeover = false): PhoneClaim {
   const ledger = prunePhoneLedger(prev, now)
   if (licensed) {
     delete ledger.rooms[agentKey]
-    return { ok: true, ledger }
+    return { ok: true, ledger, moved: [] }
+  }
+  if (takeover) {
+    const moved = Object.keys(ledger.rooms).filter((k) => k !== agentKey)
+    for (const k of moved) delete ledger.rooms[k]
+    const kept = ledger.rooms[agentKey]
+    ledger.rooms[agentKey] = { first: kept?.first ?? now, last: now }
+    return { ok: true, ledger, moved }
   }
   const found = ledger.rooms[agentKey]
   if (found) {
     const rank = Object.entries(ledger.rooms)
       .sort(([ka, a], [kb, b]) => a.first - b.first || (ka < kb ? -1 : 1))
       .findIndex(([k]) => k === agentKey)
-    if (rank >= max) return { ok: false, ledger }
+    if (rank >= max) return { ok: false, ledger, moved: [] }
     ledger.rooms[agentKey] = { first: found.first, last: now }
-    return { ok: true, ledger }
+    return { ok: true, ledger, moved: [] }
   }
   const count = Object.keys(ledger.rooms).length
-  if (count >= max || count >= PHONE_ROOMS_MAX) return { ok: false, ledger }
+  if (count >= max || count >= PHONE_ROOMS_MAX) return { ok: false, ledger, moved: [] }
   ledger.rooms[agentKey] = { first: now, last: now }
-  return { ok: true, ledger }
+  return { ok: true, ledger, moved: [] }
 }

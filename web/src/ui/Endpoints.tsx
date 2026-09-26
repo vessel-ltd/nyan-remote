@@ -43,7 +43,7 @@ function rawEndpoints(): string {
 }
 
 interface Probe {
-  state: 'checking' | 'ok' | 'ng' | 'offline'
+  state: 'checking' | 'ok' | 'ng' | 'offline' | 'free-used'
   detail?: string
   /** Machine name of the agent that responded. Used to absorb label spelling variations */
   machine?: string
@@ -180,9 +180,11 @@ export function Endpoints({
       ...p,
       [e.id]: res.ok
         ? { state: 'ok', machine: res.machine, detail: res.machine }
-        : res.unreachable
-          ? { state: 'offline', detail: res.detail }
-          : { state: 'ng', detail: res.detail },
+        : res.freeSlot
+          ? { state: 'free-used', detail: res.detail }
+          : res.unreachable
+            ? { state: 'offline', detail: res.detail }
+            : { state: 'ng', detail: res.detail },
     }))
   }
 
@@ -345,6 +347,27 @@ export function Endpoints({
                 </button>
                 {open ? (
                   <div class="machinedetail">
+                    {/* ★ The free tier is one machine per phone; this machine can become that one at a tap (2026-09-27 / user decision) */}
+                    {p?.state === 'free-used' ? (
+                      <div class="pushmsg first offlinehelp">
+                        {t(
+                          '無料はスマホ1台につきマシン1台で、この端末の無料枠はいま別のマシンが使っています。このマシンに移すか、複数のマシンを使うなら PC で nyan login（Plus）。',
+                          'The free tier is one machine per phone, and this phone’s free slot is another machine right now. Move it here, or run nyan login on the PC for several machines (Plus).',
+                        )}
+                        <div class="epbtns">
+                          <button
+                            type="button"
+                            disabled={at < 0}
+                            onClick={() => {
+                              transports[at]?.takeoverFreeSlot()
+                              void probe(e)
+                            }}
+                          >
+                            {t('このマシンを無料で使う', 'Use this machine for free')}
+                          </button>
+                        </div>
+                      </div>
+                    ) : null}
                     {/* ★ Offline is usually just an off PC; the checks are for when it should be on (2026-09-26) */}
                     {p?.state === 'offline' ? (
                       <div class="pushmsg first offlinehelp">
