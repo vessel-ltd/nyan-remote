@@ -17,10 +17,10 @@ test('★★ state decision (failure before "registered"; a user stop is not nag
 
 test('★★ the list shows a banner only for states needing action; nothing when healthy', () => {
   const all: PushKind[] = ['unsupported', 'blocked', 'failing', 'off', 'unset', 'partial', 'ok']
-  assert.deepEqual(all.filter(showsBanner), ['blocked', 'failing', 'unset'])
-  assert.equal(showsBanner('unregistered'), true, '⚠️⚠️ no banner although registration failed')
+  assert.deepEqual(all.filter((k) => showsBanner(k, 1)), ['blocked', 'failing', 'unset'])
+  assert.equal(showsBanner('unregistered', 1), true, '⚠️⚠️ no banner although registration failed')
   // ⚠️⚠️ Failure always gets a banner (never folded away)
-  assert.equal(showsBanner('failing'), true)
+  assert.equal(showsBanner('failing', 1), true)
   assert.match(bannerText('failing'), /届いていません/)
 })
 
@@ -40,7 +40,7 @@ test('★★ the list is "list" (banner only on trouble); settings is "settings"
   assert.match(settings, /<PushPanel transports=\{transports\} mode="settings" \/>/)
   // ⚠️⚠️ The banner goes through the decision function (conditions hand-written in the screen could fold failures again)
   const panel = readFileSync(new URL('./PushPanel.tsx', import.meta.url), 'utf8')
-  assert.match(panel, /if \(!showsBanner\(kind\)\) return null/)
+  assert.match(panel, /if \(!showsBanner\(kind, transports\.length\)\) return null/)
 })
 
 test('★★ a registration failure is "failing" even if some registered (keep the banner / codex round 19, medium #3)', () => {
@@ -50,4 +50,9 @@ test('★★ a registration failure is "failing" even if some registered (keep t
   assert.equal(pushKind({ ...base, syncProblem: 'x', failure: { status: 403, at: 'T' } }), 'failing')
   assert.equal(pushBadge('unregistered', 1, 2), '⚠')
   assert.match(bannerText('unregistered'), /登録できませんでした/)
+})
+
+test('★ no banner before the first pairing (nothing to notify from; the first-run guide is showing)', () => {
+  assert.equal(showsBanner('unset', 0), false)
+  assert.equal(showsBanner('unset', 1), true)
 })

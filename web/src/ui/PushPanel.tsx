@@ -394,7 +394,7 @@ export function PushPanel({
 
   // ★★ List: nothing when healthy. A one-line banner only for states needing action
   if (mode === 'list') {
-    if (!showsBanner(kind)) return null
+    if (!showsBanner(kind, transports.length)) return null
     return (
       <div class={kind === 'failing' || kind === 'unregistered' ? 'pushline bad' : 'pushline'}>
         <span class="body">{bannerText(kind)}</span>

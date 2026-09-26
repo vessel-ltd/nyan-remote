@@ -129,7 +129,8 @@ function home(lang) {
 <p>${t('新しい端末で、こちらの relay を使うならログインしてから、スマホを登録します:', 'In a new terminal, sign in if you use our relay, then register your phone:')}</p>
 <pre><code>nyan login
 nyan pair</code></pre>
-<p>${t(`スマホで <a href="${APP}">${APP.replace('https://', '')}</a> を開き、ホーム画面に追加して、QR を読みます。`, `On your phone, open <a href="${APP}">${APP.replace('https://', '')}</a>, add it to your home screen, and scan the QR code.`)}</p>
+<p>${t(`スマホで <a href="${APP}">${APP.replace('https://', '')}</a> を開いてホーム画面に追加し、<strong>ホーム画面から開いてから</strong> QR を読みます。`, `On your phone, open <a href="${APP}">${APP.replace('https://', '')}</a> and add it to your home screen, then <strong>open it from there</strong> and scan the QR code.`)}</p>
+<p class="dim">${t('iPhone ではこの順番が大事です（ホーム画面のアプリは Safari とデータが別なので、Safari のタブでペアリングしても引き継がれません）。ブラウザのまま使うなら、そのままペアリングして構いません。', 'On iPhone the order matters: the Home Screen app keeps its data apart from Safari, so a pairing done in a Safari tab does not carry over. To use it in the browser instead, just pair there.')}</p>
 
 <h2 id="pricing">${t('料金', 'Pricing')}</h2>
 <div class="grid">
@@ -145,6 +146,7 @@ nyan pair</code></pre>
 <li><strong>${t('デスクトップ', 'Desktop')}</strong> ${t('PC 向けの画面。Windows・macOS・Linux にインストールできる形で。', 'A desktop layout, installable on Windows, macOS and Linux.')}</li>
 <li><strong>${t('WSL なしの Windows', 'Windows without WSL')}</strong> ${t('Windows の上で直接 agent を動かす。', 'Run the agent on Windows directly.')}</li>
 <li><strong>Homebrew</strong> ${t('macOS で Homebrew から入れて更新。', 'Install and update with Homebrew on macOS.')}</li>
+<li><strong>${t('音声', 'Voice')}</strong> ${t('セッションに話しかけて、返事を読み上げてもらう（手を使わずに）。', 'Talk to a session and hear its replies read aloud, hands-free.')}</li>
 </ul>
 <p class="dim">${t('nyan-remote は Anthropic の公式製品ではありません。Claude と Claude Code は Anthropic の商標です。', 'nyan-remote is not an official Anthropic product. Claude and Claude Code are trademarks of Anthropic.')}</p>`,
   )

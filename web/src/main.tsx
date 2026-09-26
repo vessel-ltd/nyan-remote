@@ -47,7 +47,8 @@ import { SessionList } from './ui/SessionList.tsx'
 import { Thread } from './ui/Thread.tsx'
 import { UpdateBanner } from './ui/UpdateBanner.tsx'
 import { syncEndpointStates, syncSubscriptions } from './ui/endpointStates.ts'
-import { machineCount, splitTrouble } from './ui/offline.ts'
+import { machineCount, machineCountLabel, splitTrouble } from './ui/offline.ts'
+import { isStandalone, onboarding, platformOf } from './ui/onboarding.ts'
 import { isUnreachable } from './transport/unreachable.ts'
 import './styles.css'
 
@@ -583,6 +584,12 @@ function App() {
   const merged = applyAutoApprove(all.flatMap((s) => combineRows(s)), autoApproveMarks)
   /** ★ **Total** history count. ⚠️ While collapsed `groups.history.length` is 0, so show this instead */
   const historyTotal = all.reduce((n, s) => n + s.historyCount, 0)
+  // ★ First-run guide (no connection yet / `ui/onboarding.ts`). ⚠️ Read the platform once per render (cheap, and no stored state)
+  const guide = onboarding(
+    endpoints.length,
+    platformOf(navigator.userAgent, navigator.maxTouchPoints),
+    isStandalone((q) => window.matchMedia?.(q).matches ?? false, (navigator as { standalone?: boolean }).standalone),
+  )
   // ★ Red only for errors after reaching a machine; an unreachable machine is a quiet line at the bottom (`ui/offline.ts`)
   const { errors, offline } = splitTrouble(all.map((s) => ({ ...s, label: s.machine ?? s.endpoint.label })), now)
 
@@ -832,7 +839,15 @@ function App() {
             <span class="pushbadge"> {pushBadge(pushInfo.kind, pushInfo.registered, pushInfo.total)}</span>
           ) : null}
           {/* ★ Machines reachable / all, always shown (2026-09-26 / user decision). Details on the connections page this opens */}
-          {all.length ? <span class="machinecount"> {machineCount(all.length, offline.length)}</span> : null}
+          {all.length ? (
+            <>
+              <span class="machinecount" aria-hidden="true">
+                {' '}
+                {machineCount(all.length, offline.length)}
+              </span>
+              <span class="srtext">{machineCountLabel(all.length, offline.length)}</span>
+            </>
+          ) : null}
         </button>
       </header>
 
@@ -852,7 +867,51 @@ function App() {
       {loading && merged.length === 0 ? <p class="notice">{t('読み込み中…', 'Loading…')}</p> : null}
 
       {/* ⚠️ While history is collapsed `merged` can be 0 (also look at `historyTotal`) */}
-      {!loading && merged.length === 0 && historyTotal === 0 && errors.length === 0 ? (
+      {/* ★ First run: install the app (phone, browser tab), then pair. Only while there is no connection (`ui/onboarding.ts`) */}
+      {guide ? (
+        <div class="notice onboard">
+          <strong>{t('はじめに', 'Getting started')}</strong>
+          <ol>
+            {guide.install === 'ios' ? (
+              <>
+                <li>{t('共有ボタンを押して「ホーム画面に追加」', 'Tap the Share button, then “Add to Home Screen”.')}</li>
+                <li>{t('ホーム画面の nyan-remote から開き直す', 'Open nyan-remote from your Home Screen.')}</li>
+              </>
+            ) : null}
+            {guide.install === 'android' ? (
+              <>
+                <li>{t('⋮ を押して「アプリをインストール」（または「ホーム画面に追加」）', 'Tap ⋮, then “Install app” (or “Add to Home screen”).')}</li>
+                <li>{t('ホーム画面の nyan-remote から開き直す', 'Open nyan-remote from your home screen.')}</li>
+              </>
+            ) : null}
+            <li>
+              {t('PC で ', 'On your PC, run ')}
+              <code>nyan pair</code>
+              {t('（こちらの relay を使うなら先に ', ' (after ')}
+              <code>nyan login</code>
+              {t('）を打ち、出た QR をここで読む', ' if you use our relay), then scan the QR code here.')}
+            </li>
+          </ol>
+          {guide.install === 'ios' ? (
+            <p class="small">
+              {t(
+                '⚠️ iPhone ではホーム画面から開いてからペアリングしてください（ホーム画面のアプリは Safari とデータが別なので、このタブでのペアリングは引き継がれません）。',
+                '⚠️ On iPhone, pair from the Home Screen app: it keeps its data apart from Safari, so a pairing done in this tab would not carry over.',
+              )}
+            </p>
+          ) : null}
+          {guide.install ? (
+            <p class="small">{t('ブラウザのまま使うなら、インストールせずにこのままペアリングできます。', 'Prefer the browser? Skip the install and pair right here.')}</p>
+          ) : null}
+          <p>
+            <button class="plain" onClick={openSettings}>
+              {t('QR を読む', 'Scan a QR code')}
+            </button>
+          </p>
+        </div>
+      ) : null}
+
+      {!loading && !guide && merged.length === 0 && historyTotal === 0 && errors.length === 0 ? (
         <p class="notice">
           {t('セッションが見つかりません。', 'No sessions found. Check ')}
           <code>~/.claude*/projects</code>

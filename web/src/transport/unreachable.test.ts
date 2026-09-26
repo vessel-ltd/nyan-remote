@@ -35,3 +35,19 @@ test('★★ the connections page probe tells "nothing answered" from "answered 
     globalThis.fetch = real
   }
 })
+
+test('★★ something that answered is never "offline", even with a broken body (codex)', async () => {
+  const real = globalThis.fetch
+  try {
+    globalThis.fetch = async () => new Response('null', { status: 200, headers: { 'content-type': 'application/json' } })
+    const p = await probeUrl('https://pc-a.example.ts.net')
+    assert.equal(p.ok, false)
+    assert.equal(p.unreachable, undefined, '/health answering null reached the machine')
+    globalThis.fetch = async () => new Response('{not json', { status: 200 })
+    await assert.rejects(httpWire('https://pc-a.example.ts.net').request({ method: 'GET', path: '/health' }).then((r) => {
+      if (r.body === undefined) throw new Error('unreadable body')
+    }), (e) => !isUnreachable(e))
+  } finally {
+    globalThis.fetch = real
+  }
+})

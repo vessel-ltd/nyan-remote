@@ -53,6 +53,9 @@ nyan login     # our hosted relay (the default) requires it — GitHub sign-in
 nyan pair      # shows a QR code; scan it with https://app.nyan-remote.app on your phone
 ```
 
+On iPhone, add the app to the Home Screen first and scan from the Home Screen app: it keeps its data apart
+from Safari, so a pairing done in a Safari tab does not carry over. (The app shows these steps on first launch.)
+
 Everyday commands (`nyan help` lists them all):
 
 | | |
@@ -245,6 +248,7 @@ Measured on the author's setup (3 machines, a full working day): the Durable Obj
 - **Desktop** — a desktop layout, installable on Windows, macOS and Linux.
 - **Windows without WSL** — run the agent on Windows directly.
 - **Homebrew** — install and update with Homebrew on macOS.
+- **Voice** — talk to a session and hear its replies read aloud, hands-free.
 
 ---
 

@@ -1,3 +1,5 @@
+import { t } from '../../../shared/i18n.ts'
+
 // ★ Which machine problems the list shows, and how (2026-09-26 / user decision).
 //
 // ★ A machine that cannot be reached at all (off, asleep, WSL not started) is a **state, not an error**:
@@ -33,4 +35,10 @@ export function splitTrouble<T extends TroubleInput>(states: readonly T[], now: 
  */
 export function machineCount(total: number, offline: number): string {
   return `🖥 ${Math.max(0, total - offline)}/${total}`
+}
+
+/** ★ What a screen reader says for the count (the emoji fraction alone does not say what it counts / codex) */
+export function machineCountLabel(total: number, offline: number): string {
+  const up = Math.max(0, total - offline)
+  return t(`${total}台中 ${up}台に接続`, `${up} of ${total} machines reachable`)
 }

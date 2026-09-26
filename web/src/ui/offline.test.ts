@@ -1,7 +1,8 @@
 // ★ Which machine problems the list shows, and how (`ui/offline.ts`).
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { machineCount, OFFLINE_GRACE_MS, splitTrouble } from './offline.ts'
+import { machineCount, machineCountLabel, OFFLINE_GRACE_MS, splitTrouble } from './offline.ts'
+import { setLang } from '../../../shared/i18n.ts'
 
 const now = 1_000_000
 
@@ -33,4 +34,9 @@ test('★ the Settings button count: reachable / all, always shown', () => {
   assert.equal(machineCount(5, 2), '🖥 3/5')
   assert.equal(machineCount(1, 0), '🖥 1/1')
   assert.equal(machineCount(1, 1), '🖥 0/1')
+})
+
+test('★ screen readers hear what the fraction counts (codex)', () => {
+  setLang('en')
+  assert.equal(machineCountLabel(2, 1), '1 of 2 machines reachable')
 })

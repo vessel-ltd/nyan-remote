@@ -38,22 +38,28 @@ export async function probeUrl(url: string): Promise<ProbeResult> {
   const ctrl = new AbortController()
   const timer = setTimeout(() => ctrl.abort(), PROBE_TIMEOUT_MS)
   try {
-    const res = await fetch(`${url}/health`, {
-      signal: ctrl.signal,
-      headers: { accept: 'application/json' },
-      credentials: 'omit',
-    })
+    let res: Response
+    try {
+      res = await fetch(`${url}/health`, {
+        signal: ctrl.signal,
+        headers: { accept: 'application/json' },
+        credentials: 'omit',
+      })
+    } catch (err) {
+      // ★ Only `fetch` itself failing = nothing answered (off / asleep). ⚠️ A body that stalls or does not parse came from something
+      //   that answered, so it stays an error below (codex: `/health` returning `null` was shown as offline)
+      return { ok: false, detail: err instanceof Error ? err.message : String(err), unreachable: true }
+    }
     if (!res.ok) return { ok: false, detail: `HTTP ${res.status}` }
-    const body = (await res.json()) as { machine?: string; accounts?: unknown[] }
+    const body = (await res.json()) as { machine?: string; accounts?: unknown[] } | null
+    if (!body || typeof body !== 'object') return { ok: false, detail: t('応答の形が違います', 'Unexpected response') }
     return {
       ok: true,
       machine: typeof body.machine === 'string' ? body.machine : undefined,
       accounts: Array.isArray(body.accounts) ? body.accounts.length : undefined,
     }
   } catch (err) {
-    // ★ A network error or our timeout = nothing answered (an HTTP error status above = something answered)
-    const unreachable = err instanceof TypeError || (err instanceof DOMException && err.name === 'AbortError')
-    return { ok: false, detail: err instanceof Error ? err.message : String(err), ...(unreachable ? { unreachable } : {}) }
+    return { ok: false, detail: err instanceof Error ? err.message : String(err) }
   } finally {
     clearTimeout(timer)
   }
@@ -103,24 +109,25 @@ export function httpWire(baseUrl: string, now: () => number = Date.now): Wire {
       const ctrl = new AbortController()
       const timer = setTimeout(() => ctrl.abort(), TIMEOUT_MS)
       try {
-        const res = await fetch(`${baseUrl}${r.path}`, {
-          method: r.method,
-          signal: ctrl.signal,
-          credentials: 'omit',
-          headers:
-            r.method === 'POST'
-              ? { 'content-type': 'application/json', accept: 'application/json' }
-              : { accept: 'application/json' },
-          ...(r.body === undefined ? {} : { body: JSON.stringify(r.body) }),
-        })
-        return { status: res.status, body: await readBody(res) }
-      } catch (err) {
-        // ★ No response at all (network error, or our timeout: on WSL a dead port hangs instead of refusing) = the machine is
-        //   unreachable, shown as "offline" rather than as an error (`unreachable.ts`)
-        if (err instanceof TypeError || (err instanceof DOMException && err.name === 'AbortError')) {
+        let res: Response
+        try {
+          res = await fetch(`${baseUrl}${r.path}`, {
+            method: r.method,
+            signal: ctrl.signal,
+            credentials: 'omit',
+            headers:
+              r.method === 'POST'
+                ? { 'content-type': 'application/json', accept: 'application/json' }
+                : { accept: 'application/json' },
+            ...(r.body === undefined ? {} : { body: JSON.stringify(r.body) }),
+          })
+        } catch {
+          // ★ No response at all (network error, or our timeout: on WSL a dead port hangs instead of refusing) = the machine is
+          //   unreachable, shown as "offline" rather than as an error (`unreachable.ts`).
+          //   ⚠️ Only `fetch` itself: once headers arrived, something answered (a stalled or broken body stays an error / codex)
           throw new UnreachableError(t('繋がりません', 'Cannot reach it'))
         }
-        throw err
+        return { status: res.status, body: await readBody(res) }
       } finally {
         clearTimeout(timer)
       }

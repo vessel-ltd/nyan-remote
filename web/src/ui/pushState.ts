@@ -49,7 +49,13 @@ export function pushKind(s: {
 }
 
 /** ★ Whether to show a banner in the list (⚠️ only states that need action) */
-export function showsBanner(kind: PushKind): boolean {
+/**
+ * ★ Whether the list shows the one-line banner.
+ * ⚠️ Nothing before the first pairing (`machines` 0): there is nothing to notify from yet, and the first-run guide is on screen
+ *    (2026-09-26 / `ui/onboarding.ts`).
+ */
+export function showsBanner(kind: PushKind, machines: number): boolean {
+  if (machines === 0) return false
   return kind === 'blocked' || kind === 'failing' || kind === 'unregistered' || kind === 'unset'
 }
 

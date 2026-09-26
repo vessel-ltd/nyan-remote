@@ -559,11 +559,36 @@ a.row:active {
   color: var(--fg);
 }
 
+/* ★ First-run guide (only while there is no connection / `ui/onboarding.ts`) */
+.notice.onboard {
+  color: var(--fg);
+}
+.notice.onboard ol {
+  margin: 8px 0;
+  padding-left: 1.3em;
+}
+.notice.onboard li {
+  margin: 4px 0;
+}
+.notice.onboard .small {
+  color: var(--dim);
+  font-size: 0.8rem;
+}
+
 /* ★ "🖥 reachable/all" on the Settings button (always shown; unreachable machines are a state, not an error) */
 .machinecount {
   color: var(--dim);
   font-size: 0.85em;
   font-variant-numeric: tabular-nums;
+}
+/* ★ Text only screen readers get (visually hidden, still part of the accessible name) */
+.srtext {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
 }
 .offlinehelp ul {
   margin: 6px 0 0;
