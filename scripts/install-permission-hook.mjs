@@ -210,8 +210,10 @@ const NOTIFY_PATH = join(home, '.claude', 'hooks', 'notify.sh')
  * ★ Which events to forward.
  * ⚠️ `Stop` does not mean "done" but **the turn ended** (SETUP.md §1 / 2026-08-16).
  * ⚠️ Do not drop `StopFailure` (directly addresses "stopped with an error and nobody noticed").
+ * ★ `SessionEnd` (2026-09-26): the agent turns that session's auto-approve off. Without it, a session ended with /exit kept its
+ *   auto-approve entry until expiry, and the phone kept showing it (never a notification: not in the agent's PUSH_EVENTS).
  */
-const NOTIFY_EVENTS = ['Stop', 'StopFailure', 'Notification']
+const NOTIFY_EVENTS = ['Stop', 'StopFailure', 'Notification', 'SessionEnd']
 
 function notifyHookEntry() {
   return { matcher: '', hooks: [{ type: 'command', command: NOTIFY_COMMAND }] }

@@ -8,6 +8,7 @@
 // Each machine pushes only its own events, so duplicates structurally cannot occur (§6.3).
 
 import { currentLang, localizeNotificationBody, t } from '../../../shared/i18n.ts'
+import { autoApproveFor, setAutoApprove } from '../autoApprove.ts'
 
 /**
  * ★ Status words for the log (`完了` done / `要対応（…）` needs attention). ⚠️ Decisions, dedup and storage use **the original Japanese**; translate only right before output
@@ -462,6 +463,18 @@ export async function hook(ctx: Ctx): Promise<{ ok: true; pushed: number }> {
   if (event.event === 'Stop' || event.event === 'StopFailure') {
     const n = abandonSession(sessionId)
     if (n > 0) console.log(t(`[perm] ターン終了で ${n} 件の承認待ちを片付けた`, `[perm] Cleared ${n} pending approvals at end of turn`))
+  }
+  // ★ The session ended (/exit etc.) ⇒ turn its auto-approve off (2026-09-26 / user report).
+  //   ⚠️ Without this the entry lived until its expiry (3 or 24 hours), and the phone kept a row for the ended session
+  //      (`applyAutoApprove` shows every live entry, on purpose: hiding marks by the index is forbidden / CLAUDE.md §2).
+  //   ★ Turning off is the safe direction. A later `--resume` of the same session starts without auto-approve.
+  if (event.event === 'SessionEnd' && sessionId && autoApproveFor(sessionId)) {
+    const r = await setAutoApprove(sessionId, false)
+    console.log(
+      r.ok
+        ? t(`[auto] セッション終了で自動承認を切った（${sessionId.slice(0, 8)}）`, `[auto] Session ended; auto-approve turned off (${sessionId.slice(0, 8)})`)
+        : t(`[auto] セッション終了で自動承認を切れなかった（${sessionId.slice(0, 8)}）: ${r.reason}`, `[auto] Session ended, but auto-approve could not be turned off (${sessionId.slice(0, 8)}): ${r.reason}`),
+    )
   }
   await appendJsonl('hooks.jsonl', event)
   broadcast({ type: 'hook', hook: event })

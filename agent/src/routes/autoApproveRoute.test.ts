@@ -25,12 +25,13 @@ import { Readable } from 'node:stream'
 import { fileURLToPath } from 'node:url'
 import { test } from 'node:test'
 import type { SessionSummary } from '../../../shared/types.ts'
-import { resetAutoApprove, setAutoApprove } from '../autoApprove.ts'
+import { autoApproveFor, resetAutoApprove, setAutoApprove } from '../autoApprove.ts'
 import { hooksFor, noteHook } from '../claude/hookState.ts'
 import { listPending, resetPending } from '../permission.ts'
 import { HttpError, type Ctx } from '../router.ts'
 import { sessionAutoApprove } from './autoApprove.ts'
 import { permissionRequest } from './permission.ts'
+import { hook } from './hook.ts'
 import { markAutoApprove } from './sessions.ts'
 
 const SESSION = '960cbcc3-0c6e-435d-b024-1867c146dfa8'
@@ -295,3 +296,14 @@ function row(over: Partial<SessionSummary>): SessionSummary {
     ...over,
   }
 }
+
+test('★★ SessionEnd (/exit) turns that session\'s auto-approve off; a turn\'s Stop does not (2026-09-26 / user report)', async (t) => {
+  await withState(t)
+  assert.equal((await setAutoApprove(SESSION, true)).ok, true)
+  // ⚠️ A turn ending is not the session ending: auto-approve must survive Stop
+  await hook(hookCtx({ hook_event_name: 'Stop', transcript_path: TRANSCRIPT, cwd: '/home/x/proj' }).ctx)
+  assert.ok(autoApproveFor(SESSION), '⚠️⚠️ a turn\'s end switched auto-approve off')
+  // ★ The session ended ⇒ off (otherwise the phone kept a row for the ended session until expiry)
+  await hook(hookCtx({ hook_event_name: 'SessionEnd', transcript_path: TRANSCRIPT, cwd: '/home/x/proj', reason: 'prompt_input_exit' }).ctx)
+  assert.equal(autoApproveFor(SESSION), undefined, '⚠️⚠️ auto-approve survived the session\'s end')
+})

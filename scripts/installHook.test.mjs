@@ -62,7 +62,7 @@ test('★★ wires Stop / StopFailure / Notification when notify.sh exists', (t)
   run(home)
   // ⚠️⚠️ Without this **not a single notification is sent** (hit for real on 2026-09-21)
   const hooks = hooksOf(home)
-  for (const ev of ['Stop', 'StopFailure', 'Notification']) {
+  for (const ev of ['Stop', 'StopFailure', 'Notification', 'SessionEnd']) {
     assert.deepEqual(
       commandsOf(hooks, ev),
       ['"$HOME/.claude/hooks/notify.sh"'],
@@ -77,7 +77,7 @@ test('★★ does not wire when notify.sh is missing (fail-closed) + says so', (
   run(home)
   // ⚠️ A hook pointing at something missing fails silently on every turn (and invisibly)
   const hooks = hooksOf(home)
-  for (const ev of ['Stop', 'StopFailure', 'Notification']) {
+  for (const ev of ['Stop', 'StopFailure', 'Notification', 'SessionEnd']) {
     assert.deepEqual(commandsOf(hooks, ev), [], `⚠️⚠️ wired ${ev} although notify.sh is not installed`)
   }
   // ★ Approvals are still installed (no notifications is no reason to drop everything)

@@ -248,11 +248,14 @@ function App() {
   //   (2026-09-16 / to move to Y). ⚠️⚠️ It used to list one unconditionally, so
   //   **a "❌ no response" row always appeared on the public origin** (= looks broken / discipline 1 violation).
   //   ⚠️ The decision is the single `shouldOfferSelf` (fail-closed: not added while unknown).
+  // ★ Whether the own-origin check has finished (the first-run guide waits for it, or it flashes on an agent-served origin / codex)
+  const [selfProbed, setSelfProbed] = useState(endpoints.length > 0)
   useEffect(() => {
-    if (endpoints.length > 0) return
+    if (endpoints.length > 0) return setSelfProbed(true)
     void (async () => {
       // ⚠️ Only `endpoints.ts` knows our own origin's URL (discipline 1 / discipline.test.ts)
       const probe = await probeUrl(selfCandidate().url)
+      setSelfProbed(true)
       // ⚠️ It may have been added from a QR while waiting, so **look again right before adding**
       setEndpoints((prev) => {
         if (!shouldOfferSelf(prev, probe)) return prev
@@ -585,7 +588,7 @@ function App() {
   /** ★ **Total** history count. ⚠️ While collapsed `groups.history.length` is 0, so show this instead */
   const historyTotal = all.reduce((n, s) => n + s.historyCount, 0)
   // ★ First-run guide (no connection yet / `ui/onboarding.ts`). ⚠️ Read the platform once per render (cheap, and no stored state)
-  const guide = onboarding(
+  const guide = !selfProbed ? undefined : onboarding(
     endpoints.length,
     platformOf(navigator.userAgent, navigator.maxTouchPoints),
     isStandalone((q) => window.matchMedia?.(q).matches ?? false, (navigator as { standalone?: boolean }).standalone),
@@ -880,7 +883,9 @@ function App() {
             ) : null}
             {guide.install === 'android' ? (
               <>
-                <li>{t('⋮ を押して「アプリをインストール」（または「ホーム画面に追加」）', 'Tap ⋮, then “Install app” (or “Add to Home screen”).')}</li>
+                <li>
+                  {t('Chrome なら ⋮ →「アプリをインストール」。ほかのブラウザでは、メニューの「ホーム画面に追加」', 'In Chrome, tap ⋮ → “Install app”. In other browsers, look for “Add to Home screen” in the menu.')}
+                </li>
                 <li>{t('ホーム画面の nyan-remote から開き直す', 'Open nyan-remote from your home screen.')}</li>
               </>
             ) : null}

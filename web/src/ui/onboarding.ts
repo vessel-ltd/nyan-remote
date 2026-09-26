@@ -1,7 +1,9 @@
 // ★ First-run guide: install the app, then pair (2026-09-26 / user decision).
 //
-// ★ Shown only while this phone has **no connection yet** (after the first pairing it never shows again, so people who prefer
-//   the browser are not nagged), and the install step only when opened in a **browser tab** (not from the home screen).
+// ★ Shown only while this phone has **no connection** (after pairing it does not show again unless every connection is removed,
+//   so people who prefer the browser are not nagged), and the install step only when opened in a **browser tab**.
+// ★ It also waits for the own-origin check (an agent-served origin adds itself a moment later / `selfProbed` in main.tsx).
+// ★ iOS 17.2+ copies cookies when installing, but not localStorage / IndexedDB (connections and the device key) / codex, WebKit blog.
 // ★★ Why the order matters on iPhone: an app added to the home screen keeps its data apart from Safari's tab, so pairing in the
 //   tab first and installing afterwards leaves the installed app with no connection and no device key (pair again).
 //   ⇒ iPhone: add to the home screen first, open it from there, then scan. (⚠️ Verify on a real iPhone when iOS changes.)
