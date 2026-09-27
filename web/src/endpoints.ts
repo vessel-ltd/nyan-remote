@@ -23,9 +23,8 @@ export interface AgentEndpoint {
    */
   relay?: { url: string; agentPublicKey: string }
   /**
-   * ★ The route to use now (§14.1.1). ⚠️ `local` if absent.
-   *
-   * ⚠️⚠️ **Even if it says `relay`, fall back to `local` when the material is missing** (`endpointRoute`).
+   * ⚠️ **Not read any more** (2026-09-27): the route follows the material (`endpointRoute`). Still written, so an older cached
+   *   app shell reading the same localStorage routes the same way.
    */
   kind?: 'local' | 'relay'
 }
@@ -33,11 +32,15 @@ export interface AgentEndpoint {
 /**
  * ★ **Which route to use for this endpoint**. **The decision lives only here**.
  *
- * ⚠️⚠️ fail-closed: even with `kind: 'relay'`, `local` if the material (entrance and public key) is missing
- *    (= don't pick an unreachable route and "die silently").
+ * ★★ 2026-09-27 (user decision): **relay if the machine has a relay, otherwise Tailscale** — no switch in the app.
+ *   ⚠️⚠️ The switch ("Switch to Tailscale") cut every machine it was pressed on in the public app: the local route talks HTTP to
+ *      `https://<pc>.ts.net`, and the agent refuses origins it was not told to allow (CLAUDE.md §4.5). It only ever worked when the
+ *      app was served by that PC itself. ⇒ Which route a machine uses is **the PC's setting** (`relayUrl` → the QR's `r`):
+ *      our relay or your own relay ⇒ relay; `"relayUrl": ""` (Tailscale only) ⇒ no relay in the QR ⇒ local.
+ *   ⚠️ A re-pairing over local **drops** a relay learned earlier (`upsertEndpoint`), so turning the relay off is followed.
  */
 export function endpointRoute(e: AgentEndpoint): 'local' | 'relay' {
-  return e.kind === 'relay' && e.relay !== undefined ? 'relay' : 'local'
+  return e.relay !== undefined ? 'relay' : 'local'
 }
 
 /**
@@ -52,33 +55,6 @@ export function endpointRoute(e: AgentEndpoint): 'local' | 'relay' {
  */
 export function hasRoute(e: AgentEndpoint, kind: 'local' | 'relay'): boolean {
   return kind === 'relay' ? e.relay !== undefined : e.url !== ''
-}
-
-/**
- * ★ Whether the route can be switched = **only when the material for both is present**.
- *
- * ⚠️ With only one, switching is meaningless (`endpointRoute` would just fall back to that route).
- */
-export function canSwitchRoute(e: AgentEndpoint): boolean {
-  return hasRoute(e, 'local') && hasRoute(e, 'relay')
-}
-
-/**
- * ★★ **Switch the route. ⚠️⚠️ Never switch to a route without material** (2026-09-21).
- *
- * ★ Why "not showing it on screen" isn't enough: that's **a convention, not an invariant**
- *   (CLAUDE.md / "please call it the moment you grab it" is a convention, not an invariant).
- *   Indeed, a mutation reverting the `.tsx` condition from `canSwitchRoute(e)` to `e.relay`
- *   **couldn't be killed by tests** (`.tsx` has no behavioral tests).
- *   ⇒ **There's one place that can break the state**, so refuse there. Pressing does **nothing** (no dead rows).
- * ⚠️ Don't silently switch to another route (don't reinterpret the user's choice = return as-is).
- */
-export function setRouteIn(
-  list: readonly AgentEndpoint[],
-  id: string,
-  kind: 'local' | 'relay',
-): readonly AgentEndpoint[] {
-  return list.map((e) => (e.id === id && hasRoute(e, kind) ? { ...e, kind } : e))
 }
 
 /**
@@ -109,8 +85,9 @@ export function upsertEndpoint(
   // ⚠️ Don't add what can't be named (empty URL and no relay material = no way to connect)
   if (!id) return undefined
   const at = list.findIndex((x) => x.id === id || (e.url !== '' && x.url === e.url))
-  // ★★ A registration confirmed over local also **switches an existing relay endpoint back to local** (2026-09-25 / codex):
-  //   after turning a PC's relay off for Tailscale, re-scanning its QR used to keep `kind: 'relay'` ⇒ it kept dialling the dead relay.
+  // ★★ A registration confirmed over local **drops a relay learned earlier** (2026-09-25 / 2026-09-27): the QR had no `r`, i.e.
+  //   the PC turned its relay off for Tailscale; keeping the old entrance would keep dialling the dead relay (the route follows the material).
+  const dropRelay = e.kind === 'local' && !e.relay
   const route = e.kind === 'relay' && e.relay ? ({ kind: 'relay' } as const) : e.kind === 'local' ? ({ kind: 'local' } as const) : {}
   if (at < 0) {
     return [...list, { id, url: e.url, label: e.label, ...(e.relay ? { relay: e.relay } : {}), ...route }]
@@ -121,7 +98,8 @@ export function upsertEndpoint(
   //   ⚠️ **`label` isn't overwritten** (don't clobber a name the user gave).
   //   ⚠️ `undefined` if nothing changes (= don't save again).
   const cur = list[at]!
-  const next: AgentEndpoint = { ...cur, ...(e.relay ? { relay: e.relay } : {}), ...route }
+  const { relay: _learned, ...withoutRelay } = cur
+  const next: AgentEndpoint = { ...(dropRelay ? withoutRelay : cur), ...(e.relay ? { relay: e.relay } : {}), ...route }
   const same =
     cur.kind === next.kind &&
     cur.relay?.url === next.relay?.url &&
@@ -179,7 +157,12 @@ export function mergeRoute(
     const relayChanged = now.relay?.url !== before.relay?.url || now.relay?.agentPublicKey !== before.relay?.agentPublicKey
     const kindChanged = now.kind !== before.kind
     if (!relayChanged && !kindChanged) return e
-    let out: AgentEndpoint = relayChanged && now.relay ? { ...e, relay: now.relay } : e
+    let out: AgentEndpoint = e
+    if (relayChanged) {
+      // ★ Removal is carried too (a re-pairing over local dropped the relay = the route is local now / 2026-09-27)
+      const { relay: _old, ...rest } = e
+      out = now.relay ? { ...rest, relay: now.relay } : rest
+    }
     if (kindChanged) {
       const { kind: _drop, ...rest } = out
       out = now.kind === undefined ? rest : { ...rest, kind: now.kind }
@@ -325,9 +308,17 @@ export function loadEndpoints(): AgentEndpoint[] {
   return []
 }
 
+/**
+ * ★ What is written: `kind` always matches the route this version uses (2026-09-27 / codex): an older cached app shell still reads
+ *   `kind`, and a row saved as `local` with relay material would send it back to the local route (the CORS failure) there.
+ */
+export function storedEndpoints(list: readonly AgentEndpoint[]): AgentEndpoint[] {
+  return list.map((e) => ({ ...e, kind: endpointRoute(e) }))
+}
+
 export function saveEndpoints(list: AgentEndpoint[]): void {
   try {
-    localStorage.setItem(KEY, JSON.stringify(list))
+    localStorage.setItem(KEY, JSON.stringify(storedEndpoints(list)))
   } catch {
     // Not fatal if it fails in private mode etc.
   }

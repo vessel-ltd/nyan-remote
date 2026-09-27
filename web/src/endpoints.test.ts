@@ -16,8 +16,8 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import {
   mergeAdded,
-  upsertEndpoint, canSwitchRoute, endpointRoute, hasRoute, loadEndpoints, mergeRoute,
-  saveEndpoints, selfCandidate, setRouteIn, shouldOfferManualUrl, shouldOfferSelf,
+  upsertEndpoint, endpointRoute, hasRoute, loadEndpoints, mergeRoute,
+  saveEndpoints, selfCandidate, shouldOfferManualUrl, shouldOfferSelf, storedEndpoints,
   type AgentEndpoint
 } from './endpoints.ts'
 import { staleTwins } from './endpoints.ts'
@@ -101,7 +101,7 @@ test('★★ saves the registered route as-is (㉙ no guessing from `url`)', () 
   assert.equal(got?.[0]?.kind, 'relay', '⚠️⚠️ the registered route is not saved')
   assert.equal(endpointRoute(got![0]!), 'relay')
 
-  // ★ Registered via local stays local (⚠️ don't change it on our own even with relay material)
+  // ★ Registered via local (no relay in the QR) stays local
   const local = upsertEndpoint([], { url: 'https://pc-b.example.ts.net', label: 'pc-b' })
   assert.equal(local?.[0]?.kind, undefined)
   assert.equal(endpointRoute(local![0]!), 'local')
@@ -214,73 +214,20 @@ test('★★ shown when there\'s an agent on our own origin (X = needed by self-
   assert.equal(shouldOfferManualUrl({ ok: true }), true)
 })
 
-// ★★ **The route-material check is needed on both the `relay` and `local` sides** (2026-09-21 / found in real use).
-//   ⚠️⚠️ `endpointRoute` was fail-closed only on the relay side with no equivalent check on the `local` side, so
-//      even for **relay-only peers** (machines without Tailscale = empty `url`) the screen
-//      offered "switch route to local", and pressing it produced **a dead row connecting to an empty URL**.
-test('★★ a route without material can\'t be chosen (⚠️ fail-closed on the local side)', () => {
-  const relayOnly: AgentEndpoint = {
-    id: 'k',
-    url: '', // ★ a peer whose QR had no `u` (a machine not using Tailscale)
-    label: 'pc-c',
-    relay: { url: 'wss://relay.example.com', agentPublicKey: 'A' },
-    kind: 'relay',
-  }
-  assert.equal(hasRoute(relayOnly, 'relay'), true)
-  assert.equal(hasRoute(relayOnly, 'local'), false, '⚠️⚠️ accepts an empty URL as local material')
-  assert.equal(canSwitchRoute(relayOnly), false, '⚠️⚠️ allows switching to an unreachable route')
-
-  const localOnly: AgentEndpoint = { id: 'u', url: 'https://x.ts.net', label: 'x' }
-  assert.equal(hasRoute(localOnly, 'local'), true)
-  assert.equal(hasRoute(localOnly, 'relay'), false)
-  assert.equal(canSwitchRoute(localOnly), false, '⚠️ offers switching without relay material')
-
-  const both: AgentEndpoint = { ...relayOnly, url: 'https://x.ts.net' }
-  assert.equal(canSwitchRoute(both), true, '⚠️ can\'t switch even though both are present')
-})
-
-// ★ `endpointRoute` and `hasRoute` look at **the same material** (⚠️ kills mutations fixing only one)
-test('★★ the chosen route always has material (correspondence between endpointRoute and hasRoute)', () => {
-  const cases: AgentEndpoint[] = [
-    { id: '1', url: '', label: 'a', relay: { url: 'wss://r', agentPublicKey: 'A' }, kind: 'relay' },
-    { id: '2', url: 'https://a', label: 'b', kind: 'local' },
-    { id: '3', url: 'https://a', label: 'c', relay: { url: 'wss://r', agentPublicKey: 'A' }, kind: 'relay' },
-    // ⚠️ Says `relay` without material (`endpointRoute` falls back to local)
-    { id: '4', url: 'https://a', label: 'd', kind: 'relay' },
+// ★★ The route follows the material (2026-09-27 / user decision: no switch in the app)
+test('★★ relay if the machine has a relay, otherwise Tailscale; `kind` is not read (the switch cut machines in the public app)', () => {
+  const relay = { url: 'wss://relay.example.com', agentPublicKey: 'A' }
+  const cases: [AgentEndpoint, 'local' | 'relay'][] = [
+    [{ id: '1', url: '', label: 'a', relay, kind: 'relay' }, 'relay'],
+    [{ id: '2', url: 'https://a', label: 'b', kind: 'local' }, 'local'],
+    // ⚠️⚠️ Switched to Tailscale with the old button: back on the relay (that is what connects from the public app)
+    [{ id: '3', url: 'https://a', label: 'c', relay, kind: 'local' }, 'relay'],
+    [{ id: '4', url: 'https://a', label: 'd', kind: 'relay' }, 'local'],
   ]
-  for (const e of cases) {
+  for (const [e, want] of cases) {
+    assert.equal(endpointRoute(e), want, e.id)
     assert.equal(hasRoute(e, endpointRoute(e)), true, `⚠️⚠️ a route without material was chosen: ${e.id}`)
   }
-})
-
-// ★★ **Put the guard where the state changes, not in the display** (2026-09-21).
-//   ⚠️⚠️ A mutation reverting the `.tsx` condition couldn't be killed (`.tsx` has no behavioral tests), so
-//      **pressing it can't break anything**. ⇒ Even if the button shows, it doesn't become a dead row.
-test('★★ doesn\'t switch to a route without material (pressing can\'t break it)', () => {
-  const relayOnly: AgentEndpoint = {
-    id: 'k',
-    url: '',
-    label: 'pc-c',
-    relay: { url: 'wss://relay.example.com', agentPublicKey: 'A' },
-    kind: 'relay',
-  }
-  const only = (l: readonly AgentEndpoint[]): AgentEndpoint => {
-    const first = l[0]
-    assert.ok(first, '⚠️ the row disappeared')
-    return first
-  }
-  assert.equal(only(setRouteIn([relayOnly], 'k', 'local')).kind, 'relay', '⚠️⚠️ a peer with an empty URL became local (dead row)')
-  assert.equal(endpointRoute(only(setRouteIn([relayOnly], 'k', 'local'))), 'relay')
-
-  // ★ With material it switches normally (⚠️ kills a do-nothing mutation)
-  const both: AgentEndpoint = { ...relayOnly, url: 'https://x.ts.net' }
-  assert.equal(only(setRouteIn([both], 'k', 'local')).kind, 'local', '⚠️ can\'t switch')
-  assert.equal(only(setRouteIn([both], 'k', 'relay')).kind, 'relay')
-
-  // ⚠️ Don't touch other rows
-  const other: AgentEndpoint = { id: 'z', url: 'https://z', label: 'z', kind: 'local' }
-  const list = setRouteIn([both, other], 'k', 'local')
-  assert.equal(list[1], other, '⚠️ rebuilt a row that was not specified')
 })
 
 test('★★ mergeAdded: adds endpoints newly added to the parent; doesn\'t bring back unlinked ones (codex round 15, medium #4)', () => {
@@ -333,6 +280,7 @@ test('★★ a local registration switches an existing relay endpoint back to lo
   const next = upsertEndpoint(list, { url: 'https://pc-b.example.ts.net', label: 'pc-b', kind: 'local' })
   assert.ok(next)
   assert.equal(endpointRoute(next[0]!), 'local', '⚠️⚠️ kept dialling the relay that was turned off')
+  assert.equal(next[0]!.relay, undefined, '⚠️⚠️ the old relay entrance was kept (the route follows the material)')
   assert.equal(next[0]!.label, 'mine', '★ the name the user gave stays')
   // ★ Without a route, an existing endpoint keeps its route (as before)
   assert.equal(upsertEndpoint(list, { url: 'https://pc-b.example.ts.net', label: 'pc-b' }), undefined)
@@ -342,11 +290,14 @@ test('★★ the open screen takes route changes made by pairing, and nothing el
   const relay = { url: 'wss://relay.example', agentPublicKey: 'K' }
   const a = { id: 'a', url: 'https://a.example.ts.net', label: 'A', relay, kind: 'relay' as const }
   const b = { id: 'b', url: 'https://b.example.ts.net', label: 'B', relay, kind: 'relay' as const }
-  // Pairing switched A to local in the parent; the user switched B to local on this screen
-  const editing = [a, { ...b, kind: 'local' as const }]
-  const got = mergeRoute(editing, [a, b], [{ ...a, kind: 'local' }, b])
+  // Pairing over local switched A to local in the parent (and dropped its relay)
+  const { relay: _r, ...aLocal } = a
+  const editing = [a, b]
+  const got = mergeRoute(editing, [a, b], [{ ...aLocal, kind: 'local' }, b])
   assert.equal(got[0]!.kind, 'local', '⚠️⚠️ Save would restore the dead relay')
-  assert.equal(got[1]!.kind, 'local', '★ the user\'s own switch is kept')
+  assert.equal(got[0]!.relay, undefined, '⚠️⚠️ Save would restore the dropped relay entrance')
+  assert.equal(endpointRoute(got[0]!), 'local')
+  assert.equal(got[1], b, 'untouched rows stay as they are')
   // ★ Back to the default (no kind) is carried too
   const { kind: _k, ...plain } = a
   assert.equal(mergeRoute([a], [a], [plain])[0]!.kind, undefined)
@@ -367,4 +318,14 @@ test('★★ a new relay entry point from pairing survives Save on the open scre
   assert.equal(got[0]!.kind, 'relay')
   // ★ Unchanged in the parent ⇒ the edited row stays as it is
   assert.equal(mergeRoute([a], [a], [a])[0], a)
+})
+
+test('★★ saved rows carry the route this version uses in `kind` (an older cached shell still reads it / codex 2026-09-27)', () => {
+  const relay = { url: 'wss://relay.example', agentPublicKey: 'K' }
+  const got = storedEndpoints([
+    { id: 'a', url: 'https://a', label: 'A', relay, kind: 'local' },
+    { id: 'b', url: 'https://b', label: 'B', kind: 'relay' },
+    { id: 'c', url: '', label: 'C', relay },
+  ])
+  assert.deepEqual(got.map((e) => e.kind), ['relay', 'local', 'relay'], '⚠️⚠️ an old shell would route these differently')
 })

@@ -3,22 +3,19 @@ import { ACCOUNT_ORIGIN } from '../../../shared/distribution.ts'
 import { planRows } from './plan.ts'
 import type { PeerCandidate } from '../../../shared/types.ts'
 import {
-  canSwitchRoute,
-  endpointRoute,
   loadEndpoints,
   mergeAdded,
   mergeRelay,
   mergeRoute,
   saveEndpoints,
   selfCandidate,
-  setRouteIn,
   shouldOfferManualUrl,
   staleTwins,
   type AgentEndpoint,
 } from '../endpoints.ts'
 import { reloadAtList } from '../route.ts'
 import { probeEndpoint, probeUrl, type Transport } from '../transport/index.ts'
-import { machineSummary, openAddByDefault, transportIndex } from './connections.ts'
+import { machineSummary, routeHint, openAddByDefault, transportIndex } from './connections.ts'
 import { t } from '../../../shared/i18n.ts'
 import { chooseLang, savedLangChoice, type LangChoice } from '../lang.ts'
 import { asThemeChoice, chooseTheme, savedThemeChoice } from '../theme.ts'
@@ -211,18 +208,6 @@ export function Endpoints({
     void probe(added)
   }
 
-  /**
-   * ★ Switch the route (③ stage 6, step ④).
-   *
-   * ⚠️ The input (relay entry point) is learned during pairing = **it cannot be added here**
-   *    (the QR is an out-of-band authenticated channel; never let the entry point be typed in the UI).
-   */
-  const setRoute = (id: string, kind: 'local' | 'relay') => {
-    // ⚠️⚠️ **The decision lives inside `setRouteIn`** (never switches to a route without inputs / fail-closed).
-    //    Do not add an `if (…)` here = the guard would exist in two places.
-    setList([...setRouteIn(list, id, kind)])
-    setDirty(true)
-  }
 
   /**
    * ★★ Unlink a connection (2026-09-21).
@@ -398,19 +383,9 @@ export function Endpoints({
                         Tailscale: <code>{e.url}</code>
                       </div>
                     ) : null}
+                    {/* ★ The route is the PC's setting, not a switch here (2026-09-27 / endpoints.ts) */}
+                    <div class="pushmsg small dim">{routeHint()}</div>
                     <div class="pushrow">
-                      {/* ⚠️⚠️ **Only when both inputs are present** (fail-closed / `canSwitchRoute`).
-                          ⚠️ Do not write the condition back here (decided in one place in `endpoints.ts`). */}
-                      {canSwitchRoute(e) ? (
-                        <button
-                          class="plain"
-                          onClick={() => setRoute(e.id, endpointRoute(e) === 'relay' ? 'local' : 'relay')}
-                        >
-                          {endpointRoute(e) === 'relay'
-                            ? t('Tailscale に切り替え', 'Switch to Tailscale')
-                            : t('relay に切り替え', 'Switch to relay')}
-                        </button>
-                      ) : null}
                       {/* ★★ **Even the last one can be removed** (2026-09-19). ⚠️⚠️ **Pressable even when the other side is down**
                           (which is why the "disconnect" entry point was consolidated **here only** / 2026-09-21). */}
                       {confirmUnlink === e.id ? (

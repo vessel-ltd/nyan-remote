@@ -8,6 +8,7 @@
 
 import { endpointRoute, type AgentEndpoint } from '../endpoints.ts'
 import { t } from '../../../shared/i18n.ts'
+import { isOurRelay } from '../../../shared/distribution.ts'
 
 export interface ProbeView {
   /**
@@ -19,9 +20,28 @@ export interface ProbeView {
   detail?: string
 }
 
-/** ★ Route name (⚠️ routes shown to users are "Tailscale / relay". `local` is the name of the mechanism / CLAUDE.md §1) */
+/**
+ * ★ Route name. ⚠️ The three routes shown to users (CLAUDE.md §1): **our relay / your own relay / Tailscale** (`local` is the name of
+ *   the mechanism, never shown). Our relay vs. yours is told by the entrance (`isOurRelay`); yours shows its host.
+ */
 export function routeName(e: AgentEndpoint): string {
-  return endpointRoute(e) === 'relay' ? t('relay 経由', 'via relay') : t('Tailscale 経由', 'via Tailscale')
+  if (endpointRoute(e) !== 'relay' || !e.relay) return t('Tailscale 経由', 'via Tailscale')
+  if (isOurRelay(e.relay.url)) return t('こちらの relay', 'our relay')
+  let host = e.relay.url
+  try {
+    host = new URL(e.relay.url).host
+  } catch {
+    // ⚠️ Shown as saved (the shape was checked when it was learned)
+  }
+  return t(`自分の relay（${host}）`, `your relay (${host})`)
+}
+
+/** ★ How the route is chosen (one line in the machine details / 2026-09-27: no switch in the app) */
+export function routeHint(): string {
+  return t(
+    '経路は PC の設定で決まります（relay があれば relay、無ければ Tailscale）。変えるときは PC の ~/.nyan-remote/config.json の relayUrl を変えて、QR を読み直します（README の「Hosting the relay」）。',
+    'The route is the PC’s setting (its relay if it has one, otherwise Tailscale). To change it, edit relayUrl in ~/.nyan-remote/config.json on the PC and scan its QR code again (see “Hosting the relay” in the README).',
+  )
 }
 
 /**

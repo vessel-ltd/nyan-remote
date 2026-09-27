@@ -12,15 +12,18 @@ const relayEp: AgentEndpoint = {
 }
 const localEp: AgentEndpoint = { id: 'https://b.ts.net', url: 'https://b.ts.net', label: 'B' }
 
-test('★★★ route names are relay / Tailscale (⚠️ never shown as local)', () => {
-  assert.equal(routeName(relayEp), 'relay 経由')
+test('★★★ route names are our relay / your relay (host) / Tailscale (⚠️ never shown as local / 2026-09-27)', () => {
+  assert.equal(routeName(relayEp), '自分の relay（relay.example）')
+  assert.equal(routeName({ ...relayEp, relay: { url: 'wss://relay.nyan-remote.app', agentPublicKey: 'K' } }), 'こちらの relay')
   assert.equal(routeName(localEp), 'Tailscale 経由')
+  // ★ The route follows the material, not `kind` (no switch any more)
+  assert.equal(routeName({ ...relayEp, kind: 'local' }), '自分の relay（relay.example）')
 })
 
 test('★★★ line 2 is "route · state" (checking while unknown = never reads as healthy)', () => {
-  assert.deepEqual(machineSummary(relayEp, undefined), { text: 'relay 経由 ・ 確認中…', tone: 'wait' })
-  assert.deepEqual(machineSummary(relayEp, { state: 'ok' }), { text: 'relay 経由 ・ 応答あり', tone: 'ok' })
-  assert.deepEqual(machineSummary(relayEp, { state: 'free-used' }), { text: 'relay 経由 ・ 無料枠は別のマシン', tone: 'off' })
+  assert.deepEqual(machineSummary(relayEp, undefined), { text: '自分の relay（relay.example） ・ 確認中…', tone: 'wait' })
+  assert.deepEqual(machineSummary(relayEp, { state: 'ok' }), { text: '自分の relay（relay.example） ・ 応答あり', tone: 'ok' })
+  assert.deepEqual(machineSummary(relayEp, { state: 'free-used' }), { text: '自分の relay（relay.example） ・ 無料枠は別のマシン', tone: 'off' })
   assert.deepEqual(machineSummary(localEp, { state: 'ng', detail: '時間切れ' }), {
     text: 'Tailscale 経由 ・ 応答なし（時間切れ）',
     tone: 'ng',

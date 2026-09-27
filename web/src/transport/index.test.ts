@@ -47,8 +47,9 @@ test('★★ returns the same one for the same endpoint (① no piling up of lin
 test('★★ rebuilds when the route changes and **closes the old line** (②)', () => {
   resetTransports()
   const m = maker()
+  // ★ The route changes when relay material arrives (2026-09-27: the route follows the material)
+  createTransports([endpoint()], m.make)
   createTransports([endpoint({ relay: RELAY })], m.make)
-  createTransports([endpoint({ relay: RELAY, kind: 'relay' })], m.make)
   assert.equal(m.built.length, 2, 'not rebuilt')
   assert.deepEqual(m.built.map((b) => b.route), ['local', 'relay'])
   assert.deepEqual(m.closed, ['e1'], '⚠️⚠️ old line not closed')
@@ -73,11 +74,11 @@ test('★★ `relay` without material falls back to `local` (④ fail-closed)', 
   resetTransports()
 })
 
-test('★★ `endpointRoute` looks at both the material and `kind`', () => {
+test('★★ `endpointRoute` follows the material (2026-09-27: relay if present, `kind` not read)', () => {
   assert.equal(endpointRoute(endpoint()), 'local')
-  assert.equal(endpointRoute(endpoint({ relay: RELAY })), 'local', 'merely remembering doesn\'t switch')
+  assert.equal(endpointRoute(endpoint({ relay: RELAY })), 'relay')
   assert.equal(endpointRoute(endpoint({ kind: 'relay' })), 'local', 'local without material')
-  assert.equal(endpointRoute(endpoint({ relay: RELAY, kind: 'relay' })), 'relay')
+  assert.equal(endpointRoute(endpoint({ relay: RELAY, kind: 'local' })), 'relay', 'the old switch no longer cuts the machine')
 })
 
 test('★★ mixes relay info learned later into the list being edited (without deleting / codex round 4, medium #9)', () => {
@@ -148,21 +149,21 @@ test('★★ local endpoints hit the URL as before', async () => {
   assert.notEqual(res.machine, 'だめ')
 })
 
-test('★★ the route is decided by "the held line" (not by a merely edited `kind` / P4)', async () => {
-  // ⚠️⚠️ Switched to `relay` on screen but **not saved yet**.
+test('★★ the route is decided by "the held line" (not by a merely edited endpoint / P4)', async () => {
+  // ⚠️⚠️ The row on screen has relay material that is **not saved yet** (learned by pairing while the screen was open).
   //    The line actually in use is local, so the check is local too.
   const inUse = [
-    { endpoint: endpoint({ relay: RELAY }), health: async () => ({ machine: '線を使った' }) },
+    { endpoint: endpoint(), health: async () => ({ machine: '線を使った' }) },
   ] as unknown as Transport[]
-  const editing = await probeEndpoint(endpoint({ relay: RELAY, kind: 'relay' }), inUse)
+  const editing = await probeEndpoint(endpoint({ relay: RELAY }), inUse)
   assert.equal(editing.ok, false, '⚠️ used the line for an unsaved edit')
   assert.notEqual(editing.machine, '線を使った')
 
-  // ★ Same rule in reverse (switched back to `local` but unsaved = still running on the relay line)
+  // ★ Same rule in reverse (the relay was dropped on screen but unsaved = still running on the relay line)
   const stillRelay = [
-    { endpoint: endpoint({ relay: RELAY, kind: 'relay' }), health: async () => ({ machine: 'relay' }) },
+    { endpoint: endpoint({ relay: RELAY }), health: async () => ({ machine: 'relay' }) },
   ] as unknown as Transport[]
-  assert.deepEqual(await probeEndpoint(endpoint({ relay: RELAY }), stillRelay), {
+  assert.deepEqual(await probeEndpoint(endpoint(), stillRelay), {
     ok: true,
     machine: 'relay',
   })
