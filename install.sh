@@ -344,7 +344,7 @@ if [ -z "$SERVICE" ]; then
 else
   printf '%s\n' "$(tr2 '★ スマホを登録するには（新しいシェルで）: nyan pair' '★ To register a phone (in a new shell): nyan pair')"
 fi
-printf '%s\n' "$(tr2 '   （アカウントは要りません。こちらの relay で複数の PC を使うなら Plus: nyan login）' '   (No account needed. For several PCs on our relay, Plus: nyan login)')"
+printf '%s\n' "$(tr2 '   （アカウントは要りません。nyan-remote relay で複数の PC を使うなら Plus: nyan login）' '   (No account needed. For several PCs on the nyan-remote relay, Plus: nyan login)')"
 printf '%s\n' "$(tr2 "   （nyan が使えないときは: cd ${HOME_DIR} && npm run pair）" "   (if nyan is not available: cd ${HOME_DIR} && npm run pair)")"
 printf '%s\n' "$(tr2 '★ 更新は: nyan update ／ 様子は: nyan status' '★ To update: nyan update / status: nyan status')"
 # ⚠️ mac uses zsh (`install-relay.mjs` also detects zsh and writes `.zshrc`), so

@@ -144,14 +144,14 @@ export function helpDetail() {
 `,
     ),
     login: t(
-      `nyan login — Plus のためにログインする（こちらの relay でマシンを増やす）
+      `nyan login — Plus のためにログインする（nyan-remote relay でマシンを増やす）
 
   GitHub でログインし、このマシンをアカウントに登録します（ブラウザでコードを入れます）。
   無料（アカウント不要）: スマホ1台につきマシン1台・マシン1台につきスマホ2台。
   Plus（$2.99/月・$24/年）: マシン5台・スマホ5台。
   ⚠️ Tailscale や自分の relay で使うなら要りません。
 `,
-      `nyan login — sign in for Plus (more machines on our relay)
+      `nyan login — sign in for Plus (more machines on the nyan-remote relay)
 
   Signs in with GitHub and registers this machine to your account (you enter a code in the browser).
   Free (no account): one machine per phone, 2 phones per machine.

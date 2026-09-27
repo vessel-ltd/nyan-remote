@@ -15,7 +15,7 @@ import {
 } from '../endpoints.ts'
 import { reloadAtList } from '../route.ts'
 import { probeEndpoint, probeUrl, type Transport } from '../transport/index.ts'
-import { machineSummary, routeHint, openAddByDefault, transportIndex } from './connections.ts'
+import { machineSummary, routeHint, routeParts, openAddByDefault, transportIndex } from './connections.ts'
 import { t } from '../../../shared/i18n.ts'
 import { chooseLang, savedLangChoice, type LangChoice } from '../lang.ts'
 import { asThemeChoice, chooseTheme, savedThemeChoice } from '../theme.ts'
@@ -373,17 +373,17 @@ export function Endpoints({
                         </ul>
                       </div>
                     ) : null}
-                    {e.relay ? (
-                      <div class="pushmsg first">
-                        relay: <code>{e.relay.url}</code>
-                      </div>
-                    ) : null}
-                    {e.url ? (
-                      <div class="pushmsg">
-                        Tailscale: <code>{e.url}</code>
-                      </div>
-                    ) : null}
-                    {/* ★ The route is the PC's setting, not a switch here (2026-09-27 / endpoints.ts) */}
+                    {/* ★ Only the route in use (two addresses read as "both are used" / 2026-09-27). The route is the PC's setting */}
+                    <div class="pushmsg first">
+                      {t('経路: ', 'Route: ')}
+                      {routeParts(e).name}
+                      {routeParts(e).address ? (
+                        <>
+                          {' '}
+                          <code>{routeParts(e).address}</code>
+                        </>
+                      ) : null}
+                    </div>
                     <div class="pushmsg small dim">{routeHint()}</div>
                     <div class="pushrow">
                       {/* ★★ **Even the last one can be removed** (2026-09-19). ⚠️⚠️ **Pressable even when the other side is down**

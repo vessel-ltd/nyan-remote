@@ -20,27 +20,41 @@ export interface ProbeView {
   detail?: string
 }
 
+/** ★ The product's name for our hosted relay (the same in both languages / 2026-09-27: "our relay" read as the operator talking) */
+export const HOSTED_RELAY_NAME = 'nyan-remote relay'
+
 /**
- * ★ Route name. ⚠️ The three routes shown to users (CLAUDE.md §1): **our relay / your own relay / Tailscale** (`local` is the name of
- *   the mechanism, never shown). Our relay vs. yours is told by the entrance (`isOurRelay`); yours shows its host.
+ * ★ The route in use: its name and its address (2026-09-27). ⚠️ The three routes shown to users (CLAUDE.md §1):
+ *   **nyan-remote relay / your own relay / Tailscale** (`local` is the name of the mechanism, never shown).
+ *   Ours vs. yours is told by the entrance (`isOurRelay`).
+ * ⚠️ Only the route in use: a Tailscale URL remembered next to a relay is not shown (two addresses read as "both are used").
  */
+export function routeParts(e: AgentEndpoint): { name: string; address: string } {
+  if (endpointRoute(e) === 'relay' && e.relay) {
+    return { name: isOurRelay(e.relay.url) ? HOSTED_RELAY_NAME : t('自分の relay', 'your relay'), address: e.relay.url }
+  }
+  return { name: 'Tailscale', address: e.url }
+}
+
+/** ★ Route name for line 2 of a machine (your relay shows its host, since there can be several) */
 export function routeName(e: AgentEndpoint): string {
-  if (endpointRoute(e) !== 'relay' || !e.relay) return t('Tailscale 経由', 'via Tailscale')
-  if (isOurRelay(e.relay.url)) return t('こちらの relay', 'our relay')
-  let host = e.relay.url
+  const { name, address } = routeParts(e)
+  if (endpointRoute(e) !== 'relay') return t('Tailscale 経由', 'via Tailscale')
+  if (name === HOSTED_RELAY_NAME) return name
+  let host = address
   try {
-    host = new URL(e.relay.url).host
+    host = new URL(address).host
   } catch {
     // ⚠️ Shown as saved (the shape was checked when it was learned)
   }
   return t(`自分の relay（${host}）`, `your relay (${host})`)
 }
 
-/** ★ How the route is chosen (one line in the machine details / 2026-09-27: no switch in the app) */
+/** ★ How the route is chosen (one short line under it / 2026-09-27: no switch in the app) */
 export function routeHint(): string {
   return t(
-    '経路は PC の設定で決まります（relay があれば relay、無ければ Tailscale）。変えるときは PC の ~/.nyan-remote/config.json の relayUrl を変えて、QR を読み直します（README の「Hosting the relay」）。',
-    'The route is the PC’s setting (its relay if it has one, otherwise Tailscale). To change it, edit relayUrl in ~/.nyan-remote/config.json on the PC and scan its QR code again (see “Hosting the relay” in the README).',
+    '経路を変えるときは、PC の relayUrl を変えて QR を読み直します（README「Hosting the relay」）',
+    'To change the route, change relayUrl on the PC and scan its QR code again (README: “Hosting the relay”)',
   )
 }
 
