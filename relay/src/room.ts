@@ -194,6 +194,13 @@ export interface Tag {
   /** ★ agent: a proof is being verified on this wire (⚠️ one per wire / codex 2026-09-27, round 4) */
   proving?: boolean
   /**
+   * ★★ agent: tickets are numbered **on arrival** (`ticketSeq`), and the number whose outcome is on the tag now is `ticketApplied`
+   *   (2026-09-27 / codex). ⚠️ An older ticket's answer arriving after a newer one's never replaces it (a slow Free renewal used to
+   *   overwrite a completed Plus upgrade and close the Plus phones).
+   */
+  ticketSeq?: number
+  ticketApplied?: number
+  /**
    * ★★ An old wire that was replaced (2026-09-15 / codex round 4, medium #3).
    *
    * ⚠️⚠️ Without it, **the late-arriving disconnect of the old agent** would also cut the phones
@@ -274,11 +281,11 @@ export interface RoomIo {
   /**
    * ★★ May this phone use this room? (`phoneLedger.ts` / 2026-09-27). ⚠️ Never throws
    * @param dkey the phone's public key (⚠️ only after its proof passed)
-   * @param licensed the room has a plan ticket right now (⇒ the ledger releases the room instead of counting it)
+   * @param licensed the room has a **Plus** ticket right now (`#paid` ⇒ the ledger releases the room instead of counting it)
    * @param takeover the phone asked to move its free slot here (⇒ the ledger drops its other rooms and tells them first)
    * @returns `unavailable` when the ledger cannot be reached (⚠️ refuses a free-tier phone = fail-closed; a licensed room carries on)
    */
-  claimPhone(dkey: string, agentKey: string, licensed: boolean, takeover: boolean): Promise<PhoneClaimResult>
+  claimPhone(dkey: string, agentKey: string, licensed: boolean, takeover: boolean, connId: number): Promise<PhoneClaimResult>
   /**
    * ★★ **Someone else's relay** (`SELF_HOSTED=1` in `wrangler.selfhost.jsonc` / 2026-09-25): no plans at all.
    *   Tickets are never asked for (so no agent, old or new, sends one) and every room takes `MAX_DEVICES` phones.
@@ -379,10 +386,16 @@ export class Room {
     return swept
   }
 
-  /** ★ The room has a valid plan ticket right now (⚠️ an expired one counts as absent) */
-  #licensed(): boolean {
+  /**
+   * ★★ The room is **outside the phones' free tier** right now: it has a valid **Plus** ticket (2026-09-27 / user report).
+   *   ⚠️⚠️ Not "any ticket": a signed-in **Free** machine must count against the phone's free slot too, or one GitHub sign-in gave a
+   *      second free machine (A signed in on Free = the account's one machine, B not signed in = the phone's free slot).
+   *   ⇒ A Free ticket still sets the room's phone limit (`#deviceLimit`) and the account's machine count (`ledger.ts`), and the
+   *     phone's one free machine is counted as if the room had no ticket.
+   */
+  #paid(): boolean {
     const lic = this.#agent()?.tag()?.lic
-    return lic !== undefined && lic.exp > this.#io.now()
+    return lic !== undefined && lic.exp > this.#io.now() && lic.plan === 'plus'
   }
 
   /**
@@ -418,7 +431,7 @@ export class Room {
     let admitted = this.#devices()
       .filter((d) => d.tag.until === undefined || d.tag.admitted === true)
       .sort((a, b) => a.connId - b.connId)
-    if (!this.#io.selfHosted() && !this.#licensed()) {
+    if (!this.#io.selfHosted() && !this.#paid()) {
       for (const d of admitted.filter((d) => d.tag.free !== true)) this.#evict(d, REASON.planChanged, CLOSE.planChanged)
       admitted = admitted.filter((d) => d.tag.free === true)
     }
@@ -538,7 +551,7 @@ export class Room {
       return connId
     }
     if (!proving) {
-      if (!this.#licensed()) {
+      if (!this.#paid()) {
         this.#evict({ socket, tag: base }, REASON.updateApp, CLOSE.updateApp)
         return connId
       }
@@ -559,9 +572,27 @@ export class Room {
    *   Wires of that phone holding this room as their free slot are closed with the reason (the app shows it and offers to move it
    *   back); a check in flight is marked stale (it asks again and gets refused). ⚠️ Wires admitted under a ticket are not touched.
    */
+  /**
+   * ★★ The Phones DO is about to drop this room from phone `dkey`'s ledger because a wire of it connected here under Plus
+   *   (called **before** the ledger is written / 2026-09-27 / codex): the phone's other wires here stop holding this room as their
+   *   free slot now, not when the releasing wire's answer comes back (in that window the phone could claim another room on the
+   *   free tier while these kept carrying). ⚠️ Marks only; `#enforce` closes them if this room is not Plus by the next message.
+   */
+  phoneFreeReleased(dkey: string, releasingConnId: number): void {
+    for (const d of this.#devices()) {
+      if (d.tag.dkey !== dkey || d.connId === releasingConnId) continue
+      // ★ A check still waiting for its answer is marked stale too (its "may pass" predates the release / codex): it asks again
+      if (d.tag.dpending !== undefined) d.socket.setTag({ ...d.tag, dstale: true })
+      else if (d.tag.free === true) {
+        const { free: _gone, ...kept } = d.tag
+        d.socket.setTag(kept)
+      }
+    }
+  }
+
   phoneFreeMoved(dkey: string): void {
     // ⚠️ A room that got a ticket after the wire was admitted keeps that wire (it is licensed now); only the stale mark goes
-    const licensed = this.#licensed()
+    const licensed = this.#paid()
     for (const d of this.#devices()) {
       if (d.tag.dkey !== dkey) continue
       if (d.tag.dpending !== undefined) d.socket.setTag({ ...d.tag, dstale: true })
@@ -671,7 +702,7 @@ export class Room {
     //   the ticket arrives or goes, or another wire of this phone releases this room. ⇒ If the world changed, ask **once more**
     //   under the current state (a stale answer must neither grant a slot the ledger no longer holds nor refuse a room that is
     //   licensed now). If it changed again, close the wire so the phone reconnects (fail-closed).
-    let licensed = this.#licensed()
+    let licensed = this.#paid()
     let claimed: PhoneClaimResult = 'unavailable'
     for (let attempt = 0; ; attempt++) {
       const agentKey = this.#agent()?.tag()?.key
@@ -681,14 +712,16 @@ export class Room {
         this.#evict({ socket, tag: before }, REASON.noAgent, CLOSE.noAgent)
         return
       }
-      claimed = await this.#io.claimPhone(dkey, agentKey, licensed, take && attempt === 0)
+      claimed = await this.#io.claimPhone(dkey, agentKey, licensed, take && attempt === 0, now0ConnId(before))
       // ★★ A licensed request is a release. It may have reached the ledger **even when the answer was lost** (`unavailable`), so
       //   **whatever became of this wire or its answer**, no other wire of this phone in this room holds the room as its free slot
       //   any more (its `free` was a cache of the ledger; a check in flight is redone / codex rounds 2-3)
       if (licensed) this.#releasedHere(dkey, socket)
       const now = socket.tag()
       if (!now || now.evicted === true || now.dpending === undefined) return
-      const changed = this.#licensed() !== licensed || now.dstale === true
+      // ⚠️ `dstale` only matters to a free claim: a Plus answer does not depend on the free slot, so a room still Plus accepts it
+      //    (three wires of one phone connecting at once used to mark each other stale until two closed with 4009 / codex)
+      const changed = this.#paid() !== licensed || (now.dstale === true && !licensed)
       if (!changed) break
       if (attempt >= 1) {
         this.#evict({ socket, tag: now }, REASON.planChanged, CLOSE.planChanged)
@@ -696,7 +729,7 @@ export class Room {
       }
       const { dstale: _seen, ...fresh } = now
       socket.setTag(fresh)
-      licensed = this.#licensed()
+      licensed = this.#paid()
     }
     const after = socket.tag()
     if (!after || after.evicted === true || after.dpending === undefined) return
@@ -840,32 +873,31 @@ export class Room {
    * ⚠️ If it fails, **remove it from the tag** (do not keep running on the previous ticket). ⚠️ The reason goes back to the agent (`nyan account` and the UI show it).
    */
   async #onLicense(socket: RoomSocket, payload: Uint8Array): Promise<void> {
+    // ★★ Number this ticket **before the first await** (a later ticket gets a higher number whatever order the answers come in)
+    const tag0 = socket.tag()
+    if (!tag0 || !isLiveAgent(tag0)) return
+    const gen = (tag0.ticketSeq ?? 0) + 1
+    socket.setTag({ ...tag0, ticketSeq: gen })
+    /** ⚠️ A newer ticket's outcome is already on the tag ⇒ this answer must not replace it (nor be reported) */
+    const superseded = (t: Tag) => (t.ticketApplied ?? 0) > gen
     const token = new TextDecoder().decode(payload)
     const r = await this.#io.verifyLicense(token)
     const tagNow = socket.tag()
     if (!tagNow || !isLiveAgent(tagNow)) return
     const { lic: _drop, ...without } = tagNow
-    if (!r.ok) {
-      socket.setTag(without)
-      this.#licenseResult(socket, r.reason === 'expired' ? 'expired' : 'invalid')
-      this.#enforce()
-      return
+    const refuse = (status: LicenseStatus, enforce = true): void => {
+      if (superseded(tagNow)) return
+      socket.setTag({ ...without, ticketApplied: gen })
+      this.#licenseResult(socket, status)
+      if (enforce) this.#enforce()
     }
+    if (!r.ok) return refuse(r.reason === 'expired' ? 'expired' : 'invalid')
     const l = r.license
     // ⚠️⚠️ Only tickets addressed to **this machine's key** (do not let another machine's ticket be reused / codex round 26, high #3)
-    if (!tagNow.key || l.key !== tagNow.key) {
-      socket.setTag(without)
-      this.#licenseResult(socket, 'invalid')
-      this.#enforce()
-      return
-    }
+    if (!tagNow.key || l.key !== tagNow.key) return refuse('invalid')
     // ★ Marks for in-flight checks (⚠️ the count is only what the agent sends = the key owner. A cap just in case)
     const claiming = tagNow.claiming ?? []
-    if (claiming.length >= MAX_CLAIMS_IN_FLIGHT) {
-      socket.setTag(without)
-      this.#licenseResult(socket, 'invalid')
-      return
-    }
+    if (claiming.length >= MAX_CLAIMS_IN_FLIGHT) return refuse('invalid', false)
     const seq = (tagNow.claimSeq ?? 0) + 1
     const mark = `${seq}|${l.acct} ${l.mid}`
     // ★★ Keep the current ticket while the ledger answers (2026-09-27 / codex): dropping it here made the room look unlicensed
@@ -881,20 +913,25 @@ export class Room {
     const left = (c ?? []).filter((m) => m !== mark)
     const leftRevoked = (cr ?? []).filter((m) => m !== mark && left.includes(m))
     const base: Tag = { ...rest, ...(left.length ? { claiming: left } : {}), ...(leftRevoked.length ? { claimRevoked: leftRevoked } : {}) }
+    // ⚠️⚠️ A newer ticket's outcome is on the tag ⇒ only our marks are cleared; the current ticket stays (codex 2026-09-27)
+    if (superseded(tagAfter)) {
+      socket.setTag({ ...base, ...(tagAfter.lic ? { lic: tagAfter.lic } : {}) })
+      return
+    }
     // ⚠️ Removed while waiting (`revokeLicense`) ⇒ the returning "may pass" is stale
     if (revokedDuring) {
-      socket.setTag(base)
+      socket.setTag({ ...base, ticketApplied: gen })
       this.#licenseResult(socket, 'revoked')
       this.#enforce()
       return
     }
     if (claimed !== 'ok') {
-      socket.setTag(base)
+      socket.setTag({ ...base, ticketApplied: gen })
       this.#licenseResult(socket, claimed)
       this.#enforce()
       return
     }
-    socket.setTag({ ...base, lic: { acct: l.acct, mid: l.mid, plan: l.plan, maxDevices: l.maxDevices, exp: l.exp * 1000 } })
+    socket.setTag({ ...base, ticketApplied: gen, lic: { acct: l.acct, mid: l.mid, plan: l.plan, maxDevices: l.maxDevices, exp: l.exp * 1000 } })
     this.#licenseResult(socket, 'ok')
     // ★ If the ticket lowers the limit (Plus → Free), close the excess wires here
     this.#enforce()
@@ -939,7 +976,7 @@ export class Room {
       }
       // ★ A room without a ticket admits only phones holding it as their free slot (the ticket may have gone between the
       //   phone's check and the agent's reply; `#enforce` only looks at admitted wires, so it is checked here too / 2026-09-27)
-      if (!this.#io.selfHosted() && !this.#licensed() && target.tag.free !== true) {
+      if (!this.#io.selfHosted() && !this.#paid() && target.tag.free !== true) {
         this.#evict(target, REASON.planChanged, CLOSE.planChanged)
         return
       }
@@ -999,6 +1036,11 @@ export class Room {
       for (const d of this.#devices()) this.#evict(d, REASON.agentGone, CLOSE.agentGone)
     }
   }
+}
+
+/** ⚠️ The connection number of a phone wire (always set by `startDevice` before any await) */
+function now0ConnId(tag: Tag): number {
+  return tag.connId ?? 0
 }
 
 function isLiveAgent(tag: Tag | null | undefined): boolean {

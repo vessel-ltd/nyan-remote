@@ -121,14 +121,15 @@ function rig(
       await o.duringClaimAsync?.()
       return r.ok ? 'ok' : (r.reason ?? 'machine-limit')
     },
-    claimPhone: async (dkey, agentKey, licensed, takeover) => {
+    claimPhone: async (dkey, agentKey, licensed, takeover, connId) => {
       o.duringPhoneClaim?.()
       if (typeof o.phoneLedgerDown === 'function' ? o.phoneLedgerDown() : o.phoneLedgerDown) return 'unavailable'
       rooms.set(agentKey, room)
       // ★ The ledger commits at once (a Durable Object does), the **answer** may travel slowly (the hook holds it)
       const r = claimRoom(phones.get(dkey) ?? { rooms: {} }, agentKey, licensed, now, undefined, takeover)
-      // ★ Same order as the Phones DO: the rooms left are told **before** the ledger is written
+      // ★ Same order as the Phones DO: the rooms left (and a room released by a Plus connect) are told **before** the ledger is written
       for (const left of r.moved) rooms.get(left)?.phoneFreeMoved(dkey)
+      if (r.released) room.phoneFreeReleased(dkey, connId)
       phones.set(dkey, r.ledger)
       phoneCalls += 1
       await o.duringPhoneClaimAsync?.(phoneCalls)
@@ -623,6 +624,8 @@ const LIC_FREE: LicenseCheck = {
 }
 const PLUS = { v: 3, acct: 'acct_plus_01', key: '', mid: 'm_plus0001', plan: 'plus', maxMachines: 5, maxDevices: 5, iat: 1, exp: 4_000_000_000 } as const
 const LIC_PLUS: LicenseCheck = { ok: true, license: PLUS }
+/** ★ A Plus ticket with LIC_FREE's account and number (tests of "a paid room" that also release it / 2026-09-27: only Plus is outside the phones' free tier) */
+const LIC_PAID: LicenseCheck = { ok: true, license: { ...(LIC_FREE.ok ? LIC_FREE.license : PLUS), plan: 'plus', maxMachines: 5, maxDevices: 5 } }
 
 /** Ticket replies (their text) that reached the agent, oldest first */
 function licenseResults(agent: Fake): string[] {
@@ -753,7 +756,7 @@ test('★★ one machine per phone on the free tier: the second machine is refus
   // ★ A reconnect to A keeps working (the slot is A's)
   await freePhone(a, phone)
   // ★ A signs in later ⇒ connecting to it releases the slot ⇒ C is now allowed
-  const aLic = rig({ phones, licenses: { FREE: LIC_FREE } })
+  const aLic = rig({ phones, licenses: { FREE: LIC_PAID } })
   const agentA2 = await becomeAgent(aLic, await generateDeviceKey(), { licensing: true })
   await sendLicense(aLic, agentA2, 'FREE')
   await freePhone(aLic, phone)
@@ -795,7 +798,7 @@ test('★★ an old app (no key proof) is closed with "update the app" in a room
   assert.deepEqual(old.socket.closed, { code: CLOSE.updateApp, reason: REASON.updateApp }, '⚠️⚠️ an app without the proof got into a free room')
   assert.deepEqual(openedIds(agent), [])
   // A room with a ticket: as before (no challenge, opened right away)
-  const lic = rig({ licenses: { FREE: LIC_FREE } })
+  const lic = rig({ licenses: { FREE: LIC_PAID } })
   const la = await becomeAgent(lic, await generateDeviceKey(), { licensing: true })
   await sendLicense(lic, la, 'FREE')
   const onLic = await joinDevice(lic, { old: true })
@@ -816,7 +819,7 @@ test('★★ a phone that proved its key is still refused when the free-tier led
   const d = await joinDevice(r)
   await prove(r, d, await generateDeviceKey())
   assert.deepEqual(d.socket.closed, { code: CLOSE.unavailable, reason: REASON.ledgerDown }, '⚠️⚠️ let a phone in without checking the free tier')
-  const lic = rig({ phoneLedgerDown: true, licenses: { FREE: LIC_FREE } })
+  const lic = rig({ phoneLedgerDown: true, licenses: { FREE: LIC_PAID } })
   const la = await becomeAgent(lic, await generateDeviceKey(), { licensing: true })
   await sendLicense(lic, la, 'FREE')
   await freePhone(lic)
@@ -861,7 +864,7 @@ test('★★ the agent cannot promote or reach a phone that has not proved its k
 })
 
 test('★★ a room that loses its ticket closes the phones admitted under it (they reconnect and claim the free tier); phones holding the free slot stay', async () => {
-  const r = rig({ licenses: { FREE: LIC_FREE } })
+  const r = rig({ licenses: { FREE: LIC_PAID } })
   const agent = await becomeAgent(r, await generateDeviceKey(), { licensing: true })
   // A phone admitted before the ticket arrived holds the free slot
   const early = await freePhone(r)
@@ -871,13 +874,13 @@ test('★★ a room that loses its ticket closes the phones admitted under it (t
   await agentReplies(r, agent, under.connId)
   assert.equal(under.socket.tag()?.free, undefined)
   // The ticket is removed ⇒ the room is the free tier again
-  r.release(LIC_FREE.ok ? LIC_FREE.license.acct : '', agent.tag()!.key!, LIC_FREE.ok ? LIC_FREE.license.mid : '')
+  r.release(LIC_PAID.ok ? LIC_PAID.license.acct : '', agent.tag()!.key!, LIC_PAID.ok ? LIC_PAID.license.mid : '')
   assert.deepEqual(under.socket.closed, { code: CLOSE.planChanged, reason: REASON.planChanged }, '⚠️⚠️ kept carrying a phone that never claimed the free tier')
   assert.equal(early.socket.closed, undefined, '⚠️⚠️ closed a phone that holds this room as its free slot')
 })
 
 test('★★ a self-hosted relay asks for no ticket, and every room takes MAX_DEVICES phones (2026-09-25 / codex)', async () => {
-  const r = rig({ licenses: { FREE: LIC_FREE }, selfHosted: true })
+  const r = rig({ licenses: { FREE: LIC_PAID }, selfHosted: true })
   // A signed-in agent (old or new) announces tickets …
   const agent = await becomeAgent(r, await generateDeviceKey(), { licensing: true })
   // … but is never asked, so it never sends one
@@ -892,7 +895,7 @@ test('★★ a self-hosted relay asks for no ticket, and every room takes MAX_DE
 })
 
 test('★★ a ticket from an agent that did not announce it is cut as "a type that cannot be sent", as before', async () => {
-  const r = rig({ licenses: { FREE: LIC_FREE } })
+  const r = rig({ licenses: { FREE: LIC_PAID } })
   const agent = await becomeAgent(r, await generateDeviceKey())
   await sendLicense(r, agent, 'FREE')
   assert.equal(agent.closed?.code, CLOSE.badFrame)
@@ -922,7 +925,7 @@ test('★★ a ticket addressed to the key of another machine does not pass (cod
 })
 
 test('★★ when a ticket expires, phones admitted under it are closed too (codex round 26, high #2)', async () => {
-  const short: LicenseCheck = { ok: true, license: { ...LIC_FREE.license, exp: 1_100 } }
+  const short: LicenseCheck = { ok: true, license: { ...(LIC_PAID.ok ? LIC_PAID.license : PLUS), exp: 1_100 } }
   const r = rig({ licenses: { SHORT: short } })
   const agent = await becomeAgent(r, await generateDeviceKey(), { licensing: true })
   await sendLicense(r, agent, 'SHORT')
@@ -956,21 +959,22 @@ test('★★ when the ticket changes Plus → Free, excess phones are closed lat
     ds.push(d)
   }
   await sendLicense(r, agent, 'FREE')
+  // ★ 2026-09-27: a Free ticket is inside the phones' free tier ⇒ phones admitted under Plus (no free mark) all reconnect and claim it
   assert.deepEqual(
     ds.map((d) => d.socket.closed?.code ?? null),
-    [null, null, CLOSE.tooMany, CLOSE.tooMany, CLOSE.tooMany],
+    [CLOSE.planChanged, CLOSE.planChanged, CLOSE.planChanged, CLOSE.planChanged, CLOSE.planChanged],
     '⚠️⚠️ still 5 after going back to Free',
   )
 })
 
 test('★★ removed from the account: the room ticket is removed too, and the same ticket at hand cannot bring it back (codex round 26, high #3)', async () => {
-  const r = rig({ licenses: { FREE: LIC_FREE } })
+  const r = rig({ licenses: { FREE: LIC_PAID } })
   const agent = await becomeAgent(r, await generateDeviceKey(), { licensing: true })
   await sendLicense(r, agent, 'FREE')
   const d = await freePhone(r)
   await agentReplies(r, agent, d.connId)
   r.advance(10)
-  r.release(LIC_FREE.ok ? LIC_FREE.license.acct : '', agent.tag()!.key!, LIC_FREE.ok ? LIC_FREE.license.mid : '')
+  r.release(LIC_PAID.ok ? LIC_PAID.license.acct : '', agent.tag()!.key!, LIC_PAID.ok ? LIC_PAID.license.mid : '')
   assert.equal(agent.tag()?.lic, undefined, '⚠️⚠️ the room ticket remained after removal')
   assert.equal(d.socket.closed?.reason, REASON.planChanged)
   assert.deepEqual(licenseResults(agent).slice(-1), ['revoked'])
@@ -981,7 +985,7 @@ test('★★ removed from the account: the room ticket is removed too, and the s
 
 test('★★ if removed while waiting for the ledger reply, the returning "may pass" is not used', async () => {
   let release = () => {}
-  const r = rig({ licenses: { FREE: LIC_FREE }, duringClaim: () => release() })
+  const r = rig({ licenses: { FREE: LIC_PAID }, duringClaim: () => release() })
   const agent = await becomeAgent(r, await generateDeviceKey(), { licensing: true })
   release = () => {
     release = () => {}
@@ -993,7 +997,7 @@ test('★★ if removed while waiting for the ledger reply, the returning "may p
 })
 
 test('★★ a "remove" from another account or another passphrase does not remove the room ticket (codex round 27, high #1)', async () => {
-  const r = rig({ licenses: { FREE: LIC_FREE } })
+  const r = rig({ licenses: { FREE: LIC_PAID } })
   const agent = await becomeAgent(r, await generateDeviceKey(), { licensing: true })
   await sendLicense(r, agent, 'FREE')
   const d = await freePhone(r)
@@ -1007,7 +1011,7 @@ test('★★ a "remove" from another account or another passphrase does not remo
 
 test('★★ removal marks for in-flight checks are not pushed out however many other revocations arrive (codex round 28, medium #5)', async () => {
   let during = () => {}
-  const r = rig({ licenses: { FREE: LIC_FREE }, duringClaim: () => during() })
+  const r = rig({ licenses: { FREE: LIC_PAID }, duringClaim: () => during() })
   const agent = await becomeAgent(r, await generateDeviceKey(), { licensing: true })
   during = () => {
     during = () => {}
@@ -1023,7 +1027,7 @@ test('★★ removal marks for in-flight checks are not pushed out however many 
 test('★★ checking the same ticket twice: the one finishing first does not clear the later mark (codex round 29, high #1)', async () => {
   const gates: (() => void)[] = []
   let hold = false
-  const r = rig({ licenses: { FREE: LIC_FREE }, duringClaimAsync: () => (hold ? new Promise<void>((ok) => gates.push(ok)) : Promise.resolve()) })
+  const r = rig({ licenses: { FREE: LIC_PAID }, duringClaimAsync: () => (hold ? new Promise<void>((ok) => gates.push(ok)) : Promise.resolve()) })
   const agent = await becomeAgent(r, await generateDeviceKey(), { licensing: true })
   hold = true
   const one = sendLicense(r, agent, 'FREE')
@@ -1042,7 +1046,7 @@ test('★★ checking the same ticket twice: the one finishing first does not cl
 
 test('★★ a ticket renewal keeps the current ticket while the ledger answers: a message meanwhile does not close licensed phones (codex 2026-09-27)', async () => {
   let during = async () => {}
-  const r = rig({ licenses: { FREE: LIC_FREE }, duringClaimAsync: () => during() })
+  const r = rig({ licenses: { FREE: LIC_PAID }, duringClaimAsync: () => during() })
   const agent = await becomeAgent(r, await generateDeviceKey(), { licensing: true })
   await sendLicense(r, agent, 'FREE')
   const d = await freePhone(r)
@@ -1063,7 +1067,7 @@ test('★★ a ticket renewal keeps the current ticket while the ledger answers:
 
 test('★★ a licensed connect releases the room from the phone\'s ledger, so an older free-tier wire of that phone loses its mark and cannot become a second free machine (codex 2026-09-27)', async () => {
   const phones = new Map<string, PhoneLedger>()
-  const a = rig({ phones, licenses: { FREE: LIC_FREE } })
+  const a = rig({ phones, licenses: { FREE: LIC_PAID } })
   const agentA = await becomeAgent(a, await generateDeviceKey(), { licensing: true })
   const phone = await generateDeviceKey()
   // P holds A as its free slot (no ticket yet)
@@ -1081,7 +1085,7 @@ test('★★ a licensed connect releases the room from the phone\'s ledger, so a
   const onC = await freePhone(c, phone)
   await agentReplies(c, agentC, onC.connId)
   // A loses its ticket ⇒ both of P's wires there must go (they reconnect and get refused: C holds the free slot)
-  a.release(LIC_FREE.ok ? LIC_FREE.license.acct : '', agentA.tag()!.key!, LIC_FREE.ok ? LIC_FREE.license.mid : '')
+  a.release(LIC_PAID.ok ? LIC_PAID.license.acct : '', agentA.tag()!.key!, LIC_PAID.ok ? LIC_PAID.license.mid : '')
   assert.equal(w1.socket.closed?.code, CLOSE.planChanged, '⚠️⚠️ P kept A on the free tier while also holding C')
   assert.equal(w2.socket.closed?.code, CLOSE.planChanged)
   const again = await joinDevice(a)
@@ -1094,7 +1098,7 @@ test('★★ a licensed connect releases the room from the phone\'s ledger, so a
 test('★★ a licensed connect evicted while the ledger answers still clears the older free mark of that phone in the room (round 2, #1)', async () => {
   const phones = new Map<string, PhoneLedger>()
   let during = () => {}
-  const a = rig({ phones, licenses: { FREE: LIC_FREE }, duringPhoneClaim: () => during() })
+  const a = rig({ phones, licenses: { FREE: LIC_PAID }, duringPhoneClaim: () => during() })
   const agentA = await becomeAgent(a, await generateDeviceKey(), { licensing: true })
   const phone = await generateDeviceKey()
   const w1 = await freePhone(a, phone)
@@ -1114,7 +1118,7 @@ test('★★ a licensed connect evicted while the ledger answers still clears th
   const b = rig({ phones })
   await becomeAgent(b, await generateDeviceKey())
   await freePhone(b, phone)
-  a.release(LIC_FREE.ok ? LIC_FREE.license.acct : '', agentA.tag()!.key!, LIC_FREE.ok ? LIC_FREE.license.mid : '')
+  a.release(LIC_PAID.ok ? LIC_PAID.license.acct : '', agentA.tag()!.key!, LIC_PAID.ok ? LIC_PAID.license.mid : '')
   assert.equal(w1.socket.closed?.code, CLOSE.planChanged)
 })
 
@@ -1122,7 +1126,7 @@ test('★★ a delayed free-claim answer does not restore a slot released meanwh
   const phones = new Map<string, PhoneLedger>()
   const gates: (() => void)[] = []
   let hold = 0
-  const a = rig({ phones, licenses: { FREE: LIC_FREE }, duringPhoneClaimAsync: (n) => (n === hold ? new Promise<void>((ok) => gates.push(ok)) : Promise.resolve()) })
+  const a = rig({ phones, licenses: { FREE: LIC_PAID }, duringPhoneClaimAsync: (n) => (n === hold ? new Promise<void>((ok) => gates.push(ok)) : Promise.resolve()) })
   const agentA = await becomeAgent(a, await generateDeviceKey(), { licensing: true })
   const phone = await generateDeviceKey()
   // W2: a free claim of A whose answer is delayed (the ledger already holds A for P)
@@ -1150,7 +1154,7 @@ test('★★ a delayed free-claim answer does not restore a slot released meanwh
   const b = rig({ phones })
   await becomeAgent(b, await generateDeviceKey())
   await freePhone(b, phone)
-  a.release(LIC_FREE.ok ? LIC_FREE.license.acct : '', agentA.tag()!.key!, LIC_FREE.ok ? LIC_FREE.license.mid : '')
+  a.release(LIC_PAID.ok ? LIC_PAID.license.acct : '', agentA.tag()!.key!, LIC_PAID.ok ? LIC_PAID.license.mid : '')
   assert.equal((w2.socket as { closed?: { code: number } }).closed?.code, CLOSE.planChanged)
   assert.equal(w3.socket.closed?.code, CLOSE.planChanged)
 })
@@ -1174,13 +1178,13 @@ test('★★ a ticket arriving while the free claim is refused: the room is lice
   assert.equal(d.socket.tag()?.free, undefined)
   assert.deepEqual(openedIds(agentA), [d.connId])
   // ⚠️ And the opposite drift (the ticket goes while a licensed check is in flight) ends in a fresh free claim, not a stale grant
-  const c = rig({ phones, licenses: { FREE: LIC_FREE }, duringPhoneClaimAsync: () => during() })
+  const c = rig({ phones, licenses: { FREE: LIC_PAID }, duringPhoneClaimAsync: () => during() })
   const agentC = await becomeAgent(c, await generateDeviceKey(), { licensing: true })
   await sendLicense(c, agentC, 'FREE')
   const e = await joinDevice(c)
   during = async () => {
     during = async () => {}
-    c.release(LIC_FREE.ok ? LIC_FREE.license.acct : '', agentC.tag()!.key!, LIC_FREE.ok ? LIC_FREE.license.mid : '')
+    c.release(LIC_PAID.ok ? LIC_PAID.license.acct : '', agentC.tag()!.key!, LIC_PAID.ok ? LIC_PAID.license.mid : '')
   }
   await prove(c, e, phone)
   // P's free slot is B ⇒ the fresh claim of C is refused (not silently admitted on a stale licensed answer)
@@ -1188,12 +1192,12 @@ test('★★ a ticket arriving while the free claim is refused: the room is lice
 })
 
 test('★★ a phone whose room lost its ticket between its check and the agent\'s reply is not promoted without the free mark', async () => {
-  const r = rig({ licenses: { FREE: LIC_FREE } })
+  const r = rig({ licenses: { FREE: LIC_PAID } })
   const agent = await becomeAgent(r, await generateDeviceKey(), { licensing: true })
   await sendLicense(r, agent, 'FREE')
   const d = await freePhone(r)
   assert.equal(d.socket.tag()?.free, undefined)
-  r.release(LIC_FREE.ok ? LIC_FREE.license.acct : '', agent.tag()!.key!, LIC_FREE.ok ? LIC_FREE.license.mid : '')
+  r.release(LIC_PAID.ok ? LIC_PAID.license.acct : '', agent.tag()!.key!, LIC_PAID.ok ? LIC_PAID.license.mid : '')
   assert.equal(d.socket.closed, undefined, 'not admitted yet = enforce leaves it alone')
   await agentReplies(r, agent, d.connId)
   assert.equal((d.socket as { closed?: { code: number } }).closed?.code, CLOSE.planChanged, '⚠️⚠️ promoted a phone without a free slot in a room without a ticket')
@@ -1247,7 +1251,7 @@ test('★★ a second copy of a valid proof is refused, not run alongside the fi
 test('★★ a licensed release whose answer was lost still clears the older free marks of that phone in the room (round 3, #3)', async () => {
   const phones = new Map<string, PhoneLedger>()
   let down = false
-  const a = rig({ phones, licenses: { FREE: LIC_FREE }, phoneLedgerDown: () => down })
+  const a = rig({ phones, licenses: { FREE: LIC_PAID }, phoneLedgerDown: () => down })
   const agentA = await becomeAgent(a, await generateDeviceKey(), { licensing: true })
   const phone = await generateDeviceKey()
   const w1 = await freePhone(a, phone)
@@ -1421,7 +1425,7 @@ test('★★ pairing or "use this machine for free" moves the slot: the previous
 test('★★ moving the slot does not touch wires admitted under a ticket, and a licensed room never takes over', async () => {
   const phones = new Map<string, PhoneLedger>()
   const rooms = new Map<string, Room>()
-  const a = rig({ phones, rooms, licenses: { FREE: LIC_FREE } })
+  const a = rig({ phones, rooms, licenses: { FREE: LIC_PAID } })
   const agentA = await becomeAgent(a, await generateDeviceKey(), { licensing: true })
   await sendLicense(a, agentA, 'FREE')
   const b = rig({ phones, rooms })
@@ -1497,7 +1501,7 @@ test('★★ a stale takeover retry is a plain claim: it cannot take the slot ba
 test('★★ moving the slot away from a room that got a ticket meanwhile clears the mark but keeps the wire (codex)', async () => {
   const phones = new Map<string, PhoneLedger>()
   const rooms = new Map<string, Room>()
-  const a = rig({ phones, rooms, licenses: { FREE: LIC_FREE } })
+  const a = rig({ phones, rooms, licenses: { FREE: LIC_PAID } })
   const agentA = await becomeAgent(a, await generateDeviceKey(), { licensing: true })
   const b = rig({ phones, rooms })
   await becomeAgent(b, await generateDeviceKey())
@@ -1509,4 +1513,132 @@ test('★★ moving the slot away from a room that got a ticket meanwhile clears
   await freePhone(b, phone, { takeover: true })
   assert.equal(onA.socket.closed, undefined, '⚠️⚠️ closed a wire in a room that is licensed now')
   assert.equal(onA.socket.tag()?.free, undefined, 'the stale free mark remained')
+})
+
+test('★★ a signed-in Free machine counts against the phone\'s free slot (no second free machine by signing in / 2026-09-27)', async () => {
+  const phones = new Map<string, PhoneLedger>()
+  const rooms = new Map<string, Room>()
+  const a = rig({ phones, rooms, licenses: { FREE: LIC_FREE } })
+  const agentA = await becomeAgent(a, await generateDeviceKey(), { licensing: true })
+  await sendLicense(a, agentA, 'FREE')
+  const b = rig({ phones, rooms })
+  await becomeAgent(b, await generateDeviceKey())
+  const phone = await generateDeviceKey()
+  // A: signed in on Free ⇒ this phone's free machine
+  const onA = await freePhone(a, phone)
+  assert.equal(onA.socket.tag()?.free, true, '⚠️⚠️ a Free-ticket room was not counted as the phone\'s free machine')
+  // B: not signed in ⇒ refused (the phone's free slot is A)
+  const onB = await joinDevice(b)
+  await prove(b, onB, phone)
+  assert.equal(onB.socket.closed?.code, CLOSE.freeUsed, '⚠️⚠️ one GitHub sign-in gave a second free machine')
+  // ★ Plus is outside it (as before)
+  const c = rig({ phones, rooms, licenses: { PLUS: LIC_PLUS } })
+  const agentC = await becomeAgent(c, await generateDeviceKey(), { licensing: true })
+  await sendLicense(c, agentC, 'PLUS')
+  const onC = await freePhone(c, phone)
+  assert.equal(onC.socket.tag()?.free, undefined)
+  // ⚠️ An old app (no key proof) cannot be counted per phone ⇒ refused in a Free-ticket room too
+  const old = await joinDevice(a, { old: true })
+  assert.equal(old.socket.closed?.code, CLOSE.updateApp)
+})
+
+// ─── ★★ codex 2026-09-27 (after #paid) ───────────────────────────────────────────────────────
+
+test('★★ an older ticket\'s answer never replaces a newer one (a slow Free renewal cannot undo a completed Plus upgrade)', async () => {
+  const gates: (() => void)[] = []
+  let hold = true
+  const r = rig({ licenses: { FREE: LIC_FREE, PLUS: LIC_PAID }, duringClaimAsync: () => (hold ? new Promise<void>((ok) => gates.push(ok)) : Promise.resolve()) })
+  const agent = await becomeAgent(r, await generateDeviceKey(), { licensing: true })
+  const slowFree = sendLicense(r, agent, 'FREE')
+  for (let i = 0; i < 200 && gates.length === 0; i++) await new Promise((ok) => setTimeout(ok, 1))
+  hold = false
+  await sendLicense(r, agent, 'PLUS')
+  assert.equal(agent.tag()?.lic?.plan, 'plus')
+  const phone = await freePhone(r)
+  await agentReplies(r, agent, phone.connId)
+  gates.shift()!()
+  await slowFree
+  assert.equal(agent.tag()?.lic?.plan, 'plus', '⚠️⚠️ the older Free answer replaced the newer Plus ticket')
+  assert.equal(phone.socket.closed, undefined, '⚠️⚠️ a Plus phone was closed by a stale answer')
+  assert.deepEqual(licenseResults(agent), ['want', 'ok'], 'a superseded answer must not be reported')
+  assert.equal(agent.tag()?.claiming, undefined, 'the stale claim left its mark')
+})
+
+test('★★ a Plus connect clears the phone\'s free marks in the room before the ledger forgets it (not when its answer returns)', async () => {
+  const phones = new Map<string, PhoneLedger>()
+  const rooms = new Map<string, Room>()
+  const gates: (() => void)[] = []
+  let hold = 0
+  const a = rig({ phones, rooms, licenses: { PLUS: LIC_PAID }, duringPhoneClaimAsync: (n) => (n === hold ? new Promise<void>((ok) => gates.push(ok)) : Promise.resolve()) })
+  const agentA = await becomeAgent(a, await generateDeviceKey(), { licensing: true })
+  const phone = await generateDeviceKey()
+  const w1 = await freePhone(a, phone)
+  await agentReplies(a, agentA, w1.connId)
+  assert.equal(w1.socket.tag()?.free, true)
+  await sendLicense(a, agentA, 'PLUS')
+  // W2's Plus connect: the ledger drops A, its answer is held
+  hold = 2
+  const w2 = await joinDevice(a)
+  const proving = prove(a, w2, phone)
+  for (let i = 0; i < 200 && gates.length === 0; i++) await new Promise((ok) => setTimeout(ok, 1))
+  assert.equal(gates.length, 1)
+  assert.equal(w1.socket.tag()?.free, undefined, '⚠️⚠️ the older wire still holds the room as its free slot while the ledger forgot it')
+  gates.shift()!()
+  await proving
+})
+
+test('★★ a Plus release marks the phone\'s pending free checks in the room stale (Free → Plus → Free with both answers held / codex)', async () => {
+  const phones = new Map<string, PhoneLedger>()
+  const rooms = new Map<string, Room>()
+  const gates = new Map<number, () => void>()
+  const held = new Set<number>()
+  const a = rig({ phones, rooms, licenses: { PLUS: LIC_PAID }, duringPhoneClaimAsync: (n) => (held.has(n) ? new Promise<void>((ok) => gates.set(n, ok)) : Promise.resolve()) })
+  const agentA = await becomeAgent(a, await generateDeviceKey(), { licensing: true })
+  const b = rig({ phones, rooms })
+  await becomeAgent(b, await generateDeviceKey())
+  const phone = await generateDeviceKey()
+  const wait = async (n: number) => {
+    for (let i = 0; i < 300 && !gates.has(n); i++) await new Promise((ok) => setTimeout(ok, 1))
+    assert.ok(gates.has(n), `ledger call ${n} was not made`)
+  }
+  // ① W1: a free claim of A, its answer held
+  held.add(1)
+  const w1 = await joinDevice(a)
+  const p1 = prove(a, w1, phone)
+  await wait(1)
+  // ② A upgrades; W2's Plus connect releases A, its answer held too
+  await sendLicense(a, agentA, 'PLUS')
+  held.add(2)
+  const w2 = await joinDevice(a)
+  const p2 = prove(a, w2, phone)
+  await wait(2)
+  assert.equal(w1.socket.tag()?.dstale, true, '⚠️⚠️ the pending free check was not marked stale by the release')
+  // ③ A goes back to Free; the phone takes B on the free tier
+  a.release(LIC_PAID.ok ? LIC_PAID.license.acct : '', agentA.tag()!.key!, LIC_PAID.ok ? LIC_PAID.license.mid : '')
+  await freePhone(b, phone)
+  // ④ W1's old "may pass" arrives: it must ask again (and be refused: the slot is B)
+  gates.get(1)!()
+  await p1
+  assert.equal(w1.socket.closed?.code, CLOSE.freeUsed, '⚠️⚠️ one phone ended with free wires on two machines')
+  gates.get(2)!()
+  await p2
+})
+
+test('★★ several wires of one phone connecting to a Plus room at once all get in (stale marks do not matter to Plus answers / codex)', async () => {
+  const gates: (() => void)[] = []
+  let hold = true
+  const r = rig({ licenses: { PLUS: LIC_PAID }, duringPhoneClaimAsync: () => (hold ? new Promise<void>((ok) => gates.push(ok)) : Promise.resolve()) })
+  const agent = await becomeAgent(r, await generateDeviceKey(), { licensing: true })
+  hold = false
+  await sendLicense(r, agent, 'PLUS')
+  hold = true
+  const phone = await generateDeviceKey()
+  const ws = [await joinDevice(r), await joinDevice(r), await joinDevice(r)]
+  const proofs = ws.map((w) => prove(r, w, phone))
+  for (let i = 0; i < 300 && gates.length < 3; i++) await new Promise((ok) => setTimeout(ok, 1))
+  assert.equal(gates.length, 3)
+  hold = false
+  for (const g of gates.splice(0)) g()
+  await Promise.all(proofs)
+  assert.deepEqual(ws.map((w) => w.socket.closed?.code ?? null), [null, null, null], '⚠️⚠️ Plus wires of one phone closed each other')
 })

@@ -96,11 +96,14 @@ export class Phones extends DurableObject<Env> {
    * ⚠️⚠️ The whole step is under `blockConcurrencyWhile`: the notification is an RPC (not a storage op), so without it a second claim
    *    of the same phone could read the ledger in between and the last write would win (two machines on the free tier).
    */
-  async claim(dkey: string, agentKey: string, licensed: boolean, takeover: boolean): Promise<PhoneClaimResult> {
+  async claim(dkey: string, agentKey: string, licensed: boolean, takeover: boolean, connId: number): Promise<PhoneClaimResult> {
     return await this.ctx.blockConcurrencyWhile(async () => {
       const r = claimRoom(readPhoneLedger(await this.ctx.storage.get('rooms')), agentKey, licensed, Date.now(), undefined, takeover)
       // ⚠️ If a room cannot be told, throw (the caller answers `unavailable` and the phone tries again; the ledger stays as it was)
       for (const room of r.moved) await this.env.RENDEZVOUS.getByName(room).phoneFreeMoved(dkey)
+      // ★ A Plus connect releases the calling room: its other wires of this phone drop their free mark before the ledger forgets it
+      //   (⚠️ the calling room is awaiting this call on an RPC, not storage, so it can take this one = no deadlock)
+      if (r.released) await this.env.RENDEZVOUS.getByName(agentKey).phoneFreeReleased(dkey, connId)
       await this.ctx.storage.put('rooms', r.ledger)
       return r.ok ? 'ok' : 'machine-limit'
     })
@@ -142,9 +145,9 @@ export class Rendezvous extends DurableObject<Env> {
         return 'machine-limit'
       }
     },
-    claimPhone: async (dkey, agentKey, licensed, takeover) => {
+    claimPhone: async (dkey, agentKey, licensed, takeover, connId) => {
       try {
-        return await this.env.PHONES.getByName(dkey).claim(dkey, agentKey, licensed, takeover)
+        return await this.env.PHONES.getByName(dkey).claim(dkey, agentKey, licensed, takeover, connId)
       } catch {
         // ⚠️ Cannot reach the ledger ⇒ `room.ts` refuses a free-tier phone (fail-closed) and lets a licensed room carry on
         return 'unavailable'
@@ -180,6 +183,11 @@ export class Rendezvous extends DurableObject<Env> {
   /** ★ A passphrase was removed from the account (from `Accounts.release` / `revokeLicense` in `room.ts`) */
   async revokeLicense(acct: string, mid: string): Promise<void> {
     this.#room.revokeLicense(acct, mid)
+  }
+
+  /** ★ A Plus connect of this phone released this room from its ledger (from `Phones.claim` / `phoneFreeReleased` in `room.ts`) */
+  async phoneFreeReleased(dkey: string, releasingConnId: number): Promise<void> {
+    this.#room.phoneFreeReleased(dkey, releasingConnId)
   }
 
   /** ★ A phone moved its free slot to another machine (from `Phones.claim` / `phoneFreeMoved` in `room.ts`) */

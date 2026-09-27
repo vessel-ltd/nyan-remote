@@ -37,6 +37,8 @@ export type PhoneClaim = {
   ledger: PhoneLedger
   /** ★ Rooms this claim took the free slot away from (`takeover`). ⚠️ The DO tells those rooms **before** writing the ledger */
   moved: string[]
+  /** ★ A licensed (Plus) connect dropped this room from the ledger ⇒ the DO tells the room **before** writing (`phoneFreeReleased`) */
+  released?: boolean
 }
 
 const finite = (t: unknown): t is number => typeof t === 'number' && Number.isFinite(t)
@@ -76,8 +78,9 @@ export function prunePhoneLedger(prev: PhoneLedger, now: number): PhoneLedger {
 export function claimRoom(prev: PhoneLedger, agentKey: string, licensed: boolean, now: number, max: number = FREE_MACHINES_PER_PHONE, takeover = false): PhoneClaim {
   const ledger = prunePhoneLedger(prev, now)
   if (licensed) {
+    const had = agentKey in ledger.rooms
     delete ledger.rooms[agentKey]
-    return { ok: true, ledger, moved: [] }
+    return { ok: true, ledger, moved: [], ...(had ? { released: true } : {}) }
   }
   if (takeover) {
     const moved = Object.keys(ledger.rooms).filter((k) => k !== agentKey)
