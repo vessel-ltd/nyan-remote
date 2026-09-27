@@ -65,8 +65,41 @@ const NOTICE: Record<string, string> = {
   'revoke-failed': 'Could not remove the machine (the relay did not respond). Wait a moment and try again.',
 }
 
+/**
+ * ★ The subscription's next step, stated positively (2026-09-27 / user request: "is it renewing, or until when?").
+ *   - renewing ⇒ "Next renewal <date>" (in a trial ⇒ "Trial ends <date>")
+ *   - cancellation at the end of this period (or a `cancel_at` within it) ⇒ "Plus until <date> (not renewing)"
+ *   - a `cancel_at` after this period ⇒ "Next renewal <date> · cancellation scheduled for <date>" (it still renews until then / codex)
+ *   - payment failing ⇒ say so
+ *   ⚠️ No date is shown when Stripe did not give one, or when it has already passed (never guessed, never a date in the past).
+ */
+export function billingLine(a: AccountRow, now: number): string {
+  const s = a.subscriptionStatus
+  if (s !== 'active' && s !== 'trialing' && s !== 'past_due') return ''
+  if (s === 'past_due') return `<p>Payment failed — Stripe is retrying. Check your card under “Manage billing”.</p>`
+  const day = (ms: number | undefined) => (ms !== undefined && ms > now ? new Date(ms).toISOString().slice(0, 10) : undefined)
+  const periodEnd = day(a.subscriptionPeriodEnd)
+  const cancelAt = day(a.subscriptionCancelAt)
+  if (a.subscriptionCancelling) {
+    // ⚠️⚠️ Which wording is decided from the **stored** dates; the clock only hides dates already past (codex round 2: filtering first
+    //    turned "renews Oct 27, cancels Dec 27" into "until Dec 27 (not renewing)" once Oct 27 had passed before the next sync)
+    const ca = a.subscriptionCancelAt
+    const pe = a.subscriptionPeriodEnd
+    if (ca !== undefined && (pe === undefined || ca > pe)) {
+      // A cancellation dated after this period (or with no known period): renewals may still happen ⇒ never "not renewing"
+      const next = pe !== undefined && ca > pe && periodEnd ? `Next ${s === 'trialing' ? 'period starts' : 'renewal'} ${periodEnd} · ` : ''
+      return `<p class="dim">${next}${next ? 'c' : 'C'}ancellation scheduled${cancelAt ? ` for ${cancelAt}` : ''}.</p>`
+    }
+    // Cancellation at the end of this period (or dated within it)
+    const until = ca !== undefined ? cancelAt : periodEnd
+    return until ? `<p>Plus until ${until} (not renewing).</p>` : `<p>Cancellation scheduled (not renewing).</p>`
+  }
+  if (!periodEnd) return ''
+  return s === 'trialing' ? `<p class="dim">Trial ends ${periodEnd}.</p>` : `<p class="dim">Next renewal ${periodEnd}.</p>`
+}
+
 export function accountPage(
-  o: { account: AccountRow; plan: Plan; machines: MachineRow[]; notice?: string; admin?: boolean },
+  o: { account: AccountRow; plan: Plan; machines: MachineRow[]; notice?: string; admin?: boolean; now?: number },
 ): string {
   const lim = PLAN_LIMITS[o.plan]
   // ⚠️ Own keys only (`n=constructor` would otherwise print `function Object() …` / codex)
@@ -111,6 +144,7 @@ ${[
 ${top}
 <h2>Plan</h2>
 <div class="card"><strong>${o.plan === 'plus' ? 'Plus' : 'Free'}</strong> · ${`${groups.length} ${groups.length === 1 ? 'machine' : 'machines'} signed in · ${lim.maxMachines} can connect · up to ${lim.maxDevices} phones each`}
+${billingLine(o.account, o.now ?? Date.now())}
 ${upgrade}</div>
 <h2>Machines</h2>
 <div class="card">${machines}</div>

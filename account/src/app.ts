@@ -521,6 +521,7 @@ export async function handle(req: Request, d: Deps): Promise<Response> {
           machines: await d.store.machinesOf(acct.id),
           notice: url.searchParams.get('n') ?? undefined,
           admin: (d.config.adminGithubIds ?? []).includes(acct.githubId),
+          now: d.now(),
         }),
       )
     }

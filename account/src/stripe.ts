@@ -33,6 +33,33 @@ export const STRIPE_TIMEOUT_MS = 10_000
 export interface StripeSubscription {
   id: string
   status: string
+  /**
+   * ★ End of the current billing period (ms / 2026-09-27: "next renewal" or "Plus until"). ⚠️ Absent if unreadable (never guessed).
+   *   Newer API versions keep it on the items, older ones on the subscription ⇒ both are read.
+   */
+  periodEnd?: number
+  /** ★ Cancellation is scheduled (`cancel_at_period_end`, or a `cancel_at` date) = it will not renew */
+  cancelling?: boolean
+  /** ★ When a scheduled cancellation takes effect, if Stripe says (ms) */
+  cancelAt?: number
+}
+
+const secToMs = (v: unknown): number | undefined => (typeof v === 'number' && Number.isFinite(v) && v > 0 ? v * 1000 : undefined)
+
+/** ★ The fields the account page shows, read from one subscription object (⚠️ never throws; unknown shapes give nothing) */
+export function subscriptionDates(s: Record<string, unknown>): Pick<StripeSubscription, 'periodEnd' | 'cancelling' | 'cancelAt'> {
+  const items = (s['items'] as { data?: unknown } | undefined)?.data
+  const itemEnds = Array.isArray(items)
+    ? items.flatMap((i) => {
+        const v = secToMs((i as Record<string, unknown> | null)?.['current_period_end'])
+        return v === undefined ? [] : [v]
+      })
+    : []
+  // ⚠️ Items with different periods: the **earliest** end is the next renewal (codex: the latest hid the nearer one)
+  const periodEnd = secToMs(s['current_period_end']) ?? (itemEnds.length ? Math.min(...itemEnds) : undefined)
+  const cancelAt = secToMs(s['cancel_at'])
+  const cancelling = s['cancel_at_period_end'] === true || cancelAt !== undefined
+  return { ...(periodEnd === undefined ? {} : { periodEnd }), ...(cancelling ? { cancelling: true } : {}), ...(cancelAt === undefined ? {} : { cancelAt }) }
 }
 
 export interface StripeApi {
@@ -137,7 +164,7 @@ export function stripeApi(secretKey: string, f: Fetch = (u, i) => fetch(u, i)): 
     createPortal: async (o) => str((await post('billing_portal/sessions', { customer: o.customer, return_url: o.returnUrl })).url, 'portal url'),
     listSubscriptions: async (customer, onPage) =>
       (await list(`subscriptions?${formEncode({ customer, status: 'all', limit: '100' })}`, onPage)).flatMap((s) =>
-        typeof s['id'] === 'string' && typeof s['status'] === 'string' ? [{ id: s['id'], status: s['status'] }] : [],
+        typeof s['id'] === 'string' && typeof s['status'] === 'string' ? [{ id: s['id'], status: s['status'], ...subscriptionDates(s) }] : [],
       ),
     listOpenCheckouts: async (customer, onPage) =>
       (await list(`checkout/sessions?${formEncode({ customer, status: 'open', limit: '100' })}`, onPage)).flatMap((s) =>

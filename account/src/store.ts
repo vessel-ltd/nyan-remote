@@ -22,6 +22,12 @@ export interface AccountRow {
    * ★★ Number of live subscriptions (2026-09-24 / codex round 26, high #8). ⚠️ 2 or more = paying twice ⇒ the page tells the user.
    */
   subscriptionCount?: number
+  /** ★ End of the deciding subscription's current period (ms / 2026-09-27: "next renewal" / "Plus until" on the page) */
+  subscriptionPeriodEnd?: number
+  /** ★ The deciding subscription has a cancellation scheduled (at period end, or on `subscriptionCancelAt`) */
+  subscriptionCancelling?: boolean
+  /** ★ When a scheduled cancellation takes effect, if Stripe gave a date (ms). ⚠️ May be after several more renewals */
+  subscriptionCancelAt?: number
   /**
    * ★★ How many times a re-read of subscriptions is requested (incremented on every webhook / codex round 27, high #4).
    *   ⚠️ The re-reader remembers the value before starting, and if it changed after writing, **reads again**.
@@ -51,6 +57,9 @@ export interface SubscriptionSummary {
   subscriptionId?: string
   subscriptionStatus?: string
   subscriptionCount: number
+  subscriptionPeriodEnd?: number
+  subscriptionCancelling?: boolean
+  subscriptionCancelAt?: number
 }
 
 export interface MachineRow {
@@ -141,11 +150,22 @@ export const OPEN_STATUSES = ['active', 'trialing', 'past_due', 'incomplete', 'u
  *   ⚠️ Overwriting one state per event meant that, with two subscriptions, **cancelling one also removed the other's Plus**.
  *   ⇒ Decide by the subscription in the best state, and count the live ones.
  */
-export function summarize(subs: { id: string; status: string }[]): SubscriptionSummary {
+export function summarize(subs: { id: string; status: string; periodEnd?: number; cancelling?: boolean; cancelAt?: number }[]): SubscriptionSummary {
   const rank = (s: string) => ['active', 'trialing', 'past_due', 'unpaid', 'incomplete'].indexOf(s)
   const open = subs.filter((s) => (OPEN_STATUSES as readonly string[]).includes(s.status))
-  const best = [...open].sort((a, b) => rank(a.status) - rank(b.status))[0]
-  if (best) return { subscriptionId: best.id, subscriptionStatus: best.status, subscriptionCount: open.length }
+  // ★ Among equally good ones, one that renews wins (two subscriptions, one of them cancelled: the page must not say "until")
+  const best = [...open].sort((a, b) => rank(a.status) - rank(b.status) || Number(a.cancelling === true) - Number(b.cancelling === true))[0]
+  if (best) {
+    // ★ Both dates are kept (the page decides the wording: a `cancel_at` after the period end still renews until then / codex)
+    return {
+      subscriptionId: best.id,
+      subscriptionStatus: best.status,
+      subscriptionCount: open.length,
+      ...(best.periodEnd === undefined ? {} : { subscriptionPeriodEnd: best.periodEnd }),
+      ...(best.cancelling ? { subscriptionCancelling: true } : {}),
+      ...(best.cancelAt === undefined ? {} : { subscriptionCancelAt: best.cancelAt }),
+    }
+  }
   const last = subs[0]
   return { ...(last ? { subscriptionId: last.id, subscriptionStatus: last.status } : {}), subscriptionCount: 0 }
 }
@@ -206,7 +226,7 @@ export function memoryStore(): Store & { accounts: Map<string, AccountRow>; mach
       const a = accounts.get(id)
       const l = leases.get(id)
       if (!a || l?.token !== token || l.until < now) return false
-      const { subscriptionId: _i, subscriptionStatus: _s, ...rest } = a
+      const { subscriptionId: _i, subscriptionStatus: _s, subscriptionPeriodEnd: _e, subscriptionCancelling: _c, subscriptionCancelAt: _a, ...rest } = a
       accounts.set(id, { ...rest, ...sum })
       return true
     },

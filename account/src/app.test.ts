@@ -5,7 +5,7 @@ import { test } from 'node:test'
 import { importLicensePublicKey, signLicense, verifyLicense, type License } from '../../shared/license.ts'
 import { AGENT_KEY_HEADER, ATTEMPT_SETTLE_MS, handle, MACHINE_FORGET_MS, MACHINE_REFUSE_MS, MAX_MACHINE_CREDENTIALS, sha256b64, type Deps } from './app.ts'
 import { makeSession, SESSION_COOKIE } from './session.ts'
-import { memoryStore } from './store.ts'
+import { memoryStore, summarize } from './store.ts'
 import { StripeError } from './stripe.ts'
 
 const ORIGIN = 'https://account.nyan-remote.app'
@@ -24,7 +24,7 @@ async function rig() {
   let clock = T
   // ★ Fake Stripe: one customer per idempotency key, subscriptions in a per-customer table (tests rewrite it)
   const customers = new Map<string, string>()
-  const subs = new Map<string, { id: string; status: string }[]>()
+  const subs = new Map<string, { id: string; status: string; periodEnd?: number; cancelling?: boolean; cancelAt?: number }[]>()
   // ★ Checkout: one per idempotency key (⚠️ like the real one, a retry with the same key returns the same Checkout), with state
   const sessions = new Map<string, { customer: string; status: 'open' | 'expired' | 'complete'; key?: string; params?: string }>()
   const stripeHooks: {
@@ -945,4 +945,98 @@ test('★★ the page counts machines, not sign-ins: three sign-ins of one PC ar
   const other = await login(r, 'gho_other', KEY)
   await r.call('/machines/revoke', { method: 'POST', body: new URLSearchParams({ key: KEY }), headers: { cookie, origin: ORIGIN } })
   assert.ok([...r.store.machines.values()].some((m) => m.accountId === other.body.account.id), '⚠️⚠️ removed a machine of another account')
+})
+
+// ─── ★★ Next renewal / Plus until (2026-09-27 / user request) ───────────────────────────────
+
+test('★★ the page says when Plus renews, until when a cancelled Plus lasts, and when payment is failing', async () => {
+  const r = await rig()
+  const { body } = await login(r)
+  await r.store.setCustomerIfNone(body.account.id, 'cus_1')
+  const cookie = await sessionCookie(r, body.account.id)
+  // ⚠️ The rig's clock is T (2027-01-15): dates must be after it (past dates are not shown)
+  const END = Date.UTC(2027, 9, 27)
+  const show = async (subs: { id: string; status: string; periodEnd?: number; cancelling?: boolean; cancelAt?: number }[], evt: string) => {
+    r.subs.set('cus_1', subs)
+    r.advance(1)
+    await hook(r, evt)
+    return await (await r.call('/', { headers: { cookie } })).text()
+  }
+  const renewing = await show([{ id: 'sub_1', status: 'active', periodEnd: END }], 'evt_a')
+  assert.match(renewing, /Next renewal 2027-10-27/)
+  assert.doesNotMatch(renewing, /not renewing/)
+  // ★ Cancelled in the portal (at period end): still Plus, until the end of the period
+  const cancelled = await show([{ id: 'sub_1', status: 'active', periodEnd: END, cancelling: true }], 'evt_b')
+  assert.match(cancelled, /<strong>Plus<\/strong>/, '⚠️⚠️ lost Plus before the paid period ended')
+  assert.match(cancelled, /Plus until 2027-10-27 \(not renewing\)/)
+  assert.doesNotMatch(cancelled, /Next renewal/)
+  assert.equal(await planNow(r, body.credential), 'plus', '⚠️⚠️ tickets stopped before the paid period ended')
+  // A cancellation dated within this period ends it then
+  const dated = await show([{ id: 'sub_1', status: 'active', periodEnd: END, cancelling: true, cancelAt: Date.UTC(2027, 9, 20) }], 'evt_c')
+  assert.match(dated, /Plus until 2027-10-20/)
+  // ⚠️ A cancellation dated after this period: it still renews until then (codex)
+  const later = await show([{ id: 'sub_1', status: 'active', periodEnd: END, cancelling: true, cancelAt: Date.UTC(2027, 11, 27) }], 'evt_c2')
+  assert.match(later, /Next renewal 2027-10-27 · cancellation scheduled for 2027-12-27/)
+  assert.doesNotMatch(later, /not renewing/)
+  // ⚠️ Cancelling but no readable date: no invented end (codex)
+  const undated = await show([{ id: 'sub_1', status: 'active', cancelling: true }], 'evt_c3')
+  assert.match(undated, /Cancellation scheduled \(not renewing\)/)
+  assert.doesNotMatch(undated, /end of this period/)
+  // ⚠️ A trial's period end is the trial end, not a renewal (codex)
+  const trial = await show([{ id: 'sub_1', status: 'trialing', periodEnd: END }], 'evt_c4')
+  assert.match(trial, /Trial ends 2027-10-27/)
+  // ⚠️ A date already past is not shown
+  const past = await show([{ id: 'sub_1', status: 'active', periodEnd: T - 1000 }], 'evt_c5')
+  assert.doesNotMatch(past, /Next renewal/)
+  const failing = await show([{ id: 'sub_1', status: 'past_due', periodEnd: END }], 'evt_d')
+  assert.match(failing, /Payment failed/)
+  // ⚠️ No date from Stripe ⇒ none shown (never guessed)
+  const nodate = await show([{ id: 'sub_1', status: 'active' }], 'evt_e')
+  assert.doesNotMatch(nodate, /Next renewal|until 20/)
+  // Ended ⇒ Free, no billing line
+  const ended = await show([{ id: 'sub_1', status: 'canceled', periodEnd: END, cancelling: true }], 'evt_f')
+  assert.match(ended, /<strong>Free<\/strong>/)
+  assert.doesNotMatch(ended, /until|Next renewal/)
+})
+
+test('★★ with two subscriptions, the renewing one decides the line (one cancelled + one active must not say "until")', () => {
+  const END = Date.UTC(2026, 9, 27)
+  const sum = summarize([
+    { id: 'sub_old', status: 'active', periodEnd: END, cancelling: true },
+    { id: 'sub_new', status: 'active', periodEnd: END + 1 },
+  ])
+  assert.equal(sum.subscriptionId, 'sub_new')
+  assert.equal(sum.subscriptionCancelling, undefined)
+  assert.equal(sum.subscriptionPeriodEnd, END + 1)
+  // ★ Both dates are kept (the page decides the wording)
+  const both = summarize([{ id: 's', status: 'active', periodEnd: END, cancelling: true, cancelAt: END + 5 }])
+  assert.deepEqual([both.subscriptionPeriodEnd, both.subscriptionCancelling, both.subscriptionCancelAt], [END, true, END + 5])
+})
+
+test('★★ Stripe shapes: the period end is read from the subscription (older API) or its items (newer API); cancellation from either flag', async () => {
+  const { subscriptionDates } = await import('./stripe.ts')
+  assert.deepEqual(subscriptionDates({ current_period_end: 1_800_000_000 }), { periodEnd: 1_800_000_000_000 })
+  // ⚠️ Items with different periods: the earliest end is the next renewal (codex)
+  assert.deepEqual(subscriptionDates({ items: { data: [{ current_period_end: 1_800_000_100 }, { current_period_end: 1_800_000_000 }] } }), { periodEnd: 1_800_000_000_000 })
+  assert.deepEqual(subscriptionDates({ cancel_at_period_end: true, current_period_end: 1_800_000_000 }), { periodEnd: 1_800_000_000_000, cancelling: true })
+  assert.deepEqual(subscriptionDates({ cancel_at: 1_800_000_000 }), { cancelling: true, cancelAt: 1_800_000_000_000 })
+  // ⚠️ Unknown shapes give nothing (never throw, never guess)
+  assert.deepEqual(subscriptionDates({ current_period_end: 'soon', items: { data: [null, { current_period_end: -1 }] } }), {})
+})
+
+test('★★ billing line: the wording follows the stored dates; the clock only hides past dates (codex round 2)', async () => {
+  const { billingLine } = await import('./pages.ts')
+  const OCT = Date.UTC(2027, 9, 27)
+  const DEC = Date.UTC(2027, 11, 27)
+  const base = { id: 'a', githubId: 1, githubLogin: 'x', created: 0, subscriptionStatus: 'active' } as const
+  // Renews Oct 27, cancels Dec 27; after Oct 27 (before the next sync): still "scheduled", never "not renewing"
+  const later = { ...base, subscriptionCancelling: true, subscriptionPeriodEnd: OCT, subscriptionCancelAt: DEC }
+  assert.match(billingLine(later, OCT - 1), /Next renewal 2027-10-27 · cancellation scheduled for 2027-12-27/)
+  assert.equal(billingLine(later, OCT + 1), '<p class="dim">Cancellation scheduled for 2027-12-27.</p>', '⚠️⚠️ turned into "not renewing" once the renewal date passed')
+  // An explicit cancel_at within this period that has passed: no later date is invented from the period end
+  const within = { ...base, subscriptionCancelling: true, subscriptionPeriodEnd: DEC, subscriptionCancelAt: OCT }
+  assert.match(billingLine(within, OCT - 1), /Plus until 2027-10-27 \(not renewing\)/)
+  assert.equal(billingLine(within, OCT + 1), '<p>Cancellation scheduled (not renewing).</p>', '⚠️⚠️ fell back to the period end')
+  // cancel_at with no known period: no "not renewing" claim
+  assert.equal(billingLine({ ...base, subscriptionCancelling: true, subscriptionCancelAt: DEC }, OCT), '<p class="dim">Cancellation scheduled for 2027-12-27.</p>')
 })

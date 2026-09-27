@@ -57,6 +57,9 @@ const toAccount = (r: Row | null): AccountRow | undefined =>
         ...(r['subscription_id'] ? { subscriptionId: String(r['subscription_id']) } : {}),
         ...(r['subscription_status'] ? { subscriptionStatus: String(r['subscription_status']) } : {}),
         ...(r['subscription_count'] != null ? { subscriptionCount: Number(r['subscription_count']) } : {}),
+        ...(r['subscription_period_end'] != null ? { subscriptionPeriodEnd: Number(r['subscription_period_end']) } : {}),
+        ...(r['subscription_cancelling'] ? { subscriptionCancelling: true } : {}),
+        ...(r['subscription_cancel_at'] != null ? { subscriptionCancelAt: Number(r['subscription_cancel_at']) } : {}),
         ...(r['sync_wanted'] != null ? { syncWanted: Number(r['sync_wanted']) } : {}),
         ...(r['checkout_key'] ? { checkoutKey: String(r['checkout_key']) } : {}),
         ...(r['checkout_params'] ? { checkoutParams: String(r['checkout_params']) } : {}),
@@ -130,10 +133,13 @@ function d1Store(db: D1Database): Store {
     // ⚠️⚠️ Write only while holding the lease (never overwrite with a stale read after it expired and someone else took it)
     writeSync: async (id, token, sum, now) => {
       const r = await run(
-        'UPDATE accounts SET subscription_id = ?, subscription_status = ?, subscription_count = ? WHERE id = ? AND lease_token = ? AND lease_until >= ?',
+        'UPDATE accounts SET subscription_id = ?, subscription_status = ?, subscription_count = ?, subscription_period_end = ?, subscription_cancelling = ?, subscription_cancel_at = ? WHERE id = ? AND lease_token = ? AND lease_until >= ?',
         sum.subscriptionId ?? null,
         sum.subscriptionStatus ?? null,
         sum.subscriptionCount,
+        sum.subscriptionPeriodEnd ?? null,
+        sum.subscriptionCancelling ? 1 : 0,
+        sum.subscriptionCancelAt ?? null,
         id,
         token,
         now,
