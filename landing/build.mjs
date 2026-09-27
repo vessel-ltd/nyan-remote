@@ -146,6 +146,8 @@ function home(lang) {
 <li><strong>${t('WSL なしの Windows', 'Windows without WSL')}</strong> ${t('Windows の上で直接 agent を動かす。', 'Run the agent on Windows directly.')}</li>
 <li><strong>Homebrew</strong> ${t('macOS で Homebrew から入れて更新。', 'Install and update with Homebrew on macOS.')}</li>
 <li><strong>${t('音声', 'Voice')}</strong> ${t('セッションに話しかけて、返事を読み上げてもらう（手を使わずに）。', 'Talk to a session and hear its replies read aloud, hands-free.')}</li>
+<li><strong>${t('画像とファイル', 'Images and files')}</strong> ${t('スマホから画像やファイルをセッションに渡す（スクリーンショット・写真・ログなど）。', 'Send images and files from your phone to a session: screenshots, photos, logs.')}</li>
+<li><strong>${t('画像とファイル', 'Images and files')}</strong> ${t('スマホから画像やファイルをセッションに渡す（スクリーンショット・写真・ログなど）。', 'Send images and files from your phone to a session: screenshots, photos, logs.')}</li>
 </ul>
 <p class="dim">${t('nyan-remote は Anthropic の公式製品ではありません。Claude と Claude Code は Anthropic の商標です。', 'nyan-remote is not an official Anthropic product. Claude and Claude Code are trademarks of Anthropic.')}</p>`,
   )

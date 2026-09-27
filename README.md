@@ -253,6 +253,8 @@ Measured on the author's setup (3 machines, a full working day): the Durable Obj
 - **Windows without WSL** — run the agent on Windows directly.
 - **Homebrew** — install and update with Homebrew on macOS.
 - **Voice** — talk to a session and hear its replies read aloud, hands-free.
+- **Images and files** — send images and files from your phone to a session: screenshots, photos, logs.
+- **Images and files** — send images and files from your phone to a session: screenshots, photos, logs.
 
 ---
 
