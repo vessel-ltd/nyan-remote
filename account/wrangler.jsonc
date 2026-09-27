@@ -15,8 +15,8 @@
     // ★ Values that may be public (Client ID)
     "GITHUB_CLIENT_ID": "Ov23liR5gPIqJCohxOey",
     // ★ Stripe Price IDs (⚠️ **test mode** values / 2026-09-24. Replace them when switching to live)
-    "PRICE_USD_MONTH": "price_1UJCf4FQRnbVQ6jcVeZ2Tbqz",
-    "PRICE_USD_YEAR": "price_1UJCgJFQRnbVQ6jcyfs7USZg",
+    "PRICE_USD_MONTH": "price_1UKJKgFQRnbVQ6jcCxXRGX9N",
+    "PRICE_USD_YEAR": "price_1UKJLGFQRnbVQ6jcpJxfIbZo",
     // ★ Ops watcher (src/ops.ts / 2026-09-25). ⚠️ CF_ANALYTICS_TOKEN is a secret (read-only token)
     "CF_ACCOUNT_ID": "de3117b74037f67ec29c1db3c5b67213",
     "ADMIN_GITHUB_IDS": "15623109",
