@@ -996,7 +996,7 @@ test('★★ the page says when Plus renews, until when a cancelled Plus lasts, 
   // Ended ⇒ Free, no billing line
   const ended = await show([{ id: 'sub_1', status: 'canceled', periodEnd: END, cancelling: true }], 'evt_f')
   assert.match(ended, /<strong>Free<\/strong>/)
-  assert.doesNotMatch(ended, /until|Next renewal/)
+  assert.doesNotMatch(ended, /Plus until 20|Next renewal/)
 })
 
 test('★★ with two subscriptions, the renewing one decides the line (one cancelled + one active must not say "until")', () => {

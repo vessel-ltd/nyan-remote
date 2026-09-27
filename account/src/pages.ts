@@ -131,13 +131,14 @@ export function accountPage(
       : `<p>Plus: 5 machines and 5 phones</p>
 <div class="row">
 ${[
-  ['usd-year', '$24 / year'],
-  ['usd-month', '$2.99 / month'],
+  // ★ Yearly first, shown per month with the yearly charge right beside it (2026-09-27 / user decision; never hide the $24)
+  ['usd-year', '$2 / month · billed $24 yearly'],
+  ['usd-month', '$2.99 month-to-month'],
 ]
   .map(([v, label], i) => `<form method="post" action="/billing/checkout"><input type="hidden" name="price" value="${v}"><button class="${i === 0 ? 'primary' : ''}">${label}</button></form>`)
   .join('')}
 </div>
-<p class="dim">Yearly is cheaper ($2/month). Cancel anytime.</p>`
+<p class="dim">Cancel anytime; you keep Plus until the end of the period you paid for.</p>`
   return page(
     `<div class="row"><h1 class="grow">${HOME}</h1>${o.admin ? '<a class="btn" href="/admin">Admin</a>' : ''}<form method="post" action="/logout"><button>Sign out</button></form></div>
 <p class="dim">GitHub: ${esc(o.account.githubLogin)}</p>
