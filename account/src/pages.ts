@@ -3,7 +3,7 @@
 // ★ English only (2026-09-25 / user decision: same as the landing site; the only Japanese page is the legal notice there).
 
 import { PLAN_LIMITS, type Plan } from '../../shared/license.ts'
-import type { AccountRow, MachineRow } from './store.ts'
+import { machineGroups, type AccountRow, type MachineRow } from './store.ts'
 
 /** ★ The optional name on the contact form (characters) */
 export const SUPPORT_NAME_MAX = 100
@@ -77,11 +77,13 @@ export function accountPage(
   const supportNote = n && forSupport ? `<p class="card">${n}</p>` : ''
   const supportOpen = forSupport && o.notice !== 'support-sent' ? ' open' : ''
   const date = (ms: number) => new Date(ms).toISOString().slice(0, 10)
-  const machines = o.machines.length
-    ? `<ul>${o.machines
+  // ★ One row per machine (sign-ins with the same key are one machine / `machineGroups`). "Remove" removes all its sign-ins
+  const groups = machineGroups(o.machines)
+  const machines = groups.length
+    ? `<ul>${groups
         .map(
-          (m) => `<li><span class="grow name">${esc(m.label)}<br><span class="dim">Last used ${date(m.lastSeen)}</span></span>
-<form method="post" action="/machines/revoke"><input type="hidden" name="id" value="${esc(m.id)}"><button>Remove</button></form></li>`,
+          (g) => `<li><span class="grow name">${esc(g.label)}<br><span class="dim">Last used ${date(g.lastSeen)}</span></span>
+<form method="post" action="/machines/revoke">${g.rows[0]!.agentKey ? `<input type="hidden" name="key" value="${esc(g.rows[0]!.agentKey)}">` : `<input type="hidden" name="id" value="${esc(g.rows[0]!.id)}">`}<button>Remove</button></form></li>`,
         )
         .join('')}</ul>`
     : `<p class="dim">None yet. Run nyan login on your PC.</p>`
@@ -108,11 +110,11 @@ ${[
 <p class="dim">GitHub: ${esc(o.account.githubLogin)}</p>
 ${top}
 <h2>Plan</h2>
-<div class="card"><strong>${o.plan === 'plus' ? 'Plus' : 'Free'}</strong> · ${`Machines ${o.machines.length}/${lim.maxMachines} · up to ${lim.maxDevices} phones`}
+<div class="card"><strong>${o.plan === 'plus' ? 'Plus' : 'Free'}</strong> · ${`${groups.length} ${groups.length === 1 ? 'machine' : 'machines'} signed in · ${lim.maxMachines} can connect · up to ${lim.maxDevices} phones each`}
 ${upgrade}</div>
 <h2>Machines</h2>
 <div class="card">${machines}</div>
-<p class="dim">Remove machines you no longer use to free a slot (unused for 30 days, they are removed automatically).</p>
+<p class="dim">Remove machines you no longer use to free a slot. A machine not connected for 30 days stops taking a slot; a sign-in unused for 90 days is deleted.</p>
 <details id="support"${supportOpen}><summary>Contact support</summary>
 ${supportOpen ? supportNote : ''}
 <form class="card" method="post" action="/support">

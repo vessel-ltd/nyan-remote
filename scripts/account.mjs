@@ -169,6 +169,9 @@ export async function login(f = fetch, wait = sleep, open = openUrl) {
     console.error(t(`✗ ログインできませんでした: ${why}`, `✗ Sign-in failed: ${why}`))
     return 1
   }
+  // ⚠️ A previous sign-in of this machine is **not** removed here (2026-09-27 / codex): the relay does not say which sign-in it
+  //    accepted, so "the new one is in use" cannot be confirmed, and removing the old one too early closes the phones and can free
+  //    the slot. It is harmless to keep: it is the same machine (one slot in the relay's ledger, one row on the account page).
   await withAccountLock(() => writeAccount({ v: 1, origin: ACCOUNT_ORIGIN, credential: j.credential, account: { id: j.account.id, login: j.account.login } }))
   const plan = j.account.plan === 'plus' ? 'Plus' : 'Free'
   console.log(t(`✅ ${j.account.login} でログインしました（${plan}）`, `✅ Signed in as ${j.account.login} (${plan})`))

@@ -920,3 +920,29 @@ test('★ the account pages are English only, with the cat and the favicon from 
     assert.match(res.headers.get('content-security-policy') ?? '', /img-src https:\/\/app\.nyan-remote\.app[;\s]/)
   }
 })
+
+// ─── ★★ One machine signed in several times (2026-09-27 / user report "Machines 6/5") ─────────
+
+test('★★ the page counts machines, not sign-ins: three sign-ins of one PC are one row, and "Remove" removes all of them', async () => {
+  const r = await rig()
+  const a = await login(r)
+  await login(r)
+  await login(r)
+  await login(r, 'gho_good', KEY2)
+  const cookie = await sessionCookie(r, a.body.account.id)
+  const page = await (await r.call('/', { headers: { cookie } })).text()
+  assert.match(page, /2 machines signed in · 1 can connect/, '⚠️⚠️ the page counts sign-ins as machines')
+  assert.equal((page.match(/action="\/machines\/revoke"/g) ?? []).length, 2, 'one row per machine')
+  assert.match(page, new RegExp(`name="key" value="${KEY}"`), 'the form names the machine by its key')
+  // ⚠️ A stale page: the newest sign-in it showed may be gone by now; the key still names the machine (codex)
+  const newest = [...r.store.machines.values()].filter((m) => m.agentKey === KEY).sort((a, b) => b.created - a.created)[0]!
+  r.store.machines.delete(newest.id)
+  const res = await r.call('/machines/revoke', { method: 'POST', body: new URLSearchParams({ key: KEY }), headers: { cookie, origin: ORIGIN } })
+  assert.equal(res.headers.get('location'), '/?n=revoked')
+  assert.deepEqual([...r.store.machines.values()].map((m) => m.agentKey), [KEY2], '⚠️⚠️ "Remove" left sign-ins of the same machine')
+  assert.equal(r.released.length, 2, 'each remaining sign-in was released to relay')
+  // ⚠️ Another account's key cannot be removed by naming it
+  const other = await login(r, 'gho_other', KEY)
+  await r.call('/machines/revoke', { method: 'POST', body: new URLSearchParams({ key: KEY }), headers: { cookie, origin: ORIGIN } })
+  assert.ok([...r.store.machines.values()].some((m) => m.accountId === other.body.account.id), '⚠️⚠️ removed a machine of another account')
+})

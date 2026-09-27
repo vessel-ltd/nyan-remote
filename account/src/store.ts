@@ -277,3 +277,21 @@ export function memoryStore(): Store & { accounts: Map<string, AccountRow>; mach
     },
   }
 }
+
+/**
+ * ★★ Sign-ins grouped by **machine** (2026-09-27 / user report: "Machines 6/5" with 4 real machines).
+ *   Each `nyan login` makes a passphrase row, so one PC signed in three times had three rows. The relay counts machines by key
+ *   (`relay/src/ledger.ts`), so the page does too: rows with the same agent key are one machine; a row without a key yet
+ *   (the agent was stopped at sign-in) is its own. Newest row first in each group; groups in the order of their first sign-in.
+ */
+export function machineGroups(rows: readonly MachineRow[]): { label: string; lastSeen: number; rows: MachineRow[] }[] {
+  const groups = new Map<string, MachineRow[]>()
+  for (const m of [...rows].sort((a, b) => a.created - b.created)) {
+    const k = m.agentKey ? `k:${m.agentKey}` : `id:${m.id}`
+    groups.set(k, [...(groups.get(k) ?? []), m])
+  }
+  return [...groups.values()].map((g) => {
+    const newest = [...g].sort((a, b) => b.created - a.created)
+    return { label: newest[0]!.label, lastSeen: Math.max(...g.map((m) => m.lastSeen)), rows: newest }
+  })
+}

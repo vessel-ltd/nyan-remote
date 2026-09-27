@@ -18,7 +18,7 @@ import { licenseFor, PLAN_LIMITS, type License } from '../../shared/license.ts'
 import { adminPage, DEFAULT_SPIKE_DAILY, usageAlerts, type UsageDay } from './ops.ts'
 import { accountPage, landingPage, SUPPORT_NAME_MAX } from './pages.ts'
 import { cookieOf, makeSession, readSession, SESSION_COOKIE, SESSION_TTL_SEC, setCookie, STATE_COOKIE } from './session.ts'
-import { OPEN_STATUSES, planOf, summarize, type AccountRow, type Store } from './store.ts'
+import { machineGroups, OPEN_STATUSES, planOf, summarize, type AccountRow, type Store } from './store.ts'
 import type { CheckoutParams, StripeApi } from './stripe.ts'
 import { StripeError, verifyWebhook } from './stripe.ts'
 
@@ -574,7 +574,7 @@ export async function handle(req: Request, d: Deps): Promise<Response> {
           `From: ${acct.githubLogin} (GitHub id ${acct.githubId}, account ${acct.id}, plan ${planOf(acct)})`,
           `Name: ${name || '(not given)'}`,
           `Reply to: ${email || '(not given — reply through GitHub)'}`,
-          `Machines: ${(await d.store.machinesOf(acct.id)).length}`,
+          `Machines: ${machineGroups(await d.store.machinesOf(acct.id)).length}`,
           '',
           message,
         ]
@@ -591,8 +591,19 @@ export async function handle(req: Request, d: Deps): Promise<Response> {
         return redirect('/?n=support-sent#support')
       }
       if (path === '/machines/revoke') {
-        const r = await removeMachine(d, acct.id, String(form.get('id') ?? ''))
-        return redirect(r === 'failed' ? '/?n=revoke-failed' : '/?n=revoked')
+        // ★ "Remove" is per machine: the form names the machine's **key** (a sign-in id could be gone by the time a stale page is sent,
+        //   and removing nothing while saying "removed" hid the machine that stayed / codex). A row without a key is named by its id.
+        //   ⚠️ Only this account's rows; oldest first
+        const key = String(form.get('key') ?? '')
+        const id = String(form.get('id') ?? '')
+        const mine = await d.store.machinesOf(acct.id)
+        const byId = mine.find((m) => m.id === id)
+        const targets = (key ? mine.filter((m) => m.agentKey === key) : byId ? (byId.agentKey ? mine.filter((m) => m.agentKey === byId.agentKey) : [byId]) : []).sort(
+          (a, b) => a.created - b.created,
+        )
+        let failed = false
+        for (const m of targets) if ((await removeMachine(d, acct.id, m.id)) === 'failed') failed = true
+        return redirect(failed ? '/?n=revoke-failed' : '/?n=revoked')
       }
     }
     return new Response('not found', { status: 404 })
