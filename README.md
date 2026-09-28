@@ -218,8 +218,8 @@ With several PCs, open the app from one of them (say `pc-a`) and pair the others
 (Nothing is accepted automatically: any web page served from any machine of your tailnet would otherwise be able to
 use your Tailscale identity against the agent.)
 
-> ⚠️ On a PC shared with other OS users, anyone logged in there can reach `127.0.0.1:7777` and pose as Tailscale;
-> prefer the relay route on such machines.
+The Tailscale route assumes you are the only OS user on that PC; on a shared PC use the relay route
+(see [Assumptions and known limitations](SECURITY.md#assumptions-and-known-limitations)).
 
 Measured on the author's setup (3 machines, a full working day): the Durable Object was awake for
 **69 seconds per day** — the hibernation design is what keeps self-hosting essentially free.
