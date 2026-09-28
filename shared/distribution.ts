@@ -91,3 +91,25 @@ export const ACCOUNT_ORIGIN = 'https://account.nyan-remote.app'
  *   Used by `nyan login` for GitHub's Device Flow. ⚠️ Same value as `GITHUB_CLIENT_ID` in `account/wrangler.jsonc`.
  */
 export const GITHUB_CLIENT_ID = 'Ov23liR5gPIqJCohxOey'
+
+/**
+ * ★★ Headers on every PWA response, wherever it is served from (security audit 2026-09-28, F5).
+ *
+ * ⚠️⚠️ **No framing**: the PWA has approve / send / stop buttons, so another site must not embed it (clickjacking).
+ *    `frame-ancestors` works **only as a response header** (a `<meta>` CSP ignores it) ⇒ X (agent, `agent/src/static.ts`) sends
+ *    these itself and Y (the distribution origin) gets them from the `_headers` file `scripts/site-stage.mjs` writes from this table.
+ *    `X-Frame-Options` is for browsers without CSP level 2.
+ * ⚠️ This is **not** a full CSP. A `script-src` must also cover the inline theme script in `web/index.html` and every relay a
+ *    user may host (`connect-src`); it needs checking on real iPhones first (a wrong CSP blanks the app).
+ * ⚠️ Referrer: `web/index.html` already has `<meta name="referrer" content="no-referrer">`.
+ */
+export const PWA_HEADERS: Readonly<Record<string, string>> = {
+  'content-security-policy': "frame-ancestors 'none'",
+  'x-frame-options': 'DENY',
+  'x-content-type-options': 'nosniff',
+}
+
+/** ★ Cloudflare's `_headers` file for the distribution origin (every path gets `PWA_HEADERS`) */
+export function pwaHeadersFile(): string {
+  return ['/*', ...Object.entries(PWA_HEADERS).map(([k, v]) => `  ${k}: ${v}`), ''].join('\n')
+}

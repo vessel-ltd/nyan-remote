@@ -14,7 +14,7 @@
 import { createHash } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { join, resolve } from 'node:path'
-import { DISTRIBUTION_ORIGIN } from '../shared/distribution.ts'
+import { DISTRIBUTION_ORIGIN, PWA_HEADERS } from '../shared/distribution.ts'
 import { t } from '../shared/i18n.ts'
 import { initCliLang } from './lib/lang.mjs'
 
@@ -56,10 +56,16 @@ for (let i = 1; i <= TRIES; i++) {
           ),
         )
       }
+      // ★★ The page itself carries the no-framing headers (`_headers` / security audit 2026-09-28, F5)
+      const page = await fetch(`${DISTRIBUTION_ORIGIN}/`)
+      for (const [name, value] of Object.entries(PWA_HEADERS)) {
+        const got = page.headers.get(name)
+        if (got !== value) throw new Error(t(`ヘッダ ${name} が違う（${got ?? 'なし'}）`, `header ${name} differs (${got ?? 'missing'})`))
+      }
       console.log(
         t(
-          `✔ 配布元が版 ${rev} を返しています（${i} 回目 / install.sh と tarball も一致）`,
-          `✔ The distribution origin serves version ${rev} (attempt ${i} / install.sh and tarball match too)`,
+          `✔ 配布元が版 ${rev} を返しています（${i} 回目 / install.sh と tarball とヘッダも一致）`,
+          `✔ The distribution origin serves version ${rev} (attempt ${i} / install.sh, tarball and headers match too)`,
         ),
       )
       console.log(`  ${DISTRIBUTION_ORIGIN}`)

@@ -14,7 +14,7 @@
     "ORIGIN": "https://account.nyan-remote.app",
     // ★ Values that may be public (Client ID)
     "GITHUB_CLIENT_ID": "Ov23liR5gPIqJCohxOey",
-    // ★ Stripe Price IDs (⚠️ **test mode** values / 2026-09-24. Replace them when switching to live)
+    // ★ Stripe Price IDs (**live mode** since 2026-09-27; test mode used price_1UJC…. Not secrets: Checkout shows them to the buyer)
     "PRICE_USD_MONTH": "price_1UKJKgFQRnbVQ6jcCxXRGX9N",
     "PRICE_USD_YEAR": "price_1UKJLGFQRnbVQ6jcpJxfIbZo",
     // ★ Ops watcher (src/ops.ts / 2026-09-25). ⚠️ CF_ANALYTICS_TOKEN is a secret (read-only token)

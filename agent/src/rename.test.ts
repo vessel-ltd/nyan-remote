@@ -347,7 +347,7 @@ test('★★★ measured: the header name notify.sh sends matches the one auth.t
   //     causes "no notifications even after git pull" (the hardest cause to find).
   const sh = readFileSync(join(ROOT, 'hooks/notify.sh'), 'utf8')
   const auth = readFileSync(join(ROOT, 'agent/src/auth.ts'), 'utf8')
-  const sent = sh.match(/-H "([\w-]+-Token): /i)
+  const sent = sh.match(/header = "([\w-]+-Token): /i)
   const read = auth.match(/header\(req, '([\w-]+-token)'\)/i)
   assert.ok(sent, 'cannot read the header name notify.sh sends (shape changed)')
   assert.ok(read, 'cannot read the header name auth.ts reads (shape changed)')

@@ -8,7 +8,7 @@
 //
 // ⚠️ Only "decisions" live here. Accepting sockets, storing tags and key generation are on the other side of `RoomIo`.
 
-import { relayProof, sameBytes, toBase64Url, type Jwk, type Key } from '../../shared/crypto.ts'
+import { initDevicePublicKey, relayProof, sameBytes, toBase64Url, type Jwk, type Key } from '../../shared/crypto.ts'
 import {
   RELAY_NONCE_BYTES,
   decodeDeviceProof,
@@ -139,6 +139,7 @@ export const REASON = {
   badProof: 'Could not read the proof / 証明を受け取れませんでした',
   lateProof: 'Proof came too late / 証明が遅すぎます',
   notOwner: 'Could not verify the key owner / 鍵の持ち主だと確かめられません',
+  keyMismatch: 'Handshake key is not the proven key / 握手の鍵が証明した鍵と違います',
   agentReplaced: 'Agent reconnected on another link / agent が別の線で繋ぎ直しました',
   agentReconnected: 'Agent reconnected / agent が繋ぎ直しました',
   agentClosed: 'Closed by the agent / agent が閉じました',
@@ -178,6 +179,11 @@ export interface Tag {
   held?: Uint8Array
   /** ★ `device`: the phone's public key (base64url), known only after its proof passed */
   dkey?: string
+  /**
+   * ★★ `device`: the handshake's first message named `dkey` (security audit 2026-09-28, F1/F2 / `#binds`).
+   *   ⚠️ Checked once, on the first message that goes to the agent; later messages are sealed frames.
+   */
+  dbound?: boolean
   /** ★ `device`: the phone asked to move its free slot here (`f=1` / passed to the ledger with its proof) */
   dtake?: boolean
   /**
@@ -250,6 +256,12 @@ export interface Tag {
    *    (the proof can continue even if it sleeps midway). ⚠️ A per-connection value, deleted once done.
    */
   pending?: { key: string; nonce: Uint8Array; jwk: Jwk; until: number }
+  /**
+   * ★★ agent: accepted, its challenge still being made (security audit 2026-09-28, F3). Counts toward `MAX_PENDING_AGENTS`
+   *   **from the moment the wire is accepted**: without it, wires opened together were all admitted while `newChallenge()` was
+   *   awaited (the count only saw tagged wires). Replaced by `pending` once the challenge is sent; swept at `until` like it.
+   */
+  reserving?: { until: number }
 }
 
 /** One wire (⚠️ `worker.ts` wraps the Durable Object's WebSocket) */
@@ -376,7 +388,8 @@ export class Room {
     const now = this.#io.now()
     let swept = 0
     for (const s of this.#pending()) {
-      const until = s.tag()?.pending?.until
+      const tag = s.tag()
+      const until = tag?.pending?.until ?? tag?.reserving?.until
       // ⚠️ Tags without a deadline (= old versions, broken tags) are evicted too (fail-closed)
       if (until === undefined || until <= now) {
         this.#drop(s, REASON.noProof, CLOSE.badProof)
@@ -475,7 +488,12 @@ export class Room {
 
   /** Put a tag on the accepted agent wire and **send the challenge first** */
   async startAgent(socket: RoomSocket, key: string, control = false, licensing = false): Promise<void> {
+    // ⚠️⚠️ Tagged **before** the await (F3): an untagged wire is not counted by `admitAgent`, so the limit did not hold
+    socket.setTag({ side: 'agent', reserving: { until: this.#io.now() + PROOF_DEADLINE_MS } })
     const c = await this.#io.newChallenge()
+    // ⚠️ The wire may be gone meanwhile (swept, or closed = retired). Then no challenge
+    const now = socket.tag()
+    if (!now || now.retired === true || now.reserving === undefined) return
     socket.setTag({
       side: 'agent',
       ...(control ? { control: true } : {}),
@@ -530,8 +548,10 @@ export class Room {
    *    to an unrelated device / codex round 4, medium #2).
    * ★★ A phone that announced the key proof (`p=1`) is **challenged first** (2026-09-27): the agent is told `opened` only
    *   after the proof and the free-tier check pass (`#checkDeviceProof`). ⚠️ Not on a self-hosted relay (no plans, no ledger).
-   * ⚠️ An old app (no `p=1`) in a room without a ticket is closed **with a reason** right after accepting (a refusal before the
-   *    upgrade would be invisible to the browser = it would show as "offline" instead of "update the app").
+   * ⚠️ An old app (no `p=1`) is closed **with a reason** right after accepting (a refusal before the upgrade would be invisible
+   *    to the browser = it would show as "offline" instead of "update the app").
+   *    ⚠️⚠️ **In every room, Plus included** (codex 2026-09-28 on the audit fix): without a proven key `#binds` has nothing to
+   *    compare with, so a Plus room let an unproven wire name a registered phone's public key and hold the slots (F1 again).
    * @param proving the phone announced `p=1`
    * @param takeover the phone announced `f=1` (move its free slot here / only meaningful with `proving`)
    */
@@ -551,11 +571,7 @@ export class Room {
       return connId
     }
     if (!proving) {
-      if (!this.#paid()) {
-        this.#evict({ socket, tag: base }, REASON.updateApp, CLOSE.updateApp)
-        return connId
-      }
-      this.#toAgent({ type: RELAY_FRAME.opened, connId })
+      this.#evict({ socket, tag: base }, REASON.updateApp, CLOSE.updateApp)
       return connId
     }
     const c = await this.#io.newChallenge()
@@ -632,8 +648,44 @@ export class Room {
     this.#enforce()
     if (socket.tag()?.evicted === true) return
     if (tag?.side === 'agent') return await this.#fromAgent(socket, new Uint8Array(message))
-    if (tag?.side === 'device' && tag.connId) return this.#fromDevice(tag.connId, message)
+    if (tag?.side === 'device' && tag.connId) {
+      if (!this.#binds(socket, new Uint8Array(message))) return
+      return this.#fromDevice(tag.connId, message)
+    }
     this.#drop(socket, REASON.unknownSocket, CLOSE.badFrame)
+  }
+
+  /**
+   * ★★ A phone that proved a key must hand the agent **that same key** in its handshake (security audit 2026-09-28, F1/F2).
+   *
+   * ⚠️⚠️ Without this, the relay's key (the free-tier count) and the agent's key (registration) were unrelated:
+   *    F1: prove any key, then name a victim phone's **public** key in the handshake ⇒ the agent replies (it cannot tell yet),
+   *        the wire is admitted and holds the victim room's slots while it stays open.
+   *    F2: keep one paired key for the agent and prove a fresh key per room ⇒ one app, many free machines.
+   * ★ Only the first message that reaches the agent is the handshake (the agent takes one per connection number), so it is
+   *   checked once and remembered (`dbound`). Usually that is the held message (`#checkDeviceProof`); this covers the case where
+   *   the handshake comes after the proof.
+   * ⚠️ Not checked on a self-hosted relay only (no proofs there). ⚠️⚠️ On our relay a wire **without a proven key carries
+   *    nothing** (codex 2026-09-28 round 2: while `startDevice` awaited the challenge the tag had neither `dpending` nor `dkey`,
+   *    so a message in that window went straight to the agent). ⚠️ A wire the agent already admitted is **not** exempt either
+   *    (a deploy closes the wires anyway; an exemption would be one more way past this check).
+   * @returns false = the wire was closed
+   */
+  #binds(socket: RoomSocket, bytes: Uint8Array): boolean {
+    if (this.#io.selfHosted()) return true
+    const tag = socket.tag()
+    if (!tag?.dkey) {
+      if (tag) this.#evict({ socket, tag }, REASON.badProof, CLOSE.badProof)
+      else this.#drop(socket, REASON.unknownSocket, CLOSE.badFrame)
+      return false
+    }
+    if (tag.dbound === true) return true
+    if (!namesKey(bytes, tag.dkey)) {
+      this.#evict({ socket, tag }, REASON.keyMismatch, CLOSE.badProof)
+      return false
+    }
+    socket.setTag({ ...tag, dbound: true })
+    return true
   }
 
   /**
@@ -748,7 +800,12 @@ export class Room {
       return
     }
     const { dpending: _p, dproof: _q, dstale: _s, held, ...rest } = after
-    socket.setTag({ ...rest, dkey, ...(licensed ? {} : { free: true }) })
+    // ★★ The held message is the handshake's first message: it must name the proven key (before the agent hears of this phone)
+    if (held !== undefined && !namesKey(new Uint8Array(held), dkey)) {
+      this.#evict({ socket, tag: after }, REASON.keyMismatch, CLOSE.badProof)
+      return
+    }
+    socket.setTag({ ...rest, dkey, ...(licensed ? {} : { free: true }), ...(held !== undefined ? { dbound: true } : {}) })
     this.#toAgent({ type: RELAY_FRAME.opened, connId: rest.connId as number })
     if (held !== undefined) this.#toAgent({ type: RELAY_FRAME.data, connId: rest.connId as number, payload: new Uint8Array(held) })
   }
@@ -1036,6 +1093,12 @@ export class Room {
       for (const d of this.#devices()) this.#evict(d, REASON.agentGone, CLOSE.agentGone)
     }
   }
+}
+
+/** ★ `bytes` is a handshake's first message naming the device key `dkey` (base64url / `#binds`) */
+function namesKey(bytes: Uint8Array, dkey: string): boolean {
+  const named = initDevicePublicKey(bytes)
+  return named !== undefined && toBase64Url(named) === dkey
 }
 
 /** ⚠️ The connection number of a phone wire (always set by `startDevice` before any await) */

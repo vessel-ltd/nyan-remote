@@ -23,6 +23,7 @@ import {
   fromBase64Url,
   generateDeviceKey,
   relayProof,
+  startHandshake,
   toBase64Url,
   type Jwk,
   type KeyPair,
@@ -78,6 +79,8 @@ function rig(
     duringProof?: () => void
     /** ★ Rooms by agent key (shared between rigs = the Phones DO can tell the room a phone moved away from) */
     rooms?: Map<string, Room>
+    /** ★ Challenges are made only after this resolves (= wires accepted together all wait inside `newChallenge`) */
+    challengeGate?: Promise<void>
   } = {},
 ) {
   const all: { side: 'agent' | 'device'; socket: Fake }[] = []
@@ -90,6 +93,7 @@ function rig(
   const room = new Room({
     sockets: (side) => all.filter((s) => s.side === side).map((s) => s.socket),
     newChallenge: async () => {
+      await o.challengeGate
       const eph = (await crypto.subtle.generateKey(ECDH_PARAMS, true, [
         'deriveBits',
       ])) as KeyPair
@@ -215,10 +219,25 @@ async function prove(r: ReturnType<typeof rig>, d: { socket: Fake }, identity: K
   await r.room.onMessage(d.socket, bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer)
 }
 
-/** ★ A phone that connected and proved its key (a fresh phone unless `identity` is given). `takeover` = it asked to move its free slot here */
+/**
+ * ★ The handshake's first message a real phone sends for `identity` (the addressed agent does not matter to relay).
+ *   ⚠️ relay only carries a phone whose first message names the key it proved (`#binds` / security audit 2026-09-28, F1/F2)
+ */
+async function initFor(identity: KeyPair): Promise<Uint8Array> {
+  const anyAgent = await generateDeviceKey()
+  return (await startHandshake(identity, await exportPublicKey(anyAgent.publicKey))).message
+}
+
+/**
+ * ★ A phone that connected and proved its key (a fresh phone unless `identity` is given). `takeover` = it asked to move its free slot here.
+ *   ★ Like the real app, the handshake's first message crossed the challenge (held, then forwarded after `opened`).
+ */
 async function freePhone(r: ReturnType<typeof rig>, identity?: KeyPair, o: { takeover?: boolean } = {}): Promise<{ socket: Fake; connId: number; identity: KeyPair }> {
   const id = identity ?? (await generateDeviceKey())
   const d = await joinDevice(r, o)
+  const challenge = d.socket.sent.shift() as Uint8Array
+  await r_onMessage(r, d.socket, await initFor(id))
+  d.socket.sent.unshift(challenge)
   await prove(r, d, id)
   assert.equal(d.socket.closed, undefined, `the phone was cut after a real proof: ${d.socket.closed?.reason ?? ''}`)
   return { ...d, identity: id }
@@ -696,13 +715,58 @@ test('★★ a room without a ticket takes phones that proved their key; nothing
   assert.equal(d.socket.closed, undefined, 'a small crossing message is held, not cut')
   const identity = await generateDeviceKey()
   await prove(r, d, identity)
-  assert.equal(d.socket.closed, undefined, `cut after a real proof: ${(d.socket as { closed?: { reason: string } }).closed?.reason ?? ''}`)
-  assert.deepEqual(openedIds(agent), [d.connId], '⚠️⚠️ the agent was not told opened after the proof')
-  assert.equal(d.socket.tag()?.free, true, 'the wire does not carry the free-tier mark')
-  assert.equal(d.socket.tag()?.dkey, toBase64Url(await exportPublicKey(identity.publicKey)))
+  // ⚠️⚠️ ...but a held message that is not a handshake naming the proven key never reaches the agent (F1/F2)
+  assert.deepEqual(d.socket.closed, { code: CLOSE.badProof, reason: REASON.keyMismatch })
+  assert.deepEqual(openedIds(agent), [], '⚠️⚠️ opened was sent for a phone whose held message did not bind')
+  // ★ A real phone: its handshake crosses the challenge, then the proof
+  const e = await joinDevice(r)
+  const challenge = e.socket.sent.shift() as Uint8Array
+  await r_onMessage(r, e.socket, await initFor(identity))
+  e.socket.sent.unshift(challenge)
+  await prove(r, e, identity)
+  assert.equal(e.socket.closed, undefined, `cut after a real proof: ${e.socket.closed?.reason ?? ''}`)
+  assert.deepEqual(openedIds(agent), [e.connId], '⚠️⚠️ the agent was not told opened after the proof')
+  assert.equal(e.socket.tag()?.free, true, 'the wire does not carry the free-tier mark')
+  assert.equal(e.socket.tag()?.dkey, toBase64Url(await exportPublicKey(identity.publicKey)))
   // ★ From here on, bytes are carried
-  await agentReplies(r, agent, d.connId)
-  assert.deepEqual([...(d.socket.sent.at(-1) as Uint8Array)], [7])
+  await agentReplies(r, agent, e.connId)
+  assert.deepEqual([...(e.socket.sent.at(-1) as Uint8Array)], [7])
+})
+
+test('★★ the handshake must name the key the phone proved to relay (security audit 2026-09-28, F1/F2)', async () => {
+  const phones = new Map<string, PhoneLedger>()
+  const victim = await generateDeviceKey()
+  const r = rig({ phones })
+  const agent = await becomeAgent(r, await generateDeviceKey())
+  // F1: prove your own key, then name the victim's **public** key in the handshake (held before the proof)
+  const held = await joinDevice(r)
+  const c1 = held.socket.sent.shift() as Uint8Array
+  await r_onMessage(r, held.socket, await initFor({ publicKey: victim.publicKey, privateKey: (await generateDeviceKey()).privateKey }))
+  held.socket.sent.unshift(c1)
+  await prove(r, held, await generateDeviceKey())
+  assert.deepEqual(held.socket.closed, { code: CLOSE.badProof, reason: REASON.keyMismatch }, '⚠️⚠️ a held handshake naming another key went on')
+  // ...or send it after the proof
+  const after = await joinDevice(r)
+  await prove(r, after, await generateDeviceKey())
+  assert.equal(after.socket.closed, undefined)
+  agent.sent.length = 0
+  await r_onMessage(r, after.socket, await initFor({ publicKey: victim.publicKey, privateKey: (await generateDeviceKey()).privateKey }))
+  assert.deepEqual(after.socket.closed, { code: CLOSE.badProof, reason: REASON.keyMismatch }, '⚠️⚠️ a later handshake naming another key went on')
+  assert.equal(agent.sent.filter((b) => decodeRelayFrame(b).ok && (decodeRelayFrame(b) as { value: { type: number } }).value.type === RELAY_FRAME.data).length, 0, '⚠️⚠️ the forged handshake reached the agent')
+  // ⚠️ Anything that is not a handshake as the first message is refused too (no way to skip the check)
+  const junk = await joinDevice(r)
+  await prove(r, junk, await generateDeviceKey())
+  await r_onMessage(r, junk.socket, new Uint8Array([1, 2, 3]))
+  assert.equal(junk.socket.closed?.reason, REASON.keyMismatch)
+  // ★ The proven key in its own handshake passes, sent after the proof as well; later frames are not handshakes and still pass
+  const own = await generateDeviceKey()
+  const ok = await joinDevice(r)
+  await prove(r, ok, own)
+  await r_onMessage(r, ok.socket, await initFor(own))
+  await r_onMessage(r, ok.socket, new Uint8Array([4, 5, 6]))
+  assert.equal(ok.socket.closed, undefined, `cut a phone naming its own key: ${ok.socket.closed?.reason ?? ''}`)
+  // ★ F2 in one line: the ledger only ever saw keys that the agent was handed, so one paired key = one free machine
+  assert.equal(phones.has(toBase64Url(await exportPublicKey(victim.publicKey))), false)
 })
 
 test('★★ a proof with wrong contents does not pass, and a proof naming someone else\'s key does not fill their slot (⑧ impostor)', async () => {
@@ -769,11 +833,14 @@ test('★★ the handshake\'s first message may cross the challenge: held once, 
   const r = rig()
   const agent = await becomeAgent(r, await generateDeviceKey())
   const d = await joinDevice(r)
-  const init = new Uint8Array(196).fill(3)
+  const identity = await generateDeviceKey()
+  const init = await initFor(identity)
+  const challenge = d.socket.sent.shift() as Uint8Array
   await r_onMessage(r, d.socket, init)
+  d.socket.sent.unshift(challenge)
   assert.equal(d.socket.closed, undefined, '⚠️⚠️ cut a phone whose handshake crossed the challenge')
   assert.deepEqual(openedIds(agent), [], '⚠️⚠️ the held message reached the agent before the proof')
-  await prove(r, d, await generateDeviceKey())
+  await prove(r, d, identity)
   const frames = agent.sent.flatMap((b) => {
     const x = decodeRelayFrame(b)
     return x.ok ? [x.value] : []
@@ -791,20 +858,22 @@ test('★★ the handshake\'s first message may cross the challenge: held once, 
   assert.equal(f.socket.closed?.code, CLOSE.badProof, '⚠️ held an oversized message')
 })
 
-test('★★ an old app (no key proof) is closed with "update the app" in a room without a ticket, and works as before elsewhere (⑧)', async () => {
+test('★★ an old app (no key proof) is closed with "update the app" in every room on our relay; a self-hosted relay never challenges (⑧)', async () => {
   const r = rig()
   const agent = await becomeAgent(r, await generateDeviceKey())
   const old = await joinDevice(r, { old: true })
   assert.deepEqual(old.socket.closed, { code: CLOSE.updateApp, reason: REASON.updateApp }, '⚠️⚠️ an app without the proof got into a free room')
   assert.deepEqual(openedIds(agent), [])
-  // A room with a ticket: as before (no challenge, opened right away)
-  const lic = rig({ licenses: { FREE: LIC_PAID } })
+  // ⚠️⚠️ A Plus room too (codex 2026-09-28): an unproven wire leaves `#binds` nothing to compare with, so it could name a
+  //    registered phone's public key and hold the slots (F1). ★ A current app still gets in
+  const lic = rig({ licenses: { PLUS: LIC_PLUS } })
   const la = await becomeAgent(lic, await generateDeviceKey(), { licensing: true })
-  await sendLicense(lic, la, 'FREE')
+  await sendLicense(lic, la, 'PLUS')
   const onLic = await joinDevice(lic, { old: true })
-  assert.equal(onLic.socket.closed, undefined)
-  assert.equal(onLic.socket.sent.length, 0, '⚠️ challenged an app that cannot answer')
-  assert.deepEqual(openedIds(la), [onLic.connId])
+  assert.deepEqual(onLic.socket.closed, { code: CLOSE.updateApp, reason: REASON.updateApp }, '⚠️⚠️ an app without the proof got into a Plus room')
+  assert.deepEqual(openedIds(la), [])
+  const current = await freePhone(lic)
+  assert.deepEqual(openedIds(la), [current.connId])
   // A self-hosted relay: never challenges anyone
   const self = rig({ selfHosted: true })
   const sa = await becomeAgent(self, await generateDeviceKey())
@@ -1641,4 +1710,104 @@ test('★★ several wires of one phone connecting to a Plus room at once all ge
   for (const g of gates.splice(0)) g()
   await Promise.all(proofs)
   assert.deepEqual(ws.map((w) => w.socket.closed?.code ?? null), [null, null, null], '⚠️⚠️ Plus wires of one phone closed each other')
+})
+
+test('★★ the pending-agent limit holds while challenges are still being made (security audit 2026-09-28, F3)', async () => {
+  let release = () => {}
+  const r = rig({ challengeGate: new Promise<void>((resolve) => (release = resolve)) })
+  const key = toBase64Url(await exportPublicKey((await generateDeviceKey()).publicKey))
+  const starts: Promise<void>[] = []
+  let admitted = 0
+  // ⚠️ Accept + start without awaiting, like concurrent upgrades in the Durable Object (its input gate does not cover crypto awaits)
+  for (let i = 0; i < MAX_PENDING_AGENTS * 3; i++) {
+    if (!r.room.admitAgent().ok) continue
+    admitted += 1
+    starts.push(r.room.startAgent(r.open('agent'), key))
+  }
+  assert.equal(admitted, MAX_PENDING_AGENTS, '⚠️⚠️ more agent wires were admitted than the pending limit while challenges were awaited')
+  release()
+  await Promise.all(starts)
+  // ★ The reserved wires got their challenge; a reservation left past the deadline is swept like a pending proof
+  r.advance(PROOF_DEADLINE_MS + 1)
+  assert.equal(r.room.admitAgent().ok, true, 'expired wires were not swept')
+})
+
+test('★ a wire swept while its challenge was being made gets no challenge (F3)', async () => {
+  let release = () => {}
+  const r = rig({ challengeGate: new Promise<void>((resolve) => (release = resolve)) })
+  const key = toBase64Url(await exportPublicKey((await generateDeviceKey()).publicKey))
+  const socket = r.open('agent')
+  const start = r.room.startAgent(socket, key)
+  r.advance(PROOF_DEADLINE_MS + 1)
+  assert.equal(r.room.admitAgent().ok, true)
+  assert.equal(socket.closed?.code, CLOSE.badProof, 'the expired reservation was not swept')
+  release()
+  await start
+  assert.equal(socket.sent.length, 0, '⚠️ a challenge was sent on a swept wire')
+})
+
+// ─── ★★ codex 2026-09-28 round 2 (after the audit fix) ───────────────────────────────────────────
+
+test('★★ no key proof ⇒ "update the app" whatever else the phone asks for (p=0 with f=1), in a free or a Plus room', async () => {
+  const free = rig()
+  const fa = await becomeAgent(free, await generateDeviceKey())
+  const plus = rig({ licenses: { PLUS: LIC_PLUS } })
+  const pa = await becomeAgent(plus, await generateDeviceKey(), { licensing: true })
+  await sendLicense(plus, pa, 'PLUS')
+  for (const [r, agent] of [[free, fa], [plus, pa]] as const) {
+    const d = await joinDevice(r, { old: true, takeover: true })
+    assert.deepEqual(d.socket.closed, { code: CLOSE.updateApp, reason: REASON.updateApp }, '⚠️⚠️ f=1 without p=1 was not refused')
+    assert.equal(d.socket.sent.length, 0, '⚠️ challenged an app that cannot answer')
+    assert.deepEqual(openedIds(agent), [])
+  }
+})
+
+test('★★ a Plus room also refuses a handshake naming another key than the proven one (F1 in a Plus room)', async () => {
+  const r = rig({ licenses: { PLUS: LIC_PLUS } })
+  const agent = await becomeAgent(r, await generateDeviceKey(), { licensing: true })
+  await sendLicense(r, agent, 'PLUS')
+  const victim = await generateDeviceKey()
+  const d = await joinDevice(r)
+  await prove(r, d, await generateDeviceKey())
+  assert.equal(d.socket.closed, undefined)
+  agent.sent.length = 0
+  await r_onMessage(r, d.socket, await initFor({ publicKey: victim.publicKey, privateKey: (await generateDeviceKey()).privateKey }))
+  assert.deepEqual(d.socket.closed, { code: CLOSE.badProof, reason: REASON.keyMismatch }, '⚠️⚠️ a forged handshake went on in a Plus room')
+  assert.equal(agent.sent.length, 0, '⚠️⚠️ the forged handshake reached the agent')
+})
+
+test('★★ nothing is carried while the phone\'s challenge is still being made (no proven key yet)', async () => {
+  const opts: { challengeGate?: Promise<void> } = {}
+  const r = rig(opts)
+  const agent = await becomeAgent(r, await generateDeviceKey())
+  let release = () => {}
+  opts.challengeGate = new Promise<void>((resolve) => (release = resolve))
+  assert.equal(r.room.admitDevice().ok, true)
+  const socket = r.open('device')
+  const start = r.room.startDevice(socket, true)
+  agent.sent.length = 0
+  await r_onMessage(r, socket, await initFor(await generateDeviceKey()))
+  assert.equal(agent.sent.length, 0, '⚠️⚠️ bytes reached the agent before the phone proved any key')
+  assert.equal(socket.closed?.code, CLOSE.badProof)
+  release()
+  await start
+  assert.equal(socket.sent.length, 0, '⚠️ a challenge was sent on a closed wire')
+})
+
+test('★ a reserved agent wire keeps its place until the proof deadline (not swept early)', async () => {
+  const opts: { challengeGate?: Promise<void> } = { challengeGate: new Promise<void>(() => {}) }
+  const r = rig(opts)
+  const key = toBase64Url(await exportPublicKey((await generateDeviceKey()).publicKey))
+  const wires: Fake[] = []
+  for (let i = 0; i < MAX_PENDING_AGENTS; i++) {
+    assert.equal(r.room.admitAgent().ok, true)
+    const w = r.open('agent')
+    wires.push(w)
+    void r.room.startAgent(w, key)
+  }
+  r.advance(PROOF_DEADLINE_MS - 1)
+  assert.equal(r.room.admitAgent().ok, false, '⚠️ reservations were swept before the deadline')
+  assert.ok(wires.every((w) => w.closed === undefined), '⚠️ a reserved wire was closed before the deadline')
+  r.advance(1)
+  assert.equal(r.room.admitAgent().ok, true, 'reservations were not swept at the deadline')
 })

@@ -10,7 +10,7 @@
 
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { DEFAULT_RELAY_URL, DISTRIBUTION_ORIGIN } from './distribution.ts'
+import { DEFAULT_RELAY_URL, DISTRIBUTION_ORIGIN, PWA_HEADERS, pwaHeadersFile } from './distribution.ts'
 import { isRelayBase } from './relayFrame.ts'
 
 test('★★ both official entry points are known answers (⚠️ changing them disagrees with what is deployed)', () => {
@@ -53,4 +53,13 @@ test('★★ the PWA is on **a subdomain, not the apex** (⚠️⚠️ origin gr
   //   this checks "a different branch of the same tree" = it fails even if one is copied into the other)
   const relayHost = new URL(DEFAULT_RELAY_URL).hostname
   assert.notEqual(relayHost.split('.')[0], labels[0], '⚠️⚠️ distribution origin and relay have the same name')
+})
+
+test('★★ the PWA refuses to be framed, and Y\'s `_headers` carries exactly that table to every path (security audit 2026-09-28, F5)', () => {
+  assert.equal(PWA_HEADERS['content-security-policy'], "frame-ancestors 'none'")
+  assert.equal(PWA_HEADERS['x-frame-options'], 'DENY')
+  const lines = pwaHeadersFile().split('\n')
+  // ⚠️ Cloudflare applies the rules under a path line; the rules must be indented under `/*` (a stray rule is ignored)
+  assert.equal(lines[0], '/*')
+  for (const [k, v] of Object.entries(PWA_HEADERS)) assert.ok(lines.includes(`  ${k}: ${v}`), `${k} is not in _headers`)
 })

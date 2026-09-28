@@ -394,6 +394,21 @@ function parseInit(message: Uint8Array): Init {
 }
 
 /**
+ * ★★ The device key a handshake's first message names, **for relay's binding check only** (security audit 2026-09-28, F1/F2).
+ *
+ * relay counts phones by the key they proved to it (`shared/relayAuth.ts`), while the agent authorizes the key in this message.
+ * ⚠️⚠️ Unbound, a phone could prove one key and hand the agent another: fill a victim's slots with the victim's **public** key
+ *    (F1), or keep one paired key and prove a fresh key per room to get many free machines in one app (F2).
+ *    ⇒ relay requires the two to be the same key before anything reaches the agent (`room.ts`).
+ * ⚠️ **Not an authorization** (it proves nothing about registration; that stays `acceptHandshake`'s `authorize`).
+ * ⚠️ Never throws (hostile input): not a first message ⇒ `undefined`.
+ */
+export function initDevicePublicKey(message: Uint8Array): Uint8Array | undefined {
+  if (message.length !== INIT_BYTES || message[0] !== V || message[1] !== INIT_TYPE) return undefined
+  return message.slice(2, 2 + PUBKEY_BYTES)
+}
+
+/**
  * Who is let through. ⚠️ **The caller looks at `devices.json`** (this layer only knows keys).
  *
  * ★★ **The return value may be "the thing let through" itself** (2026-09-08 / step 6 ① of ③).

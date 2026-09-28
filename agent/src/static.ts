@@ -3,6 +3,7 @@
 // Because of this we can say "if you are worried, open it from your own agent".
 // This escape hatch is what backs the trustworthiness of Y (serving from a public origin), so never remove it.
 
+import { PWA_HEADERS } from '../../shared/distribution.ts'
 import { t } from '../../shared/i18n.ts'
 import { createReadStream } from 'node:fs'
 import { stat } from 'node:fs/promises'
@@ -62,9 +63,22 @@ export function resolveUnderDist(
   return { file, pathname }
 }
 
-export async function serveStatic(ctx: Ctx): Promise<undefined> {
+/** ★ Headers of a served file (a pure function so the test sees what is actually sent / codex 2026-09-28) */
+export function staticHeaders(pathname: string, file: string, size: number): Record<string, string | number> {
+  return {
+    'content-type': TYPES[extname(file)] ?? 'application/octet-stream',
+    'content-length': size,
+    'cache-control': cacheControl(pathname),
+    // whatever the distribution origin, prevent embedding and MIME misinterpretation (one table with Y / `PWA_HEADERS`)
+    ...PWA_HEADERS,
+    'referrer-policy': 'no-referrer',
+  }
+}
+
+/** @param dist ⚠️ only tests pass another directory (the real one is `web/dist`) */
+export async function serveStatic(ctx: Ctx, dist = DIST): Promise<undefined> {
   const { req, res, url } = ctx
-  const safe = resolveUnderDist(url.pathname, DIST)
+  const safe = resolveUnderDist(url.pathname, dist)
   if (!safe) {
     res.writeHead(403, { 'content-type': 'text/plain; charset=utf-8' }).end('forbidden')
     return
@@ -76,13 +90,13 @@ export async function serveStatic(ctx: Ctx): Promise<undefined> {
   if (!s?.isFile()) {
     // a path without an extension is treated as an SPA route and gets index.html
     if (!extname(pathname)) {
-      file = join(DIST, 'index.html')
+      file = join(dist, 'index.html')
       s = await tryStat(file)
     }
   }
 
   if (!s?.isFile()) {
-    if (!(await tryStat(join(DIST, 'index.html')))) {
+    if (!(await tryStat(join(dist, 'index.html')))) {
       placeholder(ctx)
       return
     }
@@ -90,14 +104,7 @@ export async function serveStatic(ctx: Ctx): Promise<undefined> {
     return
   }
 
-  res.writeHead(200, {
-    'content-type': TYPES[extname(file)] ?? 'application/octet-stream',
-    'content-length': s.size,
-    'cache-control': cacheControl(pathname),
-    // whatever the distribution origin, prevent embedding and MIME misinterpretation
-    'x-content-type-options': 'nosniff',
-    'referrer-policy': 'no-referrer',
-  })
+  res.writeHead(200, staticHeaders(pathname, file, s.size))
   if (req.method === 'HEAD') {
     res.end()
     return
@@ -130,6 +137,8 @@ NYAN_REMOTE_DEV=1 npm run dev</pre>
     .writeHead(200, {
       'content-type': 'text/html; charset=utf-8',
       'cache-control': 'no-store',
+      // ⚠️ this page too (codex 2026-09-28 round 2: it was the one HTML response that could be framed)
+      ...PWA_HEADERS,
     })
     .end(body)
 }

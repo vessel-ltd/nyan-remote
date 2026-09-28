@@ -21,7 +21,7 @@ import { join, resolve } from 'node:path'
 // ★ **Never copy the distribution URL by hand** (built from the single place in `shared/distribution.ts`).
 //   ⚠️ It was hard-coded here, so the 2026-09-21 move to our own domain nearly **kept pointing users at the old URL**
 //      (CLAUDE.md "when you change a decision, fix the text that shows it the same day").
-import { DISTRIBUTION_ORIGIN } from '../shared/distribution.ts'
+import { DISTRIBUTION_ORIGIN, pwaHeadersFile } from '../shared/distribution.ts'
 import { t } from '../shared/i18n.ts'
 import { initCliLang } from './lib/lang.mjs'
 import { linkEntries, privateEntries, unpublishedEntries } from './lib/tarPolicy.mjs'
@@ -85,6 +85,9 @@ rmSync(SITE, { recursive: true, force: true })
 mkdirSync(SITE, { recursive: true })
 cpSync(join(ROOT, 'web/dist'), SITE, { recursive: true })
 cpSync(TAR, join(SITE, 'nyan-remote.tar.gz'))
+// ★★ Response headers for every path (no framing / security audit 2026-09-28, F5). Cloudflare reads `_headers` and does not serve it.
+//   ⚠️ `site:verify` checks the served page carries them (a file that was written is not a header that was sent)
+writeFileSync(join(SITE, '_headers'), pwaHeadersFile())
 
 // ★ ③ Extract install.sh and RELEASE **from inside the tarball** (reason above)
 for (const name of ['install.sh', 'RELEASE']) {

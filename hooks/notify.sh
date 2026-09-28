@@ -29,12 +29,22 @@ fi
 #       so IP cannot tell them apart. The shared token in ~/.nyan-remote/hook-token (600) does.
 AGENT_URL="${NYAN_REMOTE_HOOK_URL:-http://127.0.0.1:7777/hook}"
 TOKEN_FILE="${NYAN_REMOTE_TOKEN_FILE:-$HOME/.nyan-remote/hook-token}"
+#
+# ★★ Secrets never go on curl's command line (security audit 2026-09-28, F6).
+#   ⚠️⚠️ Arguments are readable by **other OS users** (`/proc/<pid>/cmdline` is 0444 on Linux, `ps` shows them on mac)
+#      ⇒ the token would let them mint a pairing one-time (`/pair/token`) = register their own phone.
+#   ⇒ The token goes through a curl config read from a pipe, the body through stdin. `printf` is a bash builtin (no argv).
+#   ⚠️ Do not go back to `-H "…: $(cat …)"` or `-d "$payload"`.
+# In a curl config, `\` and `"` inside quotes must be escaped
+cfg_quote() { local v="${1//\\/\\\\}"; printf '%s' "${v//\"/\\\"}"; }
 if [ -r "$TOKEN_FILE" ]; then
-  curl -sS --max-time 5 \
+  token="$(<"$TOKEN_FILE")"
+  printf '%s' "$payload" | curl -sS --max-time 5 \
+    --config <(printf 'header = "X-Nyan-Remote-Token: %s"\n' "$(cfg_quote "$token")") \
     -H "Content-Type: application/json" \
-    -H "X-Nyan-Remote-Token: $(cat "$TOKEN_FILE")" \
-    -X POST -d "$payload" \
+    -X POST --data-binary @- \
     "$AGENT_URL" >/dev/null 2>&1 || true
+  unset token
 fi
 
 j() { printf '%s' "$payload" | jq -r "$1 // empty" 2>/dev/null; }
@@ -86,11 +96,11 @@ key="WEBHOOK_$(printf '%s' "${account#.}" | tr '.-' '__')"
 url="${!key:-${WEBHOOK_DEFAULT:-}}"
 [ -z "$url" ] && exit 0
 
-curl -sS --max-time 10 \
+# ⚠️ The webhook URL is a secret too (anyone holding it can post) ⇒ through the config, like the token above
+jq -nc --arg c "$text" '{content:$c}' | curl -sS --max-time 10 \
+  --config <(printf 'url = "%s"\n' "$(cfg_quote "$url")") \
   -H "Content-Type: application/json" \
-  -X POST \
-  -d "$(jq -nc --arg c "$text" '{content:$c}')" \
-  "$url" >/dev/null 2>&1
+  -X POST --data-binary @- >/dev/null 2>&1
 
 # Do not let a hook failure get in the way of the session
 exit 0
