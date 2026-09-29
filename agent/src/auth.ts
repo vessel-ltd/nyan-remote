@@ -43,6 +43,28 @@ export interface Identity {
   via: 'tailscale' | 'dev' | 'local-hook' | 'device' | 'pairing'
 }
 
+/**
+ * ★ Who did it, for the journal (2026-09-29). Used on the operations that let commands run:
+ *   answering an approval and toggling auto-approve.
+ * ⚠️ Why: auto-approve was turned on for a session and nobody could tell which phone did it
+ *   (five phones registered, and the log had only the session). The device fingerprint is not a secret
+ *   (`npm run devices` prints it), so its head is enough to match a line to a phone.
+ * ⚠️ No tailnet login (an email address) in the log: Tailscale is shown by the tailnet IP it already carries.
+ */
+export function actorOf(id: Identity): string {
+  switch (id.via) {
+    case 'device':
+    case 'pairing':
+      return `${id.via}:${id.deviceId.slice(0, 8)}`
+    case 'tailscale':
+      return `tailscale:${id.deviceId}`
+    case 'local-hook':
+      return id.login
+    case 'dev':
+      return 'dev'
+  }
+}
+
 export type AuthResult =
   | { ok: true; identity: Identity; rememberLogin?: string }
   | { ok: false; status: number; message: string }

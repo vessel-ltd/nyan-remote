@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import {
+  actorOf,
   blocksCrossOrigin,
   isAllowedOrigin,
   isSameOrigin,
@@ -155,4 +156,17 @@ test('★★★ a same-tailnet origin is not allowed unless written in allowedOr
   await loadConfig()
   assert.equal(await isAllowedOrigin(other), true)
   assert.equal(await isAllowedOrigin('https://pc-c.example.ts.net'), false)
+})
+
+// ── actorOf: who did it, for the journal (2026-09-29) ─────────────────────────
+
+test('★ actorOf names a phone by the head of its fingerprint and never logs a tailnet login', () => {
+  const fp = '5mrRnXP20fRrDRbpzeVE2O21n1M9yPCbc24GQvl-rNQ'
+  assert.equal(actorOf({ login: `device:${fp}`, deviceId: fp, via: 'device' }), 'device:5mrRnXP2')
+  assert.equal(actorOf({ login: `device:${fp}`, deviceId: fp, via: 'pairing' }), 'pairing:5mrRnXP2')
+  const ts = actorOf({ login: 'someone@example.com', deviceId: '100.64.0.9', via: 'tailscale' })
+  assert.equal(ts, 'tailscale:100.64.0.9')
+  assert.ok(!ts.includes('@'), '⚠️ a tailnet login (an email address) went into the journal')
+  assert.equal(actorOf({ login: 'local-cli', deviceId: 'local', via: 'local-hook' }), 'local-cli')
+  assert.equal(actorOf({ login: 'dev@localhost', deviceId: 'dev', via: 'dev' }), 'dev')
 })

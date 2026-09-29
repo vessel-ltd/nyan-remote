@@ -309,7 +309,10 @@ export async function setAutoApprove(
   now = Date.now(),
   /** ★ Name of the duration (⚠️ the length comes from the table; never take a length from the screen) */
   duration: AutoApproveDuration = AUTO_APPROVE_DEFAULT,
+  /** ★ Who asked (`actorOf` in auth.ts). Only for the journal: a toggle must be traceable to a phone */
+  by?: string,
 ): Promise<SetResult> {
+  const who = by ? ` by=${by}` : ''
   if (!sessionId) return { ok: false, reason: t('セッションが指定されていません', 'No session was specified.'), saved: false }
   // ★★ **Serialize the whole toggle** (2026-09-07 codex, high #1).
   //
@@ -333,8 +336,13 @@ export async function setAutoApprove(
       clearTimer(sessionId)
       // ★ We are inside the serial section, so writing **the current memory as is** is fine
       const saved = await writeState([...active.values()].map((a) => a.entry))
-      if (!saved.ok) return { ok: false, reason: saved.reason, saved: false }
-      if (had) console.log(t(`[auto] 自動承認オフ session=${sessionId.slice(0, 8)}`, `[auto] Auto-approve off session=${sessionId.slice(0, 8)}`))
+      if (!saved.ok) {
+        // ⚠️ Memory already dropped it (it stops passing now), but the file keeps it until expiry ⇒ restarting revives it.
+        //   Still say who asked (codex: the actor was missing exactly on this partial outcome)
+        if (had) console.warn(t(`[auto] 自動承認オフ（保存に失敗・再起動で戻る） session=${sessionId.slice(0, 8)}${who}`, `[auto] Auto-approve off (not saved; a restart revives it) session=${sessionId.slice(0, 8)}${who}`))
+        return { ok: false, reason: saved.reason, saved: false }
+      }
+      if (had) console.log(t(`[auto] 自動承認オフ session=${sessionId.slice(0, 8)}${who}`, `[auto] Auto-approve off session=${sessionId.slice(0, 8)}${who}`))
       return { ok: true }
     }
 
@@ -349,11 +357,14 @@ export async function setAutoApprove(
     //   ⚠️ The set is **current memory + this entry** (do not drop other sessions)
     const next = [...active.values()].map((a) => a.entry).filter((e) => e.id !== sessionId)
     const saved = await writeState([...next, entry])
-    if (!saved.ok) return { ok: false, reason: saved.reason, saved: false }
+    if (!saved.ok) {
+      console.warn(t(`[auto] 自動承認オンを断った（保存に失敗） session=${sessionId.slice(0, 8)}${who}`, `[auto] Auto-approve on refused (not saved) session=${sessionId.slice(0, 8)}${who}`))
+      return { ok: false, reason: saved.reason, saved: false }
+    }
     const found: Active = { entry, untilMs }
     active.set(sessionId, found)
     schedule(found, now)
-    console.log(t(`[auto] 自動承認オン session=${sessionId.slice(0, 8)} 期限=${entry.until}`, `[auto] Auto-approve on session=${sessionId.slice(0, 8)} until=${entry.until}`))
+    console.log(t(`[auto] 自動承認オン session=${sessionId.slice(0, 8)} 期限=${entry.until}${who}`, `[auto] Auto-approve on session=${sessionId.slice(0, 8)} until=${entry.until}${who}`))
     return { ok: true, entry }
   })
 }

@@ -17,7 +17,7 @@
 //      "it passes, yet the banner and the off button disappear")
 
 import assert from 'node:assert/strict'
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { chmod, mkdtemp, readFile, rm } from 'node:fs/promises'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -28,9 +28,10 @@ import type { SessionSummary } from '../../../shared/types.ts'
 import { autoApproveFor, resetAutoApprove, setAutoApprove } from '../autoApprove.ts'
 import { hooksFor, noteHook } from '../claude/hookState.ts'
 import { listPending, resetPending } from '../permission.ts'
+import type { Identity } from '../auth.ts'
 import { HttpError, type Ctx } from '../router.ts'
 import { sessionAutoApprove } from './autoApprove.ts'
-import { permissionRequest } from './permission.ts'
+import { permissionAnswer, permissionRequest } from './permission.ts'
 import { hook } from './hook.ts'
 import { markAutoApprove } from './sessions.ts'
 
@@ -330,4 +331,98 @@ test('★ SessionEnd ignores a malformed session_id and leaves other sessions al
   await hook(hookCtx({ hook_event_name: 'SessionEnd', session_id: '../x', cwd: '/home/x/proj' }).ctx)
   await hook(hookCtx({ hook_event_name: 'SessionEnd', session_id: '00000000-0000-0000-0000-000000000000', cwd: '/home/x/proj' }).ctx)
   assert.ok(autoApproveFor(SESSION))
+})
+
+// ── Who did it (2026-09-29) ──────────────────────────────────────────────────
+// ★★ Auto-approve was turned on for a session and nobody could tell which of five phones did it.
+//   ⇒ Toggles and approval answers name the device in the journal. The lines are captured from the real endpoints
+//      (a hand-built string would be a false green / CLAUDE.md §2).
+
+// ⚠️ Two phones, and the whole `by=` field is compared (codex: with one phone, hard-coding the actor passed;
+//   "contains the prefix" also let a login ride along). The login of each identity carries an email-like marker
+//   that must never reach the journal.
+const PHONE_A: Identity = { login: 'a@example.com', deviceId: '5mrRnXP20fRrDRbpzeVE2O21n1M9yPCbc24GQvl-rNQ', via: 'device' }
+const PHONE_B: Identity = { login: 'b@example.com', deviceId: 'H_XhoF0KyujPPS75JRJsc4HWCq06u88Y6S3sVvs1b-Y', via: 'device' }
+
+function bodyCtx(url: string, params: Record<string, string>, body: unknown, identity: Identity): Ctx {
+  const req = Readable.from([Buffer.from(JSON.stringify(body), 'utf8')]) as unknown as IncomingMessage
+  Object.assign(req, { headers: { 'content-type': 'application/json' } })
+  return { req, res: {} as ServerResponse, url: new URL(url), params, identity }
+}
+
+/** Journal lines (log and warn) written while `run` runs */
+async function logsOf(t: { after: (fn: () => void) => void }, run: () => Promise<unknown>): Promise<string[]> {
+  const lines: string[] = []
+  const orig = { log: console.log, warn: console.warn }
+  const grab = (...a: unknown[]) => void lines.push(a.map(String).join(' '))
+  console.log = grab
+  console.warn = grab
+  t.after(() => void Object.assign(console, orig))
+  try {
+    await run()
+  } finally {
+    Object.assign(console, orig)
+  }
+  return lines
+}
+
+/** The `by=` field of the lines that start with `prefix` (the whole value, up to the next space) */
+//   ⚠️ Only the action lines (`session=` / `key=`): the generic "save failed" line names a file, not an action
+const actors = (lines: string[], prefix: string): string[] =>
+  lines.filter((l) => l.startsWith(prefix) && / (session|key)=/.test(l)).map((l) => /(?:^| )by=(\S+)/.exec(l)?.[1] ?? '(none)')
+
+const noLogin = (lines: string[]) => assert.ok(!lines.some((l) => l.includes('@example.com')), `⚠️ a login went into the journal: ${lines.join(' / ')}`)
+
+const toggle = (who: Identity, on: boolean) =>
+  sessionAutoApprove(bodyCtx(`http://agent/sessions/${SESSION}/auto-approve`, { id: SESSION }, { on, duration: '24h' }, who))
+
+test('★★ turning auto-approve on and off names exactly the device that asked', async (t) => {
+  await withState(t)
+  const on = await logsOf(t, () => toggle(PHONE_A, true))
+  assert.deepEqual(actors(on, '[auto]'), ['device:5mrRnXP2'])
+  const off = await logsOf(t, () => toggle(PHONE_B, false))
+  assert.deepEqual(actors(off, '[auto]'), ['device:H_XhoF0K'])
+  noLogin([...on, ...off])
+})
+
+test('★★ a toggle whose save fails still names the device (off: memory already dropped it)', async (t) => {
+  // ⚠️ root ignores the permission bits, so the save would not fail and the failure branch would go untested (codex)
+  if (process.getuid?.() === 0) return t.skip('running as root: chmod cannot make the save fail')
+  const dir = await withState(t)
+  assert.equal((await toggle(PHONE_A, true)).ok, true)
+  // ⚠️ Read-only state dir. Restored before cleanup (`t.after` would run it after `rm`)
+  await chmod(dir, 0o500)
+  try {
+    let offRes: unknown
+    const off = await logsOf(t, async () => void (offRes = await toggle(PHONE_B, false)))
+    // ★ The save really failed (otherwise the failure branch was not exercised)
+    assert.deepEqual(offRes, { ok: false, reason: (offRes as { reason?: string }).reason, saved: false })
+    assert.deepEqual(actors(off, '[auto]'), ['device:H_XhoF0K'], `the failed "off" does not name the phone: ${off.join(' / ')}`)
+    let onRes: unknown
+    const on = await logsOf(t, async () => void (onRes = await toggle(PHONE_A, true)))
+    assert.deepEqual(onRes, { ok: false, reason: (onRes as { reason?: string }).reason, saved: false })
+    assert.deepEqual(actors(on, '[auto]'), ['device:5mrRnXP2'], `the refused "on" does not name the phone: ${on.join(' / ')}`)
+    noLogin([...on, ...off])
+  } finally {
+    await chmod(dir, 0o700)
+  }
+})
+
+test('★★ answering an approval names exactly the device that answered', async (t) => {
+  await withState(t)
+  const answerAs = async (who: Identity): Promise<string[]> => {
+    const { ctx, close } = hookCtx(bashPayload)
+    t.after(close)
+    const waiting = permissionRequest(ctx)
+    await waitPending(1)
+    const key = listPending()[0]!.key
+    const lines = await logsOf(t, () => permissionAnswer(bodyCtx('http://agent/permission/answer', {}, { key, behavior: 'allow' }, who)))
+    await settled(waiting)
+    return lines
+  }
+  const a = await answerAs(PHONE_A)
+  assert.deepEqual(actors(a, '[perm] allow'), ['device:5mrRnXP2'])
+  const b = await answerAs(PHONE_B)
+  assert.deepEqual(actors(b, '[perm] allow'), ['device:H_XhoF0K'])
+  noLogin([...a, ...b])
 })

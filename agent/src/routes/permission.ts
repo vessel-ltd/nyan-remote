@@ -49,6 +49,7 @@ import { threadUrl } from '../pushUrl.ts'
 import { HttpError, readJsonBody, type Ctx } from '../router.ts'
 
 import { buildUpdatedInput, describeInteraction, requiresInteraction } from '../claude/interaction.ts'
+import { actorOf } from '../auth.ts'
 import { autoApproveList, shouldAutoApprove } from '../autoApprove.ts'
 import { resolveAgentTranscript } from '../claude/subagentTranscript.ts'
 import { parseTranscriptPath } from './hook.ts'
@@ -316,7 +317,7 @@ export async function permissionAnswer(ctx: Ctx): Promise<{ ok: boolean; reason?
   const ok = answer(key, behavior as Behavior, { updatedInput, message: fb.message })
   if (ok) {
     console.log(
-      `[perm] ${behavior} key=${key.slice(0, 12)}…${key.slice(-4)}` +
+      `[perm] ${behavior} key=${key.slice(0, 12)}…${key.slice(-4)} by=${actorOf(ctx.identity)}` +
         (target ? ` tool=${target.toolName}${target.agentType ? ` sub=${target.agentType}` : ''}` : '') +
         // ⚠️ No contents. Only "was a reason attached" and its length
         (fb.message

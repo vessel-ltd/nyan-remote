@@ -15,6 +15,7 @@ import { broadcast } from '../events.ts'
 import { withPendingPerms } from '../permission.ts'
 import { sendToAll } from '../push.ts'
 import { threadUrl } from '../pushUrl.ts'
+import { actorOf } from '../auth.ts'
 import { HttpError, readJsonBody, type Ctx } from '../router.ts'
 import { t } from '../../../shared/i18n.ts'
 
@@ -41,7 +42,8 @@ export async function sessionAutoApprove(ctx: Ctx): Promise<AutoApproveResult> {
     if (!d) throw new HttpError(400, t('期限は 3h か 24h です', '`duration` must be 3h or 24h.'))
     duration = d
   }
-  const res = await setAutoApprove(sessionId, body.on, Date.now(), duration)
+  // ★ Who asked goes to the journal (a toggle that lets any command run must be traceable to a phone)
+  const res = await setAutoApprove(sessionId, body.on, Date.now(), duration, actorOf(ctx.identity))
   // ★ The list's marker (`SessionSummary.autoApprove`) changes, so announce it
   broadcast({ type: 'sessions-changed', at: new Date().toISOString() })
   if (!res.ok) return { ok: false, reason: res.reason, saved: res.saved }
