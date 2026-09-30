@@ -31,6 +31,39 @@ nyan-remote makes those moments reach your phone, and lets you answer:
 
 ---
 
+## How it compares
+
+Claude Code has an official way to do this, [Remote Control](https://code.claude.com/docs/en/remote-control),
+and there are good open-source apps such as [Happier](https://happier.dev/). If one of them fits you, use it.
+nyan-remote is for the cases they leave out:
+
+- **API keys.** Remote Control needs a Pro, Max, Team or Enterprise sign-in; it does not run with an API key,
+  Bedrock, Vertex or a custom `ANTHROPIC_BASE_URL`. nyan-remote reads the session files and hooks that
+  Claude Code writes, so it does not care how you sign in (tested with an API key; Bedrock and Vertex not tested yet).
+- **Several Claude accounts on one machine** (`~/.claude`, `~/.claude-work`, …) in one list on one phone.
+- **No wrapper, nothing to turn on.** Start `claude` the way you always do. The session is already on your
+  phone, and what you type there goes into that same terminal.
+
+| | Remote Control (official) | Happier | nyan-remote |
+|---|---|---|---|
+| Start a session | `claude --rc`, `/remote-control`, or on for all sessions | `happier claude`; plain `claude` sessions can be followed with *Direct sessions* (experimental) | plain `claude` |
+| API key | ✗ | ✓ | ✓ (tested) |
+| Bedrock / Vertex / gateway | ✗ | not documented | not tested |
+| Several accounts in one list | one account per app sign-in | not documented | ✓ |
+| Approve from the phone | ✓ | ✓ | ✓ |
+| Notified when a turn ends | when Claude decides | ✓ | every turn end and failure |
+| Auto-approve for a few hours | Claude Code's auto mode (Claude judges each call) | not documented | ✓ (3 h or 24 h, from the phone) |
+| Send images and files | ✓ | not documented | not yet ([roadmap](#roadmap)) |
+| Agents other than Claude Code | — | 13 agents | Claude Code only |
+| Phone app | Claude app | iOS / Android apps | web app (add to Home Screen) |
+| Self-host the relay | — | ✓ | ✓ (your Cloudflare account, or Tailscale) |
+| Price | included in your plan | free | nyan-remote relay: free for 1 machine, Plus $2.99/month or $24/year; Tailscale or your own relay: free |
+
+<sub>From their public docs as of 2026-09-29. "Not documented" means we could not find it in their docs, not that it is
+missing. If something here is wrong or out of date, please [open an issue](https://github.com/vessel-ltd/nyan-remote/issues).</sub>
+
+---
+
 ## Requirements
 
 | | |
@@ -283,6 +316,8 @@ why it exists.
 ## License
 
 MIT © Vessel Ltd. (Vessel合同会社). See [LICENSE](LICENSE).
+
+nyan-remote is not an official Anthropic product. Claude and Claude Code are trademarks of Anthropic.
 
 The cat sprites in `web/public/cats/` and `web/public/manul-cat.svg` are original artwork made for
 this project and are covered by the same license.
