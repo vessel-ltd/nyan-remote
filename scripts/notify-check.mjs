@@ -13,8 +13,9 @@
 // Usage: node scripts/notify-check.mjs
 //   exit code 0 = match (and every axis was tested) / 1 = mismatch / 2 = some axis was not tested
 import { readFileSync } from 'node:fs'
-import { homedir, hostname } from 'node:os'
+import { homedir } from 'node:os'
 import { loadConfig, config } from '../agent/src/config.ts'
+import { machineName } from '../agent/src/machine.ts'
 import { discoverConfigDirs } from '../agent/src/claude/configDirs.ts'
 import { collectSessions } from '../agent/src/claude/sessions.ts'
 import { probeStatus, settledLabel } from '../agent/src/routes/hook.ts'
@@ -61,7 +62,7 @@ async function fetchCards() {
 const cards = await fetchCards()
 const dirs = await discoverConfigDirs(config().configDirs)
 const { sessions } = await collectSessions(dirs, 60)
-const machine = hostname()
+const machine = machineName()
 const w = (s, n) => String(s ?? '').padEnd(n).slice(0, n)
 
 const rows = []

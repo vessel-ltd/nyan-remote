@@ -15,7 +15,6 @@ import { endSessionAutoApprove } from '../autoApprove.ts'
  *   (wrapping the outside in `t()` does not translate embedded values / codex round 22, low #4).
  */
 const logLabel = (label: string): string => localizeNotificationBody(label, currentLang())
-import { hostname } from 'node:os'
 import { basename } from 'node:path'
 import {
   UNKNOWN_LABEL,
@@ -42,6 +41,7 @@ import { threadUrl } from '../pushUrl.ts'
 import { appendJsonl } from '../state.ts'
 import { scheduleStopPush, type StatusProbe, type StopPushDeps } from '../stopPush.ts'
 import { readJsonBody, type Ctx } from '../router.ts'
+import { machineName } from '../machine.ts'
 
 /** /home/user/.claude-r/projects/-home-x/<uuid>.jsonl → { account: '.claude-r', sessionId: '<uuid>' } */
 export function parseTranscriptPath(path: string | undefined): {
@@ -442,7 +442,7 @@ export async function hook(ctx: Ctx): Promise<{ ok: true; pushed: number }> {
   }
   const event: HookEvent = {
     event: name,
-    machine: hostname(),
+    machine: machineName(),
     account: account ?? '(unknown)',
     project: payload.cwd ? basename(payload.cwd) : '—',
     sessionId,

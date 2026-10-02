@@ -47,6 +47,11 @@ export interface Config {
    *    is only the relay route / same treatment as `deviceKey.ts`). The reason is shown in `/health`'s `relay`.
    */
   relayUrl?: string
+  /**
+   * ★ The name shown on the phone and in notifications (default: the hostname / `machine.ts`, 2026-10-02).
+   * ⚠️ A bad value falls back to the hostname instead of refusing requests (only the name is lost).
+   */
+  machineName?: string
 }
 
 const DEFAULTS: Config = {

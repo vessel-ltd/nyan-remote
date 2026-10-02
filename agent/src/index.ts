@@ -9,7 +9,6 @@ import { reasonText } from './reasons.ts'
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import { hostAllowed } from './hostCheck.ts'
 import { watchServe } from './tailscale.ts'
-import { hostname } from 'node:os'
 import { devMode } from './auth.ts'
 import { autoApproveList, loadAutoApprove, setAutoApproveExpiryHandler } from './autoApprove.ts'
 import { discoverConfigDirs } from './claude/configDirs.ts'
@@ -17,7 +16,7 @@ import { seedHookState } from './claude/hookState.ts'
 import { startSessionWatch } from './claude/sessionWatch.ts'
 import { broadcast } from './events.ts'
 import { pendingCount } from './permission.ts'
-import { configProblem, loadConfig } from './config.ts'
+import { config, configProblem, loadConfig } from './config.ts'
 import { loadAgentKey } from './deviceKey.ts'
 import { devicesBroken, listDevices, loadDevices } from './devices.ts'
 import { startRelay, stopRelay } from './relayRun.ts'
@@ -31,6 +30,7 @@ import { AGENT_VERSION, agentBuild } from './version.ts'
 import { startAccount } from './account.ts'
 import { stateDir, legacyStateProblem } from './state.ts'
 import { beginMeasure, measureConnection, startFlushing } from './traffic.ts'
+import { machineName, machineNameProblem } from './machine.ts'
 
 // ★★ The language of this process (logs, and replies to requests that carry no language / 2026-09-24). ⚠️ Decide it before anything else
 //   ⚠️ Notification text is built in Japanese and translated right before sending (`localizeNotificationBody` in `shared/i18n.ts`), so it is not affected by this
@@ -144,7 +144,9 @@ async function main(): Promise<void> {
   })
 
   server.listen(cfg.port, cfg.host, () => {
-    console.log(`[agent] nyan-remote ${AGENT_VERSION} on ${hostname()}`)
+    console.log(`[agent] nyan-remote ${AGENT_VERSION} on ${machineName()}`)
+    const badName = machineNameProblem(config().machineName)
+    if (badName) console.warn(badName)
     console.log(t(`[agent] listening http://${cfg.host}:${cfg.port}  (loopback のみ)`, `[agent] listening http://${cfg.host}:${cfg.port}  (loopback only)`))
     console.log(`[agent] state: ${stateDir()}`)
     startFlushing()

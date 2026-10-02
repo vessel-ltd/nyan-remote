@@ -856,7 +856,7 @@ function App() {
 
       {errors.map((s) => (
         <p key={s.endpoint.id} class="notice bad">
-          {s.endpoint.label}: {s.error}
+          {s.machine ?? s.endpoint.label}: {s.error}
         </p>
       ))}
 

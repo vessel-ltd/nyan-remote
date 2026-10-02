@@ -103,6 +103,12 @@ Everyday commands (`nyan help` lists them all):
 > Your state directory (`~/.nyan-remote`) is never touched by an update, and the previous tree is
 > kept as `~/nyan-remote.old-<timestamp>` so you can go back.
 
+To show this machine on your phone under another name than its hostname (say `laptop`), add
+`"machineName": "laptop"` to `~/.nyan-remote/config.json` (keep the other keys) and restart the agent.
+Give each machine its own name. A phone that paired before keeps the old name for that machine while it is
+unreachable; to update it in the app at `app.nyan-remote.app`, remove the machine there and scan a new
+`nyan pair` QR.
+
 ### Adding a second machine
 
 Run the same installer and pair your phone with it. That is all — there is no key to copy and

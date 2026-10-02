@@ -10,7 +10,6 @@
 //
 // ⚠️ Do not write bodies into logs (§6.2). ⚠️⚠️ **Never log the one-time code.**
 
-import { hostname } from 'node:os'
 import { fingerprint, fromBase64Url, toBase64Url } from '../../../shared/crypto.ts'
 import { agentBase, buildPairUrl } from '../../../shared/pairing.ts'
 import { isRelayBase } from '../../../shared/relayFrame.ts'
@@ -31,6 +30,7 @@ import { removeSubscriptionsFor } from '../push.ts'
 import { HttpError, readJsonBody } from '../router.ts'
 import { selfAgentUrl } from '../tailscale.ts'
 import { t } from '../../../shared/i18n.ts'
+import { machineName } from '../machine.ts'
 
 /**
  * The list of registered devices (for checking on the PC, and for the phone's "is this device registered?").
@@ -76,7 +76,7 @@ export async function pairToken(): Promise<PairTokenResult> {
     throw new HttpError(503, t(`登録済みデバイスの記録が壊れています（${devicesBroken()}）`, `The registered-device records are broken (${devicesBroken()}).`))
   }
   const one = issueOneTime()
-  const machine = hostname()
+  const machine = machineName()
   // ★★ Put the relay entry in the QR (③ step 6, part ④).
   //   ⚠️⚠️ **Do not include anything of the wrong shape** (never show people an unreadable QR). Config mistakes
   //      show up in `relay` on `/health` (= you can see why it silently became local only).

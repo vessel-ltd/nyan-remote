@@ -1,7 +1,6 @@
 import { toBase64Url } from '../../../shared/crypto.ts'
 import { agentKeyProblem, agentPublicRaw } from '../deviceKey.ts'
 import { relayHealth } from '../relayRun.ts'
-import { hostname } from 'node:os'
 import type { AgentFeature, AgentHealth } from '../../../shared/types.ts'
 import { AGENT_VERSION, agentBuild } from '../version.ts'
 import { accountHealth } from '../account.ts'
@@ -9,6 +8,7 @@ import { config } from '../config.ts'
 import { devMode } from '../auth.ts'
 import { discoverConfigDirs } from '../claude/configDirs.ts'
 import { describeAccounts } from '../claude/sessions.ts'
+import { machineName } from '../machine.ts'
 
 /**
  * ★★ Features this agent has. **When you add an endpoint, add it here too.**
@@ -37,7 +37,7 @@ export async function health(): Promise<AgentHealth> {
   const cfg = config()
   const dirs = await discoverConfigDirs(cfg.configDirs)
   return {
-    machine: hostname(),
+    machine: machineName(),
     agentVersion: AGENT_VERSION,
     nodeVersion: process.version,
     uptimeSec: Math.round(process.uptime()),

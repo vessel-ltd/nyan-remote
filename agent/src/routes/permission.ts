@@ -8,7 +8,6 @@
 //   and when the phone taps, it returns the decision as that response.
 //   It is managed by **whether the connection is alive**, not by a timer (read the explanation in permission.ts).
 
-import { hostname } from 'node:os'
 import { basename } from 'node:path'
 import {
   LEGACY_SUBAGENT_LABEL,
@@ -54,6 +53,7 @@ import { autoApproveList, shouldAutoApprove } from '../autoApprove.ts'
 import { resolveAgentTranscript } from '../claude/subagentTranscript.ts'
 import { parseTranscriptPath } from './hook.ts'
 import { t } from '../../../shared/i18n.ts'
+import { machineName } from '../machine.ts'
 
 function str(v: unknown): string | undefined {
   return typeof v === 'string' && v.length > 0 ? v : undefined
@@ -141,7 +141,7 @@ export function buildPermissionInfo(body: HookPayload): PermissionRequest {
         agentId: str(body['agent_id']),
       }),
     ),
-    machine: hostname(),
+    machine: machineName(),
     account: account ?? LEGACY_UNKNOWN_ACCOUNT,
     ...(account ? {} : { accountUnknown: true as const }),
     project: cwd ? basename(cwd) : '—',
@@ -330,7 +330,7 @@ export async function permissionAnswer(ctx: Ctx): Promise<{ ok: boolean; reason?
     //       does not tell us "it has been answered", so the answering side has to clear it.
     const at = new Date().toISOString()
     const cleared = clearLabelIfSettled(target?.sessionId)
-    broadcast({ type: 'permissions-changed', machine: hostname(), at })
+    broadcast({ type: 'permissions-changed', machine: machineName(), at })
     // Make the list's status display refetch too (what changed is the session's label, not the approval list)
     if (cleared) broadcast({ type: 'sessions-changed', at })
     return { ok: true }

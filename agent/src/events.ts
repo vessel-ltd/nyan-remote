@@ -3,9 +3,9 @@
 // ✅ 2026-08-11: confirmed on a real phone that SSE is not buffered through tailscale serve
 //    (heartbeat n increased every 5 seconds). No need to switch to WebSocket.
 
-import { hostname } from 'node:os'
 import type { ServerResponse } from 'node:http'
 import type { AgentEvent } from '../../shared/types.ts'
+import { machineName } from './machine.ts'
 
 const HEARTBEAT_MS = 5000
 
@@ -88,7 +88,7 @@ export function attach(res: ServerResponse, opts: { follow?: string } = {}): voi
   res.write('retry: 3000\n\n')
   clients.set(res, opts.follow === undefined ? {} : { follow: opts.follow })
   // ★ Send `hello` to follows too (the PWA refetches on it = picks up what was missed while reconnecting)
-  write(res, { type: 'hello', machine: hostname(), at: new Date().toISOString() })
+  write(res, { type: 'hello', machine: machineName(), at: new Date().toISOString() })
   ensureHeartbeat()
 
   const drop = () => {

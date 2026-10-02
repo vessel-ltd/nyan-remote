@@ -1,4 +1,3 @@
-import { hostname } from 'node:os'
 import { basename, join } from 'node:path'
 import { readdir, stat } from 'node:fs/promises'
 import type { AccountInfo, SessionStatus, SessionSummary } from '../../../shared/types.ts'
@@ -9,6 +8,7 @@ import { liveSessions } from './sessionIndex.ts'
 import { hooksFor, type SessionHooks } from './hookState.ts'
 import { listPending } from '../permission.ts'
 import { readTranscriptMeta } from './transcript.ts'
+import { machineName } from '../machine.ts'
 
 /** Threshold for hiding empty "just started" sessions from the list (measured: many were 1520B) */
 const MIN_BYTES = 1024
@@ -22,7 +22,7 @@ export interface CollectResult {
 }
 
 export async function collectSessions(dirs: ConfigDir[], maxPerAccount: number): Promise<CollectResult> {
-  const machine = hostname()
+  const machine = machineName()
   const sessions: SessionSummary[] = []
   const accounts: AccountInfo[] = []
   // ★ Sessions currently waiting for approval. They are present only while the hook connection is alive,

@@ -8,7 +8,6 @@
 // ⚠️⚠️ **Confirmation is the UI's responsibility** (the agent cannot confirm). This operation creates a state that
 //   passes even arbitrary `Bash` commands, so the wording lives in one place: `web/src/ui/commands.ts`.
 
-import { hostname } from 'node:os'
 import { notificationText, type AutoApproveResult, type PushPayload } from '../../../shared/types.ts'
 import { AUTO_APPROVE_DEFAULT, type AutoApproveEntry, setAutoApprove, toAutoApproveDuration } from '../autoApprove.ts'
 import { broadcast } from '../events.ts'
@@ -18,6 +17,7 @@ import { threadUrl } from '../pushUrl.ts'
 import { actorOf } from '../auth.ts'
 import { HttpError, readJsonBody, type Ctx } from '../router.ts'
 import { t } from '../../../shared/i18n.ts'
+import { machineName } from '../machine.ts'
 
 interface Body {
   on?: unknown
@@ -62,7 +62,7 @@ export async function sessionAutoApprove(ctx: Ctx): Promise<AutoApproveResult> {
  */
 export const AUTO_APPROVE_OFF_LABEL = '自動承認 終了'
 
-export function autoApproveOffPayload(entry: AutoApproveEntry, machine = hostname()): PushPayload {
+export function autoApproveOffPayload(entry: AutoApproveEntry, machine = machineName()): PushPayload {
   const text = notificationText({
     title: '',
     titleSource: 'fallback',

@@ -17,6 +17,8 @@ import { t } from '../shared/i18n.ts'
 import { agentUrl, initCliLang } from './lib/lang.mjs'
 import { isMain } from './lib/isMain.mjs'
 import { openUrl } from './lib/openUrl.mjs'
+import { readJsonFile } from '../agent/src/state.ts'
+import { resolveMachineName } from '../agent/src/machine.ts'
 
 const stateDir = () => process.env.NYAN_REMOTE_STATE_DIR ?? join(homedir(), '.nyan-remote')
 const accountPath = () => join(stateDir(), 'account.json')
@@ -148,6 +150,12 @@ export async function githubDeviceToken(f = fetch, wait = sleep, print = console
   return undefined
 }
 
+/** ★ The machine's name as the phone shows it (`machineName` in config.json, else the hostname / agent/src/machine.ts) */
+async function machineLabel() {
+  const read = await readJsonFile('config.json')
+  return resolveMachineName(read.kind === 'ok' ? read.value?.machineName : undefined, hostname())
+}
+
 export async function login(f = fetch, wait = sleep, open = openUrl) {
   const token = await githubDeviceToken(f, wait, console.log, open)
   if (!token) return 1
@@ -157,7 +165,7 @@ export async function login(f = fetch, wait = sleep, open = openUrl) {
     res = await f(`${ACCOUNT_ORIGIN}/api/login`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ githubToken: token, label: hostname(), ...(agentKey ? { agentKey } : {}) }),
+      body: JSON.stringify({ githubToken: token, label: await machineLabel(), ...(agentKey ? { agentKey } : {}) }),
     })
   } catch (err) {
     console.error(t(`✗ アカウントに繋がりません: ${err.message}`, `✗ Cannot reach the account service: ${err.message}`))

@@ -31,7 +31,6 @@
 //   `prompt_id` + `tool_use_id`, the same approval goes to the phone repeatedly and waiters leak.
 
 import { createHash, randomBytes } from 'node:crypto'
-import { hostname } from 'node:os'
 import { basename } from 'node:path'
 import {
   legacySuggestionText,
@@ -43,6 +42,7 @@ import {
 } from '../../shared/types.ts'
 import { ASK_USER_QUESTION, EXIT_PLAN_MODE } from './claude/interaction.ts'
 import { t } from '../../shared/i18n.ts'
+import { machineName } from './machine.ts'
 
 export type Behavior = 'allow' | 'deny'
 
@@ -420,7 +420,7 @@ export function pendingPermTags(machine?: string): string[] {
  */
 export const PUSH_PAYLOAD_SAFE_BYTES = 3000
 
-export function withPendingPerms(payload: PushPayload, machine = hostname()): PushPayload {
+export function withPendingPerms(payload: PushPayload, machine = machineName()): PushPayload {
   // ★★ **Do not attach the list to a payload without `at`** (2026-08-20 codex high #3).
   //    The sw decides "do not close notifications newer than the list" by `at`, so without `at`
   //    order cannot be kept (falling back to the device clock **closes live notifications**).
