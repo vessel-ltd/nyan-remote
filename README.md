@@ -68,7 +68,7 @@ missing. If something here is wrong or out of date, please [open an issue](https
 
 | | |
 |---|---|
-| **Agent (your PC)** | **Node.js 24+ only.** No npm, no git, no build step. Linux (systemd), macOS (launchd), or Windows through WSL. |
+| **Agent (your PC)** | **Node.js 24+ only** ([download](https://nodejs.org/en/download)). No npm, no git, no build step. Linux (systemd), macOS (launchd), or Windows through WSL. |
 | **Phone** | Safari on iOS 16.4+ (add to Home Screen for notifications) or Chrome on Android. |
 
 ## Install

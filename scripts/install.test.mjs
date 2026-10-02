@@ -240,7 +240,7 @@ test('★★ before an update, stops with the tool matching the service type (�
   // ⚠️ Use the new tree's launchd.mjs (the old tree may not have it)
   assert.match(arm, /launchd\) node "\$TMP\/nyan-remote\/scripts\/launchd\.mjs" stop \|\|\s*\n\s*die/, 'does not stop launchd (⚠️⚠️ proceeds when it does not fully stop / codex round 15, medium #3)')
   // ⚠️ linger is systemd only
-  assert.match(CODE, /if \[ "\$SVC" = systemd \]; then\s*\n\s*loginctl enable-linger/, 'linger is not tied to systemd')
+  assert.match(CODE, /if \[ "\$SVC" = systemd \]; then\s*\n\s*ME="\$\{USER:-\$\(id -un\)\}"\s*\n\s*loginctl enable-linger "\$ME"/, 'linger is not tied to systemd')
 })
 
 test('★★★ checks the Node version (⚠️ TypeScript runs directly, so 24 or later is required)', () => {
@@ -449,4 +449,19 @@ test('★★ language: Japanese only for Japanese locales, otherwise (unset, C) 
   // ⚠️ Japanese text always goes through tr2 (never show Japanese to English users)
   const bare = CODE.split('\n').filter((l) => /(^|[;|&]\s*|\s)(say|die|printf|echo) /.test(l) && /[\u3040-\u30ff\u4e00-\u9fff]/.test(l) && !l.includes('tr2 '))
   assert.deepEqual(bare, [], '⚠️⚠️ Japanese text that bypasses tr2')
+})
+
+test('★★ never relies on `$USER` being set (set -u stops after the tree is placed, and a rerun is refused / 2026-10-02)', () => {
+  const bare = CODE.split('\n').filter((l) => /\$\{?USER\b(?!:-)/.test(l))
+  assert.deepEqual(bare, [], `a bare $USER would stop the installer in a container or non-login shell: ${bare.join(' / ')}`)
+})
+
+test('★ a missing or old Node says where to get it (2026-10-02 / Claude Code users often have no Node)', () => {
+  assert.match(CODE, /NODE_HINT="\$\(tr2 '[^']*https:\/\/nodejs\.org\/en\/download/, 'no download hint')
+  const dies = CODE.split('\n').filter((l) => /Node (\$NODE_MAJOR|が見つかりません|not found)/.test(l) && /die /.test(l))
+  assert.equal(dies.length, 2, `expected the two Node checks: ${dies.join(' / ')}`)
+  for (const d of dies) {
+    const at = CODE.indexOf(d)
+    assert.match(CODE.slice(at, at + d.length + 40), /\$NODE_HINT"/, `a Node check does not print the hint: ${d}`)
+  }
 })

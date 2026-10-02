@@ -59,9 +59,15 @@ phys() {
 }
 
 # ── ① Preflight (⚠️ only stop here for things that would otherwise break silently later) ─────────
-command -v node >/dev/null 2>&1 || die "$(tr2 'Node が見つかりません（24 以上が要ります）' 'Node not found (version 24 or later is required)')"
+# ★ Say how to get Node, not only that it is missing (2026-10-02): Claude Code has a native installer now, so many users have
+#   no Node at all, and distro packages are older than 24. ⚠️ Point to the official page instead of hard-coding one command
+#   (the right one differs by OS and shell; that page shows nvm / fnm / Homebrew / installers per OS).
+NODE_HINT="$(tr2 '入れ方: https://nodejs.org/en/download （24 以上を選んでください。入れたら新しい端末でこの1行をもう一度）' 'Get it from https://nodejs.org/en/download (pick 24 or later), then run this one-liner again in a new terminal')"
+command -v node >/dev/null 2>&1 || die "$(tr2 'Node が見つかりません（24 以上が要ります）' 'Node not found (version 24 or later is required)')
+  $NODE_HINT"
 NODE_MAJOR="$(node -p 'process.versions.node.split(".")[0]')"
-[ "$NODE_MAJOR" -ge 24 ] || die "$(tr2 "Node $NODE_MAJOR は古すぎます（24 以上が要ります。TypeScript を直接 実行します）" "Node $NODE_MAJOR is too old (24 or later is required; it runs TypeScript directly)")"
+[ "$NODE_MAJOR" -ge 24 ] || die "$(tr2 "Node $NODE_MAJOR は古すぎます（24 以上が要ります。TypeScript を直接 実行します）" "Node $NODE_MAJOR is too old (24 or later is required; it runs TypeScript directly)")
+  $NODE_HINT"
 
 # ★★ **Separate "does it run on this OS" from "how is it kept running"** (2026-09-21).
 #   ⚠️ It used to reject Darwin unconditionally, but **only the service (launchd) was missing**, so
@@ -207,8 +213,11 @@ fi
 # ── ③ Service (⚠️ no sudo) ────────────────────────────────────────────
 # ⚠️ Without this, it stops when the shell is closed
 if [ "$SVC" = systemd ]; then
-  loginctl enable-linger "$USER" >/dev/null 2>&1 ||
-    printf '%s\n' "$(tr2 "⚠️ linger を有効にできませんでした（端末を閉じると止まります。\`loginctl enable-linger ${USER}\`）" "⚠️ Could not enable linger (the agent stops when you close the terminal; run \`loginctl enable-linger ${USER}\`)")"
+  # ⚠️ `$USER` is not always set (containers, some non-login shells) and `set -u` would stop here,
+  #   **after** the tree was placed, so a rerun is refused as "already exists" (found by a clean-container install / 2026-10-02)
+  ME="${USER:-$(id -un)}"
+  loginctl enable-linger "$ME" >/dev/null 2>&1 ||
+    printf '%s\n' "$(tr2 "⚠️ linger を有効にできませんでした（端末を閉じると止まります。\`loginctl enable-linger ${ME}\`）" "⚠️ Could not enable linger (the agent stops when you close the terminal; run \`loginctl enable-linger ${ME}\`)")"
 fi
 
 # ★★ **Write the unit only when running as a service** (2026-09-21 / noticed on a real mac).
