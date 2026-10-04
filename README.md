@@ -3,7 +3,9 @@
 **Keep running `claude`. Use it from your phone.**
 
 <p align="center">
-  <img src=".github/readme/teaser.gif" width="560" alt="A session stuck on a permission prompt; approving it from the phone; every account and machine in one list">
+  <a href="https://www.youtube.com/watch?v=Qup2GjWCeoo"><img src=".github/readme/teaser.gif" width="560" alt="A session stuck on a permission prompt; approving it from the phone; every account and machine in one list"></a>
+  <br>
+  <a href="https://www.youtube.com/watch?v=Qup2GjWCeoo">▶ Watch the full video (1 min)</a>
 </p>
 
 The sessions you already started — on every machine, in every account — in one list on your
