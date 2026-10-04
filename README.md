@@ -2,6 +2,10 @@
 
 **Keep running `claude`. Use it from your phone.**
 
+<p align="center">
+  <img src=".github/readme/teaser.gif" width="560" alt="A session stuck on a permission prompt; approving it from the phone; every account and machine in one list">
+</p>
+
 The sessions you already started — on every machine, in every account — in one list on your
 phone. No tmux, no SSH, no relaunching under another command. `nyan-remote` runs one small agent
 on each PC and gives you a phone web app with push notifications when a session finishes, fails,

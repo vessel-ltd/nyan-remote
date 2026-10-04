@@ -31,7 +31,7 @@ const AUTHOR = { name: 'Vessel Ltd.', email: 'noreply@nyan-remote.app' }
  */
 export const PUBLIC_TOP = ['.github', '.gitignore', 'LICENSE', 'README.md', 'SECURITY.md', 'account', 'agent', 'hooks', 'install.sh', 'landing', 'package-lock.json', 'package.json', 'relay', 'scripts', 'shared', 'site', 'web']
 /** ★ Kept private on purpose (dropped quietly — everything else not allowed stops the publish) */
-export const PRIVATE = ['CLAUDE.md', 'docs', '.claude']
+export const PRIVATE = ['CLAUDE.md', 'docs', '.claude', 'marketing']
 const TEXT_EXT = /\.(ts|tsx|mjs|cjs|js|json|jsonc|sql|sh|py|css|html|svg|webmanifest|gitignore|ya?ml)$|(^|\/)(LICENSE|\.gitignore)$/
 const BINARY_EXT = /\.(png|jpg|jpeg|gif|webp|ico|woff2?)$/
 
