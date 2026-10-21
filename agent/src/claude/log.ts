@@ -66,6 +66,18 @@ function foldable(raw: string, max = TOOL_MAX): { summary: string; lines: number
  * ⚠️ Fold rather than drop. `<local-command-stdout>` is **the command's result itself**, so
  *    dropping it breaks the condition for the command table (the effect is visible from the phone).
  */
+/**
+ * ★★ The wordings of the real caveat (the CLI's boilerplate). ⚠️ Add, do not replace (old transcripts keep the old one).
+ * ⚠️⚠️ The CLI changed it in 2.1.285 (measured 2026-10-21): the new one fell through and was shown on the phone
+ *    as **"your message"** after every `/compact` (for 2.1.285–2.1.306, unnoticed). Keep each entry long enough
+ *    that a human is unlikely to type it (the `isMeta` AND is the real guard; this keeps the removing side strict).
+ */
+const CAVEAT_OPENINGS = [
+  'Caveat:',
+  // CLI 2.1.285+
+  'The command below was run directly in Claude Code, not sent to you as a request',
+]
+
 export function localCommandMeta(
   text: string,
   /**
@@ -86,7 +98,9 @@ export function localCommandMeta(
   //    Next it was changed to "also check the wording (`Caveat:`)", but **a human typing the same opening gets the same result**.
   //    ⇒ **AND with `isMeta` (a marker the CLI sets)**. Humans cannot set `isMeta`.
   //    ★ The wording check stays too (be strict on the removing side. ⚠️ removing too much does more harm).
-  if (isMeta && text.startsWith('<local-command-caveat>Caveat:')) return { label: '', body: '' }
+  if (isMeta && CAVEAT_OPENINGS.some((o) => text.startsWith(`<local-command-caveat>${o}`))) {
+    return { label: '', body: '' }
+  }
   const named = /^<command-name>\s*([^<\n]{1,64}?)\s*<\/command-name>/.exec(text)
   if (named) return { label: t(`コマンド ${named[1]}`, `Command ${named[1]}`), body: text }
   const head = '<local-command-stdout>'

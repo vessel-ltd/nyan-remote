@@ -11,6 +11,14 @@
 //
 // custom-title / ai-title are re-emitted on every write (measured: 31 times in 422 records),
 // so they are almost always in the last 64KB. We still look at the head as a fallback.
+//
+// ★★ Since CLI 2.1.30x the tail is not always enough (measured 2026-10-21 on 2.1.302–2.1.306).
+//    The CLI now writes `api-request` / `api-request-blob` / `api-request-shape` records
+//    (up to 290KB / 1.2MB / 100KB each, ~70% of a 388MB transcript). They are not conversation records,
+//    but **they fill the last 64KB**: replaying a 2.1.303 transcript record by record, the tail had
+//    no conversation record at ~30% of the points (lastActivity fell back to mtime, the AI title turned
+//    into the first prompt, the context chip vanished). ⇒ `readTranscriptMeta` widens the tail
+//    step by step (`TAIL_STEPS`) only while `tailIsEnough` says no.
 
 import { open } from 'node:fs/promises'
 import { basename } from 'node:path'
@@ -18,6 +26,12 @@ import type { TitleSource } from '../../../shared/types.ts'
 
 export const HEAD_BYTES = 8 * 1024
 export const TAIL_BYTES = 64 * 1024
+/**
+ * ★ How far the tail may widen when the last 64KB holds no conversation record (see the header).
+ * ⚠️ Bounded: the list reads every picked transcript on each poll, so never read the whole file.
+ *    4MB covers the largest pair seen on real data (a 1.3MB `user` tool result followed by its 1.2MB blob).
+ */
+export const TAIL_STEPS = [TAIL_BYTES, 512 * 1024, 4 * 1024 * 1024]
 const TITLE_MAX = 70
 
 export interface TranscriptMeta {
@@ -240,7 +254,10 @@ export function derive({ sessionId, headRecords, tailRecords }: DeriveInput): De
     cwd = str(r['cwd'])
     if (cwd) break
   }
-  for (const r of [...tailRecords, ...headRecords]) {
+  // ⚠️ Scan **backwards** (newest first). It used to scan the tail forwards (= the oldest record in the tail won);
+  //    harmless in 64KB, but once the tail widens (`TAIL_STEPS`) it picked a branch/version from megabytes back
+  //    (2026-10-21 codex, medium #1: `new / 2.1.306` became `old / 2.1.281`).
+  for (const r of [...tailRecords].reverse().concat([...headRecords].reverse())) {
     gitBranch ??= str(r['gitBranch'])
     cliVersion ??= str(r['version'])
     if (gitBranch && cliVersion) break
@@ -307,13 +324,64 @@ export function derive({ sessionId, headRecords, tailRecords }: DeriveInput): De
   }
 }
 
+/**
+ * ★ Whether the tail read so far is enough (otherwise `readTranscriptMeta` widens it).
+ *
+ * Enough = there is a conversation record (`lastActivity`), and either the context size was found
+ * or the compact boundary is inside the tail (then "unknown" is the correct answer, see `contextTokensOf`).
+ * ⚠️ Do not add "an AI title was found": a session that never got one would read 4MB on every poll.
+ *    The title comes back anyway once the tail reaches a conversation record (ai-title is re-emitted next to them).
+ */
+export function tailIsEnough(tailRecords: Rec[], d: Derived): boolean {
+  if (d.lastActivity === undefined) return false
+  if (d.contextTokens !== undefined) return true
+  return tailRecords.some((r) => r['type'] === 'system' && r['subtype'] === 'compact_boundary')
+}
+
+/**
+ * ★ The last result per file, reused while the file is unchanged (2026-10-21 codex, medium #2).
+ * ⚠️ Without it, a transcript whose tail never satisfies `tailIsEnough` (no assistant usage at all, zero-usage
+ *    records only, sidechain-only usage) read **4MB on every poll** of the list and on every notification.
+ * ⚠️ Unchanged = same inode, size, mtime **and ctime**. Transcripts are append-only, but a same-size rewrite with
+ *    the mtime put back would pass the first three (codex round 2, medium); ctime cannot be set from user space.
+ * ⚠️ And never trusted for longer than `META_CACHE_MAX_AGE_MS` (file times are coarse: a rewrite within one tick
+ *    keeps all of them) ⇒ a collision costs at most that long, not forever.
+ */
+const metaCache = new Map<
+  string,
+  { ino: number; size: number; mtimeMs: number; ctimeMs: number; at: number; meta: TranscriptMeta }
+>()
+export const META_CACHE_MAX = 1000
+export const META_CACHE_MAX_AGE_MS = 30_000
+
+/** How many files the cache holds (read-only / for tests) */
+export const metaCacheSize = (): number => metaCache.size
+
+/** ⚠️ For tests only: `openFile` counts the bytes read, `now` moves the clock. Default to the real ones */
+export interface ReadMetaOptions {
+  openFile?: typeof open
+  now?: () => number
+}
+
 /** Open a transcript file, read only its head and tail, and return its metadata. */
-export async function readTranscriptMeta(file: string): Promise<TranscriptMeta> {
+export async function readTranscriptMeta(file: string, opts: ReadMetaOptions = {}): Promise<TranscriptMeta> {
   const sessionId = basename(file).replace(/\.jsonl$/, '')
-  const fh = await open(file, 'r')
+  const fh = await (opts.openFile ?? open)(file, 'r')
   try {
     const st = await fh.stat()
     const size = st.size
+    const now = (opts.now ?? Date.now)()
+    const hit = metaCache.get(file)
+    if (
+      hit &&
+      hit.ino === st.ino &&
+      hit.size === size &&
+      hit.mtimeMs === st.mtimeMs &&
+      hit.ctimeMs === st.ctimeMs &&
+      now - hit.at < META_CACHE_MAX_AGE_MS
+    ) {
+      return { ...hit.meta }
+    }
 
     const headLen = Math.min(HEAD_BYTES, size)
     const headBuf = Buffer.alloc(headLen)
@@ -321,23 +389,31 @@ export async function readTranscriptMeta(file: string): Promise<TranscriptMeta> 
     const headTruncated = size > headLen
     const headRecords = parseLines(headBuf.toString('utf8'), false, headTruncated)
 
-    let tailRecords: Rec[] = headRecords
+    let d = derive({ sessionId, headRecords, tailRecords: headRecords })
     if (size > headLen) {
-      const tailLen = Math.min(TAIL_BYTES, size)
-      const start = size - tailLen
-      const tailBuf = Buffer.alloc(tailLen)
-      await fh.read(tailBuf, 0, tailLen, start)
-      tailRecords = parseLines(tailBuf.toString('utf8'), start > 0, false)
+      for (const step of TAIL_STEPS) {
+        const tailLen = Math.min(step, size)
+        const start = size - tailLen
+        const tailBuf = Buffer.alloc(tailLen)
+        await fh.read(tailBuf, 0, tailLen, start)
+        const tailRecords = parseLines(tailBuf.toString('utf8'), start > 0, false)
+        d = derive({ sessionId, headRecords, tailRecords })
+        if (start === 0 || tailIsEnough(tailRecords, d)) break
+      }
     }
 
-    const d = derive({ sessionId, headRecords, tailRecords })
-    return {
+    const meta: TranscriptMeta = {
       sessionId,
       file,
       bytes: size,
       mtimeMs: st.mtimeMs,
       ...d,
     }
+    // ⚠️ Bounded: drop the oldest entry (insertion order) instead of growing with every transcript ever listed
+    metaCache.delete(file)
+    metaCache.set(file, { ino: st.ino, size, mtimeMs: st.mtimeMs, ctimeMs: st.ctimeMs, at: now, meta })
+    if (metaCache.size > META_CACHE_MAX) metaCache.delete(metaCache.keys().next().value!)
+    return { ...meta }
   } finally {
     await fh.close()
   }

@@ -1,6 +1,18 @@
 import assert from 'node:assert/strict'
+import { appendFileSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { open } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { test } from 'node:test'
-import { derive, extractUserText, parseLines, contextTokensOf } from './transcript.ts'
+import {
+  derive,
+  extractUserText,
+  parseLines,
+  contextTokensOf,
+  metaCacheSize,
+  readTranscriptMeta,
+  tailIsEnough,
+} from './transcript.ts'
 
 type Rec = Record<string, unknown>
 
@@ -322,4 +334,254 @@ test('★★ subagent (sidechain) usage does not pollute the main number', () =>
   assert.equal(contextTokensOf([main, sub]), 1000)
   // Keep the type check too, just in case
   assert.equal(contextTokensOf([usageRec({ input_tokens: 1, cache_read_input_tokens: 9 }, 'user')]), undefined)
+})
+
+/* ==================== Records that crowd out the tail (CLI 2.1.30x) ==================== */
+
+/** ★ Shape of the records CLI 2.1.302+ writes per API request (measured: up to 290KB each on 2.1.303) */
+const apiRequest = (bytes: number): Rec => ({
+  type: 'api-request',
+  timestamp: '2026-10-21T04:00:09.000Z',
+  version: '2.1.306',
+  params: { safeguards: 'x'.repeat(bytes) },
+})
+
+function writeTranscript(records: Rec[]): { file: string; done: () => void } {
+  const dir = mkdtempSync(join(tmpdir(), 'nyan-transcript-'))
+  const file = join(dir, '00000000-0000-0000-0000-000000000000.jsonl')
+  writeFileSync(file, records.map((r) => JSON.stringify(r)).join('\n') + '\n')
+  return { file, done: () => rmSync(dir, { recursive: true, force: true }) }
+}
+
+type PinnedStat = { ino?: number; mtimeMs?: number; ctimeMs?: number }
+
+/**
+ * ★ Counts the bytes `readTranscriptMeta` actually reads (to pin the cost of the staged reads).
+ * ★ `pin` overrides what `stat()` reports, to stage a timestamp collision (file times are coarse,
+ *   and ctime cannot be set from user space, so a real collision cannot be produced on purpose).
+ */
+function countingOpen(pin: PinnedStat = {}): { openFile: typeof open; bytes: () => number } {
+  let total = 0
+  const openFile = (async (...args: Parameters<typeof open>) => {
+    const fh = await open(...args)
+    return new Proxy(fh, {
+      get(target, prop, receiver) {
+        if (prop === 'read') {
+          return async (buf: Buffer, offset: number, length: number, position: number) => {
+            total += length
+            return target.read(buf, offset, length, position)
+          }
+        }
+        if (prop === 'stat') return async () => Object.assign(await target.stat(), pin)
+        const v = Reflect.get(target, prop, receiver)
+        return typeof v === 'function' ? v.bind(target) : v
+      },
+    })
+  }) as typeof open
+  return { openFile, bytes: () => total }
+}
+
+// ⚠️ Independent of the production constants on purpose (raising the cap must fail these tests)
+const KB = 1024
+const HEAD = 8 * KB
+const STEP1 = 64 * KB
+const STEP2 = 512 * KB
+const CAP = 4 * 1024 * KB
+
+/** ★ Pushes the AI title out of the first 8KB (so it can only come from the tail) */
+const filler = (): Rec => ({ type: 'attachment', attachment: { type: 'x', content: 'f'.repeat(HEAD * 2) } })
+
+test('★★ readTranscriptMeta: widens the tail when api-request records fill the last 64KB (CLI 2.1.30x)', async () => {
+  const records: Rec[] = [
+    userMsg('first prompt', { timestamp: '2026-10-21T04:00:00.000Z' }),
+    filler(),
+    // ★ Older history, so the file is bigger than the 512KB step (the step must read exactly 512KB)
+    apiRequest(STEP2),
+    { type: 'ai-title', aiTitle: 'Cat essay' },
+    { ...usageRec({ input_tokens: 2, cache_read_input_tokens: 50000 }), timestamp: '2026-10-21T04:00:05.000Z' },
+    // ⚠️ Bigger than the 64KB tail on its own (real data: up to 290KB)
+    apiRequest(STEP1 * 2),
+  ]
+  const t = writeTranscript(records)
+  try {
+    const c = countingOpen()
+    const m = await readTranscriptMeta(t.file, { openFile: c.openFile })
+    assert.equal(m.lastActivity, '2026-10-21T04:00:05.000Z', 'lastActivity fell back (the caller would use mtime)')
+    assert.equal(m.title, 'Cat essay', 'the AI title turned into the first prompt')
+    assert.equal(m.titleSource, 'ai')
+    assert.equal(m.contextTokens, 50002, 'the context chip vanished')
+    // ★ Stops at the 512KB step (does not jump to the cap)
+    assert.equal(c.bytes(), HEAD + STEP1 + STEP2)
+  } finally {
+    t.done()
+  }
+})
+
+test('★★ readTranscriptMeta: recovers from a record bigger than 512KB too (real data: a 1.2MB blob)', async () => {
+  const records: Rec[] = [
+    userMsg('first prompt', { timestamp: '2026-10-21T04:00:00.000Z' }),
+    filler(),
+    { type: 'ai-title', aiTitle: 'Big blob' },
+    { ...usageRec({ input_tokens: 7 }), timestamp: '2026-10-21T04:00:05.000Z' },
+    apiRequest(STEP2 * 2),
+  ]
+  const t = writeTranscript(records)
+  try {
+    const m = await readTranscriptMeta(t.file)
+    assert.equal(m.lastActivity, '2026-10-21T04:00:05.000Z')
+    assert.equal(m.title, 'Big blob')
+    assert.equal(m.contextTokens, 7)
+  } finally {
+    t.done()
+  }
+})
+
+test('★ readTranscriptMeta: reads only 64KB when the tail is enough', async () => {
+  const records: Rec[] = [
+    userMsg('first prompt', { timestamp: '2026-10-21T04:00:00.000Z' }),
+    filler(),
+    apiRequest(STEP2),
+    { ...usageRec({ input_tokens: 3 }), timestamp: '2026-10-21T04:00:05.000Z' },
+  ]
+  const t = writeTranscript(records)
+  try {
+    const c = countingOpen()
+    const m = await readTranscriptMeta(t.file, { openFile: c.openFile })
+    assert.equal(m.contextTokens, 3)
+    assert.equal(c.bytes(), HEAD + STEP1)
+  } finally {
+    t.done()
+  }
+})
+
+test('★★ readTranscriptMeta: the widening is bounded at 4MB (never reads the whole file)', async () => {
+  const records: Rec[] = [
+    userMsg('first prompt', { timestamp: '2026-10-21T04:00:00.000Z' }),
+    { ...usageRec({ input_tokens: 2 }), timestamp: '2026-10-21T04:00:05.000Z' },
+    apiRequest(CAP + 64 * KB),
+  ]
+  const t = writeTranscript(records)
+  try {
+    const c = countingOpen()
+    const m = await readTranscriptMeta(t.file, { openFile: c.openFile })
+    // ★ Only the head is left: nothing from the far tail
+    assert.equal(m.lastActivity, undefined)
+    assert.equal(m.contextTokens, undefined)
+    assert.equal(c.bytes(), HEAD + STEP1 + STEP2 + CAP)
+  } finally {
+    t.done()
+  }
+})
+
+test('★★ readTranscriptMeta: an unchanged file is not read again (2026-10-21 codex, medium #2)', async () => {
+  // ⚠️ The case that never satisfies `tailIsEnough`: no assistant usage at all (real data: a 972KB transcript)
+  const t = writeTranscript([userMsg('first prompt', { timestamp: '2026-10-21T04:00:00.000Z' }), apiRequest(STEP2 * 2)])
+  try {
+    const first = countingOpen()
+    await readTranscriptMeta(t.file, { openFile: first.openFile })
+    assert.ok(first.bytes() > STEP2, 'the first read should widen')
+    const again = countingOpen()
+    await readTranscriptMeta(t.file, { openFile: again.openFile })
+    assert.equal(again.bytes(), 0, 'read the unchanged file again (4MB on every poll)')
+  } finally {
+    t.done()
+  }
+})
+
+test('★★ readTranscriptMeta: each of inode / mtime / ctime invalidates the cache on its own (codex round 2)', async () => {
+  const t = writeTranscript([userMsg('first prompt', { timestamp: '2026-10-21T04:00:00.000Z' })])
+  const base = { ino: 1, mtimeMs: 1000, ctimeMs: 1000 }
+  const now = () => 0
+  try {
+    for (const field of ['ino', 'mtimeMs', 'ctimeMs'] as const) {
+      await readTranscriptMeta(t.file, { openFile: countingOpen(base).openFile, now })
+      const same = countingOpen(base)
+      await readTranscriptMeta(t.file, { openFile: same.openFile, now })
+      assert.equal(same.bytes(), 0, `precondition (${field}): the same identity is a hit`)
+      const changed = countingOpen({ ...base, [field]: base[field] + 1 })
+      await readTranscriptMeta(t.file, { openFile: changed.openFile, now })
+      assert.ok(changed.bytes() > 0, `a change of ${field} alone was not noticed`)
+    }
+  } finally {
+    t.done()
+  }
+})
+
+test('★★ readTranscriptMeta: an append within one timestamp tick is noticed by the size', async () => {
+  const t = writeTranscript([userMsg('first prompt', { timestamp: '2026-10-21T04:00:00.000Z' }), apiRequest(STEP2 * 2)])
+  // ⚠️ Every time pinned = the append landed in the same tick (file times are coarse)
+  const pin = { ino: 7, mtimeMs: 2000, ctimeMs: 2000 }
+  const now = () => 0
+  try {
+    await readTranscriptMeta(t.file, { openFile: countingOpen(pin).openFile, now })
+    appendFileSync(t.file, JSON.stringify({ ...usageRec({ input_tokens: 9 }), timestamp: '2026-10-21T04:01:00.000Z' }) + '\n')
+    const m = await readTranscriptMeta(t.file, { openFile: countingOpen(pin).openFile, now })
+    assert.equal(m.contextTokens, 9, 'returned the stale result after an append')
+    assert.equal(m.lastActivity, '2026-10-21T04:01:00.000Z')
+  } finally {
+    t.done()
+  }
+})
+
+test('★★ readTranscriptMeta: a cached result is trusted for 30 s at most (a collision costs that long, not forever)', async () => {
+  const t = writeTranscript([userMsg('first prompt', { timestamp: '2026-10-21T04:00:00.000Z' })])
+  const pin = { ino: 3, mtimeMs: 3000, ctimeMs: 3000 }
+  const AGE = 30_000
+  try {
+    await readTranscriptMeta(t.file, { openFile: countingOpen(pin).openFile, now: () => 0 })
+    const early = countingOpen(pin)
+    await readTranscriptMeta(t.file, { openFile: early.openFile, now: () => AGE - 1 })
+    assert.equal(early.bytes(), 0, 'precondition: still a hit just before the limit')
+    const late = countingOpen(pin)
+    await readTranscriptMeta(t.file, { openFile: late.openFile, now: () => AGE })
+    assert.ok(late.bytes() > 0, 'trusted the cache past its age limit')
+  } finally {
+    t.done()
+  }
+})
+
+test('★ readTranscriptMeta: the cache stays bounded', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'nyan-transcript-many-'))
+  try {
+    const line = JSON.stringify(userMsg('hi')) + '\n'
+    for (let i = 0; i <= 1000; i++) {
+      const file = join(dir, `${String(i).padStart(8, '0')}-0000-0000-0000-000000000000.jsonl`)
+      writeFileSync(file, line)
+      await readTranscriptMeta(file)
+    }
+    assert.ok(metaCacheSize() <= 1000, `the cache grew to ${metaCacheSize()}`)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('★★ readTranscriptMeta: a wider tail does not bring back an older branch / version (2026-10-21 codex, medium #1)', async () => {
+  const records: Rec[] = [
+    userMsg('first prompt', { timestamp: '2026-10-21T04:00:00.000Z', gitBranch: 'old', version: '2.1.281' }),
+    { ...usageRec({ input_tokens: 4 }), gitBranch: 'old', version: '2.1.281', timestamp: '2026-10-21T04:00:01.000Z' },
+    apiRequest(STEP1 * 2),
+    // The current state, inside the last 64KB but without usage (⇒ the tail widens past it)
+    userMsg('second prompt', { timestamp: '2026-10-21T04:00:09.000Z', gitBranch: 'new', version: '2.1.306' }),
+  ]
+  const t = writeTranscript(records)
+  try {
+    const m = await readTranscriptMeta(t.file)
+    assert.equal(m.contextTokens, 4, 'precondition: the tail widened')
+    assert.equal(m.gitBranch, 'new')
+    assert.equal(m.cliVersion, '2.1.306')
+  } finally {
+    t.done()
+  }
+})
+
+test('★ tailIsEnough: needs a conversation record, and the context size unless the compact boundary is inside', () => {
+  const user = userMsg('hi')
+  const asst = usageRec({ input_tokens: 10 })
+  const boundary = { type: 'system', subtype: 'compact_boundary' }
+  const judge = (tail: Rec[]) => tailIsEnough(tail, derive({ sessionId: 's', headRecords: [], tailRecords: tail }))
+  assert.equal(judge([apiRequest(10)]), false, 'no conversation record')
+  assert.equal(judge([boundary, apiRequest(10)]), false, 'a compact boundary alone is not a conversation record')
+  assert.equal(judge([user, apiRequest(10)]), false, 'no assistant yet: keep looking for the context size')
+  assert.equal(judge([user, asst, apiRequest(10)]), true)
+  assert.equal(judge([boundary, user, apiRequest(10)]), true, 'right after compaction "unknown" is the answer')
 })

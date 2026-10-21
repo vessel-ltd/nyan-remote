@@ -857,6 +857,17 @@ test('★★ the caveat is detected by AND with `isMeta` (a marker the CLI sets)
   assert.equal(kept[0]?.kind === 'user' ? kept[0].text : '', content)
 })
 
+test('★★ the caveat wording of CLI 2.1.285+ is folded too (it showed as "your message" after every /compact)', () => {
+  // ★ Real record (CLI 2.1.306 / 2026-10-21, captured by sending `/compact` through the command endpoint)
+  const content =
+    "<local-command-caveat>The command below was run directly in Claude Code, not sent to you as a request, and its output goes straight to the user. It's recorded here as context for later messages.</local-command-caveat>"
+  assert.deepEqual(toEntries({ type: 'user', isMeta: true, message: { content } }), [])
+  // ⚠️ Without the marker it is still human text
+  const kept = toEntries({ type: 'user', message: { content } })
+  assert.equal(kept.length, 1, 'human text was deleted')
+  assert.equal(kept[0]?.kind, 'user')
+})
+
 test('★ a caveat with different wording is not deleted (even with the marker)', () => {
   // ⚠️ Mutation named by codex: `'…Caveat:'` → `'…Caveat'` (would also delete `Caveatを説明…`).
   //    ★ Be strict on the removing side (showing too much is safer).

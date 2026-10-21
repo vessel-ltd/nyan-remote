@@ -14,6 +14,7 @@
 //   exit code 0 = match (and every axis was tested) / 1 = mismatch / 2 = some axis was not tested
 import { readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
+import { join } from 'node:path'
 import { loadConfig, config } from '../agent/src/config.ts'
 import { machineName } from '../agent/src/machine.ts'
 import { discoverConfigDirs } from '../agent/src/claude/configDirs.ts'
@@ -39,13 +40,38 @@ const seeded = await seedHookState()
  */
 async function fetchCards() {
   try {
-    const cfg = JSON.parse(readFileSync(`${homedir()}/.nyan-remote/config.json`, 'utf8'))
+    // ★ Identify the same way as `scripts/pending.mjs` (hook token → tailnet login name).
+    //   ⚠️ It used the login name only, so on machines installed with the relay alone (no tailnet login) it
+    //      **never saw a card** and reported a mismatch for every approval (found 2026-10-21 on CLI 2.1.306).
+    const stateDir = process.env.NYAN_REMOTE_STATE_DIR ?? join(homedir(), '.nyan-remote')
+    let cfg = {}
+    try {
+      cfg = JSON.parse(readFileSync(join(stateDir, 'config.json'), 'utf8'))
+    } catch {
+      // ⚠️ Fall through: the hook token may still be there
+    }
+    let token = ''
+    try {
+      token = readFileSync(join(stateDir, 'hook-token'), 'utf8').trim()
+    } catch {
+      // ⚠️ If absent, try the tailnet login name only
+    }
     const login = cfg.allowedLogins?.[0]
-    if (!login) return { ids: new Set(), quiet: 0, ok: false, why: t('allowedLogins が空', 'allowedLogins is empty') }
-    const res = await fetch(agentUrl(cfg.port ?? 7777, '/permissions'), {
-      headers: { 'Tailscale-User-Login': login, 'X-Forwarded-Proto': 'https' },
-      signal: AbortSignal.timeout(5000),
-    })
+    const ways = [
+      ...(token ? [{ 'X-Nyan-Remote-Token': token }] : []),
+      ...(login ? [{ 'Tailscale-User-Login': login, 'X-Forwarded-Proto': 'https' }] : []),
+    ]
+    if (ways.length === 0) {
+      return { ids: new Set(), quiet: 0, ok: false, why: t('hook-token も allowedLogins も無い', 'neither hook-token nor allowedLogins exists') }
+    }
+    let res
+    for (const headers of ways) {
+      // ⚠️ Same port rule as `scripts/pending.mjs` (the environment wins)
+      const port = Number(process.env.NYAN_REMOTE_PORT ?? cfg.port ?? 7777)
+      res = await fetch(agentUrl(port, '/permissions'), { headers, signal: AbortSignal.timeout(5000) })
+      // ⚠️ An old agent refuses the hook token here (403) ⇒ try the next way
+      if (res.status !== 401 && res.status !== 403) break
+    }
     if (!res.ok) return { ids: new Set(), quiet: 0, ok: false, why: `HTTP ${res.status}` }
     const j = await res.json()
     return {
