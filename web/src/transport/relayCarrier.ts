@@ -42,7 +42,7 @@ import {
   type PendingSession,
   type Session,
 } from '../../../shared/crypto.ts'
-import { decodeDeviceChallenge, encodeDeviceProof } from '../../../shared/relayAuth.ts'
+import { answerContext, decodeDeviceChallenge, encodeDeviceProof, relayBinding } from '../../../shared/relayAuth.ts'
 import { RELAY_PING, RELAY_PING_MS, relayUrl } from '../../../shared/relayFrame.ts'
 import { relayWire, type RelayWire } from './relay.ts'
 import type { Wire } from './wire.ts'
@@ -126,6 +126,11 @@ export function openRelayCarrier(o: {
   socket: CarrierSocket
   identity: KeyPair
   agentPublicKey: string
+  /**
+   * ★★ The relay URL this wire dialed (the v2 key proof is bound to its host and room / 2026-11-10 / `relayBinding`).
+   * ⚠️ Required: without it the phone could only answer unbound proofs, which our relay refuses.
+   */
+  url: string
   /** ⚠️ Handshake wait and per-request wait (for tests; not passed from screens) */
   timeoutMs?: number
   onDown?: (reason: string) => void
@@ -200,8 +205,14 @@ export function openRelayCarrier(o: {
         if (proved) return down(t('relay が証明を2回 求めました', 'The relay asked for the key proof twice'))
         proved = true
         try {
-          const tag = await relayProof(o.identity.privateKey, challenge.value.relayPublicRaw, challenge.value.nonce)
-          o.socket.send(encodeDeviceProof({ devicePublicRaw: await exportPublicKey(o.identity.publicKey), tag }))
+          // ★★ v2: bound to the host this wire dialed and the room (a forwarding relay's proof does not verify at ours)
+          const tag = await relayProof(
+            o.identity.privateKey,
+            challenge.value.relayPublicRaw,
+            challenge.value.nonce,
+            answerContext(challenge.value.v, 'device', relayBinding(o.url)),
+          )
+          o.socket.send(encodeDeviceProof({ devicePublicRaw: await exportPublicKey(o.identity.publicKey), tag, v: challenge.value.v }))
         } catch (err) {
           return down(t(`鍵の証明を作れません: ${text(err)}`, `Could not produce the key proof: ${text(err)}`))
         }
@@ -288,13 +299,15 @@ export async function connectRelayCarrier(o: {
   takeover?: boolean
 }): Promise<{ wire: Wire; close(reason?: string): void }> {
   // ★ `p=1` = this phone answers the relay's key proof (2026-09-27). ⚠️ Old and self-hosted relays ignore it
-  const ws = (o.openLine ?? realLine)(relayUrl(o.base, 'device', o.agentPublicKey, { proof: true, ...(o.takeover ? { takeover: true } : {}) }))
+  const url = relayUrl(o.base, 'device', o.agentPublicKey, { proof: true, ...(o.takeover ? { takeover: true } : {}) })
+  const ws = (o.openLine ?? realLine)(url)
 
   // ★★ Buffer anything sent before open (⚠️ the handshake's first message may be ready before `open`)
   let live = false
   const queued: Uint8Array[] = []
   const carrier = openRelayCarrier({
     ...o,
+    url,
     socket: {
       send: (bytes) => {
         if (live) ws.send(bytes)

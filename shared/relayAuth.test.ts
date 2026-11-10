@@ -6,6 +6,7 @@
 //   ③ relay's ephemeral key is ignored (same)
 //   ④ it uses **the same inputs** as the E2E key derivation (`info` mix-up)
 //   ⑤ version, type or length are not checked / decode throws
+//   ⑥ ★★★ (v2 / 2026-11-10) the proof is not bound to the relay host, the room or the role, or the relay accepts v1
 
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
@@ -16,12 +17,15 @@ import {
   fromBase64Url,
   generateDeviceKey,
   relayProof,
+  relayProofInfo,
   sameBytes,
+  type RelayProofContext,
   toBase64Url,
 } from './crypto.ts'
 import {
   RELAY_AUTH,
   RELAY_AUTH_V,
+  RELAY_AUTH_V1,
   RELAY_NONCE_BYTES,
   RELAY_TAG_BYTES,
   decodeChallenge,
@@ -32,11 +36,17 @@ import {
   encodeDeviceChallenge,
   encodeDeviceProof,
   encodeProof,
+  answerContext,
+  relayBinding,
 } from './relayAuth.ts'
 
 function nonce(fill = 7): Uint8Array {
   return new Uint8Array(RELAY_NONCE_BYTES).fill(fill)
 }
+
+/** ★ A v2 context for tests where the binding itself is not the subject */
+const AG: RelayProofContext = { v: 2, role: 'agent', host: 'relay.example.com', room: 'ROOM' }
+const DV: RelayProofContext = { v: 2, role: 'device', host: 'relay.example.com', room: 'ROOM' }
 
 test('★★ only the private-key holder can produce the same proof', async () => {
   const agent = await generateDeviceKey()
@@ -47,14 +57,14 @@ test('★★ only the private-key holder can produce the same proof', async () =
 
   // ★ The agent side (own private key × relay ephemeral public key) and
   //   the relay side (ephemeral private key × agent public key) give **the same value**
-  const fromAgent = await relayProof(agent.privateKey, relayRaw, n)
-  const fromRelay = await relayProof(relay.privateKey, agentRaw, n)
+  const fromAgent = await relayProof(agent.privateKey, relayRaw, n, AG)
+  const fromRelay = await relayProof(relay.privateKey, agentRaw, n, AG)
   assert.ok(sameBytes(fromAgent, fromRelay), 'the two sides produced different proofs')
   assert.equal(fromAgent.length, RELAY_TAG_BYTES)
 
   // ⚠️⚠️ **Another key cannot produce it** (= knowing the public key is not enough to claim the identity)
   const impostor = await generateDeviceKey()
-  const fake = await relayProof(impostor.privateKey, relayRaw, n)
+  const fake = await relayProof(impostor.privateKey, relayRaw, n, AG)
   assert.equal(sameBytes(fake, fromRelay), false, '⚠️⚠️ a proof from another key passed')
 })
 
@@ -63,12 +73,12 @@ test('★★ the proof changes when the nonce or relay ephemeral key changes (re
   const relay = await generateDeviceKey()
   const relayRaw = await exportPublicKey(relay.publicKey)
 
-  const a = await relayProof(agent.privateKey, relayRaw, nonce(1))
-  const b = await relayProof(agent.privateKey, relayRaw, nonce(2))
+  const a = await relayProof(agent.privateKey, relayRaw, nonce(1), AG)
+  const b = await relayProof(agent.privateKey, relayRaw, nonce(2), AG)
   assert.equal(sameBytes(a, b), false, '⚠️⚠️ nonce is ignored (an earlier proof can be reused)')
 
   const relay2 = await generateDeviceKey()
-  const c = await relayProof(agent.privateKey, await exportPublicKey(relay2.publicKey), nonce(1))
+  const c = await relayProof(agent.privateKey, await exportPublicKey(relay2.publicKey), nonce(1), AG)
   assert.equal(sameBytes(a, c), false, '⚠️⚠️ relay ephemeral key is ignored')
 })
 
@@ -87,7 +97,7 @@ test('★★ frame round trip (★ contents do not change by a single byte)', as
   assert.deepEqual([...back.value.nonce], [...n])
 
   const tag = new Uint8Array(RELAY_TAG_BYTES).fill(9)
-  const p = encodeProof(tag)
+  const p = encodeProof(tag, RELAY_AUTH_V)
   assert.equal(p[1], RELAY_AUTH.proof)
   const pb = decodeProof(p)
   assert.ok(pb.ok)
@@ -113,7 +123,7 @@ test('★★ decode never throws (does not break the receiver)', () => {
   const relayRaw = new Uint8Array(PUBKEY_BYTES).fill(4)
   const challenge = encodeChallenge({ relayPublicRaw: relayRaw, nonce: nonce() })
   assert.equal(decodeProof(challenge).ok, false)
-  assert.equal(decodeChallenge(encodeProof(new Uint8Array(RELAY_TAG_BYTES))).ok, false)
+  assert.equal(decodeChallenge(encodeProof(new Uint8Array(RELAY_TAG_BYTES), RELAY_AUTH_V)).ok, false)
 })
 
 test('★★ sender-side mistakes throw (length)', () => {
@@ -125,7 +135,7 @@ test('★★ sender-side mistakes throw (length)', () => {
     () => encodeChallenge({ relayPublicRaw: new Uint8Array(PUBKEY_BYTES), nonce: new Uint8Array(3) }),
     /nonce/,
   )
-  assert.throws(() => encodeProof(new Uint8Array(3)), /証明/)
+  assert.throws(() => encodeProof(new Uint8Array(3), RELAY_AUTH_V), /証明/)
 })
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -148,6 +158,7 @@ const KAT_PRIVATE_JWK = {
 }
 const KAT_PEER_PUBLIC = 'BKAYTYDnrvPIq4sxDN1-NMb_FI6zA2C7BuixPwC3HyYUqk5rVEcLaL39ySvM4uhJ-d-m7nesWYkjDj16LGZc7BI'
 const KAT_TAG = 'GGTEQ0JJpKBMpfCVsjE44yuW_cwhnXGJsgIN1vEt_JA'
+const KAT_TAG_V2 = 'VCmIUhUInn4lJdr6Vue_NfvuhHhZRFQFJ5xXttOIurI'
 
 test('★★ known answer for the proof (⚠️ a failure means "the construction changed")', async () => {
   const priv = await crypto.subtle.importKey('jwk', KAT_PRIVATE_JWK, ECDH_PARAMS, false, [
@@ -155,14 +166,23 @@ test('★★ known answer for the proof (⚠️ a failure means "the constructio
   ])
   const nonce = new Uint8Array(32)
   for (let i = 0; i < 32; i++) nonce[i] = i
-  const tag = await relayProof(priv, fromBase64Url(KAT_PEER_PUBLIC), nonce)
+  // ★ v1 is still answered (old self-hosted relays), so its construction is pinned too
+  const tag = await relayProof(priv, fromBase64Url(KAT_PEER_PUBLIC), nonce, { v: 1 })
   assert.equal(toBase64Url(tag), KAT_TAG)
+  // ★★ v2 (2026-11-10): role, host and room in `info`
+  const v2 = await relayProof(priv, fromBase64Url(KAT_PEER_PUBLIC), nonce, {
+    v: 2,
+    role: 'device',
+    host: 'relay.example.com',
+    room: KAT_PEER_PUBLIC,
+  })
+  assert.equal(toBase64Url(v2), KAT_TAG_V2)
 })
 
 test('★★ reject messages with the same length and version but "only the type" broken', () => {
   const relayRaw = new Uint8Array(PUBKEY_BYTES).fill(4)
   const challenge = encodeChallenge({ relayPublicRaw: relayRaw, nonce: nonce(5) })
-  const proof = encodeProof(new Uint8Array(RELAY_TAG_BYTES).fill(6))
+  const proof = encodeProof(new Uint8Array(RELAY_TAG_BYTES).fill(6), RELAY_AUTH_V)
 
   // ⚠️ Keep the length **as is** and swap only the type, so it does not fail on length (= reaches the check)
   for (const [bytes, decode] of [
@@ -199,28 +219,92 @@ test('★★ the phone challenge and proof have their own types: never read as t
 
   const phone = await generateDeviceKey()
   const phoneRaw = await exportPublicKey(phone.publicKey)
-  const tag = await relayProof(phone.privateKey, relayRaw, n)
-  const dp = encodeDeviceProof({ devicePublicRaw: phoneRaw, tag })
+  const tag = await relayProof(phone.privateKey, relayRaw, n, DV)
+  const dp = encodeDeviceProof({ devicePublicRaw: phoneRaw, tag, v: RELAY_AUTH_V })
   assert.deepEqual([dp[0], dp[1]], [RELAY_AUTH_V, RELAY_AUTH.deviceProof])
   assert.equal(dp.length, 2 + PUBKEY_BYTES + RELAY_TAG_BYTES)
   const proof = decodeDeviceProof(dp)
   assert.ok(proof.ok)
   assert.ok(sameBytes(proof.value.devicePublicRaw, phoneRaw) && sameBytes(proof.value.tag, tag))
   // ★ relay verifies with the key **inside** the message and its own ephemeral private key
-  assert.ok(sameBytes(await relayProof(relay.privateKey, proof.value.devicePublicRaw, n), proof.value.tag))
+  assert.ok(sameBytes(await relayProof(relay.privateKey, proof.value.devicePublicRaw, n, DV), proof.value.tag))
   assert.equal(decodeProof(dp).ok, false)
-  assert.equal(decodeDeviceProof(encodeProof(tag)).ok, false)
+  assert.equal(decodeDeviceProof(encodeProof(tag, RELAY_AUTH_V)).ok, false)
 })
 
 test('★★ phone frames: wrong length, version or type are refused without throwing; wrong lengths cannot be encoded', () => {
-  const good = encodeDeviceProof({ devicePublicRaw: new Uint8Array(PUBKEY_BYTES).fill(4), tag: new Uint8Array(RELAY_TAG_BYTES).fill(5) })
+  const good = encodeDeviceProof({ devicePublicRaw: new Uint8Array(PUBKEY_BYTES).fill(4), tag: new Uint8Array(RELAY_TAG_BYTES).fill(5), v: RELAY_AUTH_V })
   assert.equal(decodeDeviceProof(good.slice(0, -1)).ok, false)
   const badV = new Uint8Array(good)
   badV[0] = 9
   assert.equal(decodeDeviceProof(badV).ok, false)
   assert.equal(decodeDeviceProof(new Uint8Array(0)).ok, false)
   assert.equal(decodeDeviceChallenge(new Uint8Array(0)).ok, false)
-  assert.throws(() => encodeDeviceProof({ devicePublicRaw: new Uint8Array(64), tag: new Uint8Array(RELAY_TAG_BYTES) }))
-  assert.throws(() => encodeDeviceProof({ devicePublicRaw: new Uint8Array(PUBKEY_BYTES), tag: new Uint8Array(31) }))
+  assert.throws(() => encodeDeviceProof({ devicePublicRaw: new Uint8Array(64), tag: new Uint8Array(RELAY_TAG_BYTES), v: RELAY_AUTH_V }))
+  assert.throws(() => encodeDeviceProof({ devicePublicRaw: new Uint8Array(PUBKEY_BYTES), tag: new Uint8Array(31), v: RELAY_AUTH_V }))
   assert.throws(() => encodeDeviceChallenge({ relayPublicRaw: new Uint8Array(64), nonce: nonce() }))
+})
+
+// ─── ★★★ v2: the proof is bound to the relay host, the room and the role (2026-11-10 / security check) ───────
+
+test('★★★ v2: a proof made for another relay host, room or role does not verify (the forwarding attack)', async () => {
+  const phone = await generateDeviceKey()
+  const relay = await generateDeviceKey()
+  const relayRaw = await exportPublicKey(relay.publicKey)
+  const phoneRaw = await exportPublicKey(phone.publicKey)
+  const n = nonce(4)
+  const ours: RelayProofContext = { v: 2, role: 'device', host: 'relay.nyan-remote.example', room: 'ROOM_A' }
+  // ★ What our relay checks against (its own host, the room the wire came to)
+  const expected = await relayProof(relay.privateKey, phoneRaw, n, ours)
+  assert.ok(sameBytes(await relayProof(phone.privateKey, relayRaw, n, ours), expected))
+  // ⚠️⚠️ A relay forwarding our challenge gets a proof bound to **its** host = refused here
+  for (const other of [
+    { ...ours, host: 'evil.example' },
+    { ...ours, room: 'ROOM_B' },
+    { ...ours, role: 'agent' as const },
+    { v: 1 as const },
+  ]) {
+    const forwarded = await relayProof(phone.privateKey, relayRaw, n, other)
+    assert.equal(sameBytes(forwarded, expected), false, `⚠️⚠️ not bound: ${JSON.stringify(other)}`)
+  }
+})
+
+test('★★★ the relay accepts only v2 proofs (accepting v1 would let a forwarding relay downgrade)', () => {
+  const tag = new Uint8Array(RELAY_TAG_BYTES).fill(6)
+  assert.equal(decodeProof(encodeProof(tag, RELAY_AUTH_V)).ok, true)
+  assert.equal(decodeProof(encodeProof(tag, RELAY_AUTH_V1)).ok, false, '⚠️⚠️ v1 agent proof accepted')
+  const devicePublicRaw = new Uint8Array(PUBKEY_BYTES).fill(4)
+  assert.equal(decodeDeviceProof(encodeDeviceProof({ devicePublicRaw, tag, v: RELAY_AUTH_V })).ok, true)
+  assert.equal(decodeDeviceProof(encodeDeviceProof({ devicePublicRaw, tag, v: RELAY_AUTH_V1 })).ok, false, '⚠️⚠️ v1 phone proof accepted')
+  assert.equal(RELAY_AUTH_V, 2)
+})
+
+test('★★ challenges: this relay sends v2; v1 (an old relay) still decodes and says so, so it is answered in v1', async () => {
+  const relayPublicRaw = new Uint8Array(PUBKEY_BYTES).fill(4)
+  const c2 = decodeChallenge(encodeChallenge({ relayPublicRaw, nonce: nonce() }))
+  assert.ok(c2.ok && c2.value.v === RELAY_AUTH_V)
+  const c1 = decodeChallenge(encodeChallenge({ relayPublicRaw, nonce: nonce() }, RELAY_AUTH_V1))
+  assert.ok(c1.ok && c1.value.v === RELAY_AUTH_V1)
+  const d1 = decodeDeviceChallenge(encodeDeviceChallenge({ relayPublicRaw, nonce: nonce() }, RELAY_AUTH_V1))
+  assert.ok(d1.ok && d1.value.v === RELAY_AUTH_V1)
+  const b = { host: 'h.example', room: 'R' }
+  assert.deepEqual(answerContext(RELAY_AUTH_V1, 'agent', b), { v: 1 })
+  assert.deepEqual(answerContext(RELAY_AUTH_V, 'device', b), { v: 2, role: 'device', host: 'h.example', room: 'R' })
+})
+
+test('★★ relayBinding: the same host for every side (case and the default port do not matter; the room is `a`)', () => {
+  assert.deepEqual(relayBinding('wss://Relay.Example.COM/v1/agent?a=KEY&c=1'), { host: 'relay.example.com', room: 'KEY' })
+  assert.deepEqual(relayBinding('wss://relay.example.com:443/v1/device?a=KEY&p=1'), { host: 'relay.example.com', room: 'KEY' })
+  assert.deepEqual(relayBinding('ws://127.0.0.1:8787/v1/device?a=KEY'), { host: '127.0.0.1:8787', room: 'KEY' })
+  assert.equal(relayBinding('https://relay.example.com/v1/agent?a=KEY').host, 'relay.example.com')
+  // ⚠️ no room = an empty one, which `relayProofInfo` refuses (= no proof is produced, the wire fails closed)
+  assert.equal(relayBinding('wss://relay.example.com/v1/agent').room, '')
+})
+
+test('★★ relayProofInfo: refuses an empty host or room and NUL inside a field (fields must not run into each other)', () => {
+  assert.throws(() => relayProofInfo({ v: 2, role: 'agent', host: '', room: 'R' }))
+  assert.throws(() => relayProofInfo({ v: 2, role: 'agent', host: 'h', room: '' }))
+  assert.throws(() => relayProofInfo({ v: 2, role: 'agent', host: 'h\0agent', room: 'R' }))
+  assert.equal(new TextDecoder().decode(relayProofInfo({ v: 1 })), 'nyan-relay-auth1')
+  assert.equal(new TextDecoder().decode(relayProofInfo({ v: 2, role: 'device', host: 'h', room: 'R' })), 'nyan-relay-auth2\0device\0h\0R')
 })

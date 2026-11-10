@@ -22,8 +22,8 @@ import { chmod, mkdtemp, rm } from 'node:fs/promises'
 import { hostname, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
-import { ECDH_PARAMS, exportPublicKey, generateDeviceKey, relayProof, sameBytes, toBase64Url, type KeyPair } from '../../../shared/crypto.ts'
-import { decodeDeviceProof, encodeChallenge, encodeDeviceChallenge } from '../../../shared/relayAuth.ts'
+import { ECDH_PARAMS, exportPublicKey, generateDeviceKey, relayProof, sameBytes, toBase64Url, type KeyPair, type RelayProofContext } from '../../../shared/crypto.ts'
+import { RELAY_AUTH_V, RELAY_AUTH_V1, decodeDeviceProof, encodeChallenge, encodeDeviceChallenge, type RelayAuthVersion } from '../../../shared/relayAuth.ts'
 import { isFreeSlot, isUnreachable } from './unreachable.ts'
 import {
   RELAY_FRAME,
@@ -138,7 +138,7 @@ function rig(agentPublicKey: string, identity: Awaited<ReturnType<typeof generat
 
   // ★ The relay first tells the agent "a phone arrived"
   void r.link.receive(encodeRelayFrame({ type: RELAY_FRAME.opened, connId: CONN_ID }))
-  r.carrier = openRelayCarrier({ socket, identity, agentPublicKey, timeoutMs: 300 })
+  r.carrier = openRelayCarrier({ socket, identity, agentPublicKey, url: dialed(agentPublicKey), timeoutMs: 300 })
   r.ready = r.carrier.ready.then((wire) => ({
     transport: new AgentTransport({ id: 'relay', label: 'relay', url: 'relay://tunnel' }, wire),
     /**
@@ -221,6 +221,7 @@ test('★★ if the agent stays silent, the handshake times out **with a reason*
     },
     identity,
     agentPublicKey: toBase64Url(agentPublicRaw()),
+    url: dialed('room'),
     timeoutMs: 80,
   })
   await assert.rejects(carrier.ready, /時間切れ/)
@@ -321,6 +322,7 @@ test('★★ with an unreadable agent public key, not one byte goes on the line 
     socket: { send: (b) => sent.push(b), close: () => undefined },
     identity,
     agentPublicKey: 'これは鍵ではありません',
+    url: dialed('x'),
     timeoutMs: 300,
   })
   await assert.rejects(carrier.ready, /握手を始められません/)
@@ -446,18 +448,35 @@ test('★★ sends before open are buffered and flushed on open; the heartbeat i
 //   ⑫ not announcing `p=1` (the relay would not challenge, and would refuse the phone in a room without a ticket)
 // ─────────────────────────────────────────────────────────────────────────────
 
+/** ★ The URL the wire dialed (the v2 proof is bound to its host and room / `relayBinding`) */
+const DIALED_HOST = 'relay.example.com'
+function dialed(room: string): string {
+  return `wss://${DIALED_HOST}/v1/device?a=${encodeURIComponent(room)}&p=1`
+}
+
 /** A carrier over a recording socket, plus a "relay" ephemeral key to verify the answer with */
-async function challenged(identity: KeyPair, timeoutMs = 300) {
+async function challenged(identity: KeyPair, timeoutMs = 300, v: RelayAuthVersion = RELAY_AUTH_V) {
   const sent: Uint8Array[] = []
+  const room = toBase64Url(agentPublicRaw())
   const carrier = openRelayCarrier({
     socket: { send: (b) => sent.push(b), close: () => undefined },
     identity,
-    agentPublicKey: toBase64Url(agentPublicRaw()),
+    agentPublicKey: room,
+    url: dialed(room),
     timeoutMs,
   })
   const relay = (await crypto.subtle.generateKey(ECDH_PARAMS, true, ['deriveBits'])) as KeyPair
   const nonce = crypto.getRandomValues(new Uint8Array(32))
-  return { carrier, sent, relay, nonce, challenge: encodeDeviceChallenge({ relayPublicRaw: await exportPublicKey(relay.publicKey), nonce }) }
+  // ★ What our relay verifies against: its own host and the room the wire came to (v2 / 2026-11-10)
+  const ctx: RelayProofContext = { v: 2, role: 'device', host: DIALED_HOST, room }
+  return {
+    carrier,
+    sent,
+    relay,
+    nonce,
+    ctx,
+    challenge: encodeDeviceChallenge({ relayPublicRaw: await exportPublicKey(relay.publicKey), nonce }, v),
+  }
 }
 
 test('★★ the phone answers the relay\'s challenge with a proof only its key can make, whether it arrives before or after the first message (⑩)', { timeout: 5000 }, async (t) => {
@@ -473,9 +492,31 @@ test('★★ the phone answers the relay\'s challenge with a proof only its key 
   assert.ok(proof.ok, 'the answer is not a device proof')
   assert.ok(sameBytes(proof.value.devicePublicRaw, await exportPublicKey(identity.publicKey)), '⚠️ named another key')
   // ★ Verified the way the relay does: its own ephemeral private key × the key inside the message
-  assert.ok(sameBytes(proof.value.tag, await relayProof(c.relay.privateKey, proof.value.devicePublicRaw, c.nonce)), '⚠️⚠️ the proof does not verify')
+  assert.ok(sameBytes(proof.value.tag, await relayProof(c.relay.privateKey, proof.value.devicePublicRaw, c.nonce, c.ctx)), '⚠️⚠️ the proof does not verify')
+  assert.equal((c.sent[1] as Uint8Array)[0], RELAY_AUTH_V, 'the proof does not echo v2')
   // ⚠️ The handshake is still waiting for the agent (the challenge did not break it)
   await assert.rejects(c.carrier.ready, /時間切れ/)
+})
+
+test('★★★ v2 binds the proof to the relay host and room; an old relay\'s v1 challenge is answered in v1 (2026-11-10)', { timeout: 5000 }, async (t) => {
+  await boot(t)
+  const identity = await generateDeviceKey()
+  // ⚠️⚠️ A forwarding relay: our challenge reaches a phone that dialed **another** host ⇒ the proof does not verify at ours
+  const c = await challenged(identity)
+  c.carrier.receive(c.challenge)
+  await c.carrier.flush()
+  const proof = decodeDeviceProof(c.sent[1] as Uint8Array)
+  assert.ok(proof.ok)
+  const atOtherHost = await relayProof(c.relay.privateKey, proof.value.devicePublicRaw, c.nonce, { ...c.ctx, host: 'evil.example' } as RelayProofContext)
+  assert.equal(sameBytes(proof.value.tag, atOtherHost), false, '⚠️⚠️ the proof is not bound to the host')
+  // ★ An old (self-hosted) relay asks in v1: answered in v1 (echoed version, unbound proof)
+  const old = await challenged(identity, 300, RELAY_AUTH_V1)
+  old.carrier.receive(old.challenge)
+  await old.carrier.flush()
+  const bytes = old.sent[1] as Uint8Array
+  assert.equal(bytes[0], RELAY_AUTH_V1, 'the v1 challenge was not answered in v1')
+  const tag = bytes.slice(2 + 65)
+  assert.ok(sameBytes(tag, await relayProof(old.relay.privateKey, await exportPublicKey(identity.publicKey), old.nonce, { v: 1 })))
 })
 
 test('★★ a second challenge, or a challenge after the handshake, ends the line with a reason (⑪)', { timeout: 5000 }, async (t) => {

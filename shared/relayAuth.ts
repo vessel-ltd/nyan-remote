@@ -32,10 +32,19 @@
 //   (⚠️ **never write crypto in two places**). This file is **only the frame shape**.
 
 import { t } from './i18n.ts'
-import { PUBKEY_BYTES } from './crypto.ts'
+import { PUBKEY_BYTES, type RelayProofContext } from './crypto.ts'
 
-/** ⚠️ A **different** version from frames (`RELAY_V`) (it is a different phase of the exchange) */
-export const RELAY_AUTH_V = 1
+/**
+ * ⚠️ A **different** version from frames (`RELAY_V`) (it is a different phase of the exchange).
+ * ★★★ 2 = the proof is bound to the relay host and the room (2026-11-10 / `RelayProofContext` in `shared/crypto.ts`).
+ *   This relay sends only v2 challenges and **accepts only v2 proofs** (that refusal is what closes the forwarding attack).
+ *   ⚠️ An agent or phone still answers a v1 challenge with a v1 proof (old self-hosted relays keep working).
+ *   ⚠️ An old agent cannot read a v2 challenge and closes the wire (= it must be updated before this relay is deployed).
+ */
+export const RELAY_AUTH_V = 2
+/** The version before the binding (answered, never accepted) */
+export const RELAY_AUTH_V1 = 1
+export type RelayAuthVersion = typeof RELAY_AUTH_V | typeof RELAY_AUTH_V1
 
 export const RELAY_AUTH = {
   /** relay → agent */
@@ -63,83 +72,119 @@ export interface RelayChallenge {
   nonce: Uint8Array
 }
 
+/** ★ A decoded challenge also says which version to answer in (the proof echoes it) */
+export interface ReceivedChallenge extends RelayChallenge {
+  v: RelayAuthVersion
+}
+
+/**
+ * ★★ What a v2 proof is bound to, taken **from the URL the wire dialed** (agent and phone) or **the request the relay got**.
+ * ⚠️ One function for all three sides: if they normalised the host differently (case, default port), every proof would fail.
+ */
+export interface RelayBinding {
+  host: string
+  room: string
+}
+
+export function relayBinding(url: string): RelayBinding {
+  const u = new URL(url)
+  return { host: u.host, room: u.searchParams.get('a') ?? '' }
+}
+
+/** ★ The context to answer a challenge with (v1 for an old relay, v2 bound to this wire otherwise) */
+export function answerContext(
+  v: RelayAuthVersion,
+  role: 'agent' | 'device',
+  binding: RelayBinding,
+): RelayProofContext {
+  return v === RELAY_AUTH_V1 ? { v: 1 } : { v: 2, role, host: binding.host, room: binding.room }
+}
+
 export type AuthDecoded<T> = { ok: true; value: T } | { ok: false; reason: string }
 
-function encodeChallengeOf(type: number, c: RelayChallenge): Uint8Array {
+function encodeChallengeOf(type: number, c: RelayChallenge, v: RelayAuthVersion = RELAY_AUTH_V): Uint8Array {
   if (c.relayPublicRaw.length !== PUBKEY_BYTES) throw new Error(t('relay の公開鍵の長さが違います', 'Wrong relay public key length'))
   if (c.nonce.length !== RELAY_NONCE_BYTES) throw new Error(t('nonce の長さが違います', 'Wrong nonce length'))
   const out = new Uint8Array(CHALLENGE_BYTES)
-  out[0] = RELAY_AUTH_V
+  out[0] = v
   out[1] = type
   out.set(c.relayPublicRaw, 2)
   out.set(c.nonce, 2 + PUBKEY_BYTES)
   return out
 }
 
-function decodeChallengeOf(type: number, bytes: Uint8Array): AuthDecoded<RelayChallenge> {
+function decodeChallengeOf(type: number, bytes: Uint8Array): AuthDecoded<ReceivedChallenge> {
   if (bytes.length !== CHALLENGE_BYTES) return { ok: false, reason: t('長さが違います', 'Wrong length') }
-  if (bytes[0] !== RELAY_AUTH_V) return { ok: false, reason: t('知らない版です', 'Unknown version') }
+  const v = bytes[0]
+  if (v !== RELAY_AUTH_V && v !== RELAY_AUTH_V1) return { ok: false, reason: t('知らない版です', 'Unknown version') }
   if (bytes[1] !== type) return { ok: false, reason: t('種別が違います', 'Wrong type') }
   return {
     ok: true,
     value: {
+      v,
       relayPublicRaw: bytes.slice(2, 2 + PUBKEY_BYTES),
       nonce: bytes.slice(2 + PUBKEY_BYTES),
     },
   }
 }
 
-export function encodeChallenge(c: RelayChallenge): Uint8Array {
-  return encodeChallengeOf(RELAY_AUTH.challenge, c)
+/** ⚠️ `v` is for tests only (playing an old relay); this relay always sends `RELAY_AUTH_V` */
+export function encodeChallenge(c: RelayChallenge, v: RelayAuthVersion = RELAY_AUTH_V): Uint8Array {
+  return encodeChallengeOf(RELAY_AUTH.challenge, c, v)
 }
 
-export function decodeChallenge(bytes: Uint8Array): AuthDecoded<RelayChallenge> {
+export function decodeChallenge(bytes: Uint8Array): AuthDecoded<ReceivedChallenge> {
   return decodeChallengeOf(RELAY_AUTH.challenge, bytes)
 }
 
 /** ★ relay → phone (⚠️ an agent challenge does not decode as one, and vice versa: the type byte differs) */
-export function encodeDeviceChallenge(c: RelayChallenge): Uint8Array {
-  return encodeChallengeOf(RELAY_AUTH.deviceChallenge, c)
+export function encodeDeviceChallenge(c: RelayChallenge, v: RelayAuthVersion = RELAY_AUTH_V): Uint8Array {
+  return encodeChallengeOf(RELAY_AUTH.deviceChallenge, c, v)
 }
 
-export function decodeDeviceChallenge(bytes: Uint8Array): AuthDecoded<RelayChallenge> {
+export function decodeDeviceChallenge(bytes: Uint8Array): AuthDecoded<ReceivedChallenge> {
   return decodeChallengeOf(RELAY_AUTH.deviceChallenge, bytes)
 }
 
 export interface DeviceProof {
   /** The phone's static public key (raw). relay verifies the proof with it and keys the free-tier ledger by it */
   devicePublicRaw: Uint8Array
-  /** `relayProof(phone private key, relay ephemeral public key, nonce)` */
+  /** `relayProof(phone private key, relay ephemeral public key, nonce, context)` */
   tag: Uint8Array
+  /** ★ The version of the challenge being answered (echoed in the first byte) */
+  v: RelayAuthVersion
 }
 
 export function encodeDeviceProof(p: DeviceProof): Uint8Array {
   if (p.devicePublicRaw.length !== PUBKEY_BYTES) throw new Error(t('端末の公開鍵の長さが違います', 'Wrong device public key length'))
   if (p.tag.length !== RELAY_TAG_BYTES) throw new Error(t('証明の長さが違います', 'Wrong proof length'))
   const out = new Uint8Array(DEVICE_PROOF_BYTES)
-  out[0] = RELAY_AUTH_V
+  out[0] = p.v
   out[1] = RELAY_AUTH.deviceProof
   out.set(p.devicePublicRaw, 2)
   out.set(p.tag, 2 + PUBKEY_BYTES)
   return out
 }
 
+/** ⚠️⚠️ relay side: **v2 only** (accepting v1 would reopen the forwarding attack / see `RELAY_AUTH_V`) */
 export function decodeDeviceProof(bytes: Uint8Array): AuthDecoded<DeviceProof> {
   if (bytes.length !== DEVICE_PROOF_BYTES) return { ok: false, reason: t('長さが違います', 'Wrong length') }
   if (bytes[0] !== RELAY_AUTH_V) return { ok: false, reason: t('知らない版です', 'Unknown version') }
   if (bytes[1] !== RELAY_AUTH.deviceProof) return { ok: false, reason: t('種別が違います', 'Wrong type') }
-  return { ok: true, value: { devicePublicRaw: bytes.slice(2, 2 + PUBKEY_BYTES), tag: bytes.slice(2 + PUBKEY_BYTES) } }
+  return { ok: true, value: { v: RELAY_AUTH_V, devicePublicRaw: bytes.slice(2, 2 + PUBKEY_BYTES), tag: bytes.slice(2 + PUBKEY_BYTES) } }
 }
 
-export function encodeProof(tag: Uint8Array): Uint8Array {
+/** @param v the version of the challenge being answered (echoed) */
+export function encodeProof(tag: Uint8Array, v: RelayAuthVersion): Uint8Array {
   if (tag.length !== RELAY_TAG_BYTES) throw new Error(t('証明の長さが違います', 'Wrong proof length'))
   const out = new Uint8Array(PROOF_BYTES)
-  out[0] = RELAY_AUTH_V
+  out[0] = v
   out[1] = RELAY_AUTH.proof
   out.set(tag, 2)
   return out
 }
 
+/** ⚠️⚠️ relay side: **v2 only** (see `decodeDeviceProof`) */
 export function decodeProof(bytes: Uint8Array): AuthDecoded<Uint8Array> {
   if (bytes.length !== PROOF_BYTES) return { ok: false, reason: t('長さが違います', 'Wrong length') }
   if (bytes[0] !== RELAY_AUTH_V) return { ok: false, reason: t('知らない版です', 'Unknown version') }

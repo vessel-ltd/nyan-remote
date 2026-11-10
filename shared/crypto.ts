@@ -273,12 +273,44 @@ async function deriveKeys(
  * ⚠️⚠️ **Different inputs from the E2E key derivation** (a different `info` = they never mix).
  *    ⇒ Session keys (`nyan1 d2a` / `nyan1 a2d`) cannot be derived from the value made here.
  * ⚠️ Compare with `sameBytes` (no timing leak).
+ *
+ * ★★★ **v2 binds the proof to the relay and the room** (2026-11-10 / security check / `RelayProofContext`).
+ *   v1 proved only "I own this key": a relay the user configured (someone else's self-hosted one) could forward
+ *   **our** relay's challenge to the phone or agent and carry the answer back = take that phone's free slot on our relay.
+ *   ⇒ v2 puts the role, the relay host the wire dialed and the room (agent public key) in `info`; a proof made for
+ *   another relay's host does not verify here.
+ *   ⚠️⚠️ The protection holds only because **our relay refuses v1** (`decodeProof` / `decodeDeviceProof`): the phone
+ *   and agent still answer v1 to an old relay, so a forwarding relay can always ask for v1 (downgrade).
+ *   ⚠️ The context is a **required** argument (no default = no silent v1).
  */
+export type RelayProofContext =
+  | { v: 1 }
+  | {
+      v: 2
+      role: 'agent' | 'device'
+      /** `new URL(relay url).host` of the wire (`relayHost` in `shared/relayAuth.ts`, one place for all three sides) */
+      host: string
+      /** the room = the agent public key (base64url, the `a` parameter) */
+      room: string
+    }
+
+/** ★ The HKDF `info` of a proof (exported for the known-answer test only) */
+export function relayProofInfo(ctx: RelayProofContext): Uint8Array {
+  if (ctx.v === 1) return new TextEncoder().encode('nyan-relay-auth1')
+  // ⚠️ NUL-separated: none of the fields can contain NUL (a URL host / base64url / a fixed word)
+  for (const f of [ctx.host, ctx.room]) {
+    if (f.length === 0 || f.includes('\0')) throw new Error('Bad relay proof context')
+  }
+  return new TextEncoder().encode(`nyan-relay-auth2\0${ctx.role}\0${ctx.host}\0${ctx.room}`)
+}
+
 export async function relayProof(
   privateKey: Key,
   peerPublicRaw: Uint8Array,
   nonce: Uint8Array,
+  ctx: RelayProofContext,
 ): Promise<Uint8Array> {
+  const info = relayProofInfo(ctx)
   const ikm = await ecdh(privateKey, await importPublicKey(peerPublicRaw))
   const base = await subtle().importKey('raw', ikm as Bin, 'HKDF', false, ['deriveBits'])
   const bits = await subtle().deriveBits(
@@ -286,7 +318,7 @@ export async function relayProof(
       name: 'HKDF',
       hash: 'SHA-256',
       salt: nonce as Bin,
-      info: new TextEncoder().encode('nyan-relay-auth1'),
+      info: info as Bin,
     },
     base,
     256,

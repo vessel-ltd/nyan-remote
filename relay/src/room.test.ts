@@ -27,8 +27,9 @@ import {
   toBase64Url,
   type Jwk,
   type KeyPair,
+  type RelayProofContext,
 } from '../../shared/crypto.ts'
-import { decodeChallenge, decodeDeviceChallenge, encodeDeviceProof, encodeProof } from '../../shared/relayAuth.ts'
+import { RELAY_AUTH_V, RELAY_AUTH_V1, decodeChallenge, decodeDeviceChallenge, encodeDeviceProof, encodeProof } from '../../shared/relayAuth.ts'
 import {
   MAX_RELAY_BYTES,
   RELAY_HEADER_BYTES,
@@ -180,16 +181,27 @@ function rig(
   }
 }
 
+/**
+ * ★★ The host every test wire "came to", and the v2 contexts our relay verifies against (2026-11-10 / `relayBinding`).
+ *   The phone's room is a fixed name here: the room only carries it, it does not compare it with the agent key.
+ */
+const HOST = 'relay.test'
+const DEV_BIND = { host: HOST, room: 'ROOM' }
+const DEVICE: RelayProofContext = { v: 2, role: 'device', ...DEV_BIND }
+function AGENT(key: string): RelayProofContext {
+  return { v: 2, role: 'agent', host: HOST, room: key }
+}
+
 /** ★ Return a real proof and become the agent */
 async function becomeAgent(r: ReturnType<typeof rig>, pair: KeyPair, o: { licensing?: boolean } = {}): Promise<Fake> {
   const key = toBase64Url(await exportPublicKey(pair.publicKey))
   assert.equal(r.room.admitAgent().ok, true)
   const socket = r.open('agent')
-  await r.room.startAgent(socket, key, o.licensing === true, o.licensing === true)
+  await r.room.startAgent(socket, key, HOST, o.licensing === true, o.licensing === true)
   const challenge = decodeChallenge(socket.sent.shift() as Uint8Array)
   assert.ok(challenge.ok)
-  const tag = await relayProof(pair.privateKey, challenge.value.relayPublicRaw, challenge.value.nonce)
-  await r.room.onMessage(socket, encodeProof(tag).buffer as ArrayBuffer)
+  const tag = await relayProof(pair.privateKey, challenge.value.relayPublicRaw, challenge.value.nonce, AGENT(key))
+  await r.room.onMessage(socket, encodeProof(tag, RELAY_AUTH_V).buffer as ArrayBuffer)
   assert.equal(socket.closed, undefined, 'cut despite a real proof')
   return socket
 }
@@ -197,7 +209,7 @@ async function becomeAgent(r: ReturnType<typeof rig>, pair: KeyPair, o: { licens
 /** ★ Connect and stay waiting for proof (= someone who merely knows the key) */
 async function pendingAgent(r: ReturnType<typeof rig>, key: string): Promise<Fake> {
   const socket = r.open('agent')
-  await r.room.startAgent(socket, key)
+  await r.room.startAgent(socket, key, HOST)
   return socket
 }
 
@@ -208,15 +220,15 @@ async function pendingAgent(r: ReturnType<typeof rig>, key: string): Promise<Fak
 async function joinDevice(r: ReturnType<typeof rig>, o: { old?: boolean; takeover?: boolean } = {}): Promise<{ socket: Fake; connId: number }> {
   assert.equal(r.room.admitDevice().ok, true, 'the phone is not accepted')
   const socket = r.open('device')
-  return { socket, connId: await r.room.startDevice(socket, o.old !== true, o.takeover === true) }
+  return { socket, connId: await r.room.startDevice(socket, DEV_BIND, o.old !== true, o.takeover === true) }
 }
 
 /** ★ Answer the relay's challenge with a real proof for `identity` (⚠️ `naming` = claim to be another key: the impostor case) */
 async function prove(r: ReturnType<typeof rig>, d: { socket: Fake }, identity: KeyPair, o: { naming?: Uint8Array } = {}): Promise<void> {
   const challenge = decodeDeviceChallenge(d.socket.sent.shift() as Uint8Array)
   assert.ok(challenge.ok, 'the phone did not receive a challenge')
-  const tag = await relayProof(identity.privateKey, challenge.value.relayPublicRaw, challenge.value.nonce)
-  const bytes = encodeDeviceProof({ devicePublicRaw: o.naming ?? (await exportPublicKey(identity.publicKey)), tag })
+  const tag = await relayProof(identity.privateKey, challenge.value.relayPublicRaw, challenge.value.nonce, DEVICE)
+  const bytes = encodeDeviceProof({ devicePublicRaw: o.naming ?? (await exportPublicKey(identity.publicKey)), tag , v: RELAY_AUTH_V })
   await r.room.onMessage(d.socket, bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer)
 }
 
@@ -276,7 +288,7 @@ test('★★ a bogus proof gets cut and cannot kick the real one (①)', async (
   fake.sent.length = 0
   // ⚠️⚠️ Send **a proof with the right shape and only wrong contents** (hit on 2026-09-15:
   //    sending plain garbage fails in the `decodeProof` branch and **never reaches the comparison** = the mutation slips through)
-  await r.room.onMessage(fake, encodeProof(new Uint8Array(32).fill(9)).buffer as ArrayBuffer)
+  await r.room.onMessage(fake, encodeProof(new Uint8Array(32).fill(9), RELAY_AUTH_V).buffer as ArrayBuffer)
   assert.equal(fake.closed?.code, CLOSE.badProof)
   // ★ A proof with a broken shape is refused too (that is the earlier branch)
   const fake2 = await pendingAgent(r, key)
@@ -317,9 +329,10 @@ test('★★ a proof past the deadline does not pass (③)', async () => {
     pair.privateKey,
     challenge.value.relayPublicRaw,
     challenge.value.nonce,
+    AGENT(key),
   )
   r.advance(PROOF_DEADLINE_MS + 1)
-  await r.room.onMessage(socket, encodeProof(proof).buffer as ArrayBuffer)
+  await r.room.onMessage(socket, encodeProof(proof, RELAY_AUTH_V).buffer as ArrayBuffer)
   assert.equal(socket.closed?.code, CLOSE.badProof, '⚠️ a late proof passed')
   assert.equal(r.room.admitDevice().ok, false, '⚠️⚠️ became the agent without passing')
 })
@@ -594,11 +607,11 @@ async function becomeControlAgent(r: ReturnType<typeof rig>, pair: KeyPair): Pro
   const key = toBase64Url(await exportPublicKey(pair.publicKey))
   assert.equal(r.room.admitAgent().ok, true)
   const socket = r.open('agent')
-  await r.room.startAgent(socket, key, true)
+  await r.room.startAgent(socket, key, HOST, true)
   const challenge = decodeChallenge(socket.sent.shift() as Uint8Array)
   assert.ok(challenge.ok)
-  const tag = await relayProof(pair.privateKey, challenge.value.relayPublicRaw, challenge.value.nonce)
-  await r.room.onMessage(socket, encodeProof(tag).buffer as ArrayBuffer)
+  const tag = await relayProof(pair.privateKey, challenge.value.relayPublicRaw, challenge.value.nonce, AGENT(key))
+  await r.room.onMessage(socket, encodeProof(tag, RELAY_AUTH_V).buffer as ArrayBuffer)
   assert.equal(socket.closed, undefined, 'cut despite a real proof')
   return socket
 }
@@ -619,7 +632,7 @@ test('★★ no ready before the proof (only the key owner)', async () => {
   const r = rig()
   const pair = await generateDeviceKey()
   const socket = r.open('agent')
-  await r.room.startAgent(socket, toBase64Url(await exportPublicKey(pair.publicKey)), true)
+  await r.room.startAgent(socket, toBase64Url(await exportPublicKey(pair.publicKey)), HOST, true)
   assert.equal(socket.sent.length, 1, '⚠️ sent something other than the challenge')
   assert.ok(decodeChallenge(socket.sent[0] as Uint8Array).ok)
 })
@@ -739,7 +752,7 @@ test('★★ a room without a ticket takes phones that proved their key; nothing
   assert.equal(d.socket.sent.length, 1)
   assert.ok(decodeDeviceChallenge(d.socket.sent[0] as Uint8Array).ok, 'the first message is not a device challenge')
   // ⚠️ It cannot be answered with the agent's proof shape, nor with garbage of the right length
-  const wrongShape = encodeProof(new Uint8Array(32).fill(1))
+  const wrongShape = encodeProof(new Uint8Array(32).fill(1), RELAY_AUTH_V)
   await r.room.onMessage(d.socket, wrongShape.buffer.slice(wrongShape.byteOffset, wrongShape.byteOffset + wrongShape.byteLength) as ArrayBuffer)
   assert.equal(d.socket.closed, undefined, 'a small crossing message is held, not cut')
   const identity = await generateDeviceKey()
@@ -816,7 +829,7 @@ test('★★ a proof with wrong contents does not pass, and a proof naming someo
   await freePhone(home, victim)
   // ⚠️ Wrong contents with the right key: same refusal
   const d = await joinDevice(home)
-  const bad = encodeDeviceProof({ devicePublicRaw: victimRaw, tag: new Uint8Array(32).fill(9) })
+  const bad = encodeDeviceProof({ devicePublicRaw: victimRaw, tag: new Uint8Array(32).fill(9) , v: RELAY_AUTH_V })
   await r_onMessage(home, d.socket, bad)
   assert.equal(d.socket.closed?.code, CLOSE.badProof)
 })
@@ -1333,8 +1346,8 @@ test('★★ a second copy of a valid proof is refused, not run alongside the fi
   const d = await joinDevice(r)
   const challenge = decodeDeviceChallenge(d.socket.sent.shift() as Uint8Array)
   assert.ok(challenge.ok)
-  const tag = await relayProof(identity.privateKey, challenge.value.relayPublicRaw, challenge.value.nonce)
-  const proof = encodeDeviceProof({ devicePublicRaw: await exportPublicKey(identity.publicKey), tag })
+  const tag = await relayProof(identity.privateKey, challenge.value.relayPublicRaw, challenge.value.nonce, DEVICE)
+  const proof = encodeDeviceProof({ devicePublicRaw: await exportPublicKey(identity.publicKey), tag , v: RELAY_AUTH_V })
   const first = r_onMessage(r, d.socket, proof)
   // ⚠️ The duplicate arrives while the first is still doing crypto (before any ledger call)
   const second = r_onMessage(r, d.socket, proof)
@@ -1377,13 +1390,13 @@ test('★★ a replacement agent wire that closes while its proof is verified do
   const b = await pendingAgent(r, key)
   const challenge = decodeChallenge(b.sent.shift() as Uint8Array)
   assert.ok(challenge.ok)
-  const proof = await relayProof(pair.privateKey, challenge.value.relayPublicRaw, challenge.value.nonce)
+  const proof = await relayProof(pair.privateKey, challenge.value.relayPublicRaw, challenge.value.nonce, AGENT(key))
   during = () => {
     during = () => {}
     r.room.onClose(b)
     r.forget(b)
   }
-  await r_onMessage(r, b, encodeProof(proof))
+  await r_onMessage(r, b, encodeProof(proof, RELAY_AUTH_V))
   assert.equal(live.closed, undefined, '⚠️⚠️ the live agent was replaced by a wire that had already closed')
   assert.equal(phone.socket.closed, undefined, '⚠️⚠️ the phones were cut for a wire that had already closed')
   assert.equal(r.room.admitDevice().ok, true, '⚠️ the room lost its agent (503)')
@@ -1396,7 +1409,7 @@ test('★★ a second copy of the agent\'s proof is refused instead of "replacin
   const a = await pendingAgent(r, key)
   const challenge = decodeChallenge(a.sent.shift() as Uint8Array)
   assert.ok(challenge.ok)
-  const proof = encodeProof(await relayProof(pair.privateKey, challenge.value.relayPublicRaw, challenge.value.nonce))
+  const proof = encodeProof(await relayProof(pair.privateKey, challenge.value.relayPublicRaw, challenge.value.nonce, AGENT(key)), RELAY_AUTH_V)
   const first = r_onMessage(r, a, proof)
   const second = r_onMessage(r, a, proof)
   await first
@@ -1435,7 +1448,7 @@ test('★★ an agent wire closed by the relay while its proof is verified (a du
   const b = await pendingAgent(r, key)
   const challenge = decodeChallenge(b.sent.shift() as Uint8Array)
   assert.ok(challenge.ok)
-  const proof = encodeProof(await relayProof(pair.privateKey, challenge.value.relayPublicRaw, challenge.value.nonce))
+  const proof = encodeProof(await relayProof(pair.privateKey, challenge.value.relayPublicRaw, challenge.value.nonce, AGENT(key)), RELAY_AUTH_V)
   during = () => {
     during = () => {}
     // The duplicate arrives while the first copy is being verified ⇒ relay closes B (synchronously)
@@ -1751,7 +1764,7 @@ test('★★ the pending-agent limit holds while challenges are still being made
   for (let i = 0; i < MAX_PENDING_AGENTS * 3; i++) {
     if (!r.room.admitAgent().ok) continue
     admitted += 1
-    starts.push(r.room.startAgent(r.open('agent'), key))
+    starts.push(r.room.startAgent(r.open('agent'), key, HOST))
   }
   assert.equal(admitted, MAX_PENDING_AGENTS, '⚠️⚠️ more agent wires were admitted than the pending limit while challenges were awaited')
   release()
@@ -1766,7 +1779,7 @@ test('★ a wire swept while its challenge was being made gets no challenge (F3)
   const r = rig({ challengeGate: new Promise<void>((resolve) => (release = resolve)) })
   const key = toBase64Url(await exportPublicKey((await generateDeviceKey()).publicKey))
   const socket = r.open('agent')
-  const start = r.room.startAgent(socket, key)
+  const start = r.room.startAgent(socket, key, HOST)
   r.advance(PROOF_DEADLINE_MS + 1)
   assert.equal(r.room.admitAgent().ok, true)
   assert.equal(socket.closed?.code, CLOSE.badProof, 'the expired reservation was not swept')
@@ -1813,7 +1826,7 @@ test('★★ nothing is carried while the phone\'s challenge is still being made
   opts.challengeGate = new Promise<void>((resolve) => (release = resolve))
   assert.equal(r.room.admitDevice().ok, true)
   const socket = r.open('device')
-  const start = r.room.startDevice(socket, true)
+  const start = r.room.startDevice(socket, DEV_BIND, true)
   agent.sent.length = 0
   await r_onMessage(r, socket, await initFor(await generateDeviceKey()))
   assert.equal(agent.sent.length, 0, '⚠️⚠️ bytes reached the agent before the phone proved any key')
@@ -1832,11 +1845,65 @@ test('★ a reserved agent wire keeps its place until the proof deadline (not sw
     assert.equal(r.room.admitAgent().ok, true)
     const w = r.open('agent')
     wires.push(w)
-    void r.room.startAgent(w, key)
+    void r.room.startAgent(w, key, HOST)
   }
   r.advance(PROOF_DEADLINE_MS - 1)
   assert.equal(r.room.admitAgent().ok, false, '⚠️ reservations were swept before the deadline')
   assert.ok(wires.every((w) => w.closed === undefined), '⚠️ a reserved wire was closed before the deadline')
   r.advance(1)
   assert.equal(r.room.admitAgent().ok, true, 'reservations were not swept at the deadline')
+})
+
+// ─── ★★★ v2: proofs bound to the relay host and the room (2026-11-10 / security check) ─────────────────────
+//   A relay the user configured (someone else's self-hosted one) could forward our challenge and carry the answer back.
+//   Mutations killed here: verifying without the host / room / role, accepting v1, sending a v1 challenge.
+
+test('★★★ the agent challenge is v2; a proof bound to another host, another room or made in v1 is refused', async () => {
+  for (const wrong of [
+    (key: string): RelayProofContext => ({ v: 2, role: 'agent', host: 'evil.example', room: key }),
+    (_key: string): RelayProofContext => ({ v: 2, role: 'agent', host: HOST, room: 'OTHER_ROOM' }),
+    (key: string): RelayProofContext => ({ v: 2, role: 'device', host: HOST, room: key }),
+  ]) {
+    const r = rig()
+    const pair = await generateDeviceKey()
+    const key = toBase64Url(await exportPublicKey(pair.publicKey))
+    const socket = await pendingAgent(r, key)
+    const challenge = decodeChallenge(socket.sent.shift() as Uint8Array)
+    assert.ok(challenge.ok && challenge.value.v === RELAY_AUTH_V, 'the challenge is not v2')
+    const tag = await relayProof(pair.privateKey, challenge.value.relayPublicRaw, challenge.value.nonce, wrong(key))
+    await r.room.onMessage(socket, encodeProof(tag, RELAY_AUTH_V).buffer as ArrayBuffer)
+    assert.equal(socket.closed?.code, CLOSE.badProof, `⚠️⚠️ a proof bound elsewhere passed: ${JSON.stringify(wrong(key))}`)
+    assert.equal(r.room.admitDevice().ok, false, '⚠️⚠️ became the agent')
+  }
+  // ⚠️⚠️ v1 (what a forwarding relay gets by playing an old relay) is refused even when it is a real proof
+  const r = rig()
+  const pair = await generateDeviceKey()
+  const key = toBase64Url(await exportPublicKey(pair.publicKey))
+  const socket = await pendingAgent(r, key)
+  const challenge = decodeChallenge(socket.sent.shift() as Uint8Array)
+  assert.ok(challenge.ok)
+  const v1 = await relayProof(pair.privateKey, challenge.value.relayPublicRaw, challenge.value.nonce, { v: 1 })
+  await r.room.onMessage(socket, encodeProof(v1, RELAY_AUTH_V1).buffer as ArrayBuffer)
+  assert.equal(socket.closed?.code, CLOSE.badProof, '⚠️⚠️ a v1 agent proof passed')
+  assert.equal(r.room.admitDevice().ok, false)
+})
+
+test('★★★ the phone challenge is v2; a phone proof bound to another host or room, or made in v1, is refused', async () => {
+  for (const ctx of [
+    { v: 2, role: 'device', host: 'evil.example', room: DEV_BIND.room },
+    { v: 2, role: 'device', host: HOST, room: 'OTHER_ROOM' },
+    { v: 2, role: 'agent', ...DEV_BIND },
+    { v: 1 },
+  ] as RelayProofContext[]) {
+    const r = rig()
+    await becomeAgent(r, await generateDeviceKey())
+    const identity = await generateDeviceKey()
+    const d = await joinDevice(r)
+    const challenge = decodeDeviceChallenge(d.socket.sent.shift() as Uint8Array)
+    assert.ok(challenge.ok && challenge.value.v === RELAY_AUTH_V, 'the phone challenge is not v2')
+    const tag = await relayProof(identity.privateKey, challenge.value.relayPublicRaw, challenge.value.nonce, ctx)
+    const bytes = encodeDeviceProof({ devicePublicRaw: await exportPublicKey(identity.publicKey), tag, v: ctx.v === 1 ? RELAY_AUTH_V1 : RELAY_AUTH_V })
+    await r_onMessage(r, d.socket, bytes)
+    assert.equal(d.socket.closed?.code, CLOSE.badProof, `⚠️⚠️ a phone proof bound elsewhere passed: ${JSON.stringify(ctx)}`)
+  }
 })

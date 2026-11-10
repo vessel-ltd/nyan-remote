@@ -26,7 +26,7 @@ import {
   relayProof,
   toBase64Url,
 } from '../shared/crypto.ts'
-import { decodeChallenge, encodeProof } from '../shared/relayAuth.ts'
+import { answerContext, decodeChallenge, encodeProof, relayBinding } from '../shared/relayAuth.ts'
 import { relayUrl } from '../shared/relayFrame.ts'
 import { t } from '../shared/i18n.ts'
 import { initCliLang } from './lib/lang.mjs'
@@ -72,7 +72,8 @@ const agentKey_ = toBase64Url(agentPublicRaw())
  * ⚠️ If `prove` is false, return **a bogus proof** (= someone who merely knows the key).
  */
 async function rawAgent(prove) {
-  const ws = new WebSocket(relayUrl(base, 'agent', agentKey_))
+  const url = relayUrl(base, 'agent', agentKey_)
+  const ws = new WebSocket(url)
   ws.binaryType = 'arraybuffer'
   const queue = []
   const waiters = []
@@ -100,9 +101,14 @@ async function rawAgent(prove) {
   const challenge = decodeChallenge(first)
   assert.ok(challenge.ok, t(`challenge が読めない: ${challenge.reason ?? ''}`, `Cannot read the challenge: ${challenge.reason ?? ''}`))
   const tag = prove
-    ? await relayProof(agentKey().privateKey, challenge.value.relayPublicRaw, challenge.value.nonce)
+    ? await relayProof(
+        agentKey().privateKey,
+        challenge.value.relayPublicRaw,
+        challenge.value.nonce,
+        answerContext(challenge.value.v, 'agent', relayBinding(url)),
+      )
     : new Uint8Array(32).fill(9)
-  ws.send(encodeProof(tag))
+  ws.send(encodeProof(tag, challenge.value.v))
   return { ws, closed }
 }
 

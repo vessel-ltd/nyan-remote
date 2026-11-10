@@ -29,11 +29,14 @@ import {
   exportPublicKey,
   finishHandshake,
   generateDeviceKey,
+  relayProof,
+  sameBytes,
   startHandshake,
   toBase64Url,
   type Handshake,
   type Session,
 } from '../../shared/crypto.ts'
+import { RELAY_AUTH_V, RELAY_AUTH_V1, encodeChallenge } from '../../shared/relayAuth.ts'
 import {
   RELAY_FRAME,
   RELAY_V,
@@ -1068,4 +1071,49 @@ test('★★★ if drop arrives from the relay, it is not keeping its promises, 
   const w = linkWith()
   await w.link.receive(encodeRelayFrame({ type: RELAY_FRAME.drop, connId: 1 }))
   assert.equal(w.closed, 1)
+})
+
+// ─── ★★★ The agent's key proof is bound to the relay host it dialed and to its room (v2 / 2026-11-10) ─────────
+//   Runs the real answering code in `connectRelay` (injected socket). Mutations killed: answering v2 without the binding,
+//   binding to a host other than the dialed one, not echoing the version, answering an old relay's v1 with v2.
+test('★★★ connectRelay answers a v2 challenge bound to the dialed host and room, and an old relay\'s v1 in v1', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'nyan-relaylink-'))
+  const prev = process.env['NYAN_REMOTE_STATE_DIR']
+  process.env['NYAN_REMOTE_STATE_DIR'] = dir
+  resetAgentKey()
+  t.after(async () => {
+    resetAgentKey()
+    if (prev === undefined) delete process.env['NYAN_REMOTE_STATE_DIR']
+    else process.env['NYAN_REMOTE_STATE_DIR'] = prev
+    await rm(dir, { recursive: true, force: true })
+  })
+  await loadAgentKey()
+  const room = toBase64Url(agentPublicRaw())
+
+  for (const v of [RELAY_AUTH_V, RELAY_AUTH_V1] as const) {
+    const sock = blackholeSocket()
+    await new Promise<void>((resolve, reject) => {
+      connectRelay({ base: 'wss://Relay.Example.com', router: buildRouter(), open: () => sock.ws }).then(() => resolve(), reject)
+      sock.fire('open')
+    })
+    // ⚠️ end the wire (stops its ping loop)
+    t.after(() => sock.fire('close', { code: 1000, reason: '' }))
+    const relay = await generateDeviceKey()
+    const nonce = crypto.getRandomValues(new Uint8Array(32))
+    const challenge = encodeChallenge({ relayPublicRaw: await exportPublicKey(relay.publicKey), nonce }, v)
+    sock.fire('message', { data: challenge.buffer.slice(challenge.byteOffset, challenge.byteOffset + challenge.byteLength) })
+    // the proof is made asynchronously
+    for (let i = 0; i < 50 && !sock.state.sent.some((d) => d instanceof Uint8Array && d[1] === 2); i++) await new Promise((r) => setTimeout(r, 5))
+    const sent = sock.state.sent.find((d) => d instanceof Uint8Array && d[1] === 2) as Uint8Array | undefined
+    assert.ok(sent, `no proof was sent (v${v})`)
+    assert.equal(sent[0], v, 'the proof does not echo the challenge version')
+    const tag = sent.slice(2)
+    // ★ Verified the way the relay does (its ephemeral private key × the agent's public key)
+    const ctx = v === RELAY_AUTH_V ? ({ v: 2, role: 'agent', host: 'relay.example.com', room } as const) : ({ v: 1 } as const)
+    assert.ok(sameBytes(tag, await relayProof(relay.privateKey, agentPublicRaw(), nonce, ctx)), `⚠️⚠️ the v${v} proof does not verify`)
+    if (v === RELAY_AUTH_V) {
+      const elsewhere = await relayProof(relay.privateKey, agentPublicRaw(), nonce, { v: 2, role: 'agent', host: 'evil.example', room })
+      assert.equal(sameBytes(tag, elsewhere), false, '⚠️⚠️ the proof is not bound to the dialed host')
+    }
+  }
 })

@@ -10,11 +10,15 @@
 
 import { initDevicePublicKey, relayProof, sameBytes, toBase64Url, type Jwk, type Key } from '../../shared/crypto.ts'
 import {
+  RELAY_AUTH,
+  RELAY_AUTH_V,
   RELAY_NONCE_BYTES,
+  answerContext,
   decodeDeviceProof,
   decodeProof,
   encodeChallenge,
   encodeDeviceChallenge,
+  type RelayBinding,
 } from '../../shared/relayAuth.ts'
 import {
   MAX_RELAY_BYTES,
@@ -169,7 +173,7 @@ export interface Tag {
    *   free-tier check are done; until then nothing from this wire reaches the agent and the agent has not been told `opened`.
    *   ⚠️ The ephemeral private key is on the tag to survive hibernation (a per-connection value).
    */
-  dpending?: { nonce: Uint8Array; jwk: Jwk; until: number }
+  dpending?: { nonce: Uint8Array; jwk: Jwk; until: number; bind: RelayBinding }
   /** ★ `device`: the proof passed and the free-tier check is in flight (⚠️ a second proof is not accepted meanwhile) */
   dproof?: boolean
   /**
@@ -257,7 +261,7 @@ export interface Tag {
    * ⚠️⚠️ **The ephemeral private key is on the tag to survive hibernation**
    *    (the proof can continue even if it sleeps midway). ⚠️ A per-connection value, deleted once done.
    */
-  pending?: { key: string; nonce: Uint8Array; jwk: Jwk; until: number }
+  pending?: { key: string; nonce: Uint8Array; jwk: Jwk; until: number; host: string }
   /**
    * ★★ agent: accepted, its challenge still being made (security audit 2026-09-28, F3). Counts toward `MAX_PENDING_AGENTS`
    *   **from the moment the wire is accepted**: without it, wires opened together were all admitted while `newChallenge()` was
@@ -488,8 +492,11 @@ export class Room {
     return { ok: true }
   }
 
-  /** Put a tag on the accepted agent wire and **send the challenge first** */
-  async startAgent(socket: RoomSocket, key: string, control = false, licensing = false): Promise<void> {
+  /**
+   * Put a tag on the accepted agent wire and **send the challenge first**
+   * @param host ★★ the host this request came to (`relayBinding(request.url)`): the v2 proof must be bound to it (2026-11-10)
+   */
+  async startAgent(socket: RoomSocket, key: string, host: string, control = false, licensing = false): Promise<void> {
     // ⚠️⚠️ Tagged **before** the await (F3): an untagged wire is not counted by `admitAgent`, so the limit did not hold
     socket.setTag({ side: 'agent', reserving: { until: this.#io.now() + PROOF_DEADLINE_MS } })
     const c = await this.#io.newChallenge()
@@ -504,6 +511,7 @@ export class Room {
       ...(control && licensing && !this.#io.selfHosted() ? { licensing: true } : {}),
       pending: {
         key,
+        host,
         nonce: c.nonce,
         jwk: c.jwk,
         // ★ Absolute time (⚠️ a remaining duration would rewind across hibernation)
@@ -557,7 +565,7 @@ export class Room {
    * @param proving the phone announced `p=1`
    * @param takeover the phone announced `f=1` (move its free slot here / only meaningful with `proving`)
    */
-  async startDevice(socket: RoomSocket, proving = false, takeover = false): Promise<number> {
+  async startDevice(socket: RoomSocket, bind: RelayBinding, proving = false, takeover = false): Promise<number> {
     const agent = this.#agent()
     const tag = agent?.tag()
     const last = tag?.lastConnId ?? 0
@@ -580,7 +588,7 @@ export class Room {
     // ⚠️ The wire may already be gone (evicted to make room while the key was made)
     const now = socket.tag()
     if (!now || now.evicted === true) return connId
-    socket.setTag({ ...now, dpending: { nonce: c.nonce, jwk: c.jwk, until }, ...(takeover ? { dtake: true } : {}) })
+    socket.setTag({ ...now, dpending: { nonce: c.nonce, jwk: c.jwk, until, bind }, ...(takeover ? { dtake: true } : {}) })
     socket.send(encodeDeviceChallenge({ relayPublicRaw: c.publicRaw, nonce: c.nonce }))
     return connId
   }
@@ -716,6 +724,12 @@ export class Room {
     const d = tag.dpending as NonNullable<Tag['dpending']>
     const decoded = decodeDeviceProof(bytes)
     if (!decoded.ok) {
+      // ⚠️⚠️ Typed as a proof but refused (a v1 proof = what a forwarding relay gets by playing an old relay / 2026-11-10):
+      //    refused now, not held as a handshake message (that one is type 0, so the type byte tells them apart)
+      if (bytes[1] === RELAY_AUTH.deviceProof) {
+        this.#evict({ socket, tag }, REASON.badProof, CLOSE.badProof)
+        return
+      }
       // ★ Not a proof (the handshake's first message crossed the challenge in flight) ⇒ hold exactly one small message
       if (tag.held === undefined && bytes.length <= HELD_MAX_BYTES && bytes.length > 0) {
         socket.setTag({ ...tag, held: bytes })
@@ -741,7 +755,9 @@ export class Room {
     try {
       const priv = await this.#io.importPrivate(d.jwk)
       // ⚠️ Compare with `sameBytes` (no timing leak)
-      ok = sameBytes(await relayProof(priv, decoded.value.devicePublicRaw, new Uint8Array(d.nonce)), decoded.value.tag)
+      // ★★ v2 only, bound to the host and room this wire came to (`decodeDeviceProof` already refused v1 / 2026-11-10)
+      const ctx = answerContext(RELAY_AUTH_V, 'device', d.bind)
+      ok = sameBytes(await relayProof(priv, decoded.value.devicePublicRaw, new Uint8Array(d.nonce), ctx), decoded.value.tag)
     } catch {
       // ⚠️ Broken key, broken tag. **Do not pass**
       ok = false
@@ -871,7 +887,13 @@ export class Room {
       const priv = await this.#io.importPrivate(pending.jwk)
       // ⚠️ Compare with `sameBytes` (no timing leak)
       ok = sameBytes(
-        await relayProof(priv, this.#io.publicRaw(pending.key), new Uint8Array(pending.nonce)),
+        // ★★ v2 only, bound to the host this wire came to and to the room it claims (2026-11-10)
+        await relayProof(
+          priv,
+          this.#io.publicRaw(pending.key),
+          new Uint8Array(pending.nonce),
+          answerContext(RELAY_AUTH_V, 'agent', { host: pending.host, room: pending.key }),
+        ),
         decoded.value,
       )
     } catch {

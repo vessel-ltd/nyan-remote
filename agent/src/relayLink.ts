@@ -33,7 +33,7 @@
 import { pickBilingual, t } from '../../shared/i18n.ts'
 import { relayProof, toBase64Url } from '../../shared/crypto.ts'
 import type { RelayState } from '../../shared/types.ts'
-import { decodeChallenge, encodeProof } from '../../shared/relayAuth.ts'
+import { answerContext, decodeChallenge, encodeProof, relayBinding } from '../../shared/relayAuth.ts'
 import {
   LICENSE_STATUS,
   RELAY_FRAME,
@@ -459,12 +459,15 @@ export function connectRelay(o: {
       void (async () => {
         try {
           // ⚠️ the private key is from `deviceKey.ts` (★ ECDH, not signing = do not add uses to the key)
+          // ★★ v2 is bound to the host this wire dialed and to our room (2026-11-10 / `RelayProofContext`):
+          //   a relay forwarding another relay's challenge gets a proof that does not verify there
           const tag = await relayProof(
             agentKey().privateKey,
             challenge.value.relayPublicRaw,
             challenge.value.nonce,
+            answerContext(challenge.value.v, 'agent', relayBinding(url)),
           )
-          ws.send(encodeProof(tag))
+          ws.send(encodeProof(tag, challenge.value.v))
         } catch {
           // ⚠️ the key is unusable, or it is closing. ⇒ close the link (the `close` handler cleans up)
           ws.close()

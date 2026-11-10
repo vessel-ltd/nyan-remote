@@ -20,6 +20,7 @@
 import { DurableObject } from 'cloudflare:workers'
 import { ECDH_PARAMS, fromBase64Url, type Jwk } from '../../shared/crypto.ts'
 import { RELAY_PING, RELAY_PONG, RELAY_V } from '../../shared/relayFrame.ts'
+import { relayBinding } from '../../shared/relayAuth.ts'
 import { CHALLENGE_NONCE_BYTES, KEY_RE, Room, type ClaimResult, type PhoneClaimResult, type RoomSocket, type Tag } from './room.ts'
 import { importLicensePublicKey, LICENSE_PUBLIC_KEY, verifyLicense, type LicenseCheck } from '../../shared/license.ts'
 import { claimMachine, readLedger, releaseCredential, type Ledger } from './ledger.ts'
@@ -201,6 +202,7 @@ export class Rendezvous extends DurableObject<Env> {
     const admit = side === 'agent' ? this.#room.admitAgent() : this.#room.admitDevice()
     if (!admit.ok) return new Response(admit.text, { status: admit.status })
 
+    const bind = relayBinding(request.url)
     const pair = new WebSocketPair()
     const [client, server] = Object.values(pair) as [WebSocket, WebSocket]
     this.ctx.acceptWebSocket(server, [side])
@@ -211,10 +213,11 @@ export class Rendezvous extends DurableObject<Env> {
       const c = url.searchParams.get('c')
       const control = c === '1' || c === '2'
       const licensing = c === '2' || (c === '1' && url.searchParams.get('l') === '1')
-      await this.#room.startAgent(this.#wrap(server), url.searchParams.get('a') ?? '', control, licensing)
+      // ★★ The v2 key proof is bound to the host this request came to (2026-11-10 / `relayBinding`, one place for all sides)
+      await this.#room.startAgent(this.#wrap(server), bind.room, bind.host, control, licensing)
     } else {
       // ★ `p=1` = the phone answers the key proof; `f=1` = it asks to move its free slot here (2026-09-27 / `relayUrl` in `shared/relayFrame.ts`)
-      await this.#room.startDevice(this.#wrap(server), url.searchParams.get('p') === '1', url.searchParams.get('f') === '1')
+      await this.#room.startDevice(this.#wrap(server), bind, url.searchParams.get('p') === '1', url.searchParams.get('f') === '1')
     }
     return new Response(null, { status: 101, webSocket: client })
   }

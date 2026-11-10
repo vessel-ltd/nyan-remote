@@ -4,7 +4,7 @@
   "type": "module",
   "description": "③の段6 のランデブー（Cloudflare Workers + Durable Object）。⚠️ ルートの workspaces には入れない（agent と PWA の依存ゼロを保つため）",
   "scripts": {
-    "dev": "wrangler dev",
+    "dev": "wrangler dev --local-upstream 127.0.0.1:8787 --upstream-protocol http",
     "deploy": "wrangler deploy",
     "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.test.json"
   },
