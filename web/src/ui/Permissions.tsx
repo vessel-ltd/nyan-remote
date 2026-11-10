@@ -8,6 +8,7 @@ import { cells } from './previewCells.ts'
 import { t } from '../../../shared/i18n.ts'
 import { accountLabel, agentTypeLabel, suggestionTexts } from './agentText.ts'
 import { hasHidden, reveal, type RevealScope } from '../../../shared/reveal.ts'
+import { Confirm } from './Confirm.tsx'
 
 /**
  * Pending approvals (M4-1). This is where "noticing" turns into "acting".
@@ -116,6 +117,14 @@ export function Permissions({
    * cannot be read past the "…". This toggle exists **so nobody presses Allow without being able to read it**.
    */
   const [open, setOpen] = useState<Record<string, boolean>>({})
+  /**
+   * ★★ The card whose Allow is waiting for "you have not seen all of it" (2026-11-10 / security check / user decision).
+   * A command past `DETAIL_MAX` reaches the phone cut, so whatever follows the cut runs unseen
+   * (`'#' + 'a'.repeat(8100) + '\nrm -rf ~'`). ⇒ one extra tap, never a silent Allow.
+   * ⚠️ Holds the item itself (the generation the person looked at), not a key to look up again.
+   * ⚠️ Not a block: long heredocs are normal, and blocking would stall work while away.
+   */
+  const [clippedAsk, setClippedAsk] = useState<PermissionRequest & { endpointId: string }>()
 
   if (items.length === 0) return null
 
@@ -349,7 +358,7 @@ export function Permissions({
                 <button
                   class="permok"
                   disabled={busy === p.key}
-                  onClick={() => void answer(p, 'allow')}
+                  onClick={() => (p.detailClipped ? setClippedAsk(p) : void answer(p, 'allow'))}
                 >
                   {p.interaction?.kind === 'plan' ? t('このプランで進める', 'Go with this plan') : t('許可', 'Allow')}
                 </button>
@@ -380,6 +389,25 @@ export function Permissions({
               'The same prompt is also shown on the PC screen. You can answer in either place.',
             )}
       </p>
+      {/* ⚠️ Gone from the list (answered on the PC, timed out) ⇒ the question goes too */}
+      {clippedAsk && items.some((i) => i.endpointId === clippedAsk.endpointId && i.key === clippedAsk.key) ? (
+        <Confirm
+          title={t('全文を見ていません', 'You have not seen all of it')}
+          body={t(
+            '長すぎるので、途中までしか表示できていません。表示されていない部分に何が書かれていても、そのまま実行されます。',
+            'It is too long to show in full. Whatever is in the part not shown runs as well.',
+          )}
+          note={t('PCの画面で全文を確かめるのが確実です。', 'Checking the full text on the PC screen is the safe way.')}
+          ok={t('見ずに許可する', 'Allow without seeing it')}
+          danger
+          onCancel={() => setClippedAsk(undefined)}
+          onOk={() => {
+            const item = clippedAsk
+            setClippedAsk(undefined)
+            void answer(item, 'allow')
+          }}
+        />
+      ) : null}
     </section>
   )
 }

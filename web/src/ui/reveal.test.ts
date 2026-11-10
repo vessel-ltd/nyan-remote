@@ -25,6 +25,19 @@ test('Permissions.tsx: summary and detail are only rendered through <Revealed>',
   assert.ok(clipAt < code.indexOf('{p.hidden ||'))
 })
 
+// ★★ A cut command asks once before Allow (2026-11-10 / user decision: confirm, not block)
+test('Permissions.tsx: Allow on a cut command goes through the "not seen all of it" confirmation', () => {
+  const src = readFileSync(new URL('./Permissions.tsx', import.meta.url), 'utf8')
+  const code = src.split('\n').filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)).join('\n')
+  // the plain Allow button branches on detailClipped before answering
+  assert.match(code, /onClick=\{\(\) => \(p\.detailClipped \? setClippedAsk\(p\) : void answer\(p, 'allow'\)\)\}/)
+  // no other plain `answer(p, 'allow')` (without answers) bypasses it
+  assert.equal(code.match(/answer\(p, 'allow'\)/g)?.length, 1)
+  // the confirmation answers the item it was opened for, and only while it is still listed
+  assert.match(code, /void answer\(item, 'allow'\)/)
+  assert.match(code, /clippedAsk && items\.some\(\(i\) => i\.endpointId === clippedAsk\.endpointId && i\.key === clippedAsk\.key\)/)
+})
+
 test('styles.css: .permcode forces strict left-to-right order', () => {
   const css = readFileSync(new URL('../styles.css', import.meta.url), 'utf8')
   const rule = css.match(/\.permcode\s*\{([^}]*)\}/)
