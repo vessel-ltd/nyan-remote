@@ -6,6 +6,7 @@
 //    so only those live in one place and are imported by both. Everything else stays types only.
 
 import type { BuildInfo } from './release.ts'
+import { t } from './i18n.ts'
 
 export type SessionStatus =
   | 'working' // responding (session record status is busy)
@@ -918,13 +919,6 @@ export interface MessageSendResult {
   at: string
   /** `keys` = keystrokes (no frame) / `inbox` = inbox (gets an English frame) */
   route: 'keys' | 'inbox'
-  /**
-   * ★ It started with `/` or `!`, so it was sent **as text with one space prepended** (2026-08-24).
-   *
-   * ⚠️ Returned **so it is never rewritten silently** (the UI says so). Running as a command only happens via
-   *    the table in the agent + the dedicated endpoint (never from free input).
-   */
-  neutralized?: boolean
 }
 
 /**
@@ -939,7 +933,7 @@ export interface MessageSendResult {
 /**
  * ★★ Ids of slash commands the phone may run **as real commands**.
  *
- * ⚠️⚠️ They never run from free input (`/` `!` get one space prepended and arrive **as text** /
+ * ⚠️⚠️ They never run from free input (a body starting with `/` `!` is **refused** /
  *    `sanitizeForKeys`). Only **this table + the dedicated endpoint** (`POST /sessions/:id/command`) run them.
  * ⚠️ Two conditions for adding one (CLAUDE.md §2):
  *    ① **non-interactive** (anything that opens a dialog becomes `status:'waiting'`, and keystrokes and ESC all stop)
@@ -1153,8 +1147,10 @@ export function isDroppedControl(code: number): boolean {
  *    U+3164(HANGUL FILLER)** are not dropped either.
  * ⇒ **Stop appending lists of invisible characters** (it always misses some). Select by Unicode property:
  *    whitespace + \p{Cf} (format) + \p{M} (mark) + Default_Ignorable_Code_Point.
- * ★ Which side is safe: **dropping and normalising to one space** (the shape measured to be safe).
- *    Keeping them bets on "whether the CLI ignores that character" (cannot be measured).
+ * ★ Which side is safe: **look past them**. Claude Code 2.1.322 removes such characters itself
+ *    ("Removed 1 invisible character") and leaves the `/` at the start (measured 2026-11-10), so a body is
+ *    judged by its first **visible** character. ⚠️ Never "neutralise" by adding anything in front: the CLI trims
+ *    whitespace before looking for `/` (` /exit` ended the session) ⇒ such bodies are **refused**.
  */
 export const LEADING_INVISIBLE = /^[\s\p{Cf}\p{M}\p{Default_Ignorable_Code_Point}]+/u
 
@@ -1170,11 +1166,23 @@ export function visibleHead(text: string): string {
 /**
  * Whether the CLI **may interpret the body as a command** (`/` = slash command / `!` = bash mode).
  *
- * ★ The agent (neutralising keystrokes, how to hand off to the inbox) and the UI (warning while typing) look at **this one function**.
+ * ★ The agent (refusing it on every route: keystrokes and the inbox) and the UI (Send disabled) look at **this one function**.
  */
 export function looksLikeCommand(text: string): '/' | '!' | null {
   const head = visibleHead(text)
   if (head.startsWith('/')) return '/'
   if (head.startsWith('!')) return '!'
   return null
+}
+
+/**
+ * ★★★ Why a body that `looksLikeCommand` is refused (2026-11-10). **One copy**: the agent's 400 and the UI's
+ * warning under the input box say the same thing.
+ * ⚠️ A function, not a constant (`t()` must not run before the language is decided).
+ */
+export function commandLikeMessage(): string {
+  return t(
+    '`/` や `!` で始まる文は送れません（PC でコマンドとして実行されるため）。前に語を足してください（例:「パス /home/... を見て」）。コマンドはメニューから実行できます',
+    'Messages starting with `/` or `!` cannot be sent (the PC would run them as a command). Add a word in front (e.g. "look at the path /home/..."). Commands can be run from the menu.',
+  )
 }

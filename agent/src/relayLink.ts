@@ -241,6 +241,20 @@ export function openRelayLink(o: {
   function receive(bytes: Uint8Array): Promise<void> {
     if (linkGone !== undefined) return Promise.resolve()
     const decoded = decodeRelayFrame(bytes)
+    // ★★★ **A phone's bad bytes cut that phone only** (2026-11-10 / security audit).
+    //   ⚠️⚠️ A relay that predates the fix (self-hosted ones especially) carries a phone's empty message as a
+    //      payload-less `data`; treating it as "the relay broke its promises" let **anyone who knows the agent
+    //      key take the whole link down** (every phone evicted, again after each reconnect).
+    if (!decoded.ok && decoded.phoneConnId !== undefined) {
+      // ★ Ask the relay to close it (only after `ready`), and **retire it here regardless** (codex 2026-11-10, medium):
+      //   an old relay never gets the `drop`, so without this the number kept handshaking and running requests.
+      //   ⚠️ `dead` is set synchronously (requests already queued on the chain check it before they run).
+      dropConn(decoded.phoneConnId)
+      const bad = slots.get(decoded.phoneConnId)
+      if (!bad) return Promise.resolve()
+      bad.dead = true
+      return retire(bad)
+    }
     if (!decoded.ok) {
       // ⚠️⚠️ the relay is not keeping its promises = **this link cannot be trusted** (reconnecting is ③b step ④)
       return down(t(`relay からの封が読めません（${decoded.reason}）`, `Cannot read a frame from the relay (${decoded.reason})`))

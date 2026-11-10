@@ -12,13 +12,12 @@
 //
 // ★ **Try keystrokes first; if that fails, fall back to the inbox** (a frame is better than not arriving).
 // ⚠️⚠️ But **never fall back on `partial` (typed part-way)**, because it would arrive twice.
-// ★★ A body starting with `/` or `!` goes through **keystrokes "with one space prepended"** (changed 2026-08-24).
-//   ⚠️⚠️ It used to be refused and dropped into the inbox, but the inbox **does more than add a frame**:
-//      the receiving model **executes it** as "a request from a peer" (measured: `/tes` ran make test).
-//      And even **ordinary sentences** like "look at /home/..." were being dropped there.
-//   ⇒ Nothing falls back to the inbox because of its content any more.
+// ★★★ A body starting with `/` or `!` is **refused on every route** (2026-11-10 / see `sanitizeForKeys`).
+//   ⚠️⚠️ Keystrokes: Claude Code 2.1.322 trims before looking for `/`, so the old "one leading space" ran it.
+//   ⚠️⚠️ Inbox: the receiving model **executes it** as "a request from a peer" (measured: `/tes` ran make test).
+//   ⇒ Nothing falls back to the inbox because of its content.
 
-import type { MessageSendResult } from '../../../shared/types.ts'
+import { commandLikeMessage, type MessageSendResult } from '../../../shared/types.ts'
 import { config } from '../config.ts'
 import { discoverConfigDirs } from '../claude/configDirs.ts'
 import { sendToSession } from '../claude/inbox.ts'
@@ -54,11 +53,10 @@ export function decideAfterKeys(reason: KeysFailure | undefined): RouteDecision 
     // If the body itself is bad, the inbox gives the same result
     case 'empty':
     case 'too-long':
+    // ⚠️⚠️ Starts with `/` `!`: the inbox is **worse** (the receiving model runs it as a peer's request)
+    case 'command-like':
       return { kind: 'error', status: 400 }
     // Below here, "keystrokes were unavailable" only, so go to the inbox
-    // ⚠️ `slash` / `bang` **no longer occur** (2026-08-24). Instead of refusing, we now
-    //    **neutralize with one space and pass via keystrokes** (see `sanitizeForKeys`).
-    //    ⇒ There is no longer a path that "falls back to the inbox because of content" (only route constraints remain).
     case 'pending-approval':
     // ★ The CLI shows a dialog and waits (`status:'waiting'`) → inbox.
     //   ⚠️ In the inbox it **does not become key input** (it is just queued as a framed message)
@@ -77,21 +75,15 @@ export function decideAfterKeys(reason: KeysFailure | undefined): RouteDecision 
 /**
  * ★★ **Is this a body that must not go to the inbox?** (codex 2026-08-24, high #2).
  *
- * ⚠️⚠️ Keystrokes are now neutralized with "one leading space", but **when keystrokes fail for route
- *    reasons** (`no-relay` / `waiting` / `pending-approval` / `unreachable`) it falls back to the inbox.
- *    What went there was **the original text**, so the accident of the receiving model executing it **was still
- *    there** (measured: a `/tes` that fell into the inbox ran `make test`).
- *    ⇒ **We wrote "fixed", but the same thing remained on another path** (mistake pattern 3 in VERIFY).
- *
- * ⚠️ Prepending a space and sending to the inbox is **not OK**: the space only disables **the CLI's command parsing**;
- *    **the model's interpretation remains** (the frame reads as "a request from a peer", so it tends to get executed).
- * ⇒ Instead of falling back, **refuse** (the UI shows how to rephrase).
- * ★ The decision uses `sanitizeForKeys`'s answer (do not write the leading-character check in two places;
- *   they actually disagreed on invisible characters).
+ * ⚠️⚠️ Keystrokes can fail for route reasons **before** the body is looked at
+ *    (`pending-approval` is checked first), and then it falls back to the inbox. What went there was
+ *    **the original text**, so the receiving model executed it (measured: a `/tes` that fell into the
+ *    inbox ran `make test`). ⇒ This guard is reachable and must stay.
+ * ★ The decision uses `sanitizeForKeys`'s answer (do not write the leading-character check in two places).
  */
 export function inboxRefusal(text: unknown): boolean {
   const clean = sanitizeForKeys(text)
-  return clean.ok && clean.value.neutralized === true
+  return !clean.ok && clean.reason === 'command-like'
 }
 
 export async function sessionMessage(ctx: Ctx): Promise<MessageResult> {
@@ -112,17 +104,13 @@ export async function sessionMessage(ctx: Ctx): Promise<MessageResult> {
     const at = new Date().toISOString()
     broadcast({ type: 'sessions-changed', at })
     const extra = keys.dropped ? t(` 制御文字を${keys.dropped}個落とした`, ` dropped ${keys.dropped} control characters`) : ''
-    // ★ Also log that it was neutralized (⚠️ never log the body)
-    const neu = keys.neutralized
-      ? t(' 先頭に空白を足した（コマンドとして走らせない）', ' prefixed a space (so it does not run as a command)')
-      : ''
     console.log(
       t(
-        `[keys] 打鍵で送りました session=${short} ${text.length}文字${extra}${neu}`,
-        `[keys] Sent as keystrokes session=${short} ${text.length} chars${extra}${neu}`,
+        `[keys] 打鍵で送りました session=${short} ${text.length}文字${extra}`,
+        `[keys] Sent as keystrokes session=${short} ${text.length} chars${extra}`,
       ),
     )
-    return { ok: true, at, route: 'keys', ...(keys.neutralized ? { neutralized: true } : {}) }
+    return { ok: true, at, route: 'keys' }
   }
   const decision = decideAfterKeys(keys.reason)
   if (decision.kind === 'error') throw new HttpError(decision.status, keys.message ?? t('送れませんでした', 'Could not send.'))
@@ -134,10 +122,7 @@ export async function sessionMessage(ctx: Ctx): Promise<MessageResult> {
         `[keys] Not handing to the inbox (starts with / or !) session=${short} reason=${keys.reason}`,
       ),
     )
-    throw new HttpError(
-      409,
-      t('このセッションはいま枠なしで渡せないため、`/` や `!` で始まる文は送れません（受け取った側が「別セッションからの依頼」として実行してしまうため）。言葉で頼むか、先頭に語を足してください（例:「パス /home/... を見て」）', 'This session cannot receive direct keystrokes right now, so messages starting with `/` or `!` cannot be sent (the receiver would run them as a request from another session). Phrase it in words, or add a word in front (e.g. "look at the path /home/...").'),
-    )
+    throw new HttpError(400, commandLikeMessage())
   }
   console.log(t(`[keys] 打鍵は使えません（${keys.reason}）→ 受信箱へ session=${short}`, `[keys] Keystrokes unavailable (${keys.reason}) → inbox session=${short}`))
 

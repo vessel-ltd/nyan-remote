@@ -21,7 +21,7 @@ import { alreadyInTranscript, type InflightMessage } from '../../../shared/types
 import { formatTokens } from './tokens.ts'
 import { beginSend, consumeAfterReload, finishSend, noteArrivals, type PendingSend } from './pending.ts'
 import { Permissions } from './Permissions.tsx'
-import { neutralizedNote, sendMark } from './sendMark.ts'
+import { sendMark } from './sendMark.ts'
 import {
   COMMAND_UI,
   type KeyedConfirmKind,
@@ -625,8 +625,7 @@ export function Thread({
       setPending((prev) => finishSend(prev, id, null))
       throw err
     }
-    // ★ **Do not stay silent** about the rewrite (it started with `/` `!`, so one space was added)
-    setNote(res.neutralized ? { bad: false, text: neutralizedNote() } : undefined)
+    setNote(undefined)
     // ★ Confirmed by `route`. Keystroke deliveries carry no `via`, so without it matching fails (pending.ts)
     setPending((prev) => finishSend(prev, id, res.route))
   }

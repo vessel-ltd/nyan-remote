@@ -63,21 +63,13 @@ export const KEYS_REASON_TEXT: Record<KeysUnavailable, string> = {
 }
 
 /**
- * ★★ **Cases where the text overrides the route** (2026-08-24 codex high #2).
+ * ★★★ **Text that cannot be sent at all** (2026-11-10 / security audit).
  *
- * ⚠️⚠️ The session mark (`sendRoute`) is "that session's **default** route";
- *    text starting with `/` or `!` **always falls into the inbox (= English frame)**
- *    (refused by keystrokes → dropped by `decideAfterKeys`).
- *    Letting the mark alone suggest "no frame" causes exactly the harm this mark is meant to prevent
- *    (the frame makes it reply to an unrelated session / §9.7.2).
- *
- * ⚠️ The **authority** is the agent (`sanitizeForKeys`). This is only a caution, so
- *    it just mirrors the same shape (**strip control characters, then look at the start**).
- * ⚠️ It looks at **the first non-whitespace character** (`trimStart()` also strips leading newlines, so
- *    `"\n/compact"` is `slash` = same result as the agent). Nothing after the line containing
- *    a non-whitespace character is examined (the CLI does not treat `/` on line 2+ as a command).
- *    ★ 2026-08-24 codex finding: the old comment said "only the first line", which
- *      contradicted `trimStart()`'s behaviour (**adding tests based on comments goes wrong**).
+ * ⚠️⚠️ Text starting with `/` or `!` is **refused by the agent on every route**
+ *    (keystrokes: Claude Code trims before looking for `/`, so "one leading space" ran `/exit`;
+ *    inbox: the receiving model runs it as a peer's request). ⇒ The input box disables Send.
+ * ★ The UI blocking it also protects agents that have not been updated yet (the app updates first).
+ * ⚠️ The **authority** is the agent (`sanitizeForKeys`). Both use `looksLikeCommand` in shared, so they agree.
  */
 export type PerMessageNote = 'slash' | 'bang' | null
 
@@ -93,20 +85,6 @@ export function perMessageNote(text: string): PerMessageNote {
   if (kind === '/') return 'slash'
   if (kind === '!') return 'bang'
   return null
-}
-
-/**
- * ★ Notice after sending (when it started with `/` `!`).
- *
- * ⚠️ **Never rewrite silently**. The agent sends it "as text with one space added", so
- *    the screen says it did not run as a command (otherwise it looks like "a command that does nothing").
- */
-export const NEUTRALIZED_NOTE =
-  '先頭に空白を1つ足して、文章として送りました（コマンドとしては実行されません）'
-
-/** ★ `NEUTRALIZED_NOTE` in the screen language (⚠️ `t()` is not called at module top level ⇒ it is a function) */
-export function neutralizedNote(): string {
-  return t(NEUTRALIZED_NOTE, 'Added one leading space and sent it as text (it will not run as a command)')
 }
 
 export interface SendMark {

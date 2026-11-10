@@ -7,7 +7,7 @@
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { test } from 'node:test'
-import { KEYS_REASON_TEXT, NEUTRALIZED_NOTE, perMessageNote, sendMark } from './sendMark.ts'
+import { KEYS_REASON_TEXT, perMessageNote, sendMark } from './sendMark.ts'
 import type { KeysUnavailable, SessionSummary } from '../../../shared/types.ts'
 
 const base: SessionSummary = {
@@ -107,17 +107,15 @@ test('★★ decides by the start after stripping control characters (same shape
   assert.equal(perMessageNote('\u001b!ls'), 'bang')
 })
 
-test('★★ the neutralisation notice says "sent as text" and does not mention the frame (behaviour changed on 2026-08-24)', () => {
-  // ⚠️ `/` `!` used to fall into the inbox (English frame), but now they go by **keystrokes with one space added**
-  //    (measured: the CLI's command parsing is disabled). Stale text would be a lie.
-  assert.ok(/文章として/.test(NEUTRALIZED_NOTE), NEUTRALIZED_NOTE)
-  assert.ok(!/枠/.test(NEUTRALIZED_NOTE), '⚠️ the old "a frame is added" explanation remains')
+test('★★★ text starting with `/` `!` cannot be sent from the input box (2026-11-10 / security audit)', () => {
+  // ⚠️⚠️ The agent refuses it on every route (Claude Code trims before looking for `/`, so the old
+  //    "one leading space" ran `/exit`). The input box must agree: Send disabled, the shared reason shown.
   const composer = readFileSync(new URL('./Composer.tsx', import.meta.url), 'utf8')
-  // ★ The caution while typing should also say "arrives as text"
-  assert.ok(/文章として/.test(composer), 'the input box caution is stale')
-  assert.ok(!/英文の枠付き/.test(composer), '⚠️ "arrives with an English frame" remains')
+  assert.match(composer, /canSend = [^\n]*note === null/, '⚠️⚠️ Send stays enabled for `/` `!` text')
+  assert.match(composer, /commandLikeMessage\(\)/, 'the input box does not say why')
+  assert.ok(!/文章として/.test(composer), '⚠️ the old "arrives as text" explanation remains')
   const thread = readFileSync(new URL('./Thread.tsx', import.meta.url), 'utf8')
-  assert.match(thread, /res\.neutralized/, 'does not tell after sending (rewrites silently)')
+  assert.ok(!/neutralized/.test(thread), '⚠️ the old "a space was added" notice remains')
 })
 
 test('★★ the start-of-text decision goes through the same function as the agent (no divergence on invisible characters)', () => {
@@ -153,15 +151,14 @@ test('★★ action results are shown "next to the input box" (invisible at the 
   assert.ok(!/\{notice \?/.test(thread), 'the top drawing remains')
 })
 
-test('★★ the three notices (send, stop, neutralise) share one container', () => {
+test('★★ the notices (send, stop, command) share one container', () => {
   // ⚠️ Adding more places for notices brings back "drawn but invisible" (2026-08-24 device report).
   //   ★ The component is recreated per target (`<Thread key=…>`), so notices need not carry a target.
   const thread = readFileSync(new URL('./Thread.tsx', import.meta.url), 'utf8')
   for (const [text, what] of [
-    // ★ 2026-09-23: switched by language, so it goes through functions (`stopSentNote()` / `neutralizedNote()`)
+    // ★ 2026-09-23: switched by language, so it goes through functions (`stopSentNote()`)
     // ★ 2026-09-24: passes whether the input box was cleared too (`stopSentNote(res.cleared === true)`)
     ['stopSentNote\\(res\\.cleared === true', 'the stop notice'],
-    ['neutralizedNote\\(\\)', 'the neutralisation notice'],
     ['COMMAND_UI\\[target\\.id\\]\\.sent', 'the command notice'],
   ] as const) {
     assert.match(thread, new RegExp(`setNote\\([^)]*${text}`), `${what} does not go through setNote`)

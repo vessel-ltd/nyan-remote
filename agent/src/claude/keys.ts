@@ -25,9 +25,9 @@ import { appendFile, mkdir, readdir, unlink } from 'node:fs/promises'
 import { connect } from 'node:net'
 import { dirname, join } from 'node:path'
 import {
-  LEADING_INVISIBLE,
   MAX_MESSAGE_BYTES,
   isDroppedControl,
+  commandLikeMessage,
   looksLikeCommand,
   type CommandId,
   type KeysUnavailable,
@@ -98,9 +98,9 @@ export type KeysFailure =
   | 'empty'
   | 'too-long'
   | 'pending-approval' // an approval card is showing (one held by the hook)
-// ⚠️ `slash` / `bang` **no longer exist** (2026-08-24). Instead of refusing, we **neutralize with one space**
-//    and send via keystrokes (neutralization confirmed by measurement / see `sanitizeForKeys`).
-//    ⇒ The path "dropped into the inbox because of its content" is gone.
+  // ★★★ starts with `/` or `!` (2026-11-10: **refused**, never neutralized / see `sanitizeForKeys`).
+  //    ⚠️⚠️ Never dropped into the inbox either (the receiving model runs it as a peer's request).
+  | 'command-like'
   // ⚠️ `too-soon` is a reason for control keys only (serializing is enough for keystrokes). Not part of `KeysFailure`
 
 export interface KeysResult {
@@ -110,11 +110,6 @@ export interface KeysResult {
   message?: string
   /** Number of control characters dropped (when non-zero the caller may tell the user) */
   dropped?: number
-  /**
-   * ★ The start was `/` or `!`, so it was sent **as plain text with one space added**.
-   * ⚠️ Returned so we **never rewrite silently** (the screen says so).
-   */
-  neutralized?: boolean
 }
 
 /** ★ Result of "stop". ⚠️ There is no `partial`, so there is no way to drop into the inbox */
@@ -187,6 +182,8 @@ export function failureMessage(reason: KeysFailure): string {
       return t('本文が長すぎます', 'The message is too long.')
     case 'pending-approval':
       return t('承認を待っている間は打鍵しません', 'Keystrokes are not sent while an approval is pending.')
+    case 'command-like':
+      return commandLikeMessage()
   }
 }
 
@@ -271,8 +268,6 @@ export function commandMessage(reason: CommandFailure): string {
 export interface Sanitized {
   text: string
   dropped: number
-  /** ★ The start was `/` or `!`, so **one space was added** (= made into a form that does not run as a command) */
-  neutralized?: boolean
 }
 
 /**
@@ -281,23 +276,20 @@ export interface Sanitized {
  * ⚠️ **CR becomes a newline**. Dropping it joins lines; passing it through **submits midway and splits into two instructions**.
  * ⚠️ **Control characters including ESC are dropped**. If ESC gets through, the selection in a choice dialog moves.
  *
- * ## ★★★ A leading `/` or `!` is "neutralized with one space" rather than "refused" (2026-08-24)
+ * ## ★★★ A leading `/` or `!` is **refused** (2026-11-10 / security audit / user decision)
  *
- * **Measured (2.1.241 / the real TUI)**:
- *   `␣/help` → "it was not executed because of the leading space; it arrived as a plain message"
- *   `␣!ls`   → "the leading space means the `!` prefix has no effect"
- * ⇒ **One space disables the CLI's command interpretation.**
- *
- * ⚠️⚠️ It used to "refuse and drop into the inbox", which was bad in two ways:
- *   1. The inbox **does more than add a frame**. The receiving model treats it as "a request from a peer" and
- *      **actually executes it** (measured: a dropped `/tes` ran `make test` / `!ls` ran ls)
- *   2. Even **ordinary sentences** like "look at /home/..." were dropped (because they start with `/`)
- * ⇒ **Neither drop nor refuse.** Running something as a real command happens only via
- *   the table (`SLASH_COMMANDS`) + a dedicated endpoint (never from free input).
- *
- * ⚠️ Normalization is "**drop leading whitespace and newlines, then** put one space". Sending `\n/help` as is
- *    gives **an empty line 1 and `/help` on line 2**; we have not measured whether the CLI looks at the start of input or at line 1,
- *    so we settle on a form that puts `/` **neither at a line start nor at the input start**.
+ * ⚠️⚠️ From 2026-08-24 it was "neutralized with one space" (measured on 2.1.241: `␣/help` arrived as text).
+ *    **Claude Code 2.1.322 trims before looking for `/`** (`e.trim().startsWith("/")` in the binary), so
+ *    `␣/exit` **ended the session** and `␣/compact` ran (measured in a pty, 2026-11-10).
+ *    An invisible prefix does not work either: the CLI removes it ("Removed 1 invisible character · review
+ *    and press Enter") and leaves `/exit` in the input box for the next Enter.
+ *    ⇒ **Any rewrite depends on how the CLI parses input, and a CLI update silently undoes it.**
+ *    Refusing does not depend on the CLI at all.
+ * ⚠️⚠️ **Never drop it into the inbox instead** (the receiving model treats it as a peer's request and
+ *    **runs it**: a dropped `/tes` ran `make test`). Running a real command happens only via the table
+ *    (`SLASH_COMMANDS`) + a dedicated endpoint.
+ * ★ What counts as "starts with" is shared `looksLikeCommand` (the first visible character, after control
+ *   characters and leading invisible characters are dropped; the UI disables Send with the same function).
  */
 export function sanitizeForKeys(text: unknown): { ok: true; value: Sanitized } | { ok: false; reason: KeysFailure } {
   if (typeof text !== 'string' || text.trim().length === 0) return { ok: false, reason: 'empty' }
@@ -322,19 +314,9 @@ export function sanitizeForKeys(text: unknown): { ok: true; value: Sanitized } |
   }
   if (cleaned.trim().length === 0) return { ok: false, reason: 'empty' }
 
-  // ⚠️ Check the limit against **what the user typed** (excluding the 1 byte added by neutralizing. Including it
-  //    would make "sendable on screen but refused by the agent" happen only for `/`-leading text right at the limit)
+  // ★ Refuse before anything else about the body (the reason the user can act on comes first)
+  if (looksLikeCommand(cleaned)) return { ok: false, reason: 'command-like' }
   if (Buffer.byteLength(cleaned, 'utf8') > MAX_KEYS_BYTES) return { ok: false, reason: 'too-long' }
-
-  // ⚠️ What we look at is **the first "visible" character** (the test is shared `looksLikeCommand`).
-  //    A `/` on line 2 or later is ignored (the CLI does not treat it as a command. Widening it breaks ordinary text)
-  if (looksLikeCommand(cleaned)) {
-    const head = cleaned.replace(LEADING_INVISIBLE, '')
-    // ★ **Settle on the form measured to be safe** (one space + `/`).
-    //   ⚠️ Drop leading invisible characters before adding it (keeping them gives "the char after the space is not `/`",
-    //      and how the CLI handles that is unmeasured). ⚠️ Invisible characters **inside** the body are left alone.
-    return { ok: true, value: { text: ` ${head}`, dropped, neutralized: true } }
-  }
   return { ok: true, value: { text: cleaned, dropped } }
 }
 
@@ -737,11 +719,7 @@ async function sendKeysOnce(
   })
   if (res.ok) {
     await noteSent(sessionId, clean.value.text.length, clean.value.dropped)
-    return {
-      ok: true,
-      dropped: clean.value.dropped,
-      ...(clean.value.neutralized ? { neutralized: true } : {}),
-    }
+    return { ok: true, dropped: clean.value.dropped }
   }
   // ★ Rule 6 (the record) is **needed on the failure side too**. ⚠️ The record we want most is `partial`
   //   (text has already been typed into the TUI), yet that was the one case without a record.
@@ -1020,8 +998,8 @@ const lastCommandAt = new Map<string, number>()
 /**
  * ★★★ Table of what can be typed from the phone **as a real command**. ⚠️ **This is the only source**.
  *
- * ⚠️⚠️ **Do not pass through `sanitizeForKeys`** (it would insert a space before `/` and make it
- *    "just text" = not executed). ⇒ This is **a path free input can never take**;
+ * ⚠️⚠️ **Do not pass through `sanitizeForKeys`** (it refuses anything starting with `/`).
+ *    ⇒ This is **a path free input can never take**;
  *    only a `CommandId` can be passed. **Do not add a parameter that accepts a string.**
  * ⚠️ The conditions for adding entries are in `CommandId` in `shared/types.ts` ((1) non-interactive (2) visible effect).
  * ★ No CR here (`writeKeys` sends it as "body → 120ms → CR").

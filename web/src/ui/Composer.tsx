@@ -10,7 +10,7 @@
 
 import { useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks'
 
-import { MAX_MESSAGE_BYTES } from '../../../shared/types.ts'
+import { MAX_MESSAGE_BYTES, commandLikeMessage } from '../../../shared/types.ts'
 import { t } from '../../../shared/i18n.ts'
 import { perMessageNote } from './sendMark.ts'
 import { Nyan } from './Nyan.tsx'
@@ -187,15 +187,13 @@ export function Composer({
 
   const tooLong = byteLength(text) > MAX_BYTES
   /**
-   * ★ Slash commands **don't get through** (hit twice on a real device, 2026-08-14).
-   *
-   * ⚠️ On the inbox path the CLI injects with `skipSlashCommands: true` (intentionally).
-   *    Both `/status` and `/code-review` arrive **as plain strings**.
-   *    Passing them silently looks like "I typed it and nothing happened", so say so before sending.
+   * ★★★ Text starting with `/` `!` **cannot be sent** (2026-11-10 / security audit).
+   *    Free text never runs a command; the table commands are in the menu (`commands.ts`).
    */
   // ★ Decided in one place, `ui/sendMark.ts` (⚠️ same shape as the agent = strip control chars, then look at the start)
   const note = perMessageNote(text)
-  const canSend = !disabled && !sending && text.trim().length > 0 && !tooLong
+  // ⚠️⚠️ `/` `!` at the start: never sendable (the agent refuses it too / `commandLikeMessage`)
+  const canSend = !disabled && !sending && text.trim().length > 0 && !tooLong && note === null
 
   const send = async () => {
     if (!canSend) return
@@ -275,33 +273,8 @@ export function Composer({
         </p> : null}
       {/* ★ The point is to know before sending (previously you only noticed afterwards via the "from phone" tag) */}
       {hint ? <p class="notice warn composerhint">{hint}</p> : null}
-      {/* ★★ Behavior changed on 2026-08-24: instead of rejecting and dropping into the inbox,
-             **prefix one space and send via keystrokes** (measured: this disables the CLI's command parsing).
-             ⇒ The correct description is "**arrives as plain text**", not "gets a wrapper". */}
-      {note === 'slash' && !tooLong ? (
-        <p class="notice warn composerhint">
-          {t(
-            'スラッシュコマンドは実行されません（先頭に空白を1つ足して、',
-            'Slash commands are not run (a space is added at the start, so it arrives ',
-          )}
-          <strong>{t('文章として', 'as plain text')}</strong>
-          {t('届きます）。', '). Ask in words instead, like ')}
-          <strong>{t('「コードレビューして」', '“review the code”')}</strong>
-          {t('のように言葉で頼んでください', '')}
-        </p>
-      ) : null}
-      {note === 'bang' && !tooLong ? (
-        <p class="notice warn composerhint">
-          {t('', 'Instructions starting with ')}
-          <code>!</code>
-          {t(
-            ' で始まる指示は実行されません（先頭に空白を1つ足して、',
-            ' are not run (a space is added at the start, so it arrives ',
-          )}
-          <strong>{t('文章として', 'as plain text')}</strong>
-          {t('届きます）', ')')}
-        </p>
-      ) : null}
+      {/* ★★★ 2026-11-10: text starting with `/` `!` is refused (Send is disabled). Say why and how to fix it */}
+      {note !== null && !tooLong ? <p class="notice warn composerhint">{commandLikeMessage()}</p> : null}
     </div>
   )
 }

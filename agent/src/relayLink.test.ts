@@ -36,6 +36,7 @@ import {
 } from '../../shared/crypto.ts'
 import {
   RELAY_FRAME,
+  RELAY_V,
   decodeRelayFrame,
   encodeRelayFrame,
   RELAY_PING_MS,
@@ -381,6 +382,72 @@ test('★★★★ a tampered envelope cuts it off, and that number cannot retry
   await w.link.receive(relayFrame(RELAY_FRAME.data, p.connId, again.h.message))
   assert.equal(w.link.openTunnels, 0, '⚠️⚠️ the handshake could be retried on a refused number')
   assert.deepEqual(drain(w), [], '⚠️⚠️ sent to a refused number')
+})
+
+test('★★★★ an empty `data` from one phone cuts that phone, not the link (2026-11-10 / security audit)', async (t) => {
+  // ⚠️⚠️ A relay that predates the fix (self-hosted ones especially) carries a phone's 0-byte message as a
+  //    payload-less `data`. Treating it as "the relay broke its promises" let anyone who knows the agent key
+  //    take the whole link down (every phone evicted, again after each reconnect).
+  await boot(t)
+  const w = linkWith()
+  await w.link.receive(READY)
+  const a = await peer(1)
+  const b = await peer(2)
+  await joinPeer(w, a)
+  await joinPeer(w, b)
+  w.raw.length = 0
+  // ⚠️ Built by hand: `encodeRelayFrame` refuses an empty payload
+  await w.link.receive(new Uint8Array([RELAY_V, RELAY_FRAME.data, 0, 0, 0, a.connId]))
+  await w.link.flush()
+  await new Promise((r) => setTimeout(r, 5))
+  assert.equal(w.closed, 0, '⚠️⚠️ one phone took the whole link down')
+  assert.equal(w.link.openTunnels, 1, 'the offending phone kept its tunnel')
+  assert.deepEqual(frames(w), [{ type: RELAY_FRAME.drop, connId: a.connId }], 'the offending phone was not cut')
+  // ★ Later traffic on that number does nothing (an old relay never closes it)
+  await ask(w, a, { id: 7, method: 'GET', path: '/health' })
+  await w.link.flush()
+  assert.deepEqual(frames(w), [], '⚠️⚠️ still answered the retired number')
+  // ★ The other phone is untouched
+  await ask(w, b, { id: 8, method: 'GET', path: '/health' })
+  await w.link.flush()
+  assert.equal(frames(w).filter((f) => f.connId === b.connId).length, 1, 'the other phone stopped working')
+})
+
+test('★★★★ an empty `data` that arrives while the handshake is still queued wins: no tunnel, nothing sent (codex 2026-11-10, low)', async (t) => {
+  // ⚠️ Replacing the queued retirement with immediate cleanup would let the handshake finish **after** it
+  //    and leave a live tunnel on a retired number. ⇒ Inject the empty frame without waiting for the handshake.
+  await boot(t)
+  const w = linkWith()
+  await w.link.receive(READY)
+  const a = await peer(1)
+  await w.link.receive(relayFrame(RELAY_FRAME.opened, a.connId))
+  const hs = w.link.receive(relayFrame(RELAY_FRAME.data, a.connId, a.h.message))
+  const empty = w.link.receive(new Uint8Array([RELAY_V, RELAY_FRAME.data, 0, 0, 0, a.connId]))
+  await Promise.all([hs, empty])
+  await w.link.flush()
+  await new Promise((r) => setTimeout(r, 5))
+  assert.equal(w.link.openTunnels, 0, '⚠️⚠️ the handshake finished after the retirement and left a tunnel')
+  assert.deepEqual(frames(w), [{ type: RELAY_FRAME.drop, connId: a.connId }], '⚠️⚠️ answered the handshake of a retired number')
+  // ★ A later `closed` for it is harmless
+  await w.link.receive(relayFrame(RELAY_FRAME.closed, a.connId))
+  await w.link.flush()
+  assert.equal(w.closed, 0)
+})
+
+test('★★★★ without `ready` (an old relay), an empty `data` still retires that phone locally (codex 2026-11-10, medium)', async (t) => {
+  await boot(t)
+  const w = linkWith()
+  const a = await peer(1)
+  await joinPeer(w, a)
+  w.raw.length = 0
+  await w.link.receive(new Uint8Array([RELAY_V, RELAY_FRAME.data, 0, 0, 0, a.connId]))
+  await w.link.flush()
+  assert.equal(w.closed, 0, '⚠️⚠️ one phone took the whole link down')
+  assert.equal(w.link.openTunnels, 0, '⚠️⚠️ the phone kept its tunnel (nothing else would ever close it)')
+  assert.deepEqual(frames(w), [], 'sent `drop` to a relay that did not say `ready`')
+  await ask(w, a, { id: 7, method: 'GET', path: '/health' })
+  await w.link.flush()
+  assert.deepEqual(frames(w), [], '⚠️⚠️ still answered the retired number')
 })
 
 test('★★★★ an unreadable relay envelope closes the whole link (⑩)', async (t) => {

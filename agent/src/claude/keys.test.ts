@@ -18,8 +18,10 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import { fileURLToPath } from 'node:url'
+import { MAX_MESSAGE_BYTES, commandLikeMessage } from '../../../shared/types.ts'
 import {
   MAX_KEYS_BYTES,
+  failureMessage,
   findPane,
   sanitizeForKeys,
   sendKeysToSession,
@@ -91,58 +93,28 @@ async function waitFor(cond: () => boolean, ms = 3000): Promise<boolean> {
 
 // ---------------------------------------------------------------- sanitize
 
-test('★★★ a leading `/` `!` is neutralized with "one space" and sent as keystrokes (measured 2026-08-24)', () => {
-  // ★★★ **Measured on the real machine (2.1.241) on 2026-08-24**:
-  //    `␣/help` → "it was not executed because of the leading space; it arrived as a plain message"
-  //    `␣!ls`   → "the leading space means the ! prefix has no effect"
-  //    ⇒ **One space disables the CLI's command interpretation.**
-  //
-  // ⚠️⚠️ It used to "refuse and drop into the inbox". But the inbox **does more than add a frame**:
-  //    the receiving model treats it as "a request from a peer" and **actually executes it** (measured: a `/tes`
-  //    dropped into the inbox ran `make test` / `!ls` ran ls).
-  //    And even **ordinary sentences** like "look at /home/..." were dropped.
-  // ⇒ **Neither drop nor refuse. Add one space and send as keystrokes.**
-  //    Running something as a real command happens only via the table (`SLASH_COMMANDS`) + a dedicated endpoint.
-  const a = sanitizeForKeys('/compact')
-  assert.ok(a.ok)
-  if (a.ok) {
-    assert.equal(a.value.text, ' /compact')
-    assert.equal(a.value.neutralized, true)
+test('★★★ a leading `/` `!` is refused, never rewritten (2026-11-10 / security audit)', () => {
+  // ★★★ **Measured on Claude Code 2.1.322 in a pty, 2026-11-10**:
+  //    `␣/exit` **ended the session** and `␣/compact` ran (the CLI trims before looking for `/`).
+  //    With an invisible prefix (U+200B / U+2060 / U+3164) the CLI removed it and left `/exit` in the input box.
+  //    ⇒ The "one leading space" neutralization of 2026-08-24 (measured on 2.1.241) no longer holds, and any
+  //       rewrite depends on how the CLI parses input. **Refusing does not.**
+  // ⚠️⚠️ Never into the inbox either (the receiving model runs it: a dropped `/tes` ran `make test`).
+  for (const body of ['/compact', '/exit', '!ls', '/home/user/webserv を見て']) {
+    const r = sanitizeForKeys(body)
+    assert.deepEqual(r, { ok: false, reason: 'command-like' }, JSON.stringify(body))
   }
-  const b = sanitizeForKeys('!ls')
-  assert.ok(b.ok)
-  if (b.ok) assert.equal(b.value.text, ' !ls')
-  // ★ Ordinary sentences are left alone
-  const c = sanitizeForKeys('これを見て')
-  assert.ok(c.ok)
-  if (c.ok) {
-    assert.equal(c.value.text, 'これを見て')
-    assert.ok(!c.value.neutralized)
-  }
-  // ★ Ordinary sentences starting with a path **can be sent** too (previously they fell into the inbox)
-  const d = sanitizeForKeys('/home/user/webserv を見て')
-  assert.ok(d.ok)
-  if (d.ok) assert.equal(d.value.text, ' /home/user/webserv を見て')
-})
-
-test('★★★ neutralizing "drops leading whitespace and newlines first", then puts one space', () => {
-  // ⚠️⚠️ Passing `\n/help` through gives **an empty line 1 and `/help` on line 2**.
-  //    We have **not measured** whether the CLI looks at the start of the whole input or at line 1, so
-  //    normalize to a form (` /help`) that puts `/` **neither at a line start nor at the input start**.
-  for (const raw of ['  /compact', '\n/compact', '\t/compact', '\n\n  /compact']) {
-    const r = sanitizeForKeys(raw)
-    assert.ok(r.ok, raw)
-    if (r.ok) assert.equal(r.value.text, ' /compact', JSON.stringify(raw))
+  // ★ Ordinary sentences are left alone (including a path that is not at the start)
+  for (const body of ['これを見て', 'パス /home/user を見て', 'echo !ls']) {
+    const r = sanitizeForKeys(body)
+    assert.ok(r.ok, JSON.stringify(body))
+    if (r.ok) assert.equal(r.value.text, body)
   }
 })
 
-test('★★★ a leading invisible character does not slip past neutralization (2026-08-24)', () => {
-  // ⚠️⚠️ `trimStart()` only drops Unicode **whitespace**. Measured (node):
-  //    U+FEFF (BOM) / U+3000 (ideographic space) are dropped, but
-  //    **U+200B (zero width) / U+200C / U+200D / U+2060 are not**.
-  //    ⇒ With a naive check, `\u200b/help` looks like "an ordinary sentence" and **is sent as is**.
-  //    Whether the CLI treats it as a command is **unmeasured**, so
-  //    **always settle on** "the form measured to be safe" (one leading space, then `/`).
+test('★★★ no leading whitespace, newline or invisible character slips past the refusal', () => {
+  // ⚠️⚠️ `trimStart()` only drops Unicode **whitespace** (U+200B / U+2060 survive it), and the CLI strips
+  //    invisible characters on its own. ⇒ Look at the first **visible** character (`looksLikeCommand`).
   // ★ Exhaustive (listing one by one always misses some. A VERIFY mistake type)
   const prefixes = [
     '',
@@ -150,32 +122,42 @@ test('★★★ a leading invisible character does not slip past neutralization 
     '  ',
     '\t',
     '\n',
+    '\n\n  ',
     '\u00a0', // NBSP
     '\u3000', // ideographic (full-width) space
     '\ufeff', // BOM
-    '\u200b', // zero-width space
+    '\u200b', // zero-width space (measured: the CLI removes it and leaves `/exit` in the box)
     '\u200c',
     '\u200d',
-    '\u2060', // word joiner
+    '\u2060', // word joiner (measured: same)
+    '\u3164', // Hangul filler (measured: same)
+    '\u180e', // Mongolian vowel separator
+    '\u00ad', // soft hyphen
+    '\u0301', // combining mark
+    '\u0001', // control (dropped first)
+    '\u001b', // ESC (dropped first)
+    '\u009b', // C1 CSI (dropped first)
     ' \u200b \n\u2060',
   ]
   let checked = 0
   for (const p of prefixes) {
     for (const body of ['/compact', '!ls'] as const) {
       const r = sanitizeForKeys(`${p}${body}`)
-      assert.ok(r.ok, `refused: ${JSON.stringify(p + body)}`)
-      if (r.ok) {
-        assert.equal(
-          r.value.text,
-          ` ${body}`,
-          `⚠️⚠️ not in the form measured to be safe: ${JSON.stringify(p + body)} → ${JSON.stringify(r.value.text)}`,
-        )
-        assert.equal(r.value.neutralized, true)
-      }
+      assert.deepEqual(r, { ok: false, reason: 'command-like' }, `⚠️⚠️ got through: ${JSON.stringify(p + body)}`)
       checked += 1
     }
   }
   assert.equal(checked, prefixes.length * 2)
+})
+
+test('★ the refusal comes before the length check (the reason the user can act on)', () => {
+  const r = sanitizeForKeys(`/${'a'.repeat(MAX_MESSAGE_BYTES + 10)}`)
+  assert.deepEqual(r, { ok: false, reason: 'command-like' })
+})
+
+test('★★ the refusal reason has its own message, and it is the shared one the UI shows', () => {
+  assert.equal(failureMessage('command-like'), commandLikeMessage())
+  assert.match(commandLikeMessage(), /`\/`/)
 })
 
 test('★ invisible characters "inside the body" are left alone (not silently removed)', () => {
@@ -183,7 +165,6 @@ test('★ invisible characters "inside the body" are left alone (not silently re
   assert.ok(r.ok)
   if (r.ok) {
     assert.equal(r.value.text, 'あ\u200bい', 'removed characters inside the body')
-    assert.ok(!r.value.neutralized)
   }
 })
 
@@ -192,7 +173,6 @@ test('★ a `/` on line 2 or later is left alone (do not break ordinary text)', 
   assert.ok(r.ok)
   if (r.ok) {
     assert.equal(r.value.text, 'これを見て\n/tmp のこと')
-    assert.ok(!r.value.neutralized)
   }
 })
 test('★ sanitizeForKeys: CR becomes a newline (dropping joins lines, passing it submits midway)', () => {
@@ -389,8 +369,7 @@ test('★★★ sanitize: putting one control character in front does not let `/
   // ⚠️⚠️ This was **a hole that was actually open**. It used to be "check `/` `!` → then drop control characters",
   //    so `\x01/compact` became `/compact` and **the slash command was executed**.
   //    ⇒ Check against **the value the implementation finally produces** (mistake type 3 in VERIFY.md).
-  // ★ On 2026-08-24 "refuse" became "neutralize with one space", so what we check changed too:
-  //   **the final string does not start with `/` or `!`** (= does not run as a command).
+  // ★ 2026-11-10: a leading `/` `!` is refused, so **every one of these must be refused** as `command-like`.
   // ★ Exhaustive (listing one by one always misses some. C1 0x80-0x9f had been forgotten)
   const codes: number[] = []
   for (let c = 0x00; c <= 0x1f; c++) if (c !== 0x0a) codes.push(c)
@@ -401,11 +380,7 @@ test('★★★ sanitize: putting one control character in front does not let `/
     const p = String.fromCodePoint(c)
     for (const body of ['/compact', '!rm -rf /'] as const) {
       const r = sanitizeForKeys(`${p}${body}`)
-      assert.ok(r.ok, `refused: ${JSON.stringify(p + body)}`)
-      if (r.ok) {
-        assert.equal(r.value.text, ` ${body}`, `not neutralized: ${JSON.stringify(p + body)}`)
-        assert.equal(r.value.neutralized, true)
-      }
+      assert.deepEqual(r, { ok: false, reason: 'command-like' }, `got through: ${JSON.stringify(p + body)}`)
       checked += 1
     }
   }
@@ -419,18 +394,6 @@ test('★ sanitize: ordinary text and "a `/` on line 2" pass (do not widen too f
   for (const ok of ['ふつうの文章', 'ok\n/clear', 'a/b を直して', '／全角は文字']) {
     const r = sanitizeForKeys(ok)
     assert.equal(r.ok, true, `refused: ${JSON.stringify(ok)}`)
-  }
-})
-
-test('★★★ the 1 byte added by neutralizing does not count toward the limit (keep UI and agent in agreement)', () => {
-  // ⚠️ The UI (Composer) checks the limit against the byte count of **what the user typed**.
-  //    Counting the 1-byte space added by neutralizing would create, **only for `/`-leading text right at the limit**,
-  //    "sendable on screen but refused by the agent". ⇒ Check the limit against what was typed
-  const just = 'あ'.repeat(Math.floor((MAX_KEYS_BYTES - 1) / 3))
-  const withSlash = sanitizeForKeys(`/${just}`)
-  assert.ok(withSlash.ok, 'refused although within the limit')
-  if (withSlash.ok) {
-    assert.ok(Buffer.byteLength(withSlash.value.text, 'utf8') > MAX_KEYS_BYTES - 1)
   }
 })
 

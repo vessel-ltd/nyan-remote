@@ -18,6 +18,7 @@ import {
 } from '../../shared/relayAuth.ts'
 import {
   MAX_RELAY_BYTES,
+  RELAY_HEADER_BYTES,
   RELAY_FRAME,
   decodeRelayFrame,
   encodeRelayFrame,
@@ -135,6 +136,7 @@ export const REASON = {
   displaced: 'Closed to make room for a newer connection / 後から来た接続のために閉じました',
   noText: 'Text frames not accepted / 文字は受け取りません',
   tooLarge: 'Too large / 大きすぎます',
+  empty: 'Empty frame / 中身がありません',
   unknownSocket: 'Unknown connection / 素性が分かりません',
   badProof: 'Could not read the proof / 証明を受け取れませんでした',
   lateProof: 'Proof came too late / 証明が遅すぎます',
@@ -630,9 +632,21 @@ export class Room {
       this.#drop(socket, REASON.noText, CLOSE.badFrame)
       return
     }
-    if (message.byteLength > MAX_RELAY_BYTES) {
+    // ★ A phone's bytes get a header before reaching the agent, so its own limit is that much smaller
+    //   (codex 2026-11-10, low: otherwise the last 6 bytes of the range passed here and vanished in `#toAgent`)
+    const limit = socket.tag()?.side === 'device' ? MAX_RELAY_BYTES - RELAY_HEADER_BYTES : MAX_RELAY_BYTES
+    if (message.byteLength > limit) {
       // ⚠️⚠️ The ToS measure itself (§14.1.1.4). **Large things are not carried**
       this.#drop(socket, REASON.tooLarge, CLOSE.badFrame)
+      return
+    }
+    // ★★★ **Empty things are not carried either** (2026-11-10 / security audit).
+    //   ⚠️⚠️ A phone's empty message became a `data` frame with no payload, which the agent cannot decode,
+    //      so **one 0-byte message from anyone who knows the agent key took the whole agent link down**
+    //      (and every phone with it, again after each reconnect). Nobody sends one legitimately
+    //      (agent frames have a 6-byte header, proofs and envelopes are never empty).
+    if (message.byteLength === 0) {
+      this.#drop(socket, REASON.empty, CLOSE.badFrame)
       return
     }
     const tag = socket.tag()

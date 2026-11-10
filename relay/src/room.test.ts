@@ -31,6 +31,7 @@ import {
 import { decodeChallenge, decodeDeviceChallenge, encodeDeviceProof, encodeProof } from '../../shared/relayAuth.ts'
 import {
   MAX_RELAY_BYTES,
+  RELAY_HEADER_BYTES,
   RELAY_FRAME,
   decodeRelayFrame,
   encodeRelayFrame,
@@ -437,6 +438,34 @@ test('★★ input breaking the contract gets cut (⑥)', async () => {
   const s2 = (await joinDevice(r)).socket
   await r.room.onMessage(s2, new ArrayBuffer(MAX_RELAY_BYTES + 1))
   assert.equal(s2.closed?.code, CLOSE.badFrame)
+
+  // ★ A phone's limit leaves room for the header the agent frame adds (codex 2026-11-10, low)
+  const s3 = await freePhone(r)
+  await r.room.onMessage(s3.socket, new ArrayBuffer(MAX_RELAY_BYTES - RELAY_HEADER_BYTES + 1))
+  assert.equal(s3.socket.closed?.code, CLOSE.badFrame, 'a phone message that cannot fit in a frame was kept')
+  const s4 = await freePhone(r)
+  agent.sent.length = 0
+  await r.room.onMessage(s4.socket, new ArrayBuffer(MAX_RELAY_BYTES - RELAY_HEADER_BYTES))
+  assert.equal(s4.socket.closed, undefined, 'a phone message that fits was cut')
+  assert.equal(agent.sent.length, 1, 'a phone message that fits did not reach the agent')
+
+  // ★ Empty **before** the proof too (the check must stay ahead of the proof path)
+  const pre = await joinDevice(r)
+  await r.room.onMessage(pre.socket, new ArrayBuffer(0))
+  assert.equal(pre.socket.closed?.reason, REASON.empty, 'an empty message before the proof was not cut')
+
+  // ★★★ Empty (2026-11-10 / security audit): from a phone that proved its key and sent its first message,
+  //    a 0-byte message used to reach the agent as a payload-less `data` and take its whole link down
+  const phone = await freePhone(r)
+  agent.sent.length = 0
+  await r.room.onMessage(phone.socket, new ArrayBuffer(0))
+  assert.equal(phone.socket.closed?.code, CLOSE.badFrame, 'an empty message was not cut')
+  assert.equal(phone.socket.closed?.reason, REASON.empty)
+  assert.ok(
+    agent.sent.every((b) => decodeRelayFrame(b).ok),
+    '⚠️⚠️ the agent received a frame it cannot decode',
+  )
+  assert.equal(agent.closed?.code, undefined, 'the agent was cut')
 
   // ⚠️ The agent cannot send anything but `data`
   await r.room.onMessage(

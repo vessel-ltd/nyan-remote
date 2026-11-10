@@ -124,7 +124,16 @@ export interface RelayFrame {
 
 export type RelayDecoded =
   | { ok: true; value: RelayFrame }
-  | { ok: false; reason: string }
+  | {
+      ok: false
+      reason: string
+      /**
+       * ★★ Set only when **the relay's framing is fine but a phone's content is not** (an empty `data` /
+       *    2026-11-10 / security audit). The phone chose those bytes, so the agent cuts **that phone**, not the link.
+       * ⚠️ Every other failure is the relay breaking its promises (the link cannot be trusted).
+       */
+      phoneConnId?: number
+    }
 
 /**
  * Put it into the shape carried on the agent-side wire.
@@ -142,6 +151,11 @@ export function encodeRelayFrame(f: RelayFrame): Uint8Array {
     throw new Error(t('接続番号が範囲外です', 'Connection number out of range'))
   }
   const payload = f.payload ?? new Uint8Array(0)
+  // ⚠️⚠️ **Never encode what `decodeRelayFrame` refuses** (2026-11-10 / security audit): relay wrapped a phone's
+  //    empty message into a payload-less `data` frame, and the agent dropped its whole link on it.
+  const carries = WITH_PAYLOAD.includes(f.type)
+  if (carries && payload.length === 0) throw new Error(t('中身のない封です', 'Frame has no payload'))
+  if (!carries && payload.length > 0) throw new Error(t('この種別に中身は付きません', 'This type carries no payload'))
   const out = new Uint8Array(RELAY_HEADER_BYTES + payload.length)
   if (out.length > MAX_RELAY_BYTES) throw new Error(t('relay の封が大きすぎます', 'Relay frame too large'))
   out[0] = RELAY_V
@@ -174,7 +188,12 @@ export function decodeRelayFrame(bytes: Uint8Array): RelayDecoded {
     return { ok: false, reason: t('この種別に中身は付きません', 'This type carries no payload') }
   }
   if (carries && payload.length === 0) {
-    return { ok: false, reason: t('中身がありません', 'Missing payload') }
+    // ★ Only `data` is a phone's bytes (`license` / `licenseResult` come from the agent / the relay)
+    return {
+      ok: false,
+      reason: t('中身がありません', 'Missing payload'),
+      ...(type === RELAY_FRAME.data ? { phoneConnId: connId } : {}),
+    }
   }
   return {
     ok: true,

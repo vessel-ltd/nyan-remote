@@ -27,6 +27,7 @@ import { discoverConfigDirs } from '../claude/configDirs.ts'
 import { waitForDecision } from '../permission.ts'
 import { HttpError, type Ctx } from '../router.ts'
 import { aliveProcStartSync } from '../claude/sessionIndex.ts'
+import { commandLikeMessage } from '../../../shared/types.ts'
 
 const ESC = '\x1b'
 const RELAY = join(fileURLToPath(new URL('../../../scripts/', import.meta.url)), 'relay.py')
@@ -275,12 +276,34 @@ test('★★★ a body starting with `/` never reaches the inbox, even for a ses
       () => sessionMessage(bodyCtx('sid-inbox-slash', text)),
       (err: unknown) => {
         assert.ok(err instanceof HttpError, `not an HttpError: ${String(err)}`)
-        assert.equal(err.status, 409, JSON.stringify(text))
+        assert.equal(err.status, 400, JSON.stringify(text))
+        assert.equal(err.message, commandLikeMessage())
         return true
       },
       `would hand it to the inbox: ${JSON.stringify(text)}`,
     )
   }
+  // ★★ The other way in: keystrokes give up **before the body is looked at** (an approval is pending), so the
+  //    refusal must come from `inboxRefusal`, not from `sanitizeForKeys` (2026-11-10: a mutation removing the
+  //    `inboxRefusal` call must fail this test).
+  void waitForDecision(
+    {
+      key: 'k-inbox-slash',
+      sessionId: 'sid-inbox-slash',
+      toolName: 'Bash',
+      summary: 'ls',
+      at: new Date().toISOString(),
+      account: '.claude-test',
+      project: 'p',
+      machine: 'm',
+    },
+    () => {},
+  )
+  await assert.rejects(
+    () => sessionMessage(bodyCtx('sid-inbox-slash', '/exit')),
+    (err: unknown) => err instanceof HttpError && err.status === 400,
+    'an approval was pending and `/exit` went to the inbox',
+  )
   await new Promise((r) => setTimeout(r, 200))
   assert.deepEqual(
     f.inboxChunks,
@@ -314,9 +337,8 @@ test('★★ ordinary sentences still reach the inbox as before (better than not
   assert.match(seen, /nyan-remote\(/, 'no sender identification')
 })
 
-test('★★★ sending a `/`-prefixed body via keystrokes puts `neutralized` on the wire (so the UI can say so)', { skip: !hasPython }, async (t) => {
-  // ⚠️ The UI can say "a leading space was added" only because this flag arrives.
-  //    ⚠️ Even if the flag is dropped, **the send itself succeeds**, so without a test it goes unnoticed (a silent rewrite).
+test('★★★ a `/`-prefixed body is refused on the keystroke route too: not one byte reaches the TUI (2026-11-10)', { skip: !hasPython }, async (t) => {
+  // ⚠️⚠️ Claude Code 2.1.322 trims before looking for `/`: the old " /compact" ran, and " /exit" ended the session.
   const prev = process.env['NYAN_REMOTE_STATE_DIR']
   const f = await setup('sid-neu')
   t.after(async () => {
@@ -325,16 +347,19 @@ test('★★★ sending a `/`-prefixed body via keystrokes puts `neutralized` on
     else process.env['NYAN_REMOTE_STATE_DIR'] = prev
     await rm(f.state, { recursive: true, force: true })
   })
-  const res = await sessionMessage(bodyCtx('sid-neu', '/compact'))
-  assert.equal(res.route, 'keys')
-  assert.equal(res.neutralized, true, '⚠️ the flag is dropped (the UI would have rewritten it silently)')
+  for (const text of ['/compact', ' /exit', '!ls']) {
+    await assert.rejects(
+      () => sessionMessage(bodyCtx('sid-neu', text)),
+      (err: unknown) => err instanceof HttpError && err.status === 400 && err.message === commandLikeMessage(),
+      JSON.stringify(text),
+    )
+  }
   await new Promise((r) => setTimeout(r, 250))
-  // ★ Also look at the bytes actually sent (one space + body + CR)
-  assert.equal(f.chunks.join(''), ' /compact\r', JSON.stringify(f.chunks))
+  assert.deepEqual(f.chunks, [], `⚠️⚠️ typed into the TUI: ${JSON.stringify(f.chunks)}`)
   assert.deepEqual(f.inboxChunks, [], 'it went to the inbox')
 })
 
-test('★ ordinary sentences do not raise the flag (do not say "rewritten" every time)', { skip: !hasPython }, async (t) => {
+test('★ ordinary sentences are typed as is', { skip: !hasPython }, async (t) => {
   const prev = process.env['NYAN_REMOTE_STATE_DIR']
   const f = await setup('sid-plainkeys')
   t.after(async () => {
@@ -345,7 +370,6 @@ test('★ ordinary sentences do not raise the flag (do not say "rewritten" every
   })
   const res = await sessionMessage(bodyCtx('sid-plainkeys', 'ふつうの指示'))
   assert.equal(res.route, 'keys')
-  assert.equal(res.neutralized, undefined)
   await new Promise((r) => setTimeout(r, 250))
   assert.equal(f.chunks.join(''), 'ふつうの指示\r')
 })

@@ -34,7 +34,7 @@ export function buildRouter(): Router {
   //   ⚠️⚠️ The endpoints are separate so there is no "endpoint that can fire anything in the table"
   router.post('/sessions/:id/clear', sessionClear)
   // ★ Slash commands from the table (`/compact` / `/exit`). ⚠️ Only the **id** is taken from the body.
-  //   ⚠️⚠️ Free text never runs them (`/` `!` become plain text with one leading space / routes/command.ts)
+  //   ⚠️⚠️ Free text never runs them (text starting with `/` `!` is refused / keys.ts `sanitizeForKeys`)
   router.post('/sessions/:id/command', sessionCommand)
   // ★ Toggle auto-approve mode (per session, with an expiry / autoApprove.ts).
   //   ⚠️⚠️ **POST only** (with GET, merely getting someone to follow a link could enable auto-approve)

@@ -2,8 +2,8 @@
 //
 // ## Why "a table + a dedicated endpoint"
 //
-// Free text (`/sessions/:id/message`) delivers a body starting with `/` or `!` **with one space prepended**,
-// as plain text (= it never runs as a command). Break that and the phone's input box becomes
+// Free text (`/sessions/:id/message`) **refuses** a body starting with `/` or `!` (2026-11-10; the old
+// "one space prepended" stopped working when the CLI began trimming first). Break that and the phone's input box becomes
 // **the TUI's command line** (`/exit` and `!rm` could both be typed).
 // ⇒ What may run is **enumerated in a table**, and runs **only through this endpoint**.
 //

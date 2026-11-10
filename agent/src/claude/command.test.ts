@@ -99,15 +99,15 @@ function cleanup(t: { after: (fn: () => void | Promise<void>) => void }, f: Fix,
   })
 }
 
-test('★★★ SLASH_COMMANDS: the table has exactly two entries, contains no CR, and is not neutralized', () => {
+test('★★★ SLASH_COMMANDS: the table has exactly two entries, contains no CR, and free input can never send them', () => {
   assert.deepEqual(Object.keys(SLASH_COMMANDS), ['compact', 'exit'])
   for (const [id, text] of Object.entries(SLASH_COMMANDS)) {
     assert.ok(text.startsWith('/'), `${id} does not start with / (would not run)`)
     assert.ok(!text.includes('\r'), `${id} contains a CR (writeKeys sends that)`)
     assert.ok(!text.includes('\n'), `${id} contains an LF`)
-    // ⚠️⚠️ This is the essence: **going through the free-input path turns it into something else** (a space is added)
+    // ⚠️⚠️ This is the essence: **the free-input path refuses it** (2026-11-10) = only the dedicated endpoint runs it
     const via = sanitizeForKeys(text)
-    assert.ok(via.ok && via.value.text !== text, `${id} is unchanged by sanitizeForKeys (the premise broke)`)
+    assert.deepEqual(via, { ok: false, reason: 'command-like' }, `${id} could be sent as free input`)
   }
 })
 

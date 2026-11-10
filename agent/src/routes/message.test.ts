@@ -21,9 +21,9 @@ const EXPECTED: Record<KeysFailure, RouteDecision> = {
   // The body is bad = same result in the inbox
   empty: { kind: 'error', status: 400 },
   'too-long': { kind: 'error', status: 400 },
+  // ⚠️⚠️ Starts with `/` `!` (2026-11-10): refused. The inbox is worse (the receiving model runs it)
+  'command-like': { kind: 'error', status: 400 },
   // Keystrokes were merely unavailable → inbox (a frame is added, but it arrives)
-  // ⚠️ `slash` / `bang` were **removed from the type** (2026-08-24). Instead of refusing, they are neutralized
-  //    with one space and passed via keystrokes, so **nothing falls back to the inbox because of its content**
   'pending-approval': { kind: 'fallback' },
   // ★ Also to the inbox while a dialog is open (keystrokes would become key input; the inbox does not)
   waiting: { kind: 'fallback' },
@@ -42,7 +42,7 @@ test('★★ decideAfterKeys: pin every reason exhaustively', () => {
     checked += 1
   }
   // ★ Prevents "green with an empty table" (same trap as notify:check's `0 / 0`)
-  assert.equal(checked, 11, 'if reasons are added/removed, fix this count together with the table')
+  assert.equal(checked, 12, 'if reasons are added/removed, fix this count together with the table')
 })
 
 test('★★ decideAfterKeys: only partial never falls back to the inbox (it would arrive twice)', () => {
@@ -55,27 +55,20 @@ test('decideAfterKeys: with no reason (called after keystrokes succeeded) it fal
   assert.deepEqual(decideAfterKeys(undefined), { kind: 'fallback' })
 })
 
-test('★★★ no path falls back to the inbox because of content (`/` `!` are neutralized and sent as keystrokes)', () => {
+test('★★★ no path falls back to the inbox because of content', () => {
   // ⚠️⚠️ The inbox does more than "add a frame": the receiving model **executes it as a peer request**
-  //    (measured: a `/tes` that fell there ran `make test`). ⇒ Content-based fallback was removed.
-  // ★ `slash` / `bang` were removed from the type, so **writing them in the table fails the type check**.
-  //   Here the table contents pin down that "the only reasons to fall back are route constraints".
-  const contentReasons = Object.keys(EXPECTED).filter((r) => r === 'empty' || r === 'too-long')
-  assert.deepEqual(contentReasons.sort(), ['empty', 'too-long'])
-  for (const r of contentReasons as ('empty' | 'too-long')[]) {
+  //    (measured: a `/tes` that fell there ran `make test`). ⇒ Every content reason is an error.
+  const contentReasons = ['empty', 'too-long', 'command-like'] as const
+  for (const r of contentReasons) {
     assert.equal(decideAfterKeys(r).kind, 'error', `${r} must not fall back to the inbox`)
   }
 })
 
 test('★★★ a body starting with `/` or `!` is never handed to the inbox, even when the route fails (codex 2026-08-24, high #2)', () => {
-  // ⚠️⚠️ **My fix only worked on one of the paths**. Keystrokes were changed to "neutralize with one space",
-  //    but **when keystrokes failed for route reasons** (`no-relay` / `waiting` /
-  //    `pending-approval` / `unreachable`), `decideAfterKeys` fell back to the inbox,
-  //    and **the original text** went there. ⇒ The accident of the receiving model executing it remained
-  //    (measured: a `/tes` that fell into the inbox ran `make test`).
-  // ⚠️ Prepending a space and sending to the inbox is **not OK** (the space only disables the CLI's command parsing;
-  //    **the model's interpretation remains**). ⇒ Refuse instead of falling back.
-  for (const text of ['/tes', '!ls', '  /compact', '\u200b/help']) {
+  // ⚠️⚠️ Keystrokes can fail for route reasons **before the body is looked at** (`pending-approval` is
+  //    checked first), and then `decideAfterKeys` falls back to the inbox with **the original text**.
+  //    ⇒ The receiving model executed it (measured: a `/tes` that fell into the inbox ran `make test`).
+  for (const text of ['/tes', '!ls', '  /compact', '\u200b/help', '\u3164/exit']) {
     assert.equal(inboxRefusal(text), true, `would hand it to the inbox: ${JSON.stringify(text)}`)
   }
   // ★ Ordinary sentences may still fall back to the inbox as before (better than not arriving)
@@ -93,6 +86,6 @@ test('★★ the decision goes through `sanitizeForKeys` (do not write the leadi
     .split('\n')
     .map((l) => l.replace(/\/\/.*$/, ''))
     .join('\n')
-  assert.match(code, /sanitizeForKeys\(/, 'the neutralization check is hand-rolled')
+  assert.match(code, /sanitizeForKeys\(/, 'the leading-character check is hand-rolled')
   assert.ok(!/startsWith\('\/'\)/.test(code), "⚠️ the leading-character check is hand-rolled")
 })

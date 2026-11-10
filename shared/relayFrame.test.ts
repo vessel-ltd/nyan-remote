@@ -100,6 +100,26 @@ test('★★ only `data` carries a payload / `data` cannot be empty', () => {
   assert.equal(decodeRelayFrame(empty).ok, false)
 })
 
+test('★★★ an empty `data` names the phone, so the agent cuts that phone, not the link (2026-11-10 / security audit)', () => {
+  const empty = decodeRelayFrame(new Uint8Array([RELAY_V, RELAY_FRAME.data, 0, 0, 0, 9]))
+  assert.equal(empty.ok, false)
+  if (!empty.ok) assert.equal(empty.phoneConnId, 9)
+  // ⚠️ Not for frames a phone cannot choose (those still mean the relay broke its promises)
+  const lic = decodeRelayFrame(new Uint8Array([RELAY_V, RELAY_FRAME.licenseResult, 0, 0, 0, 0]))
+  assert.equal(lic.ok, false)
+  if (!lic.ok) assert.equal(lic.phoneConnId, undefined)
+  const broken = decodeRelayFrame(new Uint8Array([0, RELAY_FRAME.data, 0, 0, 0, 9]))
+  assert.equal(broken.ok, false)
+  if (!broken.ok) assert.equal(broken.phoneConnId, undefined)
+})
+
+test('★★★ the encoder refuses what the decoder refuses (an empty `data` took the whole agent link down)', () => {
+  assert.throws(() => encodeRelayFrame({ type: RELAY_FRAME.data, connId: 1, payload: new Uint8Array(0) }))
+  assert.throws(() => encodeRelayFrame({ type: RELAY_FRAME.data, connId: 1 }))
+  assert.throws(() => encodeRelayFrame({ type: RELAY_FRAME.licenseResult, connId: 0, payload: new Uint8Array(0) }))
+  assert.throws(() => encodeRelayFrame({ type: RELAY_FRAME.opened, connId: 1, payload: new Uint8Array([1]) }))
+})
+
 test('★★ limit (★ the ToS measure itself)', () => {
   // ⚠️⚠️ **Never smaller than the payload limit** (if smaller, relay drops correct responses)
   assert.ok(
