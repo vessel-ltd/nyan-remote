@@ -73,6 +73,38 @@ test('buildPermissionInfo: no structured markers when it is the main agent and t
   assert.equal(info.accountUnknown, undefined)
 })
 
+test('★★ buildPermissionInfo: hidden characters reach the phone (trailing NBSP, past the cut) / 2026-11-10', () => {
+  // A trailing NBSP was trimmed from the collapsed line and no full text was sent = nothing to mark (codex medium)
+  const nbsp = buildPermissionInfo({ tool_name: 'Bash', tool_input: { command: 'cat log.txt\u00A0' } })
+  assert.equal(nbsp.summary, 'cat log.txt')
+  assert.equal(nbsp.detail, 'cat log.txt\u00A0', 'the full text keeps the character for the phone to mark')
+  assert.equal(nbsp.hidden, true)
+  // A direction control after the cut: not in detail, but the flag still says so (codex medium)
+  const command = '#' + 'a'.repeat(8100) + '\nrm -rf ~/Documents #\u202E'
+  const far = buildPermissionInfo({ tool_name: 'Bash', tool_input: { command } })
+  assert.equal(far.detailClipped, true)
+  assert.equal(far.detail?.includes('\u202E'), false)
+  assert.equal(far.hidden, true)
+  // Inside JSON (unknown tools) and question lists too
+  assert.equal(buildPermissionInfo({ tool_name: 'mcp__x__y', tool_input: { p: 'a\u2066b' } }).hidden, true)
+  assert.equal(
+    buildPermissionInfo({ tool_name: 'AskUserQuestion', tool_input: { questions: [{ question: 'ok\u202E?' }] } }).hidden,
+    true,
+  )
+  // A direction control only in an option label still raises the flag (codex round 2); emoji ZWJ does not
+  const q = (label: string) =>
+    buildPermissionInfo({
+      tool_name: 'AskUserQuestion',
+      tool_input: { questions: [{ question: 'Proceed?', header: 'Go', options: [{ label }, { label: 'Stop' }] }] },
+    }).hidden
+  assert.equal(q('\u202EON\u202C'), true)
+  assert.equal(q('dev \u{1F468}\u200D\u{1F4BB}'), undefined)
+  // Ordinary input: no flag, and no full text just for it
+  const plain = buildPermissionInfo({ tool_name: 'Bash', tool_input: { command: 'ls -la' } })
+  assert.equal(plain.hidden, undefined)
+  assert.equal(plain.detail, undefined)
+})
+
 test('★★ agentTypeOf: a request from the main agent is undefined (the side that notifies immediately)', () => {
   assert.equal(agentTypeOf({ agent_type: 'main' }), undefined, 'no agent_id means the main agent')
   assert.equal(agentTypeOf({}), undefined)

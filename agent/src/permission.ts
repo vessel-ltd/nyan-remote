@@ -42,6 +42,7 @@ import {
 } from '../../shared/types.ts'
 import { ASK_USER_QUESTION, EXIT_PLAN_MODE } from './claude/interaction.ts'
 import { t } from '../../shared/i18n.ts'
+import { hasBidi, hasHidden } from '../../shared/reveal.ts'
 import { machineName } from './machine.ts'
 
 export type Behavior = 'allow' | 'deny'
@@ -613,7 +614,11 @@ export function detailOf(
   //   was dropped, it looks the same, so only that case is excluded.
   //   ⚠️ for JSON the folded line is already everything, so it is not opened just for formatting
   const flattened = raw.kind !== 'json' && source.trim() !== flat
-  if (!truncated && !flattened) return undefined
+  // ★★ Hidden characters (2026-11-10 / security check): the collapsed line trims and squashes them away
+  //   (`cat log.txt\u00A0` became `cat log.txt` with no full text = nothing for the phone to mark).
+  //   ⇒ Whenever the input has a character the phone marks (`shared/reveal.ts`), the full text is sent as is.
+  const hidden = hasHidden(source)
+  if (!truncated && !flattened && !hidden) return undefined
   // ★ unknown tools / MCP are "one-line JSON", so **make it readable when opened**.
   //   ⚠️ shown as is, `\n` would just **sit there as characters** in a lump, defeating the point of opening
   //      (2026-08-18 /code-review medium #1).
@@ -621,6 +626,27 @@ export function detailOf(
   const full = raw.kind === 'json' ? JSON.stringify(raw.value, null, 2) : raw.text
   const clipped = full.length > DETAIL_MAX
   return { text: clipped ? full.slice(0, DETAIL_MAX) : full, clipped }
+}
+
+/**
+ * ★★ Whether the tool input contains a character the phone draws as a marker (`shared/reveal.ts`),
+ *    checked on the **whole input, before any cut** (2026-11-10 / codex).
+ * ⚠️ `detail` is cut at `DETAIL_MAX`, so a direction control placed after 8000 characters was neither shown
+ *    nor warned about. The phone warns when this is set even if it cannot show where.
+ */
+export function hiddenIn(toolName: string, input: unknown): boolean {
+  const raw = rawText(toolName, input)
+  if (!raw) return false
+  switch (raw.kind) {
+    case 'list':
+      // ★ The card also draws headers, labels and descriptions (direction controls are marked there / codex round 2).
+      //   ⚠️ Only direction controls count in those: emoji ZWJ in a label is normal and must not raise the warning
+      return hasHidden(...raw.items) || hasBidi(JSON.stringify(input))
+    case 'json':
+      return hasHidden(JSON.stringify(raw.value))
+    default:
+      return hasHidden(raw.text)
+  }
 }
 
 function clip(text: string): string {

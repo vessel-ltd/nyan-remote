@@ -35,6 +35,7 @@ import {
   pendingWithMeta,
   summarize,
   detailOf,
+  hiddenIn,
   validateFeedback,
   waitForDecision,
   type Behavior,
@@ -154,6 +155,8 @@ export function buildPermissionInfo(body: HookPayload): PermissionRequest {
     summary: summarize(toolName, body['tool_input']),
     // ★ Some approvals cannot be judged without seeing past the "…", so the full text is passed too (tap to open in the UI)
     ...(detail ? { detail: detail.text, detailClipped: detail.clipped } : {}),
+    // ★★ Checked on the uncut input (the phone warns even if the character lies past the cut / 2026-11-10)
+    ...(hiddenIn(toolName, body['tool_input']) ? { hidden: true as const } : {}),
     suggestions: items.map(legacySuggestionText),
     suggestionItems: items,
     permissionMode: str(body['permission_mode']),

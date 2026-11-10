@@ -527,6 +527,12 @@ export interface PermissionRequest {
   /** ★ Even that full text is cut off (= seeing it is not seeing everything). The UI says so */
   detailClipped?: boolean
   /**
+   * ★★ The tool input contains invisible or direction-changing characters (`shared/reveal.ts`), checked on the
+   *    **whole input before any cut** (2026-11-10 / security check). The UI warns even if it cannot show where.
+   *    Absent = none (and old agents).
+   */
+  hidden?: true
+  /**
    * ⚠️ **Legacy**. Sentences like "このディレクトリを許可: …" that the agent turned into **Japanese sentences**.
    *    New UIs use {@link suggestionItems} and read this **only when that is absent (old agents)**.
    * ★ New agents keep sending it too (decided 2026-09-24): old UIs only read this field, and

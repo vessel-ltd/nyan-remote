@@ -7,6 +7,7 @@ import { needsSubmit, previewText, tapAnswers } from './interaction.ts'
 import { cells } from './previewCells.ts'
 import { t } from '../../../shared/i18n.ts'
 import { accountLabel, agentTypeLabel, suggestionTexts } from './agentText.ts'
+import { hasHidden, reveal, type RevealScope } from '../../../shared/reveal.ts'
 
 /**
  * Pending approvals (M4-1). This is where "noticing" turns into "acting".
@@ -39,6 +40,23 @@ import { accountLabel, agentTypeLabel, suggestionTexts } from './agentText.ts'
  *    (waiting two `requestAnimationFrame`s always yields two frames = 33ms no matter what;
  *    it was 33ms even with the diagram set to `display: none`). Recorded in VERIFY.md.
  */
+/**
+ * ★★ Third-party text on the card, with hidden characters drawn as markers (`shared/reveal.ts` / 2026-11-10).
+ * ⚠️ Never render `p.summary` / `p.detail` directly (`reveal.test.ts` checks this file).
+ * ★ `all` (the command) is wrapped in **one** inline `.permcode` that forces strict left-to-right order.
+ *   ⚠️ Put the override on this wrapper, not on the parent: `.body .sub` is a flex box, which turns its text
+ *      into anonymous blocks; by the spec the parent's `unicode-bidi` need not reach them (codex). Chromium applied
+ *      it either way (measured 2026-11-10; without an override the Hebrew letters were reordered), Safari unmeasured
+ *      ⇒ the wrapper does not depend on the parent's layout.
+ * ★ `bidi` (choice labels) marks direction controls only and keeps the natural direction (Hebrew labels stay readable).
+ */
+function Revealed({ text, scope = 'all' }: { text: string; scope?: RevealScope }): VNode {
+  const parts = reveal(text, scope).map((part, i) =>
+    part.kind === 'text' ? part.text : <span key={i} class="hiddenchar">{part.label}</span>,
+  )
+  return scope === 'all' ? <span class="permcode">{parts}</span> : <>{parts}</>
+}
+
 function PreviewArt({ art }: { art: string }): VNode {
   const children = useMemo(
     () =>
@@ -167,28 +185,38 @@ export function Permissions({
                       aria-expanded={open[p.key] ? 'true' : 'false'}
                       onClick={() => setOpen((m) => ({ ...m, [p.key]: !m[p.key] }))}
                     >
-                      {open[p.key] ? null : <span class="sub mono">{p.summary}</span>}
+                      {open[p.key] ? null : <span class="sub mono"><Revealed text={p.summary} /></span>}
                       <span class="permmorehint">{open[p.key] ? t('▲ 全文を閉じる', '▲ Hide full text') : t('▼ 全文を見る', '▼ Show full text')}</span>
                     </button>
                     {open[p.key] ? (
                       <>
-                        <div class="permfull mono">{p.detail}</div>
-                        {/* ★ If still partial after opening, say so. Cutting silently makes you
-                            press Allow believing "I saw it all" */}
-                        {p.detailClipped ? (
-                          <span class="permmsg">
-                            {t(
-                              '⚠️ 長すぎるので、ここまでしか表示していません（この先はPCの画面で確認してください）',
-                              '⚠️ Too long, showing only this much (check the rest on the PC screen)',
-                            )}
-                          </span>
-                        ) : null}
+                        <div class="permfull mono"><Revealed text={p.detail} /></div>
                       </>
                     ) : null}
                   </>
                 ) : (
-                  <span class="sub mono">{p.summary}</span>
+                  <span class="sub mono"><Revealed text={p.summary} /></span>
                 )}
+                {/* ★ If even the full text is partial, say so **whether or not it is opened** (2026-11-10 / codex:
+                    shown only after opening, the warning was missed). Cutting silently makes you
+                    press Allow believing "I saw it all" */}
+                {p.detailClipped ? (
+                  <span class="permmsg">
+                    {t(
+                      '⚠️ 長すぎるので、途中までしか表示できません（この先はPCの画面で確認してください）',
+                      '⚠️ Too long to show in full (check the rest on the PC screen)',
+                    )}
+                  </span>
+                ) : null}
+                {/* ★★ `p.hidden` is checked by the agent on the uncut input (the character may lie past the cut) */}
+                {p.hidden || hasHidden(p.summary, p.detail) ? (
+                  <span class="permmsg">
+                    {t(
+                      '⚠️ 見えない文字・文字の向きを変える文字が入っています（U+… の印で表示しています）。意図したものか確かめてください',
+                      '⚠️ Contains invisible or direction-changing characters (shown as U+… markers). Make sure this is what you intended.',
+                    )}
+                  </span>
+                ) : null}
                 <span class="chips">
                   {inThread ? null : (
                     <>
@@ -223,8 +251,8 @@ export function Permissions({
                   return (
                     <div class="permq" key={q.question}>
                       <span class="permqhead">
-                        {q.header ? <span class="chip">{q.header}</span> : null}
-                        <span class="permqtext">{q.question}</span>
+                        {q.header ? <span class="chip"><Revealed text={q.header} scope="bidi" /></span> : null}
+                        <span class="permqtext"><Revealed text={q.question} scope="bidi" /></span>
                       </span>
                       <div class="permopts">
                         {q.options.map((o) => {
@@ -241,9 +269,9 @@ export function Permissions({
                                   : pick(p.key, q.question, o.label, q.multiSelect)
                               }
                             >
-                              <span class="permoptlabel">{o.label}</span>
+                              <span class="permoptlabel"><Revealed text={o.label} scope="bidi" /></span>
                               {o.description ? (
-                                <span class="permoptdesc">{o.description}</span>
+                                <span class="permoptdesc"><Revealed text={o.description} scope="bidi" /></span>
                               ) : null}
                             </button>
                             {/* ★★ The diagram attached to an option (`preview`).

@@ -1743,6 +1743,22 @@ input.urlinput {
   color: var(--bad-fg);
   font-size: 0.8rem;
 }
+/* ★★ The command on the approval card is drawn in strict left-to-right order (2026-11-10 / security check).
+   Direction controls are already turned into markers (`reveal.ts`); this stops right-to-left letters
+   from reordering their neighbours. ⚠️ Don't remove: the card must show the order bash receives */
+.permcode {
+  direction: ltr;
+  unicode-bidi: bidi-override;
+}
+/* A hidden character drawn as a marker (`U+202E`). Must stand out from the command around it */
+.hiddenchar {
+  color: var(--bad-fg);
+  border: 1px solid currentColor;
+  border-radius: 3px;
+  padding: 0 2px;
+  margin: 0 1px;
+  font-size: 0.85em;
+}
 .notice.small {
   font-size: 0.78rem;
   opacity: 0.8;
