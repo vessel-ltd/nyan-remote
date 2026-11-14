@@ -173,7 +173,11 @@ export async function login(f = fetch, wait = sleep, open = openUrl) {
   }
   const j = await res.json().catch(() => ({}))
   if (!res.ok || typeof j.credential !== 'string') {
-    const why = j.error === 'too-many-machines' ? t('登録できるマシンの上限です（アカウントの画面で外してください）', 'Too many machines registered (remove some on the account page)') : String(j.error ?? res.status)
+    const why = res.status === 429
+      ? t('ログインの試行が多すぎます。1分待ってから nyan login をやり直してください', 'Too many sign-in attempts. Wait one minute, then run nyan login again')
+      : j.error === 'login-unavailable'
+        ? t('ログインを一時的に利用できません。少し待ってからやり直してください', 'Sign-in is temporarily unavailable. Please try again shortly')
+        : j.error === 'too-many-machines' ? t('登録できるマシンの上限です（アカウントの画面で外してください）', 'Too many machines registered (remove some on the account page)') : String(j.error ?? res.status)
     console.error(t(`✗ ログインできませんでした: ${why}`, `✗ Sign-in failed: ${why}`))
     return 1
   }

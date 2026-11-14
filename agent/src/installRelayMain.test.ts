@@ -440,7 +440,7 @@ test('★★ main(): rejects unknown arguments (Q3)', (t) => {
     const r = run(bad)
     assert.notEqual(r.status, 0, `accepted ${bad}`)
     assert.match(r.out, /知らない引数/, r.out)
-    assert.match(r.out, new RegExp(bad.replace(/[-]/g, '\\-')), `does not say which argument is wrong: ${r.out}`)
+    assert.match(r.out, new RegExp(bad.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')), `does not say which argument is wrong: ${r.out}`)
     untouched()
   }
   // ★ Valid combinations pass (and write nothing)

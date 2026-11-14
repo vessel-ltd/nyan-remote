@@ -120,7 +120,7 @@ test('★★ instructions differ by service type (⚠️ never suggest systemctl
     const h = hints(kind)
     for (const v of Object.values(h)) assert.doesNotMatch(v, /systemctl|journalctl/, `${kind}: ${v}`)
   }
-  assert.match(hints('launchd').start, new RegExp(`kickstart -k gui/\\$\\(id -u\\)/${LAUNCHD_LABEL.replace(/\./g, '\\.')}`))
+  assert.match(hints('launchd').start, new RegExp(`kickstart -k gui/\\$\\(id -u\\)/${LAUNCHD_LABEL.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`))
   assert.match(hints('launchd').logs, /~\/Library\/Logs\/nyan-remote\/agent\.log/)
   assert.match(hints('none').start, /npm start/)
   assert.match(hints('systemd').start, /systemctl --user start nyan-remote/)

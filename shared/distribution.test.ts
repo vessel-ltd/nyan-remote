@@ -10,7 +10,9 @@
 
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { DEFAULT_RELAY_URL, DISTRIBUTION_ORIGIN, PWA_HEADERS, pwaHeadersFile } from './distribution.ts'
+import { createHash } from 'node:crypto'
+import { readFileSync } from 'node:fs'
+import { DEFAULT_RELAY_URL, DISTRIBUTION_ORIGIN, PWA_CSP, PWA_HEADERS, PWA_INLINE_SCRIPT_HASHES, pwaHeadersFile } from './distribution.ts'
 import { isRelayBase } from './relayFrame.ts'
 
 test('★★ both official entry points are known answers (⚠️ changing them disagrees with what is deployed)', () => {
@@ -56,10 +58,35 @@ test('★★ the PWA is on **a subdomain, not the apex** (⚠️⚠️ origin gr
 })
 
 test('★★ the PWA refuses to be framed, and Y\'s `_headers` carries exactly that table to every path (security audit 2026-09-28, F5)', () => {
-  assert.equal(PWA_HEADERS['content-security-policy'], "frame-ancestors 'none'")
+  assert.equal(PWA_HEADERS['content-security-policy'], PWA_CSP)
+  assert.match(PWA_CSP, /(^|; )frame-ancestors 'none'(;|$)/)
   assert.equal(PWA_HEADERS['x-frame-options'], 'DENY')
   const lines = pwaHeadersFile().split('\n')
   // ⚠️ Cloudflare applies the rules under a path line; the rules must be indented under `/*` (a stray rule is ignored)
   assert.equal(lines[0], '/*')
   for (const [k, v] of Object.entries(PWA_HEADERS)) assert.ok(lines.includes(`  ${k}: ${v}`), `${k} is not in _headers`)
+})
+
+/** The directives of the PWA's CSP as a map (name → sources) */
+const directives = (csp: string) =>
+  new Map(csp.split(';').map((d) => d.trim().split(/\s+/)).map(([k, ...v]) => [k!, v]))
+
+test('★★ the PWA CSP: scripts only from this origin and the hashed inline script (2026-11-14)', () => {
+  const d = directives(PWA_CSP)
+  assert.deepEqual(d.get('script-src'), ["'self'", ...PWA_INLINE_SCRIPT_HASHES])
+  assert.deepEqual(d.get('default-src'), ["'self'"])
+  for (const k of ['object-src', 'base-uri', 'frame-ancestors', 'frame-src', 'form-action']) assert.deepEqual(d.get(k), ["'none'"], k)
+  assert.doesNotMatch(PWA_CSP, /unsafe-inline|unsafe-eval|strict-dynamic|\*/, '⚠️⚠️ a loosened source')
+  // ⚠️ Self-hosted relays and tailnet agents live on any host (§1.95) ⇒ connect-src must not be narrowed to ours
+  assert.deepEqual(d.get('connect-src'), ["'self'", 'https:', 'wss:', 'ws:'])
+})
+
+test('★★ every inline script in web/index.html is in the CSP (editing the theme script changes its hash)', () => {
+  const html = readFileSync(new URL('../web/index.html', import.meta.url), 'utf8')
+  const inline = [...html.matchAll(/<script(\s[^>]*)?>([\s\S]*?)<\/script>/g)].filter((m) => !/\ssrc=/.test(m[1] ?? ''))
+  assert.ok(inline.length >= 1, 'the theme script is gone — drop its hash too')
+  const hashes = inline.map((m) => `'sha256-${createHash('sha256').update(m[2]!, 'utf8').digest('base64')}'`)
+  assert.deepEqual(hashes, [...PWA_INLINE_SCRIPT_HASHES], 'update PWA_INLINE_SCRIPT_HASHES in shared/distribution.ts')
+  // ⚠️ No inline event handlers or style attributes (CSP blocks them; they would silently do nothing)
+  assert.doesNotMatch(html, /\son[a-z]+=|\sstyle=/i)
 })

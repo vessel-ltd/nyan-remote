@@ -70,7 +70,7 @@ test('★★★ calls the existing steps as they are (never write a step in two 
   const pkg = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8'))
   for (const [name, script] of Object.entries(PASSTHROUGH)) {
     const npmName = name === 'keys' ? 'keys' : name
-    assert.ok(pkg.scripts[npmName]?.includes(script.replace('scripts/', 'scripts/')), `⚠️ npm run ${npmName} and ${script} disagree`)
+    assert.ok(pkg.scripts[npmName]?.includes(script), `⚠️ npm run ${npmName} and ${script} disagree`)
   }
   assert.equal(main(['nosuch']), 2)
 })

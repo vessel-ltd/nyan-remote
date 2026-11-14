@@ -99,12 +99,50 @@ export const GITHUB_CLIENT_ID = 'Ov23liR5gPIqJCohxOey'
  *    `frame-ancestors` works **only as a response header** (a `<meta>` CSP ignores it) ⇒ X (agent, `agent/src/static.ts`) sends
  *    these itself and Y (the distribution origin) gets them from the `_headers` file `scripts/site-stage.mjs` writes from this table.
  *    `X-Frame-Options` is for browsers without CSP level 2.
- * ⚠️ This is **not** a full CSP. A `script-src` must also cover the inline theme script in `web/index.html` and every relay a
- *    user may host (`connect-src`); it needs checking on real iPhones first (a wrong CSP blanks the app).
+ * ★★ Full CSP since 2026-11-14 (`PWA_CSP`). What it is for: if a bug ever lets text from a transcript become markup,
+ *    no script from anywhere but this origin runs (the transcript carries file contents and web pages).
  * ⚠️ Referrer: `web/index.html` already has `<meta name="referrer" content="no-referrer">`.
  */
+/**
+ * ★ The one inline script in `web/index.html` (applies the saved theme before the first paint).
+ * ⚠️⚠️ **Editing that script changes this hash** ⇒ `distribution.test.ts` recomputes it from the file and fails until it matches.
+ *    A stale hash does not blank the app (only the early theme is skipped; `theme.ts` applies it a moment later).
+ *    Vite copies the script byte for byte (checked against `web/dist/index.html` on 2026-11-14).
+ */
+export const PWA_INLINE_SCRIPT_HASHES = ["'sha256-ea0Chc02AmlLRDFJGzibrjWxbARJY4B5iZSE5N7KnuA='"] as const
+
+/**
+ * ★★ Content-Security-Policy for the PWA (2026-11-14). ⚠️ A wrong CSP blanks the app on every phone ⇒ check on a real
+ *    iPhone and Android after changing it.
+ * - `script-src`: this origin and the hashed inline script only (no `unsafe-inline` / `unsafe-eval`). Service workers
+ *   (`sw.js` / `push-sw.js` and their `importScripts('/push-core.js')`) are same-origin too.
+ * - ⚠️⚠️ `connect-src` stays wide: the PWA talks to **agents on any tailnet name** (`https:`) and to **relays anyone can host**
+ *   (`wss:`, and `ws:` for a local relay in development — pairing accepts both / `isRelayBase`). Narrowing it to our relay
+ *   would cut off self-hosters (§1.95). The protection here is `script-src`, not where data may go.
+ * - `style-src 'self'`: Preact writes styles through the CSSOM, which CSP does not block; there is no `<style>` or style
+ *   attribute in the markup.
+ * - `img-src` keeps `data:` / `blob:` for drawn QR codes and camera frames.
+ * - `frame-ancestors` works only as a header (a `<meta>` CSP ignores it) — the reason this is a header at all.
+ */
+export const PWA_CSP = [
+  "default-src 'self'",
+  `script-src 'self' ${PWA_INLINE_SCRIPT_HASHES.join(' ')}`,
+  "style-src 'self'",
+  "img-src 'self' data: blob:",
+  "font-src 'self'",
+  "connect-src 'self' https: wss: ws:",
+  "worker-src 'self'",
+  "manifest-src 'self'",
+  "media-src 'self' blob:",
+  "object-src 'none'",
+  "frame-src 'none'",
+  "base-uri 'none'",
+  "form-action 'none'",
+  "frame-ancestors 'none'",
+].join('; ')
+
 export const PWA_HEADERS: Readonly<Record<string, string>> = {
-  'content-security-policy': "frame-ancestors 'none'",
+  'content-security-policy': PWA_CSP,
   'x-frame-options': 'DENY',
   'x-content-type-options': 'nosniff',
 }

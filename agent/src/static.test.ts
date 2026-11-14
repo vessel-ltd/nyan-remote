@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { Ctx } from './router.ts'
 import { cacheControl, resolveUnderDist, serveStatic, staticHeaders } from './static.ts'
+import { PWA_CSP } from '../../shared/distribution.ts'
 
 // Can be judged independently of the real DIST (it is a pure function).
 const DIST = '/home/user/nyan-remote/web/dist'
@@ -110,7 +111,7 @@ test('cacheControl: only hashed build outputs are cached permanently', () => {
 test('★★ every file the agent serves refuses framing (security audit 2026-09-28, F5 / same table as Y)', () => {
   for (const [path, file] of [['/index.html', `${DIST}/index.html`], ['/sw.js', `${DIST}/sw.js`], ['/assets/a.js', `${DIST}/assets/a.js`]] as const) {
     const h = staticHeaders(path, file, 1)
-    assert.equal(h['content-security-policy'], "frame-ancestors 'none'", `${path}: can be framed`)
+    assert.equal(h['content-security-policy'], PWA_CSP, `${path}: can be framed`)
     assert.equal(h['x-frame-options'], 'DENY', `${path}: can be framed by old browsers`)
     assert.equal(h['x-content-type-options'], 'nosniff')
   }
@@ -140,13 +141,13 @@ test('★★ the responses serveStatic sends refuse framing: files, SPA routes a
     // ⚠️ No build yet ⇒ the placeholder page (it used to be the one HTML response without the headers)
     const empty = await served('/', dir)
     assert.equal(empty.status, 200)
-    assert.equal(empty.headers['content-security-policy'], "frame-ancestors 'none'", 'the placeholder can be framed')
+    assert.equal(empty.headers['content-security-policy'], PWA_CSP, 'the placeholder can be framed')
     assert.equal(empty.headers['x-frame-options'], 'DENY')
     writeFileSync(join(dir, 'index.html'), '<!doctype html>')
     for (const path of ['/', '/index.html', '/s/abc']) {
       const r = await served(path, dir)
       assert.equal(r.status, 200, path)
-      assert.equal(r.headers['content-security-policy'], "frame-ancestors 'none'", `${path}: can be framed`)
+      assert.equal(r.headers['content-security-policy'], PWA_CSP, `${path}: can be framed`)
       assert.equal(r.headers['x-frame-options'], 'DENY', path)
       assert.equal(r.headers['x-content-type-options'], 'nosniff', path)
     }

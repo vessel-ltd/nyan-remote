@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { createHmac } from 'node:crypto'
 import { test } from 'node:test'
 import { importLicensePublicKey, signLicense, verifyLicense, type License } from '../../shared/license.ts'
-import { AGENT_KEY_HEADER, ATTEMPT_SETTLE_MS, handle, MACHINE_FORGET_MS, MACHINE_REFUSE_MS, MAX_MACHINE_CREDENTIALS, sha256b64, type Deps } from './app.ts'
+import { AGENT_KEY_HEADER, ATTEMPT_SETTLE_MS, handle, loginBucket, MACHINE_FORGET_MS, MACHINE_REFUSE_MS, MAX_MACHINE_CREDENTIALS, sha256b64, type Deps } from './app.ts'
 import { makeSession, SESSION_COOKIE } from './session.ts'
 import { memoryStore, summarize } from './store.ts'
 import { StripeError } from './stripe.ts'
@@ -40,6 +40,7 @@ async function rig() {
   const relay: { down?: boolean } = {}
   const d: Deps = {
     store,
+    loginRateLimit: { limit: async () => ({ success: true }) },
     stripe: {
       createCustomer: async (_o, key) => {
         calls.push('customer')
@@ -102,7 +103,11 @@ async function rig() {
       prices: { 'usd-month': 'price_um', 'usd-year': 'price_uy' },
     },
   }
-  const call = (path: string, init: RequestInit = {}) => handle(new Request(`${ORIGIN}${path}`, init), d)
+  const call = (path: string, init: RequestInit = {}) => {
+    const headers = new Headers(init.headers)
+    headers.set('cf-connecting-ip', '192.0.2.1')
+    return handle(new Request(`${ORIGIN}${path}`, { ...init, headers }), d)
+  }
   return {
     d,
     store,
@@ -133,6 +138,68 @@ async function login(r: Awaited<ReturnType<typeof rig>>, token = 'gho_good', age
 
 const license = (r: Awaited<ReturnType<typeof rig>>, cred: string, key: string | null = KEY) =>
   r.call('/api/license', { headers: { authorization: `Bearer ${cred}`, ...(key ? { [AGENT_KEY_HEADER]: key } : {}) } })
+
+test('login throttling stops rotated tokens and malformed bodies before GitHub or storage', async () => {
+  const r = await rig()
+  const buckets: string[] = []
+  r.d.loginRateLimit.limit = async ({ key }) => {
+    buckets.push(key)
+    return { success: false }
+  }
+  r.d.github.checkToken = async () => assert.fail('throttled login reached GitHub')
+  for (const body of ['{"githubToken":"first"}', '{"githubToken":"second"}', '{']) {
+    const res = await r.call('/api/login', { method: 'POST', body, headers: { 'x-forwarded-for': crypto.randomUUID() } })
+    assert.equal(res.status, 429)
+    assert.equal(res.headers.get('retry-after'), '60')
+    assert.deepEqual(await res.json(), { error: 'rate-limited' })
+  }
+  assert.deepEqual(buckets, Array(3).fill('cli-login:192.0.2.1'))
+  assert.equal(r.store.machines.size, 0)
+})
+
+test('login limit failures and missing trusted IP fail closed without affecting other routes', async () => {
+  const r = await rig()
+  r.d.github.checkToken = async () => assert.fail('unavailable limiter reached GitHub')
+  r.d.loginRateLimit.limit = async () => { throw new Error('unavailable') }
+  assert.equal((await login(r)).res.status, 503)
+  assert.equal((await r.call('/')).status, 200)
+  assert.equal((await r.call('/api/license')).status, 401)
+  const req = new Request(`${ORIGIN}/api/login`, {
+    method: 'POST', headers: { 'x-forwarded-for': '192.0.2.2' }, body: '{"githubToken":"gho_good"}',
+  })
+  assert.equal((await handle(req, r.d)).status, 503)
+  assert.equal(r.store.machines.size, 0)
+})
+
+test('login buckets separate trusted client IPs and successful attempts still consume a check', async () => {
+  const r = await rig()
+  const buckets: string[] = []
+  r.d.loginRateLimit.limit = async ({ key }) => { buckets.push(key); return { success: true } }
+  assert.equal((await login(r)).res.status, 200)
+  const res = await handle(new Request(`${ORIGIN}/api/login`, {
+    method: 'POST', headers: { 'cf-connecting-ip': '192.0.2.2' }, body: '{"githubToken":"gho_bad"}',
+  }), r.d)
+  assert.equal(res.status, 401)
+  assert.deepEqual(buckets, ['cli-login:192.0.2.1', 'cli-login:192.0.2.2'])
+})
+
+test('login buckets group IPv6 by /64 (rotating addresses inside one line does not bypass the limit)', async () => {
+  const same = ['2001:db8:1:2::1', '2001:db8:1:2:ffff:ffff:ffff:ffff', '2001:0DB8:0001:0002:0:0:0:abcd', '2001:db8:1:2::ffff:192.0.2.1', '2001:db8:1:2::1%eth0']
+  for (const ip of same) assert.equal(loginBucket(ip), '2001:db8:1:2::/64', ip)
+  assert.equal(loginBucket('2001:db8:1:3::1'), '2001:db8:1:3::/64')
+  assert.equal(loginBucket('::1'), '0:0:0:0::/64')
+  assert.equal(loginBucket('2001:db8::'), '2001:db8:0:0::/64')
+  assert.equal(loginBucket('1:2:3:4:5:6:7::'), '1:2:3:4::/64')
+  assert.equal(loginBucket('192.0.2.1'), '192.0.2.1', 'IPv4 stays per address')
+  for (const bad of ['1::2::3', '1:2:3:4:5:6:7:8:9', 'xyz::1', '1:2:3:4:5:6:7:8::']) assert.equal(loginBucket(bad), bad, bad)
+  const r = await rig()
+  const buckets: string[] = []
+  r.d.loginRateLimit.limit = async ({ key }) => { buckets.push(key); return { success: true } }
+  for (const ip of ['2001:db8:1:2::a', '2001:db8:1:2::b']) {
+    await handle(new Request(`${ORIGIN}/api/login`, { method: 'POST', headers: { 'cf-connecting-ip': ip }, body: '{"githubToken":"gho_bad"}' }), r.d)
+  }
+  assert.deepEqual(buckets, ['cli-login:2001:db8:1:2::/64', 'cli-login:2001:db8:1:2::/64'])
+})
 
 test('★★ nyan login → passphrase → ticket (Free, signature verifies)', async () => {
   const r = await rig()

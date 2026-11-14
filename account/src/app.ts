@@ -42,6 +42,8 @@ export interface Deps {
   store: Store
   stripe: StripeApi
   github: GithubApi
+  /** Cloudflare's approximate per-location limit, before any GitHub request. */
+  loginRateLimit: { limit(options: { key: string }): Promise<{ success: boolean }> }
   signLicense(l: License): Promise<string>
   /**
    * ★★ Tell relay "this passphrase (`mid`) was removed" (record in the ledger → remove the room ticket → free the slot).
@@ -394,6 +396,39 @@ async function upsertAccount(d: Deps, gh: { id: number; login: string }): Promis
   return row
 }
 
+/**
+ * ★ Rate-limit bucket for a client IP (2026-11-14).
+ * ⚠️ IPv6 is bucketed by its /64: one home or VPS line usually holds a whole /64, so a per-address bucket
+ *    could be bypassed by rotating 2^64 addresses. IPv4 stays per address.
+ * ⚠️ Anything that does not parse as IPv6 keeps the raw value (still limited, never widened to a shared bucket).
+ */
+export function loginBucket(ip: string): string {
+  if (!ip.includes(':')) return ip
+  const addr = ip.split('%')[0]!.toLowerCase()
+  const halves = addr.split('::')
+  if (halves.length > 2) return ip
+  const groups = (s: string): string[] | undefined => {
+    if (s === '') return []
+    const out: string[] = []
+    const parts = s.split(':')
+    for (let i = 0; i < parts.length; i++) {
+      const p = parts[i]!
+      // An embedded IPv4 tail (e.g. ::ffff:192.0.2.1) counts as two groups; it never reaches the first four here
+      if (i === parts.length - 1 && /^\d{1,3}(\.\d{1,3}){3}$/.test(p)) out.push('0', '0')
+      else if (/^[0-9a-f]{1,4}$/.test(p)) out.push(p)
+      else return undefined
+    }
+    return out
+  }
+  const head = groups(halves[0]!)
+  const tail = halves.length === 2 ? groups(halves[1]!) : []
+  if (!head || !tail) return ip
+  const gap = 8 - head.length - tail.length
+  if (halves.length === 2 ? gap < 1 : gap !== 0) return ip
+  const full = [...head, ...Array<string>(gap).fill('0'), ...tail]
+  return `${full.slice(0, 4).map((g) => parseInt(g, 16).toString(16)).join(':')}::/64`
+}
+
 export async function handle(req: Request, d: Deps): Promise<Response> {
   const url = new URL(req.url)
   const path = url.pathname
@@ -401,6 +436,21 @@ export async function handle(req: Request, d: Deps): Promise<Response> {
   try {
     // ── CLI and agent ───────────────────────────────────────────────────────
     if (method === 'POST' && path === '/api/login') {
+      // Cloudflare overwrites this header at ingress. Never trust X-Forwarded-For
+      // or a caller-selected token as the bucket (rotating tokens would bypass it).
+      const ip = req.headers.get('cf-connecting-ip')
+      if (!ip) return json({ error: 'login-unavailable' }, 503)
+      let allowed: boolean
+      try {
+        allowed = (await d.loginRateLimit.limit({ key: `cli-login:${loginBucket(ip)}` })).success
+      } catch {
+        return json({ error: 'login-unavailable' }, 503)
+      }
+      if (!allowed) {
+        const res = json({ error: 'rate-limited' }, 429)
+        res.headers.set('retry-after', '60')
+        return res
+      }
       const body = await readJson(req)
       const token = typeof body?.['githubToken'] === 'string' ? body['githubToken'] : ''
       if (!token || token.length > 512) return json({ error: 'bad-request' }, 400)

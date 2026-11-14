@@ -90,7 +90,7 @@ function matches(glob: string, path: string): boolean {
   const re = new RegExp(
     `^${glob
       .split('/')
-      .map((seg) => (seg === '**' ? '(?:.+)' : seg.replace(/\*/g, '[^/]*').replace(/\./g, '\\.')))
+      .map((seg) => (seg === '**' ? '(?:.+)' : seg.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '[^/]*')))
       .join('/')
       .replace('/(?:.+)/', '(?:/.+)?/')}$`,
   )

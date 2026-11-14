@@ -10,6 +10,9 @@
   "workers_dev": false,
   "routes": [{ "pattern": "account.nyan-remote.app", "custom_domain": true }],
   "observability": { "enabled": true },
+  // Unauthenticated CLI login: approximate per-IP, per-location allowance.
+  // Separate namespace/key prefix from other Workers; not a global GitHub quota.
+  "ratelimits": [{ "name": "LOGIN_RATE_LIMITER", "namespace_id": "2026111401", "simple": { "limit": 30, "period": 60 } }],
   "vars": {
     "ORIGIN": "https://account.nyan-remote.app",
     // ★ Values that may be public (Client ID)

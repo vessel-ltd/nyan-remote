@@ -222,7 +222,7 @@ function allBlocks(selector: string): string[] {
   // ⚠️ Counting blocks from the outside **breaks with `@media` nesting** (in practice,
   //    a mutation adding the same selector inside `@media` stayed green).
   //    ⇒ **Pick up every `{...}` right after the selector** (hits even when nested)
-  const re = new RegExp(`${selector.replace(/\./g, '\\.')}(?![\\w-])[^{}]*\\{([^}]*)\\}`, 'g')
+  const re = new RegExp(`${selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![\\w-])[^{}]*\\{([^}]*)\\}`, 'g')
   return [...CSS.matchAll(re)].map((m) => m[1]!.replace(/\/\*[\s\S]*?\*\//g, ''))
 }
 

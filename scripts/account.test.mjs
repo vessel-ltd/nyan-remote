@@ -153,3 +153,38 @@ test('★★ while logout checks and removes, login cannot write (lock / codex r
     rmSync(dir, { recursive: true, force: true })
   }
 })
+
+test('login: a throttled or unavailable sign-in tells the user what to do (not a bare status code)', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'nyan-login-'))
+  const prev = process.env.NYAN_REMOTE_STATE_DIR
+  process.env.NYAN_REMOTE_STATE_DIR = dir
+  writeFileSync(join(dir, 'hook-token'), 'hooktok\n')
+  try {
+    for (const [status, error, want] of [[429, 'rate-limited', /Wait one minute/], [503, 'login-unavailable', /temporarily unavailable/]]) {
+      const { f } = fakeFetch((url) => {
+        if (url.includes('/device/code')) return { device_code: 'dc', user_code: 'X', interval: 5 }
+        if (url.includes('/access_token')) return { access_token: 'gho_x' }
+        if (url.includes('/health')) return { agentPublicKey: 'K'.repeat(87) }
+        if (url.endsWith('/api/login')) return new Response(JSON.stringify({ error }), { status })
+        return new Response('?', { status: 404 })
+      })
+      const errs = []
+      const err = console.error
+      const log = console.log
+      console.error = (...a) => errs.push(a.join(' '))
+      console.log = () => {}
+      try {
+        assert.equal(await login(f, async () => {}, () => {}), 1)
+      } finally {
+        console.error = err
+        console.log = log
+      }
+      assert.match(errs.join('\n'), want)
+      assert.equal(existsSync(join(dir, 'account.json')), false)
+    }
+  } finally {
+    if (prev === undefined) delete process.env.NYAN_REMOTE_STATE_DIR
+    else process.env.NYAN_REMOTE_STATE_DIR = prev
+    rmSync(dir, { recursive: true, force: true })
+  }
+})

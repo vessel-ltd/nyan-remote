@@ -16,6 +16,7 @@ interface RelayAccounts {
 
 export interface Env {
   DB: D1Database
+  LOGIN_RATE_LIMITER: RateLimit
   /** ★ relay's Account DO (`script_name: nyan-relay`). A removed machine is removed from the ledger too */
   ACCOUNTS: DurableObjectNamespace<RelayAccounts & Rpc.DurableObjectBranded>
   ORIGIN: string
@@ -279,6 +280,7 @@ function deps(env: Env): Deps {
   void PRICE_CHOICES
   return {
     store: d1Store(env.DB),
+    loginRateLimit: env.LOGIN_RATE_LIMITER,
     stripe: stripeApi(env.STRIPE_SECRET_KEY),
     github: {
       // ★★ GitHub's "Check a token": asked with our client id / secret ⇒ tokens of other apps give 404 (codex round 26, high #1)
