@@ -1,6 +1,6 @@
 # nyan-remote
 
-**Keep running `claude`. Use it from your phone.**
+**Keep running `claude` and `codex`. Use them from your phone.**
 
 <p align="center">
   <a href="https://www.youtube.com/watch?v=Qup2GjWCeoo"><img src=".github/readme/teaser.gif" width="560" alt="A session stuck on a permission prompt; approving it from the phone; every account and machine in one list"></a>
@@ -8,8 +8,8 @@
   <a href="https://www.youtube.com/watch?v=Qup2GjWCeoo">▶ Watch the full video (1 min)</a>
 </p>
 
-The sessions you already started — on every machine, in every account — in one list on your
-phone. No tmux, no SSH, no relaunching under another command. `nyan-remote` runs one small agent
+The Claude Code and Codex sessions you already started — on every machine, in every account — in one
+list on your phone. No tmux, no SSH, no relaunching under another command. `nyan-remote` runs one small agent
 on each PC and gives you a phone web app with push notifications when a session finishes, fails,
 or needs your approval, and lets you answer, reply, or stop it from there.
 
@@ -34,6 +34,9 @@ nyan-remote makes those moments reach your phone, and lets you answer:
 - **Approve or deny** permission prompts from your phone — including ones that would otherwise
   be auto-denied for background agents.
 - **Reply, stop, or run a slash command** in a running session.
+- **Codex too** (experimental): your OpenAI Codex CLI sessions in the same list — state, notifications, command
+  approvals, sending and stopping. On by default where Codex runs; read
+  [what it changes on your PC](#codex-sessions-experimental) and how to turn it off.
 
 ---
 
@@ -60,12 +63,12 @@ nyan-remote is for the cases they leave out:
 | Notified when a turn ends | when Claude decides | ✓ | every turn end and failure |
 | Auto-approve for a few hours | Claude Code's auto mode (Claude judges each call) | not documented | ✓ (3 h or 24 h, from the phone) |
 | Send images and files | ✓ | not documented | not yet ([roadmap](#roadmap)) |
-| Agents other than Claude Code | — | 13 agents | Claude Code only |
+| Agents other than Claude Code | — | 13 agents | Codex (experimental) |
 | Phone app | Claude app | iOS / Android apps | web app (add to Home Screen) |
 | Self-host the relay | — | ✓ | ✓ (your Cloudflare account, or Tailscale) |
 | Price | included in your plan | free | nyan-remote relay: free for 1 machine, Plus $2.99/month or $24/year; Tailscale or your own relay: free |
 
-<sub>From their public docs as of 2026-09-29. "Not documented" means we could not find it in their docs, not that it is
+<sub>From their public docs as of 2026-09-29 (our column as of 2026-11-15). "Not documented" means we could not find it in their docs, not that it is
 missing. If something here is wrong or out of date, please [open an issue](https://github.com/vessel-ltd/nyan-remote/issues).</sub>
 
 ---
@@ -343,13 +346,12 @@ How it works:
 
 ## Roadmap
 
-- **Codex** — OpenAI Codex sessions in the same view. Viewing, command approvals, sending and stopping are in (on by default, see [Codex sessions](#codex-sessions-experimental)); the other kinds of approval and closed sessions as history come next.
+- **Codex, more of it** — closed Codex sessions as history, and the other kinds of Codex approval (file changes, network access, questions).
 - **Phone apps** — native apps for iPhone and Android.
 - **Desktop** — a desktop layout, installable on Windows, macOS and Linux.
 - **Windows without WSL** — run the agent on Windows directly.
 - **Homebrew** — install and update with Homebrew on macOS.
 - **Voice** — talk to a session and hear its replies read aloud, hands-free.
-- **Images and files** — send images and files from your phone to a session: screenshots, photos, logs.
 - **Images and files** — send images and files from your phone to a session: screenshots, photos, logs.
 
 ---
@@ -380,7 +382,8 @@ why it exists.
 
 MIT © Vessel Ltd. (Vessel合同会社). See [LICENSE](LICENSE).
 
-nyan-remote is not an official Anthropic product. Claude and Claude Code are trademarks of Anthropic.
+nyan-remote is not an official product of Anthropic or OpenAI. Claude and Claude Code are trademarks of Anthropic.
+OpenAI and Codex are trademarks of OpenAI.
 
 The cat sprites in `web/public/cats/` and `web/public/manul-cat.svg` are original artwork made for
 this project and are covered by the same license.

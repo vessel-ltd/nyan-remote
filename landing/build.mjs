@@ -10,6 +10,7 @@ import { mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { PLAN_LIMITS } from '../shared/license.ts'
+import { ROADMAP } from './roadmap.mjs'
 
 const OUT = join(dirname(fileURLToPath(import.meta.url)), 'public')
 
@@ -19,6 +20,10 @@ const COMPANY = {
   en: { name: 'Vessel Ltd.', manager: 'Kosuke Osawa', address: '5-3-10 Koyama, Shinagawa-ku, Tokyo 142-0062, Japan' },
 }
 const UPDATED = '2026-09-25'
+/** The privacy policy alone was updated later (Codex sessions, 2026-11-15) */
+const PRIVACY_UPDATED = '2026-11-15'
+/** The README's Codex section (what turning it on changes, and how to turn it off) */
+const README_CODEX = 'https://github.com/vessel-ltd/nyan-remote#codex-sessions-experimental'
 const APP = 'https://app.nyan-remote.app'
 const ACCOUNT = 'https://account.nyan-remote.app'
 const REPO = 'https://github.com/vessel-ltd/nyan-remote'
@@ -48,7 +53,7 @@ function ogTags(url, title, description, lang) {
     `<meta property="og:image" content="${SITE}/og.png">`,
     `<meta property="og:image:width" content="1280">`,
     `<meta property="og:image:height" content="640">`,
-    `<meta property="og:image:alt" content="nyan-remote — Claude Code sessions on your phone">`,
+    `<meta property="og:image:alt" content="nyan-remote — Claude Code and Codex sessions on your phone">`,
     `<meta property="og:locale" content="${lang === 'ja' ? 'ja_JP' : 'en_US'}">`,
     `<meta name="twitter:card" content="summary_large_image">`,
   ].join('\n')
@@ -61,8 +66,8 @@ function page(lang, path, title, body) {
   return `<!doctype html>
 <html lang="${lang}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>${esc(title)}</title>
-<meta name="description" content="${esc(t('いつもの claude のまま、全部のマシンと全部のアカウントの Claude Code を、ねこと一緒にスマホで。', 'Your Claude Code sessions on every machine and every account, on your phone — keep starting claude as usual.'))}">
-${ogTags(`${SITE}${path}`, title, t('いつもの claude のまま、全部のマシンと全部のアカウントの Claude Code を、ねこと一緒にスマホで。', 'Your Claude Code sessions on every machine and every account, on your phone — keep starting claude as usual.'), lang)}
+<meta name="description" content="${esc(t('いつもの claude と codex のまま、全部のマシンと全部のアカウントのセッションを、ねこと一緒にスマホで。', 'Your Claude Code and Codex sessions on every machine and every account, on your phone — keep starting claude and codex as usual.'))}">
+${ogTags(`${SITE}${path}`, title, t('いつもの claude と codex のまま、全部のマシンと全部のアカウントのセッションを、ねこと一緒にスマホで。', 'Your Claude Code and Codex sessions on every machine and every account, on your phone — keep starting claude and codex as usual.'), lang)}
 <link rel="icon" href="/favicon.png"><link rel="stylesheet" href="/style.css">
 </head><body>
 <header class="top"><a href="/"><img src="/icon.png" alt=""></a><a class="grow" href="/"><strong>nyan-remote</strong></a><a class="navlink" href="${REPO}">GitHub</a><a class="btn ghost" href="${ACCOUNT}">Account</a></header>
@@ -82,11 +87,11 @@ function home(lang) {
   return page(
     lang,
     lang === 'ja' ? '/ja/' : '/',
-    t('nyan-remote — Claude Code をスマホで', 'nyan-remote — Claude Code on your phone'),
+    t('nyan-remote — Claude Code と Codex をスマホで', 'nyan-remote — Claude Code and Codex on your phone'),
     `<section class="hero">
 <div class="text">
-<h1>${t('いつもの claude のまま、<br>スマホから。', 'Keep running claude.<br>Use it from your phone.')}</h1>
-<p class="lead">${t('もう始めてあるセッションを、全部のアカウント・全部のマシンから、1つの画面に。', 'The sessions you already started, from every account and every machine, in one place.')}</p>
+<h1>${t('いつもの claude と codex のまま、<br>スマホから。', 'Keep running claude and codex.<br>Use them from your phone.')}</h1>
+<p class="lead">${t('もう始めてある Claude Code と Codex のセッションを、全部のアカウント・全部のマシンから、1つの画面に。', 'The Claude Code and Codex sessions you already started, from every account and every machine, in one place.')}</p>
 <p class="chips"><span>${t('tmux なし', 'No tmux')}</span><span>${t('SSH なし', 'No SSH')}</span><span>${t('起動し直しなし', 'No relaunching')}</span></p>
 <p><a class="btn" href="#install">${t('はじめる', 'Get started')}</a> <a class="btn ghost" href="#pricing">${t('料金', 'Pricing')}</a></p>
 <p class="small dim">${t(`無料から始められます・<a href="${REPO}">オープンソース（MIT）</a>・E2E で暗号化`, `Free to start · <a href="${REPO}">Open source (MIT)</a> · End-to-end encrypted`)}</p>
@@ -97,7 +102,7 @@ function home(lang) {
 <h2>${t('しくみ', 'How it works')}</h2>
 <ol class="steps">
 <li><strong>${t('PC に入れる', 'Install on your PC')}</strong><span>${t('1行のコマンドで。WSL・macOS・Linux。', 'One command. WSL, macOS or Linux.')}</span></li>
-<li><strong>${t('いつもどおり <code>claude</code>', 'Use <code>claude</code> as usual')}</strong><span>${t('起動のしかたも、アカウントの分け方もそのまま。', 'Same command, same accounts, nothing to relaunch.')}</span></li>
+<li><strong>${t('いつもどおり <code>claude</code> と <code>codex</code>', 'Use <code>claude</code> and <code>codex</code> as usual')}</strong><span>${t('起動のしかたも、アカウントの分け方もそのまま。', 'Same command, same accounts, nothing to relaunch.')}</span></li>
 <li><strong>${t('スマホを開く', 'Open your phone')}</strong><span>${t('リンクを開いてホーム画面に追加するだけ（ストアは要りません）。始めたセッションが全部並び、承認も返事もそこから。', 'Open a link and add it to your home screen, no app store. The sessions you start are all there, ready for you to answer and reply.')}</span></li>
 </ol>
 
@@ -117,11 +122,21 @@ function home(lang) {
 <li><strong>${t('承認と質問', 'Approvals and questions')}</strong> ${t('許可も、選択肢への回答も、その場で。', 'Allow, deny, or pick an answer right there.')}</li>
 <li><strong>${t('返事と停止', 'Reply and stop')}</strong> ${t('動いているセッションに打ち込んだり、止めたり。', 'Type into a running session, or stop it.')}</li>
 <li><strong>${t('条件つきの自動承認', 'Auto-approve, on your terms')}</strong> ${t('1つのセッションを3時間か24時間だけ。オンの間はずっと見えていて、1タップで止まります。', 'One session, for 3 or 24 hours. Always visible, one tap to turn off.')}</li>
+<li><strong>Codex <span class="badge">${t('実験的', 'Experimental')}</span></strong> ${t('Codex のセッションも同じ一覧に。状態・会話・通知・コマンドの承認・送信・停止。<a href="#codex">PC で何が変わるか</a>。', 'Codex sessions in the same list: state, conversation, notifications, command approvals, sending and stopping. <a href="#codex">What it changes on your PC</a>.')}</li>
 <li><strong>${t('ストアは要らない', 'No app store')}</strong> ${t('ホーム画面に追加する Web アプリ。', 'A web app you add to your home screen.')}</li>
 <li><strong>${t('ねこ', 'A cat')}</strong> ${t('7匹から選べて、Claude が動いている間だけ走ります。', 'Pick one of seven. It runs while Claude is working.')}</li>
 </ul>
 </div>
 </div>
+
+<h2 id="codex">Codex <span class="badge">${t('実験的', 'Experimental')}</span></h2>
+<p>${t('OpenAI Codex CLI のセッションも同じ一覧に出ます。Codex が動いている PC では<strong>既定でオン</strong>です（Codex の無い PC では何も起きません）。オンにすると PC で次のことが変わります:', 'OpenAI Codex CLI sessions show up in the same list. This is <strong>on by default</strong> on every PC where Codex runs (nothing happens on a PC without Codex). Here is what it changes on your PC:')}</p>
+<ol>
+<li>${t('<strong>Codex の通信に <code>nyan-remote</code> の名前が載ります。</strong> agent は Codex の常駐サーバー（daemon）に名乗って繋ぎ、Codex は最後に繋いだ名前を OpenAI に送る User-Agent の末尾に付けます（あなた自身のアカウントの通信です）。', '<strong>Your Codex requests carry the name <code>nyan-remote</code>.</strong> The agent connects to the Codex background server (its daemon) and says who it is; Codex puts that name at the end of the User-Agent it sends to OpenAI, on your own account.')}</li>
+<li>${t('<strong>agent が先に繋ぐと、Codex の機能が少し外れることがあります。</strong> daemon が起きた直後に agent が先に繋ぐと、スキルが使う MCP の扱いが外れます。数秒待ってから繋ぐので起きにくくしてありますが、防ぎきれません。', '<strong>If the agent connects first, some Codex features can be lost until the daemon restarts.</strong> When a daemon has just started and the agent talks to it before your <code>codex</code> does, the MCP dependencies that skills rely on are not handled. The agent waits a few seconds first, which makes this unlikely but cannot rule it out.')}</li>
+<li>${t('<strong>Codex はこの daemon を「実験的」としています。</strong> codex-cli 0.169.0（Linux）で作って確かめました。Codex の更新で動かなくなることがあります。', '<strong>Codex calls its daemon experimental.</strong> Built and measured against codex-cli 0.169.0 on Linux; a Codex update can break this until we catch up.')}</li>
+</ol>
+<p>${t(`オフにするには <code>~/.nyan-remote/config.json</code> に <code>"codex": { "enabled": false }</code> を書いて agent を再起動します。<code>nyan status</code> でいまの様子が見られます。詳しくは <a href="${README_CODEX}">README</a>。`, `To turn it off, put <code>"codex": { "enabled": false }</code> in <code>~/.nyan-remote/config.json</code> and restart the agent. <code>nyan status</code> shows whether it is on. Details are in the <a href="${README_CODEX}">README</a>.`)}</p>
 
 <h2 id="install">${t('はじめかた', 'Get started')}</h2>
 <p>${t('PC（WSL / macOS / Linux・Node 24）で:', 'On your PC (WSL / macOS / Linux, Node 24):')}</p>
@@ -140,16 +155,9 @@ function home(lang) {
 <p class="dim">${t('価格は税込み・米ドルです（日本円のカードでは、カード会社の換算レートが適用されます）。いつでも解約でき、次の更新日から請求されません。', 'Prices are in US dollars and include tax. Cancel anytime; you will not be charged from the next renewal.')}</p>
 <h2 id="soon">${t('これから', 'Roadmap')}</h2>
 <ul class="roadmap">
-<li><strong>Codex</strong> ${t('OpenAI Codex のセッションも同じ画面に。', 'OpenAI Codex sessions in the same view.')}</li>
-<li><strong>${t('スマホのアプリ', 'Phone apps')}</strong> ${t('iPhone と Android のネイティブアプリ。', 'Native apps for iPhone and Android.')}</li>
-<li><strong>${t('デスクトップ', 'Desktop')}</strong> ${t('PC 向けの画面。Windows・macOS・Linux にインストールできる形で。', 'A desktop layout, installable on Windows, macOS and Linux.')}</li>
-<li><strong>${t('WSL なしの Windows', 'Windows without WSL')}</strong> ${t('Windows の上で直接 agent を動かす。', 'Run the agent on Windows directly.')}</li>
-<li><strong>Homebrew</strong> ${t('macOS で Homebrew から入れて更新。', 'Install and update with Homebrew on macOS.')}</li>
-<li><strong>${t('音声', 'Voice')}</strong> ${t('セッションに話しかけて、返事を読み上げてもらう（手を使わずに）。', 'Talk to a session and hear its replies read aloud, hands-free.')}</li>
-<li><strong>${t('画像とファイル', 'Images and files')}</strong> ${t('スマホから画像やファイルをセッションに渡す（スクリーンショット・写真・ログなど）。', 'Send images and files from your phone to a session: screenshots, photos, logs.')}</li>
-<li><strong>${t('画像とファイル', 'Images and files')}</strong> ${t('スマホから画像やファイルをセッションに渡す（スクリーンショット・写真・ログなど）。', 'Send images and files from your phone to a session: screenshots, photos, logs.')}</li>
+${ROADMAP.map((r) => `<li><strong>${esc(r.title)}</strong> ${esc(r.text.charAt(0).toUpperCase() + r.text.slice(1))}</li>`).join('\n')}
 </ul>
-<p class="dim">${t('nyan-remote は Anthropic の公式製品ではありません。Claude と Claude Code は Anthropic の商標です。', 'nyan-remote is not an official Anthropic product. Claude and Claude Code are trademarks of Anthropic.')}</p>`,
+<p class="dim">${t('nyan-remote は Anthropic と OpenAI のどちらの公式製品でもありません。Claude と Claude Code は Anthropic の商標です。OpenAI と Codex は OpenAI の商標です。', 'nyan-remote is not an official product of Anthropic or OpenAI. Claude and Claude Code are trademarks of Anthropic. OpenAI and Codex are trademarks of OpenAI.')}</p>`,
   )
 }
 
@@ -227,7 +235,8 @@ function privacy(lang) {
     `<h1>${t('プライバシーポリシー', 'Privacy Policy')}</h1>
 <p>${t(`${c}（以下「当社」）は、nyan-remote のホスティングサービスで取り扱う情報を、次のとおり扱います。`, `This policy explains how ${c} ("we") handles information in the nyan-remote hosted services.`)}</p>
 ${s(t('1. 取り扱わないもの', '1. What we do not handle'),
-  t('Claude Code の会話・プロンプト・コード・ファイルの中身は、スマホと PC の間で端から端まで暗号化されており、当社の relay を通っても当社には読めません。当社はそれを保存しません。', 'Your Claude Code conversations, prompts, code and file contents are end-to-end encrypted between your phone and PC. They pass through our relay but we cannot read them, and we do not store them.'))}
+  t('Claude Code と Codex の会話・プロンプト・コード・ファイルの中身は、スマホと PC の間で端から端まで暗号化されており、当社の relay を通っても当社には読めません。当社はそれを保存しません。', 'Your Claude Code and Codex conversations, prompts, code and file contents are end-to-end encrypted between your phone and PC. They pass through our relay but we cannot read them, and we do not store them.'),
+  t('PC の agent は Codex の常駐サーバーに PC の中で繋ぎます。その接続から当社に届くものはありません（Codex が OpenAI に送る通信に <code>nyan-remote</code> の名前が載ることは、<a href="/#codex">トップページ</a>に書いてあります）。', 'The agent on your PC connects to the Codex background server on that PC. Nothing from that connection reaches us. (That your Codex requests to OpenAI carry the name <code>nyan-remote</code> is explained on the <a href="/#codex">home page</a>.)'))}
 <h2>${t('2. 取り扱う情報', '2. Information we handle')}</h2>
 ${li([
   t('GitHub のアカウントの id と表示名（ログインのため）。GitHub のトークンは確認に一度使うだけで保存しません。パスワードは受け取りません', 'Your GitHub account id and username (for sign-in). GitHub tokens are used once for verification and not stored. We do not receive your password'),
@@ -241,7 +250,7 @@ ${s(t('4. 削除', '4. Deletion'),
   t('<code>nyan logout</code> またはアカウントの画面でマシンを外すと、そのマシンの情報（合言葉のハッシュを含む）は削除されます。90日使われなかったマシンの情報も自動で削除します。relay の台数の記録は、マシンを外したときか、30日使われなかったときに消えます。アカウント全体の削除をご希望の場合はお問い合わせください。', 'Removing a machine with <code>nyan logout</code> or on the account page deletes its information (including the credential hash). Machines unused for 90 days are also deleted automatically. The relay’s machine count forgets a machine when you remove it or after 30 days unused. To delete your whole account, please contact us.'))}
 ${s(t('5. お問い合わせ', '5. Contact'),
   t(`${c}（アカウントの画面のお問い合わせフォーム）`, `${c} — use the contact form on your <a href="${SUPPORT_FORM}">account page</a>.`))}
-<p class="dim">${t('最終更新', 'Last updated')}: ${UPDATED}</p>`,
+<p class="dim">${t('最終更新', 'Last updated')}: ${PRIVACY_UPDATED}</p>`,
   )
 }
 

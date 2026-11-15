@@ -78,3 +78,6 @@ footer a{color:inherit}
 /* ★ Roadmap: a short list, deliberately lighter than the features */
 .roadmap{padding-left:1.2em;color:var(--dim)}
 .roadmap strong{color:var(--fg)}
+/* ★ "Experimental" next to a feature name (Codex / 2026-11-15) */
+.badge{display:inline-block;vertical-align:middle;margin-left:6px;padding:1px 9px;border-radius:999px;border:1px solid var(--line);background:var(--chip);color:var(--dim);font-size:.75rem;font-weight:600;letter-spacing:.02em}
+h2 .badge{font-size:.8rem}
