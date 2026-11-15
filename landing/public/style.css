@@ -81,3 +81,7 @@ footer a{color:inherit}
 /* ★ "Experimental" next to a feature name (Codex / 2026-11-15) */
 .badge{display:inline-block;vertical-align:middle;margin-left:6px;padding:1px 9px;border-radius:999px;border:1px solid var(--line);background:var(--chip);color:var(--dim);font-size:.75rem;font-weight:600;letter-spacing:.02em}
 h2 .badge{font-size:.8rem}
+/* ★ The headline is two sentences: one line each when they fit, and when they do not, the break is balanced inside
+   the sentence (never one word alone on a line) / 2026-11-15. A little smaller than other h1s so each fits beside the phone */
+.hero h1{font-size:clamp(1.75rem,3vw,2.1rem)}
+.hero h1 span{display:block;text-wrap:balance}

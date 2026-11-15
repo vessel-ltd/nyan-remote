@@ -90,7 +90,7 @@ function home(lang) {
     t('nyan-remote — Claude Code と Codex をスマホで', 'nyan-remote — Claude Code and Codex on your phone'),
     `<section class="hero">
 <div class="text">
-<h1>${t('いつもの claude と codex のまま、<br>スマホから。', 'Keep running claude and codex.<br>Use them from your phone.')}</h1>
+<h1>${t('<span>いつもの claude と codex のまま、</span><span>スマホから。</span>', '<span>Keep running claude&nbsp;and&nbsp;codex.</span> <span>Use them from your phone.</span>')}</h1>
 <p class="lead">${t('もう始めてある Claude Code と Codex のセッションを、全部のアカウント・全部のマシンから、1つの画面に。', 'The Claude Code and Codex sessions you already started, from every account and every machine, in one place.')}</p>
 <p class="chips"><span>${t('tmux なし', 'No tmux')}</span><span>${t('SSH なし', 'No SSH')}</span><span>${t('起動し直しなし', 'No relaunching')}</span></p>
 <p><a class="btn" href="#install">${t('はじめる', 'Get started')}</a> <a class="btn ghost" href="#pricing">${t('料金', 'Pricing')}</a></p>
