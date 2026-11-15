@@ -106,6 +106,8 @@ export interface AutoApproveMark {
   /** Absolute time as ISO (the agent's own decision) */
   until: string
   machine?: string
+  /** Which tool's session (absent = Claude). ⚠️ Carried onto a row built from the mark: its gates depend on it */
+  tool?: 'codex'
 }
 
 /**
@@ -144,6 +146,8 @@ export function applyAutoApprove(
     out.push({
       machine: m.machine ?? '',
       account: '',
+      // ⚠️⚠️ Keep the tool: a Codex row without it passes for Claude and gets Claude's buttons (codex review, medium #7)
+      ...(m.tool ? { tool: m.tool } : {}),
       sessionId: m.sessionId,
       cwd: '',
       project: '—',
@@ -176,6 +180,9 @@ export function synthesizeRows(
           {
             machine: p.machine,
             account: p.account,
+            // ⚠️⚠️ Keep the tool: a Codex card's row without it passes for Claude — sending was enabled without
+            //    `codex-send`, and Claude's auto-approve feature let the toggle through (codex review, medium #7)
+            ...(p.tool ? { tool: p.tool } : {}),
             ...(p.accountUnknown === true ? { accountUnknown: true as const } : {}),
             sessionId: p.sessionId as string,
             cwd: '',

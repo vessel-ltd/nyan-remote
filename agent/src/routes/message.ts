@@ -20,7 +20,10 @@
 import { commandLikeMessage, type MessageSendResult } from '../../../shared/types.ts'
 import { config } from '../config.ts'
 import { discoverConfigDirs } from '../claude/configDirs.ts'
-import { sendToSession } from '../claude/inbox.ts'
+import { failureMessage, sendToSession, validateText } from '../claude/inbox.ts'
+import { isCodexSessionId, type CodexSendResult } from '../codex/daemon.ts'
+import { shortSessionId } from '../codex/ids.ts'
+import { codexLists, codexSend } from '../codex/run.ts'
 import { sanitizeForKeys, sendKeysToSession, type KeysFailure } from '../claude/keys.ts'
 import { broadcast } from '../events.ts'
 import { hasPendingForSession } from '../permission.ts'
@@ -86,11 +89,71 @@ export function inboxRefusal(text: unknown): boolean {
   return !clean.ok && clean.reason === 'command-like'
 }
 
+/**
+ * ★★ Send to a Codex thread (2026-11-15 / docs/CODEX.md §5.2). `undefined` when the id is not a Codex row.
+ *
+ * The text becomes a new turn on the daemon (`turn/start`): no keystrokes, no inbox, no frame.
+ * ⚠️⚠️ The body is checked **before** the daemon is asked, and a body starting with `/` or `!` is refused like on
+ *    every other route. Here nothing would run it (it would reach the model as plain words), but the phone must not
+ *    learn that "a slash works on some rows".
+ * ⚠️ Only an idle thread takes it. Working or waiting ⇒ 409 (adding to a running turn is not built).
+ * ⚠️ The log line carries the length, never the text.
+ */
+export async function codexMessage(
+  sessionId: string,
+  text: string,
+  /** ★ Injected in tests */
+  codex: { lists(id: string): boolean; send(id: string, text: string): Promise<CodexSendResult | undefined> } = {
+    lists: codexLists,
+    send: codexSend,
+  },
+): Promise<MessageResult | undefined> {
+  if (!codex.lists(sessionId)) {
+    // ⚠️ A Codex row id that no line lists now (the thread closed, the line is down) is "not open" — never handed to
+    //    the Claude routes (codex review, high #1: the two kinds of id must not mix)
+    if (isCodexSessionId(sessionId)) throw new HttpError(409, t('この Codex のセッションは、いま開かれていません。', 'This Codex session is not open right now.'))
+    return undefined
+  }
+  const bad = validateText(text)
+  if (bad) throw new HttpError(400, failureMessage(bad))
+  if (inboxRefusal(text)) throw new HttpError(400, commandLikeMessage())
+  const short = shortSessionId(sessionId)
+  // ⚠️ The row can vanish between the two looks: that is "not open", never a fall-through to the Claude routes
+  const res: CodexSendResult = (await codex.send(sessionId, text)) ?? { ok: false, reason: 'not-listed' }
+  if (!res.ok) {
+    console.log(`[codex] not sent thread=${short} reason=${res.reason}${res.detail ? ` (${res.detail})` : ''}`)
+    switch (res.reason) {
+      case 'busy':
+        throw new HttpError(
+          409,
+          t(
+            'Codex が応答中か、承認を待っています。終わってから送ってください。',
+            'Codex is working or waiting for an approval. Send again when it has finished.',
+          ),
+        )
+      case 'not-listed':
+        throw new HttpError(409, t('この Codex のセッションは、いま開かれていません。', 'This Codex session is not open right now.'))
+      case 'failed':
+        throw new HttpError(409, t('Codex に送れませんでした。PC の画面を確認してください。', 'Could not send to Codex. Check the screen on the PC.'))
+    }
+  }
+  const at = new Date().toISOString()
+  broadcast({ type: 'sessions-changed', at })
+  console.log(`[codex] sent to thread=${short} ${text.length} chars`)
+  // ★ `keys`: in the thread it has the same shape as a keystroke send — a plain message of the person, no `via`
+  //   (`web/src/ui/pending.ts` matches the sent bubble by this; an unknown value would never match).
+  return { ok: true, at, route: 'keys' }
+}
+
 export async function sessionMessage(ctx: Ctx): Promise<MessageResult> {
   const sessionId = ctx.params['id']
   if (!sessionId) throw new HttpError(400, t('session id が必要です', 'A session id is required.'))
   const body = await readJsonBody<Body>(ctx.req)
   const text = typeof body.text === 'string' ? body.text : ''
+
+  // ★ A Codex thread goes to its daemon (`codexMessage`); `undefined` = not a Codex row, so the Claude routes follow
+  const viaCodex = await codexMessage(sessionId, text)
+  if (viaCodex) return viaCodex
 
   const dirs = await discoverConfigDirs(config().configDirs)
   const short = sessionId.slice(0, 8)

@@ -24,6 +24,7 @@
 //   ⚠️ This is not fail-open (the dangerous side is "on", so falling back to off is the safe direction).
 //   ⚠️ When broken, **do not write** (keep the evidence / CLAUDE.md §2). ⇒ Turning it on is refused too.
 
+import { shortSessionId } from './codex/ids.ts'
 import type { Interaction, PermissionRequest } from '../../shared/types.ts'
 import { requiresInteraction } from './claude/interaction.ts'
 import { readJsonFile, writeJson } from './state.ts'
@@ -201,7 +202,7 @@ export async function loadAutoApprove(now = Date.now()): Promise<void> {
       return
     }
     for (const entry of expired) {
-      console.log(t(`[auto] 停止中に期限切れになっていた session=${entry.id.slice(0, 8)}`, `[auto] Expired while the agent was stopped session=${entry.id.slice(0, 8)}`))
+      console.log(t(`[auto] 停止中に期限切れになっていた session=${shortSessionId(entry.id)}`, `[auto] Expired while the agent was stopped session=${shortSessionId(entry.id)}`))
       onExpire?.(entry)
     }
   })
@@ -314,6 +315,8 @@ export async function setAutoApprove(
 ): Promise<SetResult> {
   const who = by ? ` by=${by}` : ''
   if (!sessionId) return { ok: false, reason: t('セッションが指定されていません', 'No session was specified.'), saved: false }
+  // ★ When this toggle was asked (a session end after it cancels an "on" that is still waiting — see `endSessionAutoApprove`)
+  const askedAt = ++seq
   // ★★ **Serialize the whole toggle** (2026-09-07 codex, high #1).
   //
   // ⚠️⚠️ Only saving was serialized, and it broke like this:
@@ -339,10 +342,10 @@ export async function setAutoApprove(
       if (!saved.ok) {
         // ⚠️ Memory already dropped it (it stops passing now), but the file keeps it until expiry ⇒ restarting revives it.
         //   Still say who asked (codex: the actor was missing exactly on this partial outcome)
-        if (had) console.warn(t(`[auto] 自動承認オフ（保存に失敗・再起動で戻る） session=${sessionId.slice(0, 8)}${who}`, `[auto] Auto-approve off (not saved; a restart revives it) session=${sessionId.slice(0, 8)}${who}`))
+        if (had) console.warn(t(`[auto] 自動承認オフ（保存に失敗・再起動で戻る） session=${shortSessionId(sessionId)}${who}`, `[auto] Auto-approve off (not saved; a restart revives it) session=${shortSessionId(sessionId)}${who}`))
         return { ok: false, reason: saved.reason, saved: false }
       }
-      if (had) console.log(t(`[auto] 自動承認オフ session=${sessionId.slice(0, 8)}${who}`, `[auto] Auto-approve off session=${sessionId.slice(0, 8)}${who}`))
+      if (had) console.log(t(`[auto] 自動承認オフ session=${shortSessionId(sessionId)}${who}`, `[auto] Auto-approve off session=${shortSessionId(sessionId)}${who}`))
       return { ok: true }
     }
 
@@ -358,13 +361,19 @@ export async function setAutoApprove(
     const next = [...active.values()].map((a) => a.entry).filter((e) => e.id !== sessionId)
     const saved = await writeState([...next, entry])
     if (!saved.ok) {
-      console.warn(t(`[auto] 自動承認オンを断った（保存に失敗） session=${sessionId.slice(0, 8)}${who}`, `[auto] Auto-approve on refused (not saved) session=${sessionId.slice(0, 8)}${who}`))
+      console.warn(t(`[auto] 自動承認オンを断った（保存に失敗） session=${shortSessionId(sessionId)}${who}`, `[auto] Auto-approve on refused (not saved) session=${shortSessionId(sessionId)}${who}`))
       return { ok: false, reason: saved.reason, saved: false }
     }
+    // ⚠️⚠️ The session ended after this "on" was asked (codex 2026-11-15, eighth review, high): it must never come back.
+    //    Looked at after the save: the end can arrive while it is being written.
+    //    ★ Written but not taken. The file is written again by the end, which waits right behind in the chain and
+    //      reports a failure like any other (ninth review, high: a rewrite here whose failure nobody saw left the entry
+    //      in the file, and a restart revived it).
+    if (cancelledBy(sessionId, askedAt)) return { ok: true }
     const found: Active = { entry, untilMs }
     active.set(sessionId, found)
     schedule(found, now)
-    console.log(t(`[auto] 自動承認オン session=${sessionId.slice(0, 8)} 期限=${entry.until}${who}`, `[auto] Auto-approve on session=${sessionId.slice(0, 8)} until=${entry.until}${who}`))
+    console.log(t(`[auto] 自動承認オン session=${shortSessionId(sessionId)} 期限=${entry.until}${who}`, `[auto] Auto-approve on session=${shortSessionId(sessionId)} until=${entry.until}${who}`))
     return { ok: true, entry }
   })
 }
@@ -376,13 +385,39 @@ export async function setAutoApprove(
  * ★ Writes only when there was an entry (SessionEnd comes for every session; most never had auto-approve).
  */
 export async function endSessionAutoApprove(sessionId: string): Promise<{ had: boolean } & ({ ok: true } | { ok: false; reason: string })> {
+  // ⚠️⚠️ Both **now**, before waiting in the chain (codex 2026-11-15, seventh and eighth review, high): the chain can be
+  //    busy saving another session's toggle, and meanwhile an approval of the ended session (a Codex thread that was
+  //    unloaded and loaded again, a resumed session) was auto-approved —
+  //    ① by the entry still in memory ⇒ dropped here (the safe direction, the same order as "off": memory first, then save);
+  //    ② by an "on" asked earlier that was still saving and then installed itself ⇒ the mark below cancels it.
+  const mark = { at: ++seq, cancelled: false }
+  ended.set(sessionId, mark)
+  const hadNow = state.kind === 'ok' && state.active.delete(sessionId)
+  if (hadNow) clearTimer(sessionId)
   return await enqueue(async () => {
-    if (state.kind !== 'ok' || !state.active.has(sessionId)) return { ok: true, had: false }
-    state.active.delete(sessionId)
-    clearTimer(sessionId)
+    // ★ Every "on" asked before this end has run by now (the chain keeps call order) ⇒ the mark is no longer needed
+    if (ended.get(sessionId) === mark) ended.delete(sessionId)
+    // ★ `had`: it was on, or an "on" was on its way (the caller tells the phone either way)
+    const had = hadNow || mark.cancelled
+    if (state.kind !== 'ok' || !had) return { ok: true, had }
+    // ⚠️ Written again, either way the file can still hold this session: a toggle of another session that was saving
+    //    when this one was dropped took its set from memory before, and a cancelled "on" wrote it itself
     const saved = await writeState([...state.active.values()].map((a) => a.entry))
     return saved.ok ? { ok: true, had: true } : { ok: false, had: true, reason: saved.reason }
   })
+}
+
+/** Ticks for every toggle asked and every session end (orders them; see `endSessionAutoApprove`) */
+let seq = 0
+/** Sessions that ended while their cleanup waits in the chain: when they ended */
+const ended = new Map<string, { at: number; cancelled: boolean }>()
+
+/** Whether the session ended after this toggle was asked (and if so, note that an "on" was cancelled by it) */
+function cancelledBy(sessionId: string, askedAt: number): boolean {
+  const mark = ended.get(sessionId)
+  if (!mark || mark.at <= askedAt) return false
+  mark.cancelled = true
+  return true
 }
 
 /**
@@ -442,7 +477,7 @@ function schedule(found: Active, now: number): void {
       if (state.kind !== 'ok' || state.active.get(entry.id) !== found) return
       state.active.delete(entry.id)
       await writeState([...state.active.values()].map((a) => a.entry))
-      console.log(t(`[auto] 自動承認が期限切れ session=${entry.id.slice(0, 8)}`, `[auto] Auto-approve expired session=${entry.id.slice(0, 8)}`))
+      console.log(t(`[auto] 自動承認が期限切れ session=${shortSessionId(entry.id)}`, `[auto] Auto-approve expired session=${shortSessionId(entry.id)}`))
       onExpire?.(entry)
     })
   }, ms)
@@ -468,4 +503,5 @@ export function resetAutoApprove(): void {
   state = { kind: 'ok', active: new Map() }
   onExpire = undefined
   chain = Promise.resolve()
+  ended.clear()
 }

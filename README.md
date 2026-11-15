@@ -271,6 +271,57 @@ Measured on the author's setup (3 machines, a full working day): the Durable Obj
 
 ---
 
+## Codex sessions (experimental)
+
+nyan-remote also shows your [OpenAI Codex CLI](https://github.com/openai/codex) sessions in the same list. You see each
+session's state and conversation, get notified when a turn finishes, needs you, or fails, answer command approvals,
+send a message to an idle session, and stop a running turn — from the phone.
+
+**This is on by default** on every machine where Codex runs. On a machine without Codex nothing happens (there is no
+Codex socket to connect to). To turn it off, put this in `~/.nyan-remote/config.json` and restart the agent
+(`systemctl --user restart nyan-remote`, or `launchctl kickstart -k gui/$(id -u)/app.nyan-remote.agent` on macOS):
+
+```json
+"codex": { "enabled": false }
+```
+
+`nyan status` shows whether it is on, and the agent's log says it once when it first connects.
+
+**What it changes on your machine — please read before using Codex with nyan-remote:**
+
+1. **Your Codex requests carry the name `nyan-remote`.** The agent connects to the Codex background server (the
+   app-server daemon that `codex` starts for itself) and must say who it is. Codex puts the name of the last client that
+   connected at the end of the `User-Agent` it sends to OpenAI, so your Codex requests — on your own OpenAI account —
+   carry `nyan-remote` there.
+2. **If the agent connects first, some Codex features can be lost until the daemon restarts.** When a Codex daemon has
+   just started and the agent talks to it before your `codex` does, Codex treats the daemon as started by an unofficial
+   client, and the MCP dependencies that skills rely on are not handled for the sessions it then runs. The agent waits a
+   few seconds before talking to a daemon that has just started, which makes this unlikely, but it cannot rule it out.
+3. **Codex calls its daemon experimental.** This was built and measured against `codex-cli` 0.169.0 on Linux (macOS is
+   not measured yet). A Codex update can change the daemon and break this until we catch up.
+
+How it works:
+
+- You keep starting `codex` the way you always do. nyan-remote installs **no hooks and no wrapper** for Codex and
+  writes nothing under `~/.codex`. The agent never starts the Codex daemon; it connects over its local socket, lists
+  the sessions it has loaded, and reads their turns.
+- **Approvals**: when a session waits on a plain command approval, the same prompt appears on the phone as a card. The
+  PC prompt stays; answer in either place. **Allow** runs that one command. **Deny** does what "No" does in the Codex
+  TUI: the command is refused and the turn stops. The longer-lasting choices ("don't ask again for…") and every other
+  kind of prompt (file changes, network access, extra permissions, questions) are answered on the PC only.
+- **Auto-approve** works for Codex sessions too: while it is on for a session, plain command approvals are allowed
+  without asking. The other kinds of prompt still wait for you on the PC. It ends when the session is closed.
+- **Sending**: type in the phone's message box to start a new turn in a Codex session that is idle. It shows up in
+  the Codex TUI as your message. While Codex is working or waiting for an approval, sending is refused.
+- **Stopping**: "⏹ Stop" in the thread stops the turn that is running when you press it (the Codex TUI shows
+  "Conversation interrupted"). It never stops a turn that started after the press, and it waits for you to answer an
+  approval or a question first. Nothing is cleared on the PC.
+- Sessions that do not use the daemon are not shown (for example `codex --no-daemon` and `codex exec`).
+- A session stays in the list for about a minute after you close it; that is how long Codex keeps it loaded.
+- Other Codex homes can be listed with `"homes": ["/path/to/home"]` (default: `$CODEX_HOME` or `~/.codex`).
+
+---
+
 ## Limits worth knowing
 
 - **Accounts are `~/.claude` and `~/.claude-<name>`** (letters, digits, `.`, `_` and `-` in the name), once Claude Code
@@ -292,7 +343,7 @@ Measured on the author's setup (3 machines, a full working day): the Durable Obj
 
 ## Roadmap
 
-- **Codex** — OpenAI Codex sessions in the same view.
+- **Codex** — OpenAI Codex sessions in the same view. Viewing, command approvals, sending and stopping are in (on by default, see [Codex sessions](#codex-sessions-experimental)); the other kinds of approval and closed sessions as history come next.
 - **Phone apps** — native apps for iPhone and Android.
 - **Desktop** — a desktop layout, installable on Windows, macOS and Linux.
 - **Windows without WSL** — run the agent on Windows directly.

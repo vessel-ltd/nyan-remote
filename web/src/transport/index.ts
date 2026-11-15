@@ -176,7 +176,8 @@ export interface Transport {
      *    ⇒ Pass the markers along the same path as the approval list and attach them to synthetic rows (`ui/order.ts`).
      * ⚠️ Old agents don't return it (`undefined`). Then nothing shows, as before.
      */
-    autoApprove?: { id: string; until: string }[]
+    /** `tool`: which tool's session (absent = Claude) — a row built from the mark must keep it */
+    autoApprove?: { id: string; until: string; tool?: 'codex' }[]
   }>
   /**
    * Approve / deny. ok:false means it timed out or was handled on the PC.

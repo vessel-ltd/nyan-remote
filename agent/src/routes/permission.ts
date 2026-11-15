@@ -51,6 +51,7 @@ import { HttpError, readJsonBody, type Ctx } from '../router.ts'
 import { buildUpdatedInput, describeInteraction, requiresInteraction } from '../claude/interaction.ts'
 import { actorOf } from '../auth.ts'
 import { autoApproveList, shouldAutoApprove } from '../autoApprove.ts'
+import { isCodexSessionId } from '../codex/daemon.ts'
 import { resolveAgentTranscript } from '../claude/subagentTranscript.ts'
 import { parseTranscriptPath } from './hook.ts'
 import { t } from '../../../shared/i18n.ts'
@@ -102,7 +103,9 @@ export async function permissions(): Promise<{
     pendingTags: pendingPermTags(),
     at: new Date().toISOString(),
     // ⚠️ Only `sessionId` and expiry (nothing derived from the conversation / §6.2)
-    autoApprove: autoApproveList().map((e) => ({ id: e.id, until: e.until })),
+    // ★ `tool` for a Codex row's entry: the phone builds a row from a mark that landed on no row, and that row must
+    //   not pass for a Claude session (its gates differ / codex review, medium #7)
+    autoApprove: autoApproveList().map((e) => ({ id: e.id, until: e.until, ...(isCodexSessionId(e.id) ? { tool: 'codex' as const } : {}) })),
   }
 }
 
@@ -316,6 +319,17 @@ export async function permissionAnswer(ctx: Ctx): Promise<{ ok: boolean; reason?
   //   ⚠️ The body is not logged (derived from the conversation / §6.2). Only its length
   const fb = validateFeedback(body.feedback)
   if (!fb.ok) return { ok: false, reason: fb.reason }
+  // ★ A Codex approval has nowhere to put a reason (the daemon takes `accept` / `decline` only).
+  //   ⚠️ Refuse rather than drop it: a denial whose reason silently vanished reads as "I told it what to change".
+  if (target?.tool === 'codex' && fb.message) {
+    return {
+      ok: false,
+      reason: t(
+        'Codex の承認には理由を付けられません。理由を消して、もう一度 拒否してください。',
+        'A Codex approval cannot carry a reason. Clear the reason and deny again.',
+      ),
+    }
+  }
 
   const ok = answer(key, behavior as Behavior, { updatedInput, message: fb.message })
   if (ok) {

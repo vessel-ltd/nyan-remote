@@ -10,11 +10,16 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import { hostAllowed } from './hostCheck.ts'
 import { watchServe } from './tailscale.ts'
 import { devMode } from './auth.ts'
-import { autoApproveList, loadAutoApprove, setAutoApproveExpiryHandler } from './autoApprove.ts'
+import { autoApproveList, endSessionAutoApprove, loadAutoApprove, setAutoApproveExpiryHandler } from './autoApprove.ts'
 import { discoverConfigDirs } from './claude/configDirs.ts'
 import { seedHookState } from './claude/hookState.ts'
 import { startSessionWatch } from './claude/sessionWatch.ts'
-import { broadcast } from './events.ts'
+import { CODEX_FOLLOW_TICK_MS, codexFollowTick, startCodex } from './codex/run.ts'
+import { codexPayload } from './codex/notify.ts'
+import { sendToAll } from './push.ts'
+import { withPendingPerms } from './permission.ts'
+import { toPushPayload } from './routes/hook.ts'
+import { broadcast, followedSessions, notifyFollowers } from './events.ts'
 import { pendingCount } from './permission.ts'
 import { config, configProblem, loadConfig } from './config.ts'
 import { loadAgentKey } from './deviceKey.ts'
@@ -112,6 +117,59 @@ async function main(): Promise<void> {
     // ⚠️ Do not crash here. Only immediacy is lost; the feature still works through 15s polling
     const msg = err instanceof Error ? err.message : String(err)
     console.warn(t(`[agent] セッション状態の監視を開始できません: ${msg}`, `[agent] Cannot start watching session state: ${msg}`))
+  }
+
+  // ★ Codex sessions (docs/CODEX.md). ⚠️ On unless `codex.enabled` is false: connects to the user's Codex daemon under
+  //   our name (said once in the log on the first connect). ⚠️ Never awaited and never fatal: no daemon = no Codex rows.
+  {
+    let pending: NodeJS.Timeout | undefined
+    const n = startCodex(cfg.codex, {
+      machine: machineName(),
+      version: AGENT_VERSION,
+      hooks: {
+        // ★ Coalesce: one turn produces several status changes within milliseconds
+        onChange: () => {
+          pending ??= setTimeout(() => {
+            pending = undefined
+            broadcast({ type: 'sessions-changed', at: new Date().toISOString() })
+          }, 100)
+        },
+        log: (line) => console.log(line),
+        // ★ A closed thread ends its auto-approve entry, like `SessionEnd` does for Claude (never left on for a
+        //   thread nobody is running). ⚠️ Never throws into the daemon line.
+        onClosed: (threadId) => {
+          void endSessionAutoApprove(threadId)
+            .then((r) => {
+              if (r.had) broadcast({ type: 'sessions-changed', at: new Date().toISOString() })
+              if (!r.ok) console.warn(`[auto] ⚠️ could not save the end of auto-approve for a closed Codex thread (${r.reason})`)
+            })
+            .catch(() => undefined)
+        },
+      },
+      // ★ The same text builder and the same sender as the Claude side (`toPushPayload` → `sendToAll`)
+      notify: async (row, fields) =>
+        (await sendToAll(withPendingPerms(codexPayload(row, fields, new Date().toISOString(), toPushPayload)))).sent,
+      // ★ Approvals: the cards live in the same store as the Claude ones; the phones only need to read it again
+      cardsChanged: () => broadcast({ type: 'permissions-changed', machine: machineName(), at: new Date().toISOString() }),
+    })
+    if (n > 0) {
+      console.log(t(`[codex] Codex の daemon を見張ります: ${n} 件`, `[codex] Watching Codex daemons: ${n}`))
+      // ★ Follow watch (`codexFollowTick`): asks the local daemon only while a phone is viewing a Codex thread.
+      //   ⚠️ One round at a time (a slow daemon must not pile rounds up); never throws into the timer.
+      let busy = false
+      setInterval(() => {
+        if (busy) return
+        busy = true
+        codexFollowTick(followedSessions())
+          .then((ids) => {
+            for (const id of ids) notifyFollowers(id)
+          })
+          .catch(() => undefined)
+          .finally(() => {
+            busy = false
+          })
+      }, CODEX_FOLLOW_TICK_MS).unref()
+    }
   }
 
   // ★ Whether tailscale serve forwards to us (Tailscale identity headers count only then / `tailscale.ts`)

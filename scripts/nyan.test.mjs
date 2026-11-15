@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import { cliShim, commandElsewhere, installCli, isOurs, removeCli } from './lib/cli.mjs'
-import { ACCOUNT_COMMANDS, cliLang, DISTRIBUTION_ORIGIN, helpDetail, helpText, main, PASSTHROUGH, pendingDecision, ROOT, restartArgv, updatePlan, wantsHelp } from './nyan.mjs'
+import { ACCOUNT_COMMANDS, cliLang, codexStatusLines, DISTRIBUTION_ORIGIN, helpDetail, helpText, main, PASSTHROUGH, pendingDecision, ROOT, restartArgv, updatePlan, wantsHelp } from './nyan.mjs'
 import { setLang } from '../shared/i18n.ts'
 
 test('★★ update: installer machines always pass "the install location" to install.sh (machine C), starting from home', () => {
@@ -226,4 +226,79 @@ test('★★★ even if a link in the bin directory points at "a nyan-remote-sha
   const r = await installCli({ binDir: bin, root: '/opt/nr', pathEnv: bin })
   assert.equal(r.find((x) => x.name === 'nyan').result, 'skipped')
   assert.ok(lstatSync(join(bin, 'nyan')).isSymbolicLink(), "⚠️⚠️ replaced the user's link")
+})
+
+test('★ nyan status: the Codex lines (2026-11-15: on by default, so the PC says what it does and how to turn it off)', () => {
+  setLang('en')
+  const START = '[codex] start: homes=1'
+  const connected = ['[relay] Connected', START, '[codex] .codex: connecting', '[codex] .codex: connected']
+  const ok = (value) => ({ kind: 'ok', value })
+  const has = (lines, re) => lines.some((l) => re.test(l))
+  // On (no file, no section, a section without enabled): the setting, what this run logged, the User-Agent note
+  for (const cfg of [{ kind: 'missing' }, ok({}), ok({ codex: {} }), ok({ codex: { enabled: true } })]) {
+    const lines = codexStatusLines(cfg, connected)
+    assert.equal(lines[0], 'Codex:      on in the settings', JSON.stringify(cfg))
+    assert.ok(lines.includes('              .codex: connected'))
+    assert.ok(has(lines, /"nyan-remote".*User-Agent.*"enabled": false/))
+    assert.ok(!has(lines, /restarts/))
+  }
+  assert.ok(has(codexStatusLines(ok({ codex: { clientName: 'other-name' } }), connected), /other-name/))
+  // Off, and this run is off too: short
+  assert.deepEqual(codexStatusLines(ok({ codex: { enabled: false } }), ['[codex] start: homes=0']), [
+    'Codex:      off in the settings (config.json "codex": { "enabled": false })',
+    '            This agent run: not connecting to Codex',
+  ])
+  // ★ Turned off in the file while this run is connected (round 14, medium #2): the connection stays visible
+  const offButOn = codexStatusLines(ok({ codex: { enabled: false } }), connected)
+  assert.match(offButOn[0], /off in the settings/)
+  assert.ok(offButOn.includes('              .codex: connected'))
+  assert.ok(has(offButOn, /User-Agent/))
+  assert.ok(has(offButOn, /takes effect when the agent restarts/))
+  // ★ An unusable config.json: off after a restart, and the running agent is still shown (round 13 high #1 / 14 medium #2)
+  const unusable = codexStatusLines({ kind: 'unusable' }, connected)
+  assert.match(unusable[0], /cannot be used \(after a restart the agent does not connect/)
+  assert.ok(unusable.includes('              .codex: connected'))
+  assert.ok(has(unusable, /takes effect when the agent restarts/))
+  // No Codex on this PC: said as what the log showed
+  const none = codexStatusLines({ kind: 'missing' }, [START, '[codex] .codex: no-daemon'])
+  assert.ok(has(none, /no Codex daemon found/))
+  // ★ Per home: one home without a daemon does not hide a connected one, nor the note
+  const two = codexStatusLines({ kind: 'missing' }, ['[codex] start: homes=2', '[codex] a: connected', '[codex] b: no-daemon'])
+  assert.ok(two.includes('              a: connected') && two.includes('              b: no-daemon'))
+  assert.ok(has(two, /User-Agent/))
+  // ★ Fewer states than homes (round 14, medium #1: two homes can share a label, or one was not seen): never "no daemon"
+  for (const lines of [['[codex] start: homes=2', '[codex] .codex: no-daemon'], ['[codex] start: homes=2', '[codex] .codex: connected', '[codex] .codex: no-daemon']]) {
+    const out = codexStatusLines({ kind: 'missing' }, lines)
+    assert.ok(!has(out, /no Codex daemon found/), JSON.stringify(lines))
+    assert.ok(has(out, /1 more home\(s\) not seen/), JSON.stringify(lines))
+  }
+  // ★ Only this run: states before the last start mark are another run's
+  const restarted = codexStatusLines({ kind: 'missing' }, [START, '[codex] .codex: connected', START])
+  assert.ok(!restarted.includes('              .codex: connected'))
+  assert.ok(has(restarted, /1 more home\(s\) not seen/))
+  // ★ A label with spaces, a failure with its detail; the one-time notice is not a state
+  assert.ok(codexStatusLines({ kind: 'missing' }, [START, '[codex] work codex: failed (EPIPE)']).includes('              work codex: failed'))
+  assert.ok(
+    codexStatusLines({ kind: 'missing' }, [START, '[codex] .codex: connected', '[codex] ★ Connected to the Codex daemon as "nyan-remote" (…): x']).includes('              .codex: connected'),
+  )
+  // Nothing seen at all is said as such (never as "fine")
+  assert.ok(has(codexStatusLines({ kind: 'missing' }, ['[relay] Connected']), /not in the recent logs/))
+  // ★ round 15: the name this run used, not a name set since (low #3)
+  const renamed = codexStatusLines(ok({ codex: { clientName: 'new-name' } }), ['[codex] start: homes=1 name=old name', '[codex] /a/.codex: connected'])
+  assert.ok(has(renamed, /"old name"/) && !has(renamed, /new-name/))
+  // ★ Turned on while this run is off: the restart is said too (low #2)
+  assert.ok(has(codexStatusLines({ kind: 'missing' }, ['[codex] start: homes=0 name=nyan-remote']), /takes effect when the agent restarts/))
+  // ★ Off in the file, a home of this run not seen: the note stays (it may be connected / medium #1)
+  const offUnseen = codexStatusLines(ok({ codex: { enabled: false } }), ['[codex] start: homes=2 name=nyan-remote', '[codex] /b/.codex: no-daemon'])
+  assert.ok(has(offUnseen, /User-Agent/))
+  // Homes are told apart by their path (two homes may share a base name)
+  const twoSame = codexStatusLines({ kind: 'missing' }, ['[codex] start: homes=2 name=nyan-remote', '[codex] /a/.codex: connected', '[codex] /b/.codex: no-daemon'])
+  assert.ok(twoSame.includes('              /a/.codex: connected') && twoSame.includes('              /b/.codex: no-daemon'))
+  setLang('ja')
+})
+
+test('the start mark nyan status looks for is the one the agent logs', async () => {
+  const { CODEX_START_MARK } = await import('../agent/src/codex/marks.ts')
+  const src = readFileSync(new URL('./nyan.mjs', import.meta.url), 'utf8')
+  assert.ok(src.includes(`const CODEX_START_MARK = '${CODEX_START_MARK}'`))
 })

@@ -4,6 +4,7 @@ import { sessionHash } from '../route.ts'
 import { statusView } from './status.ts'
 import { currentLang, t } from '../../../shared/i18n.ts'
 import { accountLabel } from './agentText.ts'
+import { isCodex } from './tool.ts'
 
 // ★ How state is shown (`statusView`) lives in `status.ts`.
 //   ⚠️ `.tsx` cannot be imported from `node:test` (`ERR_UNKNOWN_FILE_EXTENSION`), so
@@ -66,6 +67,8 @@ export function SessionList({
                   {s.autoApprove ? <span class="chip auto">⚡ {t('自動承認', 'Auto-approve')}</span> : null}
                   {/* ★ Machines are no longer grouped, so the row shows which PC */}
                   {showMachine ? <span class="chip machine">{s.machine}</span> : null}
+                  {/* ★ Which CLI (2026-11-14). Only Codex gets a chip: a row without one is Claude Code, as before */}
+                  {isCodex(s) ? <span class="chip tool">Codex</span> : null}
                   <span class="chip account">{accountLabel(s)}</span>
                   <span>{s.project}</span>
                   {s.gitBranch ? <span class="chip">{s.gitBranch}</span> : null}

@@ -1,3 +1,4 @@
+import { actionFeatures, canSendTo, isCodex, sendBlockedNote } from './tool.ts'
 import type { VNode } from 'preact'
 import { subscribeWhileVisible, whileVisible } from '../visibility.ts'
 import { coalesce, followPlan, shouldPull } from './followPlan.ts'
@@ -59,7 +60,7 @@ export function Thread({
   canSend = false,
   permissions,
   quietPermissions = 0,
-  features,
+  features: agentFeatures,
   permissionsKnown = false,
   alert,
   onJump,
@@ -128,6 +129,10 @@ export function Thread({
   waitConfirmed: boolean
   onBack: () => void
 }) {
+  // ★★ What this row may be acted on with (2026-11-14 / `ui/tool.ts`). ⚠️ Everything below uses `features`, never
+  //   `agentFeatures`: a Codex row gets only what its own marks grant (no button that 404s). The one exception is
+  //   the message box, which asks `canSendTo` with the agent's marks.
+  const features = actionFeatures(session, agentFeatures)
   const [entries, setEntries] = useState<LogEntry[]>([])
   /**
    * ★★ **Text not yet written to the transcript** (2026-08-21).
@@ -643,7 +648,7 @@ export function Thread({
     setNote(undefined)
     try {
       const res = await transport.interrupt(sessionId)
-      setNote({ bad: false, text: stopSentNote(res.cleared === true) })
+      setNote({ bad: false, text: stopSentNote(res.cleared === true, isCodex(session)) })
     } catch (err) {
       // ⚠️ Refusal reasons (approval card showing, session that cannot be stopped, etc.) are **shown next to the input box**.
       //    They used to go into the top `error`, so the text we most wanted seen was invisible
@@ -882,7 +887,7 @@ export function Thread({
    * ⚠️ "Load older" does not go here. It is better **attached to the top of the thread**
    *    so it can be pressed repeatedly (through the menu it would be two taps each time).
    */
-  const stopBtn = stopView(session, stopping ? 'sending' : 'ready')
+  const stopBtn = stopView(session, stopping ? 'sending' : 'ready', agentFeatures)
   /**
    * ★★ How auto-approve mode looks. ⚠️ Decided in one place, `ui/autoApprove.ts`
    *    (must not use `commandView` = that conditions on the keystroke route)
@@ -1158,8 +1163,9 @@ export function Thread({
              ⚠️ Not decided by the presence of `session`. Synthetic rows also have `session` */}
       <Composer
         sessionId={sessionId}
-        disabled={!canSend}
-        hint={sendMark(session)?.text}
+        // ⚠️ A row we cannot send to (a Codex thread on an agent without `codex-send`) keeps the box but says why (`ui/tool.ts`)
+        disabled={!canSend || !canSendTo(session, agentFeatures)}
+        hint={sendBlockedNote(session, agentFeatures) ?? sendMark(session)?.text}
         result={note}
         // ★ The cat-and-status line. ⚠️ Decided in one place, `composerBusy` (including run/stop)
         busy={composerBusy(session)}

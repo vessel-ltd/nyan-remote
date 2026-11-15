@@ -514,6 +514,13 @@ a.row:active {
   font-weight: 650;
 }
 
+/* Which CLI the row belongs to (only Codex rows carry it) */
+.chip.tool {
+  color: var(--fg);
+  border-color: color-mix(in srgb, var(--fg) 35%, transparent);
+  font-weight: 650;
+}
+
 .chip.mode {
   color: var(--warn);
   border-color: color-mix(in srgb, var(--warn) 28%, transparent);

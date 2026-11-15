@@ -38,6 +38,7 @@ import {
   autoApproveBroken,
   autoApproveFor,
   autoApproveList,
+  endSessionAutoApprove,
   loadAutoApprove,
   resetAutoApprove,
   setAutoApproveExpiryHandler,
@@ -547,4 +548,70 @@ test('★★ the duration is chosen by name (3h / 24h), the cap is the longest i
   for (const bad of ['72h', 'forever', 86_400_000, '', null, 'constructor', '__proto__']) {
     assert.equal(toAutoApproveDuration(bad), undefined, String(bad))
   }
+})
+
+test('★★ SessionEnd stops auto-approve at once, even while the chain is busy saving another session (codex 2026-11-15, seventh review, high)', async (t) => {
+  await withStateDir(t)
+  assert.equal((await setAutoApprove(SESSION, true)).ok, true)
+  // Another session's toggle is saving (not awaited) when SESSION ends
+  const other = setAutoApprove(OTHER, true)
+  // Let its section start (it takes the set to save from memory, SESSION included)
+  await new Promise((r) => setImmediate(r))
+  const ended = endSessionAutoApprove(SESSION)
+  // ⚠️⚠️ Before the chain gets to it: an approval of the ended session must not pass any more
+  assert.equal(shouldAutoApprove({ sessionId: SESSION, toolName: 'Bash' }), false)
+  assert.equal(autoApproveFor(SESSION), undefined)
+  assert.deepEqual(await ended, { ok: true, had: true })
+  assert.equal((await other).ok, true)
+  // ★ And the file agrees (the other toggle had taken its set from memory before the end)
+  const stored = JSON.parse(await readFile(join(process.env['NYAN_REMOTE_STATE_DIR']!, AUTO_APPROVE_FILE), 'utf8')) as { entries: Array<{ id: string }> }
+  assert.deepEqual(stored.entries.map((e) => e.id), [OTHER])
+})
+
+test('★★ an "on" still saving when the session ends never comes back, even while another save holds the chain (codex 2026-11-15, eighth review, high)', async (t) => {
+  await withStateDir(t)
+  // A is turned on (saving), B's toggle queues behind it, then A ends (its cleanup queues behind B)
+  const onA = setAutoApprove(SESSION, true)
+  const onB = setAutoApprove(OTHER, true)
+  const ended = endSessionAutoApprove(SESSION)
+  // Step through the chain: at no point may an approval of A pass
+  let done = false
+  void Promise.all([onA, onB, ended]).then(() => (done = true))
+  for (let i = 0; i < 5000 && !done; i++) {
+    assert.equal(shouldAutoApprove({ sessionId: SESSION, toolName: 'Bash' }), false, 'the ended session was auto-approved')
+    // ★ Alternate: a turn of the event loop (an approval can arrive between two I/O steps), then a millisecond
+    await new Promise((r) => (i % 2 === 0 ? setImmediate(r) : setTimeout(r, 1)))
+  }
+  assert.ok(done)
+  assert.equal((await onA).ok, true, 'the phone is not told of a failure (the session simply ended)')
+  assert.deepEqual(await ended, { ok: true, had: true }, 'the cancelled "on" counts, so the phone is told')
+  assert.equal(autoApproveFor(SESSION), undefined)
+  assert.ok(autoApproveFor(OTHER))
+  // ★ The file agrees: a restart does not revive A
+  const stored = JSON.parse(await readFile(join(process.env['NYAN_REMOTE_STATE_DIR']!, AUTO_APPROVE_FILE), 'utf8')) as { entries: Array<{ id: string }> }
+  assert.deepEqual(stored.entries.map((e) => e.id), [OTHER])
+})
+
+test('an "on" asked after the session ended is a new start and takes effect', async (t) => {
+  await withStateDir(t)
+  assert.equal((await setAutoApprove(SESSION, true)).ok, true)
+  const ended = endSessionAutoApprove(SESSION)
+  const again = setAutoApprove(SESSION, true)
+  await ended
+  const r = await again
+  assert.ok(r.ok && r.entry)
+  assert.ok(autoApproveFor(SESSION))
+})
+
+test('an end that arrives while the "on" is being written: not taken, and the file is written again without it', async (t) => {
+  await withStateDir(t)
+  const on = setAutoApprove(SESSION, true)
+  // Let its section start writing, then end the session (nothing else is queued to write after it)
+  await new Promise((r) => setImmediate(r))
+  const ended = endSessionAutoApprove(SESSION)
+  assert.equal((await on).ok, true)
+  assert.deepEqual(await ended, { ok: true, had: true })
+  assert.equal(autoApproveFor(SESSION), undefined)
+  const stored = JSON.parse(await readFile(join(process.env['NYAN_REMOTE_STATE_DIR']!, AUTO_APPROVE_FILE), 'utf8')) as { entries: Array<{ id: string }> }
+  assert.deepEqual(stored.entries, [], 'a restart would revive it')
 })

@@ -14,6 +14,7 @@ import { autoApproveFor } from '../autoApprove.ts'
 import { ensureFollowWatch } from '../claude/follow.ts'
 import { attach } from '../events.ts'
 import { t } from '../../../shared/i18n.ts'
+import { codexLog, codexRows } from '../codex/run.ts'
 
 const DEFAULT_LIMIT = 60
 const MAX_LIMIT = 300
@@ -171,7 +172,11 @@ export async function sessions(ctx?: Ctx): Promise<SessionsPage> {
     void sweepPanes()
   }
   // ★ Markers for all items are built from **one scan** (calling findPane per session would scan the index quadratically)
-  const marked = markAutoApprove(markSend(sessions, await scanPanes(dirs)), now)
+  // ★ Codex threads join **after** `markSend` (no send route is claimed for a row we cannot send to).
+  //   ⚠️⚠️ They do get the auto-approve mark: a Codex command approval passes while the entry is in effect
+  //      (`codex/cards.ts`), and "passing but not shown" is the worst state of that feature.
+  //   ⚠️ They are live by definition (the daemon has them loaded), so they never count as history.
+  const marked = markAutoApprove([...markSend(sessions, await scanPanes(dirs)), ...codexRows()], now)
   // ⚠️⚠️ **Filtering comes after the cleanup** (`sweepInflight` / `sweepPanes` above decide on **all items**).
   //    Moving it earlier breaks two things:
   //      1) during periods with 0 active sessions (all idle) **the cleanup never runs**
@@ -200,6 +205,14 @@ export async function sessionLog(ctx: Ctx): Promise<LogPage> {
   const cfg = config()
   const dirs = await discoverConfigDirs(cfg.configDirs)
   const before = intOrNull(ctx.url.searchParams.get('before'))
+  // ★ A Codex thread has no transcript file: its turns are read from the daemon (`codex/log.ts`).
+  //   ⚠️ `undefined` = no Codex line lists this id ⇒ fall through to the Claude side as before.
+  const codex = await codexLog(sessionId, {
+    before,
+    since: intOrNull(ctx.url.searchParams.get('since')),
+    limit: clampInt(ctx.url.searchParams.get('limit'), DEFAULT_LIMIT, 1, MAX_LIMIT),
+  })
+  if (codex) return codex
   const found = await findTranscript(dirs, sessionId)
   if (!found) {
     // ★★ Even for **a session whose transcript has not a single line yet** (the shape where the first turn waits for approval),

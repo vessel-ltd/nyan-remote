@@ -76,7 +76,7 @@ export class AgentTransport implements Transport {
     quiet: number
     pendingTags?: string[]
     at?: string
-    autoApprove?: { id: string; until: string }[]
+    autoApprove?: { id: string; until: string; tool?: 'codex' }[]
   }> {
     const body = await this.get<{
       permissions: PermissionRequest[]
@@ -101,9 +101,9 @@ export class AgentTransport implements Transport {
       //    "on, but neither the banner nor the off button shows"** (the same hole as `pendingTags` on 2026-08-20)
       autoApprove: Array.isArray(body.autoApprove)
         ? body.autoApprove.flatMap((a) => {
-            const r = a as { id?: unknown; until?: unknown }
+            const r = a as { id?: unknown; until?: unknown; tool?: unknown }
             return typeof r.id === 'string' && typeof r.until === 'string'
-              ? [{ id: r.id, until: r.until }]
+              ? [{ id: r.id, until: r.until, ...(r.tool === 'codex' ? { tool: 'codex' as const } : {}) }]
               : []
           })
         : undefined,

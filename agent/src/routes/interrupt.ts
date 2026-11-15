@@ -27,6 +27,9 @@ import { discoverConfigDirs } from '../claude/configDirs.ts'
 import { sendControlToSession, sendStopToSession, type ControlFailure } from '../claude/keys.ts'
 import { broadcast } from '../events.ts'
 import { hasPendingForSession } from '../permission.ts'
+import { isCodexSessionId, type CodexInterruptResult } from '../codex/daemon.ts'
+import { shortSessionId } from '../codex/ids.ts'
+import { codexInterrupt, codexLists } from '../codex/run.ts'
 import { HttpError, type Ctx } from '../router.ts'
 import { t } from '../../../shared/i18n.ts'
 
@@ -53,6 +56,47 @@ export const INTERRUPT_STATUS: Record<ControlFailure, number> = {
   unreachable: 502,
 }
 
+/** Codex rows: what the phone is told when a stop is not sent (by reason) */
+const CODEX_INTERRUPT_REFUSAL: Record<Exclude<CodexInterruptResult, { ok: true }>['reason'], () => [number, string]> = {
+  'not-listed': () => [409, t('この Codex のセッションは、いま開かれていません。', 'This Codex session is not open right now.')],
+  idle: () => [409, t('Codex はいま応答していません（止めるものがありません）。', 'Codex is not working right now (nothing to stop).')],
+  waiting: () => [
+    409,
+    t('Codex が承認か返事を待っています。先にカードに答えてください。', 'Codex is waiting for an approval or an answer. Answer the card first.'),
+  ],
+  'too-soon': () => [429, t('止める合図を送っているところです。', 'A stop is already on its way.')],
+  failed: () => [409, t('Codex を止められませんでした。PC の画面を確認してください。', 'Could not stop Codex. Check the screen on the PC.')],
+}
+
+/**
+ * ★★ Stop a Codex thread (2026-11-15 / docs/CODEX.md §5.4). `undefined` when the id is not a Codex row.
+ *
+ * The daemon stops the turn that runs (`turn/interrupt`): no keys, no inbox, and nothing is cleared on the PC.
+ * ⚠️ A Codex row id that no line lists now is "not open" — never handed to the Claude routes (the two kinds of id
+ *    must not mix / same as `codexMessage`).
+ */
+export async function codexStop(
+  sessionId: string,
+  /** ★ Injected in tests */
+  codex: { lists(id: string): boolean; interrupt(id: string): Promise<CodexInterruptResult | undefined> } = {
+    lists: codexLists,
+    interrupt: codexInterrupt,
+  },
+): Promise<InterruptResult | undefined> {
+  if (!codex.lists(sessionId) && !isCodexSessionId(sessionId)) return undefined
+  const res: CodexInterruptResult = (await codex.interrupt(sessionId)) ?? { ok: false, reason: 'not-listed' }
+  const short = shortSessionId(sessionId)
+  if (!res.ok) {
+    console.log(`[codex] stop not sent thread=${short} reason=${res.reason}${res.detail ? ` (${res.detail})` : ''}`)
+    const [status, message] = CODEX_INTERRUPT_REFUSAL[res.reason]()
+    throw new HttpError(status, message)
+  }
+  const at = new Date().toISOString()
+  broadcast({ type: 'sessions-changed', at })
+  console.log(`[codex] sent a stop to thread=${short}`)
+  return { ok: true, at }
+}
+
 /**
  * ★★ **Clear the PC's input box** (Ctrl-U / 2026-08-25).
  *
@@ -69,6 +113,8 @@ export async function sessionClear(ctx: Ctx): Promise<InterruptResult> {
   const sessionId = ctx.params['id']
   if (!sessionId) throw new HttpError(400, t('session id が必要です', 'A session id is required.'))
   // ⚠️⚠️ **Never read the body**. Only `'clear'` is sent
+  // ⚠️ Codex rows have no input box we could reach (and their ids never go to the Claude routes)
+  if (isCodexSessionId(sessionId)) throw new HttpError(409, t('Codex のセッションでは使えません。', 'Not available for Codex sessions.'))
 
   const dirs = await discoverConfigDirs(config().configDirs)
   const res = await sendControlToSession(dirs, sessionId, 'clear', {
@@ -91,6 +137,10 @@ export async function sessionInterrupt(ctx: Ctx): Promise<InterruptResult> {
   const sessionId = ctx.params['id']
   if (!sessionId) throw new HttpError(400, t('session id が必要です', 'A session id is required.'))
   // ⚠️⚠️ **Never read the body** (point 1 above). Only `'escape'` is sent
+
+  // ★ A Codex thread is stopped by its daemon (`codexStop`); `undefined` = not a Codex row, so the Claude route follows
+  const viaCodex = await codexStop(sessionId)
+  if (viaCodex) return viaCodex
 
   const dirs = await discoverConfigDirs(config().configDirs)
   // ★★ If it was mid-response, also clear the input box after stopping (`sendStopToSession` / 2026-09-24)

@@ -7,7 +7,8 @@
 // ⚠️ Refusal decisions (approval card showing, dialog open on the PC, repeated taps) belong to the **agent**
 //   (`agent/src/routes/interrupt.ts`). The screen just shows its reason.
 
-import type { SessionSummary } from '../../../shared/types.ts'
+import type { AgentFeature, SessionSummary } from '../../../shared/types.ts'
+import { canStop } from './tool.ts'
 import { t } from '../../../shared/i18n.ts'
 
 /** `sending` right after a press (⚠️ so ESC is not sent twice) */
@@ -31,7 +32,14 @@ export const STOP_SENT_NOTE =
   '止める合図（ESC）を送りました。止まらないときは少し待ってもう一度押してください'
 
 /** ★ `STOP_SENT_NOTE` in the screen language (⚠️ `t()` is not called at module top level ⇒ it is a function) */
-export function stopSentNote(cleared = false): string {
+export function stopSentNote(cleared = false, codex = false): string {
+  // ★ Codex: the daemon stops the turn (no ESC, nothing cleared on the PC)
+  if (codex) {
+    return t(
+      '止める合図を送りました。止まらないときは少し待ってもう一度押してください',
+      'Sent the stop signal. If it does not stop, wait a moment and press it again',
+    )
+  }
   // ★ If the input box was cleared too, say so (text being typed on the PC is lost too, so include how to restore / 2026-09-24)
   if (cleared) {
     return t(
@@ -42,7 +50,12 @@ export function stopSentNote(cleared = false): string {
   return t(STOP_SENT_NOTE, 'Sent the stop signal (ESC). If it does not stop, wait a moment and press it again')
 }
 
-export function stopView(session: SessionSummary | undefined, phase: StopPhase): StopView {
+export function stopView(
+  session: SessionSummary | undefined,
+  phase: StopPhase,
+  /** ⚠️ The **agent's** features (`/health`), not `actionFeatures` (Codex rows need `codex-interrupt` / `tool.ts`) */
+  features: readonly AgentFeature[] | undefined,
+): StopView {
   // Not in the list (= unknown whether alive) / not running ⇒ do not show
   if (!session || !session.live) return { show: false, disabled: true, label: t('⏹ 止める', '⏹ Stop') }
   // ★★ **Not shown for old agents' sessions** (2026-08-24; there is a period where old and new coexist).
@@ -51,7 +64,8 @@ export function stopView(session: SessionSummary | undefined, phase: StopPhase):
   //    (measured: sent to a machine on the old version, got 404). Do not make "a button that does nothing".
   // ★ How to tell: **alive but no `sendRoute`** = that agent does not return the mark
   //    = this version is not installed (dead sessions get no mark even on a new agent).
-  if (!session.sendRoute) return { show: false, disabled: true, label: t('⏹ 止める', '⏹ Stop') }
+  // ★ Codex rows (no key route ever) show it only with the agent's `codex-interrupt` (`canStop` / 2026-11-15)
+  if (!canStop(session, features)) return { show: false, disabled: true, label: t('⏹ 止める', '⏹ Stop') }
   // ⚠️⚠️ **Do not hide based on state.** The list's state comes from the transcript and lags, so
   //    hiding it in a moment where it "does not look busy" means **it cannot be pressed when you most want to stop**.
   //    ⇒ Show it whenever alive; the agent does the refusing (approval card, dialog, repeated taps).

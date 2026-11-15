@@ -24,15 +24,15 @@ const base: SessionSummary = {
 }
 
 test('★ shown for running sessions', () => {
-  const v = stopView({ ...base, sendRoute: 'keys' }, 'ready')
+  const v = stopView({ ...base, sendRoute: 'keys' }, 'ready', undefined)
   assert.equal(v.show, true)
   assert.equal(v.disabled, false)
   assert.ok(v.label.includes('止める'), v.label)
 })
 
 test('★★ not shown for sessions missing from the list / not running (no pressable-but-inert buttons)', () => {
-  assert.equal(stopView(undefined, 'ready').show, false)
-  assert.equal(stopView({ ...base, live: false, sendRoute: 'keys' }, 'ready').show, false)
+  assert.equal(stopView(undefined, 'ready', undefined).show, false)
+  assert.equal(stopView({ ...base, live: false, sendRoute: 'keys' }, 'ready', undefined).show, false)
 })
 
 test('★★ not hidden based on state (busy or not)', () => {
@@ -52,7 +52,7 @@ test('★★ not hidden based on state (busy or not)', () => {
   ]
   for (const status of all) {
     assert.equal(
-      stopView({ ...base, status, sendRoute: 'keys' }, 'ready').show,
+      stopView({ ...base, status, sendRoute: 'keys' }, 'ready', undefined).show,
       true,
       `hidden at status=${status}`,
     )
@@ -60,12 +60,12 @@ test('★★ not hidden based on state (busy or not)', () => {
 })
 
 test('★★ cannot be pressed while sending (ESC twice opens the "go back" screen)', () => {
-  const v = stopView({ ...base, sendRoute: 'keys' }, 'sending')
+  const v = stopView({ ...base, sendRoute: 'keys' }, 'sending', undefined)
   assert.equal(v.show, true)
   assert.equal(v.disabled, true, '⚠️⚠️ can be tapped repeatedly (ESC sent twice)')
   assert.notEqual(
     v.label,
-    stopView({ ...base, sendRoute: 'keys' }, 'ready').label,
+    stopView({ ...base, sendRoute: 'keys' }, 'ready', undefined).label,
     'appearance does not change after pressing',
   )
 })
@@ -108,10 +108,10 @@ test('★★ not shown for old agents\' sessions (pressing would 404)', () => {
   //    ⇒ Do not make "a button that does nothing".
   // ★ How to tell: **alive but no `sendRoute`** = that agent does not return the mark
   //    = this version is not installed (dead sessions get no mark even on a new agent).
-  assert.equal(stopView({ ...base, sendRoute: undefined }, 'ready').show, false)
+  assert.equal(stopView({ ...base, sendRoute: undefined }, 'ready', undefined).show, false)
   // ★ Conversely: with a mark (keys or inbox), show it
-  assert.equal(stopView({ ...base, sendRoute: 'keys' }, 'ready').show, true)
-  assert.equal(stopView({ ...base, sendRoute: 'inbox', keysReason: 'no-relay' }, 'ready').show, true)
+  assert.equal(stopView({ ...base, sendRoute: 'keys' }, 'ready', undefined).show, true)
+  assert.equal(stopView({ ...base, sendRoute: 'inbox', keysReason: 'no-relay' }, 'ready', undefined).show, true)
 })
 
 test('★★ when the input box was cleared too, say so and say how to restore it (Ctrl+Y) (2026-09-24)', () => {
@@ -119,4 +119,12 @@ test('★★ when the input box was cleared too, say so and say how to restore i
   assert.match(cleared, /入力欄も消しました/)
   assert.match(cleared, /Ctrl\+Y/, '⚠️ PC text in progress is cleared too, but it does not say how to restore')
   assert.doesNotMatch(stopSentNote(), /入力欄/, '⚠️ says "cleared" although it did not (old agent)')
+})
+
+test('★ Codex: the sent notice does not mention ESC or the PC input box (the daemon stops the turn)', () => {
+  const note = stopSentNote(false, true)
+  assert.doesNotMatch(note, /ESC|Ctrl/)
+  assert.notEqual(note, stopSentNote(false, false))
+  // ⚠️ `cleared` never comes back for Codex, but even if it did, the Codex wording wins
+  assert.equal(stopSentNote(true, true), note)
 })

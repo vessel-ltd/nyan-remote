@@ -27,11 +27,11 @@ import { test } from 'node:test'
 import type { SessionSummary } from '../../../shared/types.ts'
 import { autoApproveFor, resetAutoApprove, setAutoApprove } from '../autoApprove.ts'
 import { hooksFor, noteHook } from '../claude/hookState.ts'
-import { listPending, resetPending } from '../permission.ts'
+import { listPending, resetPending, waitForDecision } from '../permission.ts'
 import type { Identity } from '../auth.ts'
 import { HttpError, type Ctx } from '../router.ts'
 import { sessionAutoApprove } from './autoApprove.ts'
-import { permissionAnswer, permissionRequest } from './permission.ts'
+import { permissionAnswer, permissionRequest, permissions } from './permission.ts'
 import { hook } from './hook.ts'
 import { markAutoApprove } from './sessions.ts'
 
@@ -425,4 +425,43 @@ test('★★ answering an approval names exactly the device that answered', asyn
   const b = await answerAs(PHONE_B)
   assert.deepEqual(actors(b, '[perm] allow'), ['device:H_XhoF0K'])
   noLogin([...a, ...b])
+})
+
+test('a Codex card refuses a denial that carries a reason (it has nowhere to go), and still takes a plain one', async (t) => {
+  await withState(t)
+  const waiting = waitForDecision(
+    { key: 'codex:abc#1', machine: 'pc-a', account: '.codex', project: 'proj', sessionId: 'thread-1', toolName: 'Bash', tool: 'codex', summary: 'touch x', at: '2026-11-14T12:00:00.000Z' },
+    () => undefined,
+  )
+  const refused = await permissionAnswer(
+    bodyCtx('http://agent/permission/answer', {}, { key: 'codex:abc#1', behavior: 'deny', feedback: 'do it differently' }, PHONE_A),
+  )
+  assert.equal(refused.ok, false)
+  assert.match(refused.reason ?? '', /Codex/)
+  assert.equal(listPending().length, 1, 'the card is still there')
+  const plain = await permissionAnswer(bodyCtx('http://agent/permission/answer', {}, { key: 'codex:abc#1', behavior: 'deny' }, PHONE_A))
+  assert.equal(plain.ok, true)
+  assert.deepEqual(await waiting, { behavior: 'deny' })
+})
+
+test('★ the list marks Codex rows too (a Codex approval passes while the entry is on, so the row must show it)', async () => {
+  const src = await readFile(fileURLToPath(new URL('./sessions.ts', import.meta.url)), 'utf8')
+  // ⚠️ Executed lines only (the comments around it say the same words)
+  const code = src
+    .split('\n')
+    .filter((l) => !l.trim().startsWith('//') && !l.trim().startsWith('*'))
+    .join('\n')
+  assert.match(code, /markAutoApprove\(\[[^\]]*\.\.\.codexRows\(\)[^\]]*\], now\)/)
+})
+
+test('★ /permissions marks a Codex row\'s auto-approve entry as Codex, and only that one (codex review, medium #7)', async (t) => {
+  await withState(t)
+  const codexId = 'codex-0123abcd0123abcd-01a1d8d9-66fc-7823-968f-c97d7234176e'
+  assert.equal((await setAutoApprove(SESSION, true, Date.now())).ok, true)
+  assert.equal((await setAutoApprove(codexId, true, Date.now())).ok, true)
+  const marks = (await permissions()).autoApprove
+  assert.deepEqual(
+    marks.map((m) => [m.id, 'tool' in m ? m.tool : undefined]).sort(),
+    [[SESSION, undefined], [codexId, 'codex']].sort(),
+  )
 })

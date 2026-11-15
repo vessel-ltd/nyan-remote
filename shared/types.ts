@@ -39,6 +39,15 @@ export interface SessionSummary {
   machine: string
   /** Base name of CLAUDE_CONFIG_DIR. '.claude' / '.claude-r' */
   account: string
+  /**
+   * ★ Which CLI the session belongs to (2026-11-14 / docs/CODEX.md). **Absent = Claude Code** (every row before this field).
+   *
+   * ⚠️ A Codex row is "a thread this machine's Codex daemon can serve", **not** "a TUI is open": the daemon keeps a
+   *    thread loaded for about a minute after its TUI exits. For such rows `account` is the label of the Codex home
+   *    (its base name, e.g. `.codex`), and `sessionId` is the Codex thread id.
+   * ⚠️ The UI must not offer what the agent cannot do for that tool (gate on `/health` features, not on this field alone).
+   */
+  tool?: 'codex'
   /** ★ A synthetic row the UI built from an approval, with unknown account (carries `PermissionRequest.accountUnknown`) */
   accountUnknown?: true
   sessionId: string
@@ -234,6 +243,37 @@ export type AgentFeature =
    *   (old agents do not know `duration`, so sending it gives 3 hours = disagrees with what the UI says).
    */
   | 'auto-approve-24h'
+  /**
+   * ★ Codex threads appear in `/sessions` with `tool: 'codex'` (2026-11-14 / docs/CODEX.md).
+   * ⚠️ Present only when the user turned it on in `config.json` (`codex.enabled`). It says the rows can appear,
+   *    **not** that anything can be done to them: each action gets its own marker when it is built.
+   */
+  | 'codex-sessions'
+  /**
+   * ★ `GET /sessions/:id/follow` also signals for Codex threads (the agent watches the daemon and sends `log-appended`).
+   * ⚠️ Separate from `log-follow`: an agent can list Codex threads without watching them.
+   */
+  | 'codex-log-follow'
+  /** ★ `POST /sessions/:id/message` sends to an idle Codex thread (a new turn on the daemon / 2026-11-15) */
+  | 'codex-send'
+  /** ★ Auto-approve mode also passes Codex command approvals, and Codex rows carry the mark (2026-11-14) */
+  | 'codex-auto-approve'
+  /** ★ `POST /sessions/:id/interrupt` stops the running turn of a Codex thread (`turn/interrupt` / 2026-11-15) */
+  | 'codex-interrupt'
+
+/** One Codex home's line to its app-server daemon (`agent/src/codex/daemon.ts`) */
+export interface CodexLineHealth {
+  /** Label of the home (its base name) */
+  home: string
+  state: 'no-daemon' | 'denied' | 'settling' | 'connecting' | 'connected' | 'failed' | 'stopped'
+  detail?: string
+  rows: number
+  /** Threads hidden because they are not a person's, by `threadSource` */
+  hidden: Record<string, number>
+  unparsed: number
+  /** Server requests seen and deliberately left unanswered */
+  unansweredRequests: number
+}
 
 export interface AgentHealth {
   machine: string
@@ -264,6 +304,8 @@ export interface AgentHealth {
    * ⚠️ Old agents do not return it (`undefined`).
    */
   relay?: RelayHealth
+  /** ★ Codex daemon lines, for diagnostics (absent when Codex support is off). ⚠️ Not a liveness signal for the UI. */
+  codex?: CodexLineHealth[]
   /**
    * ★ This agent's version (2026-09-24 / update prompts). ⚠️ Old agents do not return it; not attached if unreadable.
    *   ⚠️ A value from outside ⇒ the UI passes it through `asBuildInfo` before use.
@@ -499,6 +541,11 @@ export interface PermissionRequest {
   promptId?: string
   toolUseId?: string
   toolName: string
+  /**
+   * ★ Which coding tool asks (2026-11-14). Absent = Claude Code.
+   * ⚠️ A Codex approval is yes/no only: it cannot carry a reason with a denial, and has no choices.
+   */
+  tool?: 'codex'
   /**
    * ★ If the request comes from a subagent (the side started by `Task`), its kind.
    *

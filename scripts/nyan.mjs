@@ -420,7 +420,7 @@ function update(args) {
   return 0
 }
 
-function status() {
+async function status() {
   const kind = serviceKind(platform(), homedir())
   console.log(t(`版:         ${versionOf(ROOT)}`, `Version:    ${versionOf(ROOT)}`))
   const git = existsSync(join(ROOT, '.git'))
@@ -435,9 +435,96 @@ function status() {
     console.log(t(`動いているか: ${state ?? '不明'}`, `Running:    ${state ?? 'unknown'}`))
   }
   // ★ For the relay, print "the last line of that kind" in the affirmative (never cut by line count / CLAUDE.md §2)
-  const relay = recentLogLines(kind, homedir()).filter((l) => l.includes('[relay]')).at(-1)
+  const recent = recentLogLines(kind, homedir())
+  const relay = recent.filter((l) => l.includes('[relay]')).at(-1)
   console.log(`relay:      ${relay ? relay.replace(/^.*\[relay\]\s*/, '') : t('（ログにまだ出ていません）', '(not in the logs yet)')}`)
+  // ⚠️ Loaded only here: every other command (uninstall, help…) must not depend on the agent's sources being there
+  const { inspectConfig } = await import('../agent/src/config.ts')
+  for (const line of codexStatusLines(await inspectConfig(), recent)) console.log(line)
   return 0
+}
+
+/** = `CODEX_START_MARK` in `agent/src/codex/marks.ts` (a test keeps the two equal; not imported, see above) */
+const CODEX_START_MARK = '[codex] start: homes='
+const CODEX_STATES = ['no-daemon', 'denied', 'settling', 'connecting', 'connected', 'failed', 'stopped']
+/** `[codex] <home label>: <state>` with an optional ` (<detail>)` (⚠️ a label can hold spaces) */
+const CODEX_STATE_LINE = new RegExp(`\\[codex\\] (.+): (${CODEX_STATES.join('|')})(?: \\(.*\\))?\\s*$`)
+
+/**
+ * What this run of the agent logged about Codex: the number of homes it watches (`undefined` = no start mark in the
+ * recent logs) and the last state of each home, from the lines after the last start mark only (older ones are another run's).
+ */
+function codexRun(logLines) {
+  const startAt = logLines.findLastIndex((l) => l.includes(CODEX_START_MARK))
+  if (startAt < 0) return { homes: undefined, name: undefined, byHome: new Map() }
+  // `<mark><n> name=<name>` (the name is the rest of the line: it may hold spaces)
+  const rest = logLines[startAt].slice(logLines[startAt].indexOf(CODEX_START_MARK) + CODEX_START_MARK.length)
+  const m = rest.match(/^(\d+)(?: name=(.+?))?\s*$/)
+  const homes = m ? Number(m[1]) : NaN
+  const byHome = new Map()
+  for (const l of logLines.slice(startAt + 1)) {
+    const m = l.match(CODEX_STATE_LINE)
+    if (m) byHome.set(m[1], m[2])
+  }
+  return { homes: Number.isInteger(homes) && homes >= 0 ? homes : undefined, name: m?.[2], byHome }
+}
+
+/**
+ * ★ The Codex lines of `nyan status` (2026-11-15 / user decision: Codex is on by default, so the PC says so).
+ * @param config what `inspectConfig()` says (the agent's own reading of config.json — same validation, no writes)
+ * @param logLines the recent log lines
+ *
+ * ⚠️ Two things, always said apart (codex rounds 13–14): **the setting** (config.json now — not in effect until the
+ *    agent restarts) and **what this run of the agent logged** ("last seen", not a live check). Turning it off in the
+ *    file does not hide a connection the running agent still has.
+ * ⚠️ "No daemon" only when **every** home this run watches (`homes=<n>` of the start mark) said `no-daemon`
+ *    (two homes can share a label; fewer states than homes = not everything was seen). Nothing seen is said as such.
+ */
+export function codexStatusLines(config, logLines) {
+  const codex = config.kind === 'ok' ? config.value.codex : undefined
+  const setting = config.kind === 'unusable' ? 'unusable' : codex?.enabled === false ? 'off' : 'on'
+  const run = codexRun(logLines)
+  // ★ The name this run uses (start mark); the setting's only when the run did not say (codex round 15, low #3)
+  const name = run.name ?? (typeof codex?.clientName === 'string' ? codex.clientName : 'nyan-remote')
+  const states = [...run.byHome.values()]
+  const seenAll = run.homes !== undefined && run.byHome.size >= run.homes
+  const connected = states.includes('connected')
+
+  const head =
+    setting === 'unusable'
+      ? t('Codex:      config.json が使えません（agent を起動し直すと Codex には繋ぎません）', 'Codex:      config.json cannot be used (after a restart the agent does not connect to Codex)')
+      : setting === 'off'
+        ? t('Codex:      設定はオフ（config.json の "codex": { "enabled": false }）', 'Codex:      off in the settings (config.json "codex": { "enabled": false })')
+        : t('Codex:      設定はオン', 'Codex:      on in the settings')
+  const lines = [head]
+  if (run.homes === undefined) {
+    lines.push(t('            いまの agent の様子: 最近のログに出ていません', '            This agent run: not in the recent logs'))
+  } else if (run.homes === 0) {
+    lines.push(t('            いまの agent の様子: Codex には繋いでいません', '            This agent run: not connecting to Codex'))
+  } else if (seenAll && states.every((s) => s === 'no-daemon')) {
+    lines.push(t('            いまの agent の様子（ログで最後に見えたもの）: Codex の daemon は見つかっていません（Codex が無いか、動いていません）', '            This agent run (last seen in the log): no Codex daemon found (Codex is not installed or not running)'))
+  } else {
+    lines.push(t('            いまの agent の様子（ログで最後に見えたもの）:', '            This agent run (last seen in the log):'))
+    for (const [home, state] of run.byHome) lines.push(`              ${home}: ${state}`)
+    if (!seenAll) {
+      const missing = run.homes - run.byHome.size
+      lines.push(missing > 0 ? t(`              （ほかに ${missing} 個の home の様子は見えていません）`, `              (${missing} more home(s) not seen)`) : t('              （見えていない home があります）', '              (some homes not seen)'))
+    }
+  }
+  // ★ What a connection does, and the way off — whenever one is on, or may be (a home of this run not seen yet)
+  if (setting === 'on' || connected || (run.homes !== undefined && run.homes > 0 && !seenAll)) {
+    lines.push(
+      t(
+        `            Codex に繋ぐと、この PC の Codex が送る User-Agent の末尾に「${name}」が載ります。オフ: config.json に "codex": { "enabled": false } を書いて再起動`,
+        `            While connected, "${name}" appears at the end of the User-Agent of this PC's Codex requests. Off: put "codex": { "enabled": false } in config.json and restart`,
+      ),
+    )
+  }
+  // ⚠️ Both directions (codex round 15, low #2): turned off while this run watches, or turned on while it does not
+  if (run.homes !== undefined && (setting === 'on' ? run.homes === 0 : run.homes > 0)) {
+    lines.push(t('            ⚠️ 設定は agent を起動し直すまで反映されません', '            ⚠️ The setting takes effect when the agent restarts'))
+  }
+  return lines
 }
 
 function logs(args) {
@@ -497,5 +584,6 @@ export function main(argv, env = process.env) {
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  process.exit(main(process.argv.slice(2)))
+  // ★ `status` answers asynchronously (it reads config.json the agent's way); the others return a number
+  Promise.resolve(main(process.argv.slice(2))).then((code) => process.exit(code))
 }

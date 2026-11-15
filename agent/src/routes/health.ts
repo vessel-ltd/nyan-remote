@@ -9,6 +9,7 @@ import { devMode } from '../auth.ts'
 import { discoverConfigDirs } from '../claude/configDirs.ts'
 import { describeAccounts } from '../claude/sessions.ts'
 import { machineName } from '../machine.ts'
+import { codexEnabled, codexHealth } from '../codex/run.ts'
 
 /**
  * ★★ Features this agent has. **When you add an endpoint, add it here too.**
@@ -43,7 +44,8 @@ export async function health(): Promise<AgentHealth> {
     uptimeSec: Math.round(process.uptime()),
     devMode: devMode(),
     accounts: await describeAccounts(dirs),
-    features: AGENT_FEATURES,
+    // ★ `codex-sessions` is not in the constant: it is present only while the user has Codex support turned on
+    features: codexEnabled() ? [...AGENT_FEATURES, 'codex-sessions', 'codex-log-follow', 'codex-send', 'codex-auto-approve', 'codex-interrupt'] : AGENT_FEATURES,
     // ★ The device key for ③. ⚠️ **Omitted** when unusable (the PWA then fails to match and
     //   says "the machine that showed this QR is not among your endpoints" = never send to a false destination)
     ...(agentKeyProblem() ? {} : { agentPublicKey: toBase64Url(agentPublicRaw()) }),
@@ -53,5 +55,6 @@ export async function health(): Promise<AgentHealth> {
     ...(agentBuild() ? { build: agentBuild() } : {}),
     // ★ Account and plan (⚠️ never exposes the passphrase or the license itself)
     account: accountHealth(),
+    ...(codexHealth() ? { codex: codexHealth() } : {}),
   }
 }

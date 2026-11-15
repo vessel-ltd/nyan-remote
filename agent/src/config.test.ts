@@ -234,3 +234,39 @@ test('★ the fix instructions depend on how it is broken (if readable, do not s
     assert.equal(configProblem()?.kind, 'unreadable')
   })
 })
+
+test('★ a config that cannot be used keeps Codex off, even though Codex is on by default (codex round 13, high #1)', async () => {
+  await withStateDir(async (dir) => {
+    // An explicit opt-out next to an unrelated bad value: the file is refused as a whole
+    await writeFile(join(dir, 'config.json'), JSON.stringify({ port: 'bad', codex: { enabled: false } }))
+    await loadConfig()
+    assert.ok(configProblem())
+    assert.equal(config().codex?.enabled, false)
+    // Broken JSON too
+    await writeFile(join(dir, 'config.json'), '{ broken')
+    await loadConfig()
+    assert.equal(config().codex?.enabled, false)
+    // Control: a good file without a codex section leaves it on (absent = on)
+    await writeFile(join(dir, 'config.json'), JSON.stringify({ allowedLogins: [], hookToken: 'x'.repeat(32) }))
+    await loadConfig()
+    assert.equal(configProblem(), null)
+    assert.equal(config().codex, undefined)
+  })
+})
+
+test('inspectConfig: missing / unusable / ok, and it writes nothing (nyan status reads with it)', async () => {
+  const { inspectConfig } = await import('./config.ts')
+  const { readdir } = await import('node:fs/promises')
+  await withStateDir(async (dir) => {
+    assert.deepEqual(await inspectConfig(), { kind: 'missing' })
+    assert.deepEqual(await readdir(dir), [], 'nothing created')
+    await writeFile(join(dir, 'config.json'), JSON.stringify({ codex: { enabled: 'false' } }))
+    assert.deepEqual(await inspectConfig(), { kind: 'unusable' })
+    await writeFile(join(dir, 'config.json'), '{ broken')
+    assert.deepEqual(await inspectConfig(), { kind: 'unusable' })
+    const good = { allowedLogins: [], hookToken: 'x'.repeat(32), codex: { enabled: false } }
+    await writeFile(join(dir, 'config.json'), JSON.stringify(good))
+    assert.deepEqual(await inspectConfig(), { kind: 'ok', value: good })
+    assert.deepEqual(await readdir(dir), ['config.json'])
+  })
+})

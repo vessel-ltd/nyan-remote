@@ -9,7 +9,9 @@
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { test } from 'node:test'
-import { decideAfterKeys, inboxRefusal, type RouteDecision } from './message.ts'
+import { codexMessage, decideAfterKeys, inboxRefusal, type RouteDecision } from './message.ts'
+import { HttpError } from '../router.ts'
+import type { CodexSendResult } from '../codex/daemon.ts'
 import type { KeysFailure } from '../claude/keys.ts'
 
 /**
@@ -88,4 +90,75 @@ test('★★ the decision goes through `sanitizeForKeys` (do not write the leadi
     .join('\n')
   assert.match(code, /sanitizeForKeys\(/, 'the leading-character check is hand-rolled')
   assert.ok(!/startsWith\('\/'\)/.test(code), "⚠️ the leading-character check is hand-rolled")
+})
+
+// ── Codex threads (docs/CODEX.md §5.2) ──
+
+function codexWorld(...given: [(CodexSendResult | undefined)?]) {
+  // ⚠️ `undefined` passed on purpose is a result too (a default parameter would swallow it)
+  const result: CodexSendResult | undefined = given.length > 0 ? given[0] : { ok: true }
+  const sent: Array<[string, string]> = []
+  return {
+    sent,
+    codex: {
+      lists: (id: string) => id === 'thread-1',
+      send: async (id: string, text: string) => {
+        sent.push([id, text])
+        return result
+      },
+    },
+  }
+}
+
+async function status(run: Promise<unknown>): Promise<number | 'ok'> {
+  try {
+    await run
+    return 'ok'
+  } catch (err) {
+    assert.ok(err instanceof HttpError)
+    return err.status
+  }
+}
+
+test('codex: an id that is not a Codex row is not ours (undefined), and the daemon is never asked', async () => {
+  const w = codexWorld()
+  assert.equal(await codexMessage('some-claude-session', 'hi', w.codex), undefined)
+  // ⚠️ Even with a bad body: the Claude routes give their own answer for it
+  assert.equal(await codexMessage('some-claude-session', '', w.codex), undefined)
+  assert.deepEqual(w.sent, [])
+})
+
+test('★ codex: a Codex row id that is not listed now is "not open" (409), never handed to the Claude routes', async () => {
+  const w = codexWorld()
+  assert.equal(await status(codexMessage('codex-0123abcd0123abcd-01a1d8d9-66fc-7823-968f-c97d7234176e', 'hi', w.codex)), 409)
+  assert.deepEqual(w.sent, [])
+})
+
+test('★ codex: the text goes to the daemon as it is, and the reply names the shape the phone will see', async () => {
+  const w = codexWorld()
+  const res = await codexMessage('thread-1', 'fix the  test\nplease ', w.codex)
+  assert.deepEqual(w.sent, [['thread-1', 'fix the  test\nplease ']])
+  assert.equal(res?.ok, true)
+  // ⚠️ `keys`: a plain message without `via` (what `pending.ts` matches the sent bubble against)
+  assert.equal(res?.route, 'keys')
+})
+
+test('★ codex: an empty, too long, or `/` `!` body is refused with 400 before the daemon is asked', async () => {
+  for (const body of ['', '   ', 'x'.repeat(200_000), '/compact', '!ls', ' /exit']) {
+    const w = codexWorld()
+    assert.equal(await status(codexMessage('thread-1', body, w.codex)), 400, JSON.stringify(body.slice(0, 12)))
+    assert.deepEqual(w.sent, [])
+  }
+})
+
+test('codex: busy, gone, and refused by the daemon are 409 (the state of the other side), never a fall-through', async () => {
+  for (const r of [
+    { ok: false, reason: 'busy' },
+    { ok: false, reason: 'not-listed' },
+    { ok: false, reason: 'failed', detail: 'error -32600' },
+    // The row vanished between the look and the send
+    undefined,
+  ] as Array<CodexSendResult | undefined>) {
+    assert.equal(await status(codexMessage('thread-1', 'hi', codexWorld(r).codex)), 409, JSON.stringify(r))
+  }
 })

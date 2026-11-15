@@ -52,6 +52,44 @@ export interface Config {
    * ⚠️ A bad value falls back to the hostname instead of refusing requests (only the name is lost).
    */
   machineName?: string
+  /**
+   * ★ Codex sessions (2026-11-14 / docs/CODEX.md). **On unless `enabled` is false** (2026-11-15 / user decision).
+   *
+   * ⚠️⚠️ What turning it on does (said in the README, once in the log, and in `nyan status`): the agent connects to
+   *    the user's Codex app-server daemon under the name `nyan-remote`, and from then on that name appears at the end
+   *    of the User-Agent of the user's own Codex requests (measured on codex-cli 0.169.0). Off:
+   *    `"codex": { "enabled": false }`. On a machine without Codex nothing happens (no socket, nothing to connect to).
+   * `homes`: Codex homes to watch (absolute paths). Absent = `$CODEX_HOME` or `~/.codex`.
+   */
+  codex?: CodexConfig
+}
+
+export interface CodexConfig {
+  /** ⚠️ Absent = on. Only `false` turns it off. */
+  enabled?: boolean
+  homes?: string[]
+  /** What we call ourselves to the daemon. ⚠️ Default `nyan-remote`; see docs/CODEX.md §4 before changing it. */
+  clientName?: string
+  clientVersion?: string
+}
+
+/** ⚠️ The name goes into an HTTP header on Codex's side ⇒ visible ASCII only, bounded */
+const CODEX_NAME = /^[\x21-\x7e][\x20-\x7e]{0,63}$/
+
+export function validateCodexConfig(v: unknown): string | null {
+  if (v === undefined) return null
+  if (typeof v !== 'object' || v === null || Array.isArray(v)) return 'codex がオブジェクトではありません'
+  const o = v as Record<string, unknown>
+  if (o['enabled'] !== undefined && typeof o['enabled'] !== 'boolean') return 'codex.enabled が true / false ではありません'
+  const homes = o['homes']
+  if (homes !== undefined && (!Array.isArray(homes) || homes.some((h) => typeof h !== 'string' || !h.startsWith('/')))) {
+    return 'codex.homes が絶対パスの配列ではありません'
+  }
+  for (const k of ['clientName', 'clientVersion'] as const) {
+    const x = o[k]
+    if (x !== undefined && (typeof x !== 'string' || !CODEX_NAME.test(x))) return `codex.${k} が使えない値です`
+  }
+  return null
 }
 
 const DEFAULTS: Config = {
@@ -159,6 +197,8 @@ export function validateConfig(stored: Partial<Config>): string | null {
   if (port !== undefined && (typeof port !== 'number' || !Number.isInteger(port) || port <= 0)) {
     return 'port が正の整数ではありません'
   }
+  const codex = validateCodexConfig(o['codex'])
+  if (codex) return codex
   return null
 }
 
@@ -181,7 +221,9 @@ export async function loadConfig(): Promise<Config> {
       read.kind === 'broken'
         ? { reason: read.reason, detail: read.detail, path: statePath(FILE), kind: 'unreadable' }
         : { reason: invalid ?? '', detail: invalid ?? '', path: statePath(FILE), kind: 'invalid' }
-    const locked: Config = { ...DEFAULTS }
+    // ⚠️⚠️ Codex is off while the config cannot be used (codex round 13, high #1): Codex is on by default, so a broken
+    //    or invalid file would otherwise connect to the user's Codex daemon even when it says `"enabled": false`.
+    const locked: Config = { ...DEFAULTS, codex: { enabled: false } }
     applyPortEnv(locked)
     cached = locked
     logProblem(problem)
@@ -202,6 +244,18 @@ export async function loadConfig(): Promise<Config> {
   if (dirty) await writeJson(FILE, cfg, 0o600)
   await writeTokenFile(cfg.hookToken)
   return cfg
+}
+
+/**
+ * ★ Read config.json the way `loadConfig` judges it, **without writing anything** (for `nyan status` / 2026-11-15).
+ * `missing`: no file (first start) / `unusable`: unreadable or invalid — the agent then refuses requests and keeps
+ * Codex off / `ok`: the stored values (before defaults).
+ */
+export async function inspectConfig(): Promise<{ kind: 'ok'; value: Partial<Config> } | { kind: 'missing' } | { kind: 'unusable' }> {
+  const read = await readJsonFile<Partial<Config>>(FILE)
+  if (read.kind === 'missing') return { kind: 'missing' }
+  if (read.kind === 'broken' || validateConfig(read.value)) return { kind: 'unusable' }
+  return { kind: 'ok', value: read.value }
 }
 
 function logProblem(p: ConfigProblem): void {

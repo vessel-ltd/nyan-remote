@@ -1,0 +1,322 @@
+{
+ "note": "Real request/response pairs from codex-cli 0.169.0 (app-server, experimentalApi:false) against a mock model API. Captured 2026-11-14 by a Codex session in an isolated CODEX_HOME; payloads are verbatim.",
+ "exchanges": {
+  "turns_desc_full_page1": {
+   "request": {
+    "id": 119,
+    "method": "thread/turns/list",
+    "params": {
+     "threadId": "01a1d950-d528-7173-9bf5-c8e05c8b43cc",
+     "limit": 2,
+     "sortDirection": "desc",
+     "itemsView": "full"
+    }
+   },
+   "response": {
+    "id": 119,
+    "result": {
+     "data": [
+      {
+       "id": "01a1d950-dedf-7170-b2aa-0204bec6a983",
+       "rootTurnId": "01a1d950-dedf-7170-b2aa-0204bec6a983",
+       "items": [
+        {
+         "type": "userMessage",
+         "id": "01a1d950-deeb-7af0-8766-3de9c39c3e6b",
+         "clientId": null,
+         "content": [
+          {
+           "type": "text",
+           "text": "SYNTHETIC_USER_fail",
+           "text_elements": []
+          }
+         ],
+         "startedAtMs": 1794647318253,
+         "completedAtMs": 1794647318253
+        }
+       ],
+       "itemsView": "full",
+       "status": "failed",
+       "error": {
+        "message": "We’re currently experiencing high demand, which may cause temporary errors.",
+        "codexErrorInfo": "internalServerError",
+        "additionalDetails": null,
+        "misalignment": null
+       },
+       "startedAt": 1794647318,
+       "completedAt": 1794647318,
+       "durationMs": 33
+      },
+      {
+       "id": "01a1d950-dab7-73d2-ac99-853a9e419bd3",
+       "rootTurnId": "01a1d950-dab7-73d2-ac99-853a9e419bd3",
+       "items": [
+        {
+         "type": "userMessage",
+         "id": "01a1d950-dac6-77c2-9483-4789ec314244",
+         "clientId": null,
+         "content": [
+          {
+           "type": "text",
+           "text": "SYNTHETIC_USER_interrupt",
+           "text_elements": []
+          }
+         ],
+         "startedAtMs": 1794647317192,
+         "completedAtMs": 1794647317192
+        }
+       ],
+       "itemsView": "full",
+       "status": "interrupted",
+       "error": null,
+       "startedAt": 1794647317,
+       "completedAt": 1794647317,
+       "durationMs": 438
+      }
+     ],
+     "nextCursor": "{\"requestedThreadId\":\"01a1d950-d528-7173-9bf5-c8e05c8b43cc\",\"rolloutOrdinal\":36,\"includeAnchor\":false,\"scope\":{\"kind\":\"turns\"}}",
+     "backwardsCursor": "{\"requestedThreadId\":\"01a1d950-d528-7173-9bf5-c8e05c8b43cc\",\"rolloutOrdinal\":43,\"includeAnchor\":true,\"scope\":{\"kind\":\"turns\"}}"
+    }
+   }
+  },
+  "turns_desc_full_page2": {
+   "request": {
+    "id": 120,
+    "method": "thread/turns/list",
+    "params": {
+     "threadId": "01a1d950-d528-7173-9bf5-c8e05c8b43cc",
+     "limit": 2,
+     "sortDirection": "desc",
+     "itemsView": "full",
+     "cursor": "{\"requestedThreadId\":\"01a1d950-d528-7173-9bf5-c8e05c8b43cc\",\"rolloutOrdinal\":36,\"includeAnchor\":false,\"scope\":{\"kind\":\"turns\"}}"
+    }
+   },
+   "response": {
+    "id": 120,
+    "result": {
+     "data": [
+      {
+       "id": "01a1d950-d808-7623-8943-aa3ee91968bb",
+       "rootTurnId": "01a1d950-d808-7623-8943-aa3ee91968bb",
+       "items": [
+        {
+         "type": "userMessage",
+         "id": "01a1d950-d812-7f52-8ae1-2070ffb35435",
+         "clientId": null,
+         "content": [
+          {
+           "type": "text",
+           "text": "SYNTHETIC_USER_decline",
+           "text_elements": []
+          }
+         ],
+         "startedAtMs": 1794647316499,
+         "completedAtMs": 1794647316499
+        },
+        {
+         "type": "agentMessage",
+         "moderation": null,
+         "id": "msg_d034f3f9681a4e409e5373a262fd9138",
+         "text": "SYNTHETIC_BEFORE_decline",
+         "phase": "commentary",
+         "memoryCitation": null,
+         "delivery": null,
+         "questions": null,
+         "startedAtMs": 1794647316512,
+         "completedAtMs": 1794647316512
+        },
+        {
+         "type": "agentMessage",
+         "moderation": null,
+         "id": "msg_ff4b306867824816933d120842aaf20a",
+         "text": "SYNTHETIC_AFTER_decline",
+         "phase": "final_answer",
+         "memoryCitation": null,
+         "delivery": null,
+         "questions": null,
+         "startedAtMs": 1794647316548,
+         "completedAtMs": 1794647316548
+        }
+       ],
+       "itemsView": "full",
+       "status": "completed",
+       "error": null,
+       "startedAt": 1794647316,
+       "completedAt": 1794647316,
+       "durationMs": 65
+      },
+      {
+       "id": "01a1d950-d532-7830-987d-f8bf69e4c8f3",
+       "rootTurnId": "01a1d950-d532-7830-987d-f8bf69e4c8f3",
+       "items": [
+        {
+         "type": "userMessage",
+         "id": "01a1d950-d548-7361-b71c-e4022c68b659",
+         "clientId": null,
+         "content": [
+          {
+           "type": "text",
+           "text": "SYNTHETIC_USER_accept",
+           "text_elements": []
+          }
+         ],
+         "startedAtMs": 1794647315786,
+         "completedAtMs": 1794647315786
+        },
+        {
+         "type": "agentMessage",
+         "moderation": null,
+         "id": "msg_f8627f6aafbd44d0b6ca687f9fa99d18",
+         "text": "SYNTHETIC_BEFORE_accept",
+         "phase": "commentary",
+         "memoryCitation": null,
+         "delivery": null,
+         "questions": null,
+         "startedAtMs": 1794647315801,
+         "completedAtMs": 1794647315802
+        },
+        {
+         "type": "commandExecution",
+         "id": "call_eaf27701f8db479f82372413b8398752",
+         "pluginId": null,
+         "scriptPath": null,
+         "command": "/bin/bash -lc \"printf 'SYNTHETIC_COMMAND_OUTPUT\\\\n'\"",
+         "cwd": "/tmp/nyan-codex-followup/history-066bbda5",
+         "processId": "30129",
+         "source": "unifiedExecStartup",
+         "status": "completed",
+         "commandActions": [
+          {
+           "type": "unknown",
+           "command": "printf 'SYNTHETIC_COMMAND_OUTPUT\\n'"
+          }
+         ],
+         "aggregatedOutput": "SYNTHETIC_COMMAND_OUTPUT\n",
+         "exitCode": 0,
+         "durationMs": 0,
+         "startedAtMs": 1794647315821,
+         "completedAtMs": 1794647315857
+        },
+        {
+         "type": "agentMessage",
+         "moderation": null,
+         "id": "msg_497f3b6dc62845de95251e57546dbb01",
+         "text": "SYNTHETIC_AFTER_accept",
+         "phase": "final_answer",
+         "memoryCitation": null,
+         "delivery": null,
+         "questions": null,
+         "startedAtMs": 1794647315875,
+         "completedAtMs": 1794647315875
+        }
+       ],
+       "itemsView": "full",
+       "status": "completed",
+       "error": null,
+       "startedAt": 1794647315,
+       "completedAt": 1794647315,
+       "durationMs": 118
+      }
+     ],
+     "nextCursor": null,
+     "backwardsCursor": "{\"requestedThreadId\":\"01a1d950-d528-7173-9bf5-c8e05c8b43cc\",\"rolloutOrdinal\":21,\"includeAnchor\":true,\"scope\":{\"kind\":\"turns\"}}"
+    }
+   }
+  },
+  "streaming_turn": {
+   "request": {
+    "id": 105,
+    "method": "thread/turns/list",
+    "params": {
+     "threadId": "01a1d950-d528-7173-9bf5-c8e05c8b43cc",
+     "limit": 1,
+     "itemsView": "full",
+     "sortDirection": "desc"
+    }
+   },
+   "response": {
+    "id": 105,
+    "result": {
+     "data": [
+      {
+       "id": "01a1d950-dab7-73d2-ac99-853a9e419bd3",
+       "rootTurnId": "01a1d950-dab7-73d2-ac99-853a9e419bd3",
+       "items": [
+        {
+         "type": "userMessage",
+         "id": "01a1d950-dac6-77c2-9483-4789ec314244",
+         "clientId": null,
+         "content": [
+          {
+           "type": "text",
+           "text": "SYNTHETIC_USER_interrupt",
+           "text_elements": []
+          }
+         ],
+         "startedAtMs": 1794647317192,
+         "completedAtMs": 1794647317192
+        }
+       ],
+       "itemsView": "full",
+       "status": "inProgress",
+       "error": null,
+       "startedAt": 1794647317,
+       "completedAt": null,
+       "durationMs": null
+      }
+     ],
+     "nextCursor": "{\"requestedThreadId\":\"01a1d950-d528-7173-9bf5-c8e05c8b43cc\",\"rolloutOrdinal\":36,\"includeAnchor\":false,\"scope\":{\"kind\":\"turns\"}}",
+     "backwardsCursor": "{\"requestedThreadId\":\"01a1d950-d528-7173-9bf5-c8e05c8b43cc\",\"rolloutOrdinal\":36,\"includeAnchor\":true,\"scope\":{\"kind\":\"turns\"}}"
+    }
+   }
+  },
+  "turns_desc_notLoaded_page1": {
+   "request": {
+    "id": 115,
+    "method": "thread/turns/list",
+    "params": {
+     "threadId": "01a1d950-d528-7173-9bf5-c8e05c8b43cc",
+     "limit": 2,
+     "sortDirection": "desc",
+     "itemsView": "notLoaded"
+    }
+   },
+   "response": {
+    "id": 115,
+    "result": {
+     "data": [
+      {
+       "id": "01a1d950-dedf-7170-b2aa-0204bec6a983",
+       "rootTurnId": "01a1d950-dedf-7170-b2aa-0204bec6a983",
+       "items": [],
+       "itemsView": "notLoaded",
+       "status": "failed",
+       "error": {
+        "message": "We’re currently experiencing high demand, which may cause temporary errors.",
+        "codexErrorInfo": "internalServerError",
+        "additionalDetails": null,
+        "misalignment": null
+       },
+       "startedAt": 1794647318,
+       "completedAt": 1794647318,
+       "durationMs": 33
+      },
+      {
+       "id": "01a1d950-dab7-73d2-ac99-853a9e419bd3",
+       "rootTurnId": "01a1d950-dab7-73d2-ac99-853a9e419bd3",
+       "items": [],
+       "itemsView": "notLoaded",
+       "status": "interrupted",
+       "error": null,
+       "startedAt": 1794647317,
+       "completedAt": 1794647317,
+       "durationMs": 438
+      }
+     ],
+     "nextCursor": "{\"requestedThreadId\":\"01a1d950-d528-7173-9bf5-c8e05c8b43cc\",\"rolloutOrdinal\":36,\"includeAnchor\":false,\"scope\":{\"kind\":\"turns\"}}",
+     "backwardsCursor": "{\"requestedThreadId\":\"01a1d950-d528-7173-9bf5-c8e05c8b43cc\",\"rolloutOrdinal\":43,\"includeAnchor\":true,\"scope\":{\"kind\":\"turns\"}}"
+    }
+   }
+  }
+ }
+}

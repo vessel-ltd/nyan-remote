@@ -18,6 +18,7 @@ import { actorOf } from '../auth.ts'
 import { HttpError, readJsonBody, type Ctx } from '../router.ts'
 import { t } from '../../../shared/i18n.ts'
 import { machineName } from '../machine.ts'
+import { shortSessionId } from '../codex/ids.ts'
 
 interface Body {
   on?: unknown
@@ -86,7 +87,7 @@ export function autoApproveOffPayload(entry: AutoApproveEntry, machine = machine
 export async function notifyAutoApproveExpired(entry: AutoApproveEntry): Promise<void> {
   try {
     const res = await sendToAll(withPendingPerms(autoApproveOffPayload(entry)))
-    console.log(t(`[auto] 期限切れを通知 push=${res.sent} session=${entry.id.slice(0, 8)}`, `[auto] Notified expiry push=${res.sent} session=${entry.id.slice(0, 8)}`))
+    console.log(t(`[auto] 期限切れを通知 push=${res.sent} session=${shortSessionId(entry.id)}`, `[auto] Notified expiry push=${res.sent} session=${shortSessionId(entry.id)}`))
   } catch (err) {
     console.warn(t('[auto] 期限切れの通知に失敗: ', '[auto] Failed to notify expiry: ') + (err instanceof Error ? err.message : String(err)))
   }
