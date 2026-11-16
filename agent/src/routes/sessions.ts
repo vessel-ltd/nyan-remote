@@ -14,7 +14,7 @@ import { autoApproveFor } from '../autoApprove.ts'
 import { ensureFollowWatch } from '../claude/follow.ts'
 import { attach } from '../events.ts'
 import { t } from '../../../shared/i18n.ts'
-import { codexLog, codexRows } from '../codex/run.ts'
+import { codexHistoryWanted, codexLog, codexRows } from '../codex/run.ts'
 
 const DEFAULT_LIMIT = 60
 const MAX_LIMIT = 300
@@ -175,7 +175,7 @@ export async function sessions(ctx?: Ctx): Promise<SessionsPage> {
   // ★ Codex threads join **after** `markSend` (no send route is claimed for a row we cannot send to).
   //   ⚠️⚠️ They do get the auto-approve mark: a Codex command approval passes while the entry is in effect
   //      (`codex/cards.ts`), and "passing but not shown" is the worst state of that feature.
-  //   ⚠️ They are live by definition (the daemon has them loaded), so they never count as history.
+  //   ★ Closed Codex threads come as history rows (`live: false`, 2026-11-16 / `codex/closedThreads.ts`).
   const marked = markAutoApprove([...markSend(sessions, await scanPanes(dirs)), ...codexRows()], now)
   // ⚠️⚠️ **Filtering comes after the cleanup** (`sweepInflight` / `sweepPanes` above decide on **all items**).
   //    Moving it earlier breaks two things:
@@ -185,6 +185,11 @@ export async function sessions(ctx?: Ctx): Promise<SessionsPage> {
   //         (the set was widened once in codex 2026-08-21, medium #5. Do not narrow it)
   const historyRows = marked.filter(isHistorySession)
   const liveOnly = ctx?.url.searchParams.get('live') === '1'
+  // ★ The closed Codex threads are read again if a minute old, on any list request: the phone asks for the full list
+  //   only when the history revision changed (`web/src/ui/history.ts`), so waiting for that would never refresh it
+  //   (codex review). Cheap: one local `thread/list` a minute while a phone looks; the phone downloads the history
+  //   only when its revision changes. Never awaited (the next read shows it).
+  codexHistoryWanted()
   return {
     machine,
     sessions: liveOnly ? marked.filter((s) => !isHistorySession(s)) : marked,

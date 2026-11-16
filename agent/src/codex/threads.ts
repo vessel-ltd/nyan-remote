@@ -132,6 +132,33 @@ export function titleOf(t: CodexThread): { title: string; titleSource: TitleSour
 }
 
 /**
+ * ★ One thread as a list row — the one shape for live rows (`ThreadBook.rows`) and history rows (`closedThreads.ts`).
+ * `live: false` = history (the PWA's bucket is decided by `live` only / `isHistorySession`).
+ */
+export function threadRow(t: CodexThread, ctx: ThreadBookRowsContext, status: SessionStatus, live: boolean): SessionSummary {
+  return {
+    machine: ctx.machine,
+    account: ctx.account,
+    tool: 'codex',
+    sessionId: ctx.idPrefix + t.id,
+    cwd: t.cwd,
+    project: basename(t.cwd) || t.cwd,
+    ...titleOf(t),
+    status,
+    live,
+    ...(t.gitBranch ? { gitBranch: t.gitBranch } : {}),
+    ...(t.cliVersion ? { cliVersion: t.cliVersion } : {}),
+    lastActivity: new Date(t.updatedAt * 1000).toISOString(),
+    transcriptBytes: 0,
+  }
+}
+
+/** Newest first; ties by id (stable order) */
+export function sortRows(rows: SessionSummary[]): SessionSummary[] {
+  return rows.sort((a, b) => b.lastActivity.localeCompare(a.lastActivity) || a.sessionId.localeCompare(b.sessionId))
+}
+
+/**
  * How the last turn this connection watched ended, **as read back from the history** (`thread/turns/list`).
  * The thread status alone cannot say: a turn that failed or was interrupted also ends in `idle`.
  */
@@ -415,23 +442,9 @@ export class ThreadBook {
   rows(ctx: ThreadBookRowsContext): SessionSummary[] {
     const out: SessionSummary[] = []
     for (const { thread: t, sawActive, outcome } of this.#threads.values()) {
-      out.push({
-        machine: ctx.machine,
-        account: ctx.account,
-        tool: 'codex',
-        sessionId: ctx.idPrefix + t.id,
-        cwd: t.cwd,
-        project: basename(t.cwd) || t.cwd,
-        ...titleOf(t),
-        status: statusOf(t.status, sawActive, outcome),
-        live: true,
-        ...(t.gitBranch ? { gitBranch: t.gitBranch } : {}),
-        ...(t.cliVersion ? { cliVersion: t.cliVersion } : {}),
-        lastActivity: new Date(t.updatedAt * 1000).toISOString(),
-        transcriptBytes: 0,
-      })
+      out.push(threadRow(t, ctx, statusOf(t.status, sawActive, outcome), true))
     }
-    return out.sort((a, b) => b.lastActivity.localeCompare(a.lastActivity) || a.sessionId.localeCompare(b.sessionId))
+    return sortRows(out)
   }
 
   /**

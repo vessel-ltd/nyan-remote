@@ -31,6 +31,7 @@ import { parseTurnsPage, type TurnsPage } from './history.ts'
 import { createRpc, type Rpc, type RpcFailure, type RpcResult } from './rpc.ts'
 import { ThreadBook, type StatusChange, type TurnOutcome } from './threads.ts'
 import type { WsClosed, WsUdsConnection } from './wsUds.ts'
+import { ClosedThreads } from './closedThreads.ts'
 
 /** Do not initialize a daemon whose socket is younger than this */
 export const SETTLE_MS = 3000
@@ -143,6 +144,8 @@ export interface DaemonOptions {
   hooks?: DaemonHooks
   /** ★ Tests only: the RPC timeout (the default is rpc.ts's) */
   rpcTimeoutMs?: number
+  /** ★ How many closed threads are listed as history (`closedThreads.ts`). Default 60 (Claude's per account). */
+  historyLimit?: number
 }
 
 export type DaemonHealth = CodexLineHealth
@@ -169,11 +172,18 @@ export interface CodexDaemonLine {
   threadOf(sessionId: string): string | undefined
   /** Whether this thread is a row right now */
   lists(threadId: string): boolean
+  /** ★ Whether this thread is a row or a history row right now (its conversation may be read; nothing else) */
+  knows(threadId: string): boolean
+  /** ★ Closed threads as history rows (`live: false`) */
+  historyRows(): SessionSummary[]
+  /** ★ Read the closed threads again if the last read is older than `ms` (the phone opened its history) */
+  refreshHistory(ms: number): void
   /** Changes on every (re)connect */
   generation(): number
   /**
    * Read the newest turns of a thread (or the page behind `cursor`). `undefined` when it cannot be read now.
-   * ⚠️ Only for a thread that is **a row right now**: an id from outside never reaches the daemon.
+   * ⚠️ Only for a thread that is **a row or a history row right now**: an id from outside never reaches the daemon.
+   *    (Measured: `thread/turns/list` on a closed thread does not load it.)
    */
   turns(threadId: string, opts: { limit: number; cursor?: string }): Promise<TurnsPage | undefined>
   /**
@@ -236,6 +246,14 @@ export function startCodexDaemonLine(opts: DaemonOptions): CodexDaemonLine {
   const book = new ThreadBook()
   const idPrefix = codexSessionPrefix(home.id)
   const rowsCtx = { machine, account: home.label, idPrefix }
+  // ★ `liveRpc` is declared below; this is only called once a line is up
+  const closed = new ClosedThreads({
+    call: (method, params) => liveRpc?.call(method, params),
+    isLive: (id) => book.isRow(id),
+    now: () => deps.now(),
+    changed: () => hooks.onChange?.(),
+    limit: opts.historyLimit ?? 60,
+  })
   /**
    * Rule for `send` (high #3): thread id → the one send that owns the thread now.
    * `token`: which send (a queued write checks it is still the owner — second review, high #1).
@@ -425,7 +443,11 @@ export function startCodexDaemonLine(opts: DaemonOptions): CodexDaemonLine {
       // ⚠️⚠️ Unloaded is the end of the row, as much as `thread/closed` is (sixth review, high #1): the row is gone now, so a
       //    later `thread/closed` no longer finds it listed and would end nothing — auto-approve then outlived the thread
       //    and came back with it. Only a listed thread gets here (`setStatus` answers "changed" for rows only).
-      if (change.status.type === 'notLoaded') hooks.onClosed?.(idPrefix + change.thread.id)
+      if (change.status.type === 'notLoaded') {
+        hooks.onClosed?.(idPrefix + change.thread.id)
+        // ★ It is history now
+        void closed.refresh()
+      }
     }
     const readThread = async (r: Rpc, threadId: string): Promise<void> => {
       // ★ Stamped: a status change or a close that arrives while this read is in flight wins over its answer (high #2)
@@ -483,6 +505,12 @@ export function startCodexDaemonLine(opts: DaemonOptions): CodexDaemonLine {
             if (typeof id === 'string' && book.isRow(id)) chain = chain.then(() => readThread(r, id)).catch(() => undefined)
             break
           }
+          // ★ The saved threads changed: the history list is read again
+          case 'thread/archived':
+          case 'thread/unarchived':
+          case 'thread/deleted':
+            void closed.refresh()
+            break
           case 'serverRequest/resolved':
             approvals?.onResolved(params)
             break
@@ -496,6 +524,8 @@ export function startCodexDaemonLine(opts: DaemonOptions): CodexDaemonLine {
             hooks.onChange?.()
             if (typeof params.threadId === 'string') approvals?.sync(params.threadId)
             if (listed) hooks.onClosed?.(idPrefix + (params.threadId as string))
+            // ★ It is history now (`closedThreads.ts`)
+            if (listed) void closed.refresh()
           }
             break
           default:
@@ -554,6 +584,8 @@ export function startCodexDaemonLine(opts: DaemonOptions): CodexDaemonLine {
     //   snapshot, and only what is **known**: a thread the complete list did not name (closed), or one that was read
     //   and does not wait on an approval. ⚠️ A listed thread whose read failed keeps its entry (round 3, medium: its
     //   status is unknown, and its replay must not fetch again).
+    // ★ History: read the closed threads once the live ones are known (a thread in the book is never history)
+    if (liveRpc === live) void closed.refresh()
     if (complete && liveRpc === live) {
       for (const { threadId } of [...diffs.values()]) {
         // ⚠️ A thread waiting now is never pruned, listed or not (round 4, medium: one that started during the
@@ -624,10 +656,16 @@ export function startCodexDaemonLine(opts: DaemonOptions): CodexDaemonLine {
     sessionIdOf: (threadId) => idPrefix + threadId,
     threadOf: (sessionId) => (sessionId.startsWith(idPrefix) && sessionId.length > idPrefix.length ? sessionId.slice(idPrefix.length) : undefined),
     lists: (threadId) => book.isRow(threadId),
+    knows: (threadId) => book.isRow(threadId) || closed.has(threadId),
+    historyRows: () => closed.rows(rowsCtx),
+    refreshHistory: (ms) => {
+      if (liveRpc) closed.refreshIfOlder(ms)
+    },
     generation: () => generation,
     turns: async (threadId, o) => {
       const rpc = liveRpc
-      if (!rpc || !book.isRow(threadId)) return undefined
+      // ⚠️ A row or a history row only (never an id from outside)
+      if (!rpc || !(book.isRow(threadId) || closed.has(threadId))) return undefined
       const res = await rpc.call('thread/turns/list', {
         threadId,
         limit: o.limit,

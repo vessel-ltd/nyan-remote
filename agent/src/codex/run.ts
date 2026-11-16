@@ -144,6 +144,8 @@ export interface StartCodexOptions {
   cardsChanged?: () => void
   /** ★ Injected in tests */
   deps?: DaemonDeps
+  /** ★ How many closed threads per home are listed as history (the config's `maxSessionsPerAccount`, as for Claude) */
+  historyLimit?: number
 }
 
 /** Whether the one-time notice was logged since `startCodex` (= once per agent start: not again on a reconnect) */
@@ -180,6 +182,7 @@ export function startCodex(cfg: CodexConfig | undefined, opts: StartCodexOptions
     const line: CodexDaemonLine = startCodexDaemonLine({
       home,
       machine: opts.machine,
+      ...(opts.historyLimit === undefined ? {} : { historyLimit: opts.historyLimit }),
       clientName: cfg?.clientName ?? DEFAULT_CLIENT_NAME,
       clientVersion: cfg?.clientVersion ?? opts.version,
       deps,
@@ -238,8 +241,17 @@ export function codexEnabled(): boolean {
   return enabled
 }
 
+/** The Codex rows: live ones, then closed threads as history (`live: false` / `closedThreads.ts`) */
 export function codexRows(): SessionSummary[] {
-  return lines.flatMap((l) => l.rows())
+  return lines.flatMap((l) => [...l.rows(), ...l.historyRows()])
+}
+
+/** ★ How old the history may be when the phone opens it (it is also read again whenever a thread closes) */
+export const HISTORY_REFRESH_MS = 60_000
+
+/** The phone asked for its history: read the closed threads again if the last read is older than a minute */
+export function codexHistoryWanted(): void {
+  for (const line of lines) line.refreshHistory(HISTORY_REFRESH_MS)
 }
 
 /**
@@ -247,10 +259,11 @@ export function codexRows(): SessionSummary[] {
  * ⚠️ The id names its home (`codexSessionPrefix`), so two homes listing the same thread id are never confused, and
  *    the line must also list the thread now (the form alone proves nothing).
  */
-function locate(sessionId: string): { line: CodexDaemonLine; threadId: string } | undefined {
+function locate(sessionId: string, history = false): { line: CodexDaemonLine; threadId: string } | undefined {
   for (const line of lines) {
     const threadId = line.threadOf(sessionId)
-    if (threadId !== undefined && line.lists(threadId)) return { line, threadId }
+    // ⚠️ A history row only where it is asked for (reading the conversation); sending and stopping need a live row
+    if (threadId !== undefined && (history ? line.knows(threadId) : line.lists(threadId))) return { line, threadId }
   }
   return undefined
 }
@@ -285,12 +298,12 @@ export async function codexInterrupt(sessionId: string): Promise<CodexInterruptR
   return found.line.interrupt(found.threadId)
 }
 
-/** The thread view of a Codex row, or `undefined` if no line lists it right now. */
+/** The thread view of a Codex row or history row, or `undefined` if no line knows it right now. */
 export async function codexLog(
   sessionId: string,
   opts: { before?: number | null; since?: number | null; limit?: number },
 ): Promise<LogPage | undefined> {
-  const found = locate(sessionId)
+  const found = locate(sessionId, true)
   if (!found) return undefined
   return logs.page(logSource(found.line), sessionId, found.line.label, opts)
 }

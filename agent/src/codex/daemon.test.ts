@@ -60,6 +60,8 @@ class FakeDaemon {
   log: Array<{ received: Array<Record<string, unknown>>; closed: boolean }> = []
   /** A reply larger than this drops the connection that asked (the real line's 16 MB limit) */
   maxReply = Infinity
+  /** ★ The saved threads (`thread/list`): closed ones the daemon has not loaded. Unset = the method is unknown. */
+  saved: Array<Record<string, unknown>> | undefined
 
   get #push(): ((text: string) => void) | undefined {
     return this.#open[0]?.push
@@ -119,9 +121,14 @@ class FakeDaemon {
         else reply({ data: ids.slice(start, end), nextCursor: end < ids.length ? String(end) : null })
         break
       }
+      case 'thread/list':
+        // ★ Like the real one: `threadSource` is null in the list (only `thread/read` tells)
+        if (this.saved) reply({ data: this.saved.map((t) => ({ ...withoutTurns(t), threadSource: null })), nextCursor: null })
+        else push(JSON.stringify({ id: msg.id, error: { code: -32601, message: 'unknown' } }))
+        break
       case 'thread/read': {
         // ★ What the daemon would serve now; the answer itself may be held back (`readGate`)
-        const t = this.threads.get(String(params.threadId))
+        const t = this.threads.get(String(params.threadId)) ?? this.saved?.find((x) => x.id === params.threadId)
         // ★ Like the real daemon: no turns without `includeTurns`
         if (t) void this.readGate.then(() => reply({ thread: withoutTurns(t) }))
         else push(JSON.stringify({ id: msg.id, error: { code: -32600, message: 'not found' } }))
@@ -233,8 +240,9 @@ function start(w: World, hooks: TestHooks = {}) {
   return line
 }
 
-function startLine(w: World, hooks: TestHooks = {}, rpcTimeoutMs?: number) {
+function startLine(w: World, hooks: TestHooks = {}, rpcTimeoutMs?: number, historyLimit?: number) {
   return startCodexDaemonLine({
+    ...(historyLimit === undefined ? {} : { historyLimit }),
     ...(rpcTimeoutMs === undefined ? {} : { rpcTimeoutMs }),
     home: { id: 'default', label: '.codex', socketPath: '/x/app-server-control.sock' },
     machine: 'pc-a',
@@ -277,7 +285,8 @@ test('connects, identifies as given, declares nothing experimental, and only rea
   })
   assert.deepEqual(w.daemon.received[1], { method: 'initialized' })
   // ⚠️ The whole vocabulary of this layer. Anything else (resume, turn/start, config) must not appear.
-  const allowed = new Set(['initialize', 'initialized', 'thread/loaded/list', 'thread/read'])
+  // ★ `thread/list` (the closed threads as history) is a read too: measured not to load a thread (closedThreads.ts)
+  const allowed = new Set(['initialize', 'initialized', 'thread/loaded/list', 'thread/read', 'thread/list'])
   for (const m of w.daemon.methods()) assert.ok(allowed.has(m), `unexpected method: ${m}`)
   // ⚠️ `thread/read` never asks for turns
   for (const m of w.daemon.received) if (m.method === 'thread/read') assert.deepEqual(m.params, { threadId: (m.params as { threadId: string }).threadId })
@@ -849,6 +858,86 @@ test('file change: no size reader (or no hook) ⇒ never fetched, never answered
   for (let i = 0; i < 20; i++) await new Promise((r) => setImmediate(r))
   assert.equal(resumes(w).length, 1)
   assert.equal(offered, 0)
+  line.stop()
+  await line.done
+})
+
+// ── Closed threads as history (2026-11-16 / `closedThreads.ts`) ──
+
+test('history: closed user threads become history rows; their conversation can be read; nothing else reaches them', async () => {
+  const w = world()
+  w.daemon.threads.set('t1', thread('t1', { status: { type: 'idle' } }))
+  w.daemon.saved = [
+    thread('t1', { status: { type: 'idle' } }),
+    thread('old', { status: { type: 'notLoaded' }, updatedAt: 900 }),
+    thread('sub', { status: { type: 'notLoaded' }, threadSource: 'subagent' }),
+  ]
+  w.daemon.turnsPage = { data: [], nextCursor: null }
+  const line = start(w)
+  await until(() => line.historyRows().length === 1, 'the history')
+  const h = line.historyRows()[0]!
+  assert.equal(h.sessionId, line.sessionIdOf('old'))
+  assert.equal(h.live, false)
+  assert.equal(h.tool, 'codex')
+  assert.deepEqual(line.rows().map((r) => r.sessionId), [line.sessionIdOf('t1')], 'the live row is not history too')
+  assert.equal(line.knows('old'), true)
+  assert.equal(line.lists('old'), false, 'not a row: no send, no stop, no approvals')
+  assert.equal(line.knows('sub'), false, 'not a user thread (as for live rows)')
+  assert.ok(await line.turns('old', { limit: 5 }), 'its conversation is read')
+  assert.equal(await line.turns('sub', { limit: 5 }), undefined)
+  assert.deepEqual((await line.send('old', 'hi')).ok, false)
+  // ⚠️ Nothing that loads a thread
+  assert.ok(!w.daemon.methods().includes('thread/resume'))
+  line.stop()
+  await line.done
+})
+
+test('history: a thread that closes moves from the rows to the history; one opened again moves back', async () => {
+  const w = world()
+  const t1 = thread('t1', { status: { type: 'idle' } })
+  w.daemon.threads.set('t1', t1)
+  w.daemon.saved = [t1]
+  const line = start(w)
+  await until(() => line.rows().length === 1, 'the snapshot')
+  assert.equal(line.historyRows().length, 0)
+  // The daemon unloads it
+  w.daemon.threads.delete('t1')
+  w.daemon.saved = [{ ...t1, status: { type: 'notLoaded' } }]
+  w.daemon.notify('thread/closed', { threadId: 't1' })
+  await until(() => line.historyRows().length === 1, 'in the history')
+  assert.equal(line.rows().length, 0)
+  // Opened again in the TUI: a live row at once, and no longer history
+  w.daemon.threads.set('t1', t1)
+  w.daemon.notify('thread/started', { thread: t1 })
+  await until(() => line.rows().length === 1, 'live again')
+  assert.equal(line.historyRows().length, 0)
+  line.stop()
+  await line.done
+})
+
+test('history: the cap given to the line is the one used (the config\'s maxSessionsPerAccount / codex round 3, low)', async () => {
+  const w = world()
+  w.daemon.saved = ['a', 'b', 'c'].map((id, i) => thread(id, { status: { type: 'notLoaded' }, updatedAt: 1000 + i }))
+  const line = startLine(w, {}, undefined, 2)
+  started.push(line)
+  await until(() => line.historyRows().length === 2, 'the history')
+  for (let i = 0; i < 20; i++) await new Promise((r) => setImmediate(r))
+  assert.equal(line.historyRows().length, 2)
+  line.stop()
+  await line.done
+})
+
+test('history: each thread is read once to see whether it is a user thread', async () => {
+  const w = world()
+  w.daemon.saved = [thread('a', { status: { type: 'notLoaded' } }), thread('b', { status: { type: 'notLoaded' } })]
+  const line = start(w)
+  await until(() => line.historyRows().length === 2, 'the history')
+  const reads = () => w.daemon.received.filter((m) => m.method === 'thread/read').length
+  const before = reads()
+  w.daemon.notify('thread/deleted', { threadId: 'zzz' })
+  await until(() => w.daemon.methods().filter((m) => m === 'thread/list').length >= 2, 'listed again')
+  for (let i = 0; i < 20; i++) await new Promise((r) => setImmediate(r))
+  assert.equal(reads(), before, 'no second read')
   line.stop()
   await line.done
 })

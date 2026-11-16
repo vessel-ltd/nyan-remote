@@ -126,6 +126,8 @@ async function main(): Promise<void> {
     const n = startCodex(cfg.codex, {
       machine: machineName(),
       version: AGENT_VERSION,
+      // ★ The same cap as Claude's sessions per account (closed Codex threads per home)
+      historyLimit: cfg.maxSessionsPerAccount,
       hooks: {
         // ★ Coalesce: one turn produces several status changes within milliseconds
         onChange: () => {
