@@ -3,9 +3,11 @@ import { test } from 'node:test'
 import type { SessionSummary } from '../../../shared/types.ts'
 import type { AgentFeature } from '../../../shared/types.ts'
 import type { ConfirmKind, KeyedConfirmKind } from './commands.ts'
+import { actionFeatures } from './tool.ts'
 import {
   COMMAND_UI,
   DRAFT_WARNING,
+  commandUi,
   commandView,
   confirmNote,
   confirmTitle,
@@ -32,6 +34,10 @@ const live = (extra: Partial<SessionSummary> = {}): SessionSummary =>
     sendRoute: 'keys',
     ...extra,
   }) as SessionSummary
+
+const claudeRow = live()
+/** ★ A Codex row as an agent lists it (no key route) */
+const codexRow = live({ tool: 'codex', sendRoute: undefined, account: '.codex', sessionId: 'codex-0123abcd0123abcd-t1' })
 
 test('★★ wording differs per id and never claims "done"', () => {
   const seen = new Set<string>()
@@ -159,9 +165,9 @@ test('★★ the name is for noticeability, not a safeguard (identical names can
 
 test('★★★ notes are per operation (`clear` does not show "the draft is sent too")', () => {
   // ⚠️ Showing the same note everywhere means **nobody reads it**. `clear` sends nothing, so it is irrelevant.
-  assert.equal(confirmNote('compact'), DRAFT_WARNING)
-  assert.equal(confirmNote('exit'), DRAFT_WARNING)
-  assert.equal(confirmNote('clear'), undefined, 'an irrelevant note is shown for clear')
+  assert.equal(confirmNote('compact', claudeRow), DRAFT_WARNING)
+  assert.equal(confirmNote('exit', claudeRow), DRAFT_WARNING)
+  assert.equal(confirmNote('clear', claudeRow), undefined, 'an irrelevant note is shown for clear')
 })
 
 test('★★ the `clear` confirmation says "the draft is lost too" and "cannot be undone"', () => {
@@ -228,9 +234,9 @@ test('★★★ the auto-approve confirmation says concretely what passes automa
   assert.ok(/しました/.test(ui.sent), `unclear that it took effect: ${ui.sent}`)
   assert.ok(/3時間|自動で切れ/.test(ui.sent), `the expiry is not readable: ${ui.sent}`)
   // ★★ **No** keystroke note (the draft is sent along too) — this path types not a single byte, so it would be a lie
-  assert.equal(confirmNote('auto-approve'), undefined)
+  assert.equal(confirmNote('auto-approve', claudeRow), undefined)
   // Contrast: things sent by keystrokes do get it
-  assert.equal(confirmNote('compact'), DRAFT_WARNING)
+  assert.equal(confirmNote('compact', claudeRow), DRAFT_WARNING)
 })
 
 test('★★★★ the 24-hour button is shown only to agents with the auto-approve-24h marker (2026-09-24)', async () => {
@@ -247,4 +253,35 @@ test('★★★★ the 24-hour button is shown only to agents with the auto-appr
   )
   // ★ The message is built from the expiry the agent returned (do not add to the device clock)
   assert.match(src, /autoApproveOnText\(res\.until\)/)
+})
+
+test('★ a Codex row: only compact, only with the agent\'s codex-compact, never exit or clear (2026-11-16)', () => {
+  // The thread hands `commandView` the row's action features (`actionFeatures` / `tool.ts`)
+  const agentNew: AgentFeature[] = [...ALL, 'codex-sessions', 'codex-compact']
+  const f = actionFeatures(codexRow, agentNew)
+  assert.deepEqual(IDS.filter((id) => commandView(codexRow, id, 'ready', f).show), ['compact'])
+  assert.equal(commandView(codexRow, 'compact', 'ready', f).disabled, false)
+  assert.equal(commandView(codexRow, 'compact', 'sending', f).disabled, true, 'a double tap sends once')
+  // ⚠️ An agent without the mark (older, or Codex support without compact) ⇒ no button (it would hand the id to the Claude route)
+  const agentOld: AgentFeature[] = [...ALL, 'codex-sessions', 'codex-interrupt']
+  for (const id of IDS) assert.equal(commandView(codexRow, id, 'ready', actionFeatures(codexRow, agentOld)).show, false, id)
+  // ⚠️ The Claude-side mark alone never lets it through for a Codex row
+  assert.equal(commandView(codexRow, 'compact', 'ready', ['slash-commands']).show, false)
+  // A closed (history) row ⇒ nothing
+  assert.equal(commandView({ ...codexRow, live: false }, 'compact', 'ready', f).show, false)
+  // The Claude row is unchanged: `codex-compact` alone shows nothing there
+  assert.equal(commandView(claudeRow, 'compact', 'ready', ['codex-compact']).show, false)
+})
+
+test('★ a Codex row\'s compact wording: no "draft is sent too", no "the summary stays", says it is idle-only', () => {
+  assert.equal(confirmNote('compact', codexRow), undefined, 'nothing is typed on the PC for Codex')
+  const ui = commandUi('compact', codexRow)
+  assert.notEqual(ui.body, COMMAND_UI.compact.body)
+  assert.ok(!/要約はスレッドに残/.test(ui.body), 'Codex keeps no summary text in the thread')
+  assert.ok(/応答中/.test(ui.body))
+  assert.notEqual(ui.sent, COMMAND_UI.compact.sent)
+  assert.ok(!/圧縮しました/.test(ui.sent.replace('「会話を圧縮しました」', '')), 'never claims it is done')
+  // Claude rows keep the table's wording
+  assert.equal(commandUi('compact', claudeRow), COMMAND_UI.compact)
+  assert.equal(commandUi('exit', codexRow), COMMAND_UI.exit)
 })

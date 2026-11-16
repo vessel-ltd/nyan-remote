@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs'
 import assert from 'node:assert/strict'
 import { afterEach, test } from 'node:test'
-import { codexSessionPrefix, nextBackoff, POLL_MS, SEND_HOLD_MS, SETTLE_MS, startCodexDaemonLine, type DaemonDeps, type DaemonHooks, type SocketLook } from './daemon.ts'
+import { codexSessionPrefix, nextBackoff, POLL_MS, SEND_HOLD_MS, SETTLE_MS, startCodexDaemonLine, type CodexDaemonLine, type DaemonDeps, type DaemonHooks, type SocketLook } from './daemon.ts'
 import type { StatusChange } from './threads.ts'
 import type { WsClosed, WsUdsConnection } from './wsUds.ts'
 
@@ -152,6 +152,11 @@ class FakeDaemon {
         break
       case 'turn/interrupt':
         if (this.interruptError) push(JSON.stringify({ id: msg.id, error: this.interruptError }))
+        else reply({})
+        break
+      case 'thread/compact/start':
+        // ★ Measured (0.169.0): `{}` at once, before the compaction runs
+        if (this.turnStartError) push(JSON.stringify({ id: msg.id, error: this.turnStartError }))
         else reply({})
         break
       case 'turn/start':
@@ -1675,6 +1680,111 @@ test('★ interrupt: the pressed turn ends and the next one starts while the tur
     const res = await p
     assert.equal(res.ok, false, when)
     assert.ok(!w.daemon.methods().includes('turn/interrupt'), `never written (${when})`)
+    line.stop()
+    await line.done
+  }
+})
+
+// ── compaction (2026-11-16 / docs/CODEX.md §5.8) ─────────────────────────────────────────────────────────────
+
+test('★ compact: an idle row gets thread/compact/start with the thread id and nothing else', async () => {
+  const w = world()
+  w.daemon.threads.set('t1', thread('t1'))
+  const line = start(w)
+  await until(() => line.rows().length === 1, 'the snapshot')
+  assert.deepEqual(await line.compact('t1'), { ok: true })
+  const sent = w.daemon.received.filter((m) => m.method === 'thread/compact/start')
+  assert.deepEqual(sent.map((m) => m.params), [{ threadId: 't1' }])
+  assert.ok(!w.daemon.methods().includes('thread/resume'), 'the thread is not joined for it')
+  line.stop()
+  await line.done
+})
+
+test('★ compact: never while a turn runs or waits on a person (the daemon would abort it), nor for an id that is not a row', async () => {
+  const w = world()
+  w.daemon.threads.set('busy', thread('busy', { status: { type: 'active', activeFlags: [] } }))
+  w.daemon.threads.set('waiting', thread('waiting', { status: WAITING }))
+  w.daemon.threads.set('broken', thread('broken', { status: { type: 'systemError' } }))
+  const line = start(w)
+  await until(() => line.rows().length === 3, 'the snapshot')
+  for (const id of ['busy', 'waiting', 'broken']) assert.deepEqual(await line.compact(id), { ok: false, reason: 'busy' }, id)
+  assert.deepEqual(await line.compact('some-claude-session'), { ok: false, reason: 'not-listed' })
+  assert.ok(!w.daemon.methods().includes('thread/compact/start'))
+  line.stop()
+  await line.done
+})
+
+test('★ compact: two presses (or a press and a send) at once ⇒ one reaches the daemon, held until the status moves', async () => {
+  const w = world()
+  w.daemon.threads.set('t1', thread('t1'))
+  const line = start(w)
+  await until(() => line.rows().length === 1, 'the snapshot')
+  const a = line.compact('t1')
+  const b = line.compact('t1')
+  const c = line.send('t1', 'hello')
+  assert.deepEqual(await b, { ok: false, reason: 'busy' })
+  assert.deepEqual(await c, { ok: false, reason: 'busy' })
+  assert.deepEqual(await a, { ok: true })
+  assert.equal(w.daemon.received.filter((m) => m.method === 'thread/compact/start').length, 1)
+  assert.ok(!w.daemon.methods().includes('turn/start'))
+  // Held after success until the status moves
+  assert.deepEqual(await line.compact('t1'), { ok: false, reason: 'busy' })
+  w.daemon.notify('thread/status/changed', { threadId: 't1', status: { type: 'active', activeFlags: [] } })
+  w.daemon.notify('thread/status/changed', { threadId: 't1', status: { type: 'idle' } })
+  await until(() => line.rows()[0]!.status === 'done', 'the compaction ended')
+  assert.deepEqual(await line.compact('t1'), { ok: true }, 'a later press may compact again')
+  line.stop()
+  await line.done
+})
+
+test('★ compact: queued behind a slow line, it is not written once a turn started meanwhile (it would abort that turn)', async () => {
+  const w = world()
+  w.daemon.threads.set('t1', thread('t1'))
+  const line = start(w)
+  await until(() => line.rows().length === 1, 'the snapshot')
+  const g = gate()
+  w.daemon.gate = g.promise
+  const p = line.compact('t1')
+  // The person types in the TUI meanwhile
+  w.daemon.notify('thread/status/changed', { threadId: 't1', status: { type: 'active', activeFlags: [] } })
+  g.open()
+  assert.deepEqual(await p, { ok: false, reason: 'busy', detail: 'cancelled' })
+  assert.ok(!w.daemon.methods().includes('thread/compact/start'), 'never written')
+  line.stop()
+  await line.done
+})
+
+test('compact: a refusal by the daemon is "failed" by kind and code, and does not hold the thread', async () => {
+  const w = world()
+  w.daemon.threads.set('t1', thread('t1'))
+  w.daemon.turnStartError = { code: -32603, message: 'failed to start compaction: x' }
+  const line = start(w)
+  await until(() => line.rows().length === 1, 'the snapshot')
+  assert.deepEqual(await line.compact('t1'), { ok: false, reason: 'failed', detail: 'error -32603' })
+  w.daemon.turnStartError = undefined
+  assert.deepEqual(await line.compact('t1'), { ok: true })
+  line.stop()
+  await line.done
+})
+
+test('★ compact (and send): queued behind a slow line, it is not written once the status became unreadable (the hold alone stays)', async () => {
+  // ⚠️ An unreadable status does not end the hold (only a readable move does), so here the write guard's idle check is
+  //    the only thing between the queued call and a turn the daemon would abort (found by mutation, 2026-11-16).
+  for (const press of [(l: CodexDaemonLine) => l.compact('t1'), (l: CodexDaemonLine) => l.send('t1', 'late')]) {
+    const w = world()
+    w.daemon.threads.set('t1', thread('t1'))
+    const line = start(w)
+    await until(() => line.rows().length === 1, 'the snapshot')
+    const g = gate()
+    w.daemon.gate = g.promise
+    w.daemon.readGate = new Promise(() => undefined)
+    const p = press(line)
+    // e.g. a Codex update that adds a status, or `active` without its flags
+    w.daemon.notify('thread/status/changed', { threadId: 't1', status: { type: 'active' } })
+    for (let i = 0; i < 20; i++) await new Promise((r) => setImmediate(r))
+    g.open()
+    assert.deepEqual(await p, { ok: false, reason: 'busy', detail: 'cancelled' })
+    assert.ok(!w.daemon.methods().includes('thread/compact/start') && !w.daemon.methods().includes('turn/start'), 'never written')
     line.stop()
     await line.done
   }

@@ -10,6 +10,7 @@
 
 import type { AgentFeature, CommandId, SessionSummary, AutoApproveDuration } from '../../../shared/types.ts'
 import { t } from '../../../shared/i18n.ts'
+import { isCodex } from './tool.ts'
 
 /** `sending` right after a press (⚠️ never run twice on a double tap) */
 export type CommandPhase = 'ready' | 'sending'
@@ -57,9 +58,11 @@ export interface CommandUi {
  * ⚠️ "The draft is sent along too" is irrelevant for `clear` (it sends nothing).
  *    ⇒ Showing the same note everywhere means **nobody reads it**.
  */
-export function confirmNote(kind: ConfirmKind): string | undefined {
+export function confirmNote(kind: ConfirmKind, session: Pick<SessionSummary, 'tool'> | undefined): string | undefined {
   // ⚠️ Only operations that send text to the TUI via keystrokes are subject to "the draft is sent along too".
   //    `clear` sends nothing / `auto-approve` **uses not a single keystroke** (it goes through the approval hook)
+  // ★ A Codex row is compacted by its daemon: nothing is typed on the PC (`agent/src/routes/command.ts`)
+  if (isCodex(session)) return undefined
   return kind === 'clear' || kind === 'auto-approve' ? undefined : t(DRAFT_WARNING, DRAFT_WARNING_EN)
 }
 
@@ -149,6 +152,35 @@ export const COMMAND_UI: Record<ConfirmKind, CommandUi> = {
       return t('終了の合図を送りました。一覧から消えるまで少し待ってください', 'Sent the end signal. Wait a moment for it to leave the list')
     },
   },
+}
+
+/**
+ * ★ The wording for this row: the table's, except where a Codex row differs (2026-11-16).
+ * ⚠️⚠️ The idle check cannot be atomic (codex review round 1, high, accepted): the daemon has no "only if idle" and
+ *    aborts whatever runs, so a turn the PC starts in the few ms before its status reaches us is aborted. Said here.
+ * ⚠️ Codex compacts through its daemon, only while idle, and its summary is not shown anywhere (the item holds no text):
+ *    the dialog must not promise "the summary stays in the thread".
+ */
+export function commandUi(id: ConfirmKind, session: Pick<SessionSummary, 'tool'> | undefined): CommandUi {
+  const base = COMMAND_UI[id]
+  if (id !== 'compact' || !isCodex(session)) return base
+  return {
+    label: base.label,
+    title: base.title,
+    get body() {
+      return t(
+        'Codex にこれまでの会話を要約させて、文脈を空けます。⚠️ 元には戻せません（スレッドの表示はそのまま残ります）。Codex が応答中のときは送りません（圧縮すると応答が止まるため）。⚠️ 押したのと同時に PC で送った依頼は、止まることがあります。',
+        'Has Codex summarize the conversation so far to free up context. ⚠️ This cannot be undone (the thread view stays as it is). Nothing is sent while Codex is working (compacting would stop it). ⚠️ Something sent on the PC at the same moment may be stopped.',
+      )
+    },
+    ok: base.ok,
+    get sent() {
+      return t(
+        '圧縮を頼みました。終わるとスレッドに「会話を圧縮しました」が出ます（十数秒かかることがあります）',
+        'Asked Codex to compact. "Conversation compacted" appears in the thread when it is done (it can take a dozen seconds or so)',
+      )
+    },
+  }
 }
 
 export interface CommandView {
@@ -261,6 +293,12 @@ export function commandView(
   const ui = COMMAND_UI[id]
   // Not in the list (= unknown whether alive) / not running ⇒ do not show
   if (!session || !session.live) return { show: false, disabled: true, label: ui.label }
+  // ★ A Codex row: only `compact`, and only with the agent's `codex-compact` (granted by `actionFeatures` / `tool.ts`).
+  //   ⚠️ No key route is involved (the daemon compacts), so `sendRoute` is not looked at.
+  if (isCodex(session)) {
+    if (id !== 'compact' || !features?.includes('codex-compact')) return { show: false, disabled: true, label: ui.label }
+    return phase === 'sending' ? { show: true, disabled: true, label: `${ui.label}…` } : { show: true, disabled: false, label: ui.label }
+  }
   // ★★★ **Do not show it to agents lacking that endpoint** (multiple machines update one by one, so they always coexist)
   if (!features?.includes(NEEDS_FEATURE[id])) return { show: false, disabled: true, label: ui.label }
   // ⚠️⚠️ **Show only for `keys`** (codex low #1, 2026-08-25).

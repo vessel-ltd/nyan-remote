@@ -24,7 +24,7 @@ import { beginSend, consumeAfterReload, finishSend, noteArrivals, type PendingSe
 import { Permissions } from './Permissions.tsx'
 import { sendMark } from './sendMark.ts'
 import {
-  COMMAND_UI,
+  commandUi,
   type KeyedConfirmKind,
   commandView,
   confirmNote,
@@ -871,7 +871,7 @@ export function Thread({
       // ⚠️⚠️ Checking "does it match the current `sessionId`" here **means nothing**
       //    (`sessionId` is **the closure value of the render that created this function**, so **it always matches**
       //     = measured in 2026-08-25 codex round 7, medium #2. Isolation on switching is handled by `key`)
-      setNote({ bad: false, text: COMMAND_UI[target.id].sent })
+      setNote({ bad: false, text: commandUi(target.id, session).sent })
     } catch (err) {
       setNote({ bad: true, text: err instanceof Error ? err.message : String(err) })
     } finally {
@@ -1181,9 +1181,9 @@ export function Thread({
       {confirm ? (
         <Confirm
           title={confirmTitle(confirm.id, session)}
-          body={COMMAND_UI[confirm.id].body}
-          note={confirmNote(confirm.id)}
-          ok={COMMAND_UI[confirm.id].ok}
+          body={commandUi(confirm.id, session).body}
+          note={confirmNote(confirm.id, session)}
+          ok={commandUi(confirm.id, session).ok}
           // ⚠️ Auto-approve is "reversible", but **arbitrary commands run once pressed**, so it is red
           danger={confirm.id === 'exit' || confirm.id === 'auto-approve'}
           // ★★ Auto-approve lets you pick a duration (2026-09-24). ⚠️ 24 hours only for agents with the `auto-approve-24h` mark

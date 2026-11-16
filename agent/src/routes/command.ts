@@ -30,6 +30,9 @@ import { broadcast } from '../events.ts'
 import { hasPendingForSession } from '../permission.ts'
 import { HttpError, readJsonBody, type Ctx } from '../router.ts'
 import { t } from '../../../shared/i18n.ts'
+import { isCodexSessionId, type CodexSendResult } from '../codex/daemon.ts'
+import { shortSessionId } from '../codex/ids.ts'
+import { codexCompact, codexLists } from '../codex/run.ts'
 
 /**
  * Failure category → HTTP. ★ It is a `Record<CommandFailure, number>`, so **a new reason fails the type check**.
@@ -73,6 +76,51 @@ export function toCommandId(body: unknown): CommandId | undefined {
   return Object.hasOwn(SLASH_COMMANDS, raw) ? (raw as CommandId) : undefined
 }
 
+/** Codex rows: what the phone is told when a compaction is not sent (by reason) */
+const CODEX_COMPACT_REFUSAL: Record<Exclude<CodexSendResult, { ok: true }>['reason'], () => [number, string]> = {
+  'not-listed': () => [409, t('この Codex のセッションは、いま開かれていません。', 'This Codex session is not open right now.')],
+  busy: () => [
+    409,
+    t(
+      'Codex が応答中か、承認を待っています（圧縮すると止まってしまうので送りません）。終わってから押してください。',
+      'Codex is working or waiting for an approval (compacting would stop it, so nothing was sent). Press again when it has finished.',
+    ),
+  ],
+  failed: () => [409, t('Codex に圧縮を頼めませんでした。PC の画面を確認してください。', 'Could not ask Codex to compact. Check the screen on the PC.')],
+}
+
+/**
+ * ★★ A table command for a Codex thread (2026-11-16 / docs/CODEX.md §5.8). `undefined` when the id is not a Codex row.
+ *
+ * Only `compact`, and by the daemon (`thread/compact/start`): no keystrokes, no inbox, nothing typed on the PC.
+ * ⚠️⚠️ Only while the thread is idle (`compact` in `daemon.ts`): the daemon aborts a running or waiting turn to compact.
+ * ⚠️ `exit` is refused: the daemon has no supported way to close a thread (it unloads when no client is subscribed).
+ * ⚠️ A Codex row id that no line lists now is "not open" — never handed to the Claude routes (same as `codexStop`).
+ */
+export async function codexCommand(
+  sessionId: string,
+  id: CommandId,
+  /** ★ Injected in tests */
+  codex: { lists(id: string): boolean; compact(id: string): Promise<CodexSendResult | undefined> } = {
+    lists: codexLists,
+    compact: codexCompact,
+  },
+): Promise<CommandResult | undefined> {
+  if (!codex.lists(sessionId) && !isCodexSessionId(sessionId)) return undefined
+  if (id !== 'compact') throw new HttpError(400, t('Codex のセッションでは使えません。', 'Not available for Codex sessions.'))
+  const res: CodexSendResult = (await codex.compact(sessionId)) ?? { ok: false, reason: 'not-listed' }
+  const short = shortSessionId(sessionId)
+  if (!res.ok) {
+    console.log(`[codex] compact not sent thread=${short} reason=${res.reason}${res.detail ? ` (${res.detail})` : ''}`)
+    const [status, message] = CODEX_COMPACT_REFUSAL[res.reason]()
+    throw new HttpError(status, message)
+  }
+  const at = new Date().toISOString()
+  broadcast({ type: 'sessions-changed', at })
+  console.log(`[codex] asked thread=${short} to compact`)
+  return { ok: true, at, id }
+}
+
 export async function sessionCommand(ctx: Ctx): Promise<CommandResult> {
   const sessionId = ctx.params['id']
   if (!sessionId) throw new HttpError(400, t('session id が必要です', 'A session id is required.'))
@@ -80,6 +128,9 @@ export async function sessionCommand(ctx: Ctx): Promise<CommandResult> {
   const body = await readJsonBody<unknown>(ctx.req)
   const id = toCommandId(body)
   if (!id) throw new HttpError(400, t('知らないコマンドです', 'Unknown command.'))
+  // ★ A Codex thread is compacted by its daemon; `undefined` = not a Codex row, so the Claude route follows
+  const viaCodex = await codexCommand(sessionId, id)
+  if (viaCodex) return viaCodex
 
   const dirs = await discoverConfigDirs(config().configDirs)
   const res = await sendCommandToSession(dirs, sessionId, id, {

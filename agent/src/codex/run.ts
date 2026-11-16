@@ -291,6 +291,13 @@ export async function codexSend(sessionId: string, text: string): Promise<CodexS
   return found.line.send(found.threadId, text)
 }
 
+/** Compact an idle Codex row, or `undefined` if no line lists it right now (= not ours). */
+export async function codexCompact(sessionId: string): Promise<CodexSendResult | undefined> {
+  const found = locate(sessionId)
+  if (!found) return undefined
+  return found.line.compact(found.threadId)
+}
+
 /** Stop the running turn of a Codex row, or `undefined` if no line lists it right now (= not ours). */
 export async function codexInterrupt(sessionId: string): Promise<CodexInterruptResult | undefined> {
   const found = locate(sessionId)

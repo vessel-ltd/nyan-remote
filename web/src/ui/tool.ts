@@ -20,6 +20,8 @@ const CODEX_GRANTS: ReadonlyArray<readonly [AgentFeature, readonly AgentFeature[
   ['codex-log-follow', ['log-follow']],
   // ⚠️ The 24 h choice still needs the agent's own mark for it
   ['codex-auto-approve', ['auto-approve', 'auto-approve-24h']],
+  // ★ Compact only (`commandView` reads it for a Codex row; `slash-commands` is never granted ⇒ no `exit` / `clear`)
+  ['codex-compact', ['codex-compact']],
 ]
 
 /** The features to use for **actions on this row**. A Codex row gets only what its own marks grant. */

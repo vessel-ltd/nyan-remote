@@ -260,6 +260,11 @@ export type AgentFeature =
   | 'codex-auto-approve'
   /** ★ `POST /sessions/:id/interrupt` stops the running turn of a Codex thread (`turn/interrupt` / 2026-11-15) */
   | 'codex-interrupt'
+  /**
+   * ★ `POST /sessions/:id/command` with `compact` compacts an idle Codex thread (`thread/compact/start` / 2026-11-16).
+   * ⚠️ `compact` only: `exit` is refused for Codex rows.
+   */
+  | 'codex-compact'
 
 /** One Codex home's line to its app-server daemon (`agent/src/codex/daemon.ts`) */
 export interface CodexLineHealth {

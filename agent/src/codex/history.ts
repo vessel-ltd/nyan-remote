@@ -13,6 +13,7 @@
 //    it has `completedAtMs`, or its turn is over. An unfinished command is held back until then.
 
 import type { LogEntry } from '../../../shared/types.ts'
+import { t } from '../../../shared/i18n.ts'
 
 const TEXT_MAX = 20_000
 const TOOL_MAX = 4000
@@ -36,6 +37,15 @@ function foldable(raw: string, max = TOOL_MAX): { summary: string; lines: number
 
 /** The largest time a JavaScript `Date` can hold, in ms. ⚠️ `isFinite` alone lets `1e100` through to a `RangeError`. */
 const MAX_DATE_MS = 8.64e15
+
+/**
+ * ★ A time in ms we take as real: finite, not negative, one a `Date` can hold. Anything else is "no time".
+ * ⚠️ The one check for both "is the item finished" (`parseTurn`) and its label (`itemEntries`): two checks disagreed and
+ *    a finished item was labelled "did not finish" for good (codex review rounds 2–3, low; JSON `1e400` is Infinity).
+ */
+export function timeMs(v: unknown): number | undefined {
+  return typeof v === 'number' && Number.isFinite(v) && v >= 0 && v <= MAX_DATE_MS ? v : undefined
+}
 
 function isoFromMs(v: unknown): string | undefined {
   return typeof v === 'number' && Number.isFinite(v) && v > 0 && v <= MAX_DATE_MS ? new Date(v).toISOString() : undefined
@@ -75,7 +85,7 @@ export function parseTurn(raw: unknown): CodexTurn | undefined {
       skipped++
       continue
     }
-    items.push({ id: it.id, type: it.type, completed: typeof it.completedAtMs === 'number', raw: it })
+    items.push({ id: it.id, type: it.type, completed: timeMs(it.completedAtMs) !== undefined, raw: it })
   }
   const status = typeof raw.status === 'string' && TURN_STATUSES.has(raw.status) ? (raw.status as TurnStatus) : undefined
   const err = raw.error
@@ -155,6 +165,21 @@ export function itemEntries(item: CodexItem): LogEntry[] {
       // ★ Only the summary (the model's own short account). Empty for most turns ⇒ no empty "thinking" rows.
       const text = clip(stringList(r.summary), TEXT_MAX)
       return text ? [{ kind: 'thinking', ...withAt, text }] : []
+    }
+    case 'contextCompaction': {
+      // ★ The item holds no text (only its id and times / measured 0.169.0), so one folded line that says it happened,
+      //   with how long it took when it finished (the TUI says "Context compacted · 13s").
+      // ⚠️ Shown only once it completed or its turn is over (`journal` holds unfinished items back): an unfinished one
+      //    belongs to a turn that was interrupted, and that turn's end line says so.
+      const started = timeMs(r.startedAtMs)
+      const ended = timeMs(r.completedAtMs)
+      const secs = started !== undefined && ended !== undefined && ended >= started ? Math.max(1, Math.round((ended - started) / 1000)) : undefined
+      const label = !item.completed || ended === undefined
+        ? t('会話の圧縮（終わっていません）', 'Conversation compaction (did not finish)')
+        : secs === undefined
+          ? t('会話を圧縮しました', 'Conversation compacted')
+          : t(`会話を圧縮しました（${secs}秒）`, `Conversation compacted (${secs}s)`)
+      return [{ kind: 'meta', ...withAt, label, summary: '', lines: 0, truncated: false }]
     }
     case 'commandExecution': {
       const command = typeof r.command === 'string' ? r.command : ''

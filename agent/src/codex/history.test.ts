@@ -276,3 +276,50 @@ test('★ journal: an "interrupted" ending that turns out to be a failure is cor
   m.ingest([turn('t', 'interrupted', [user('u', 'go')])])
   assert.equal(m.ingest([turn('t', 'completed', [user('u', 'go')])]), 0)
 })
+
+test('★ a compaction item (no text in it) is one folded line that says it happened and how long it took (2026-11-16)', () => {
+  const e = (raw: Record<string, unknown>) => itemEntries(parseTurn({ id: 't', items: [raw] })!.items[0]!)
+  // ★ The shape measured on codex-cli 0.169.0 (`thread/compact/start` from a side connection / docs/CODEX.md §5.8)
+  const done = e({ type: 'contextCompaction', id: 'c1', startedAtMs: 1794823799120, completedAtMs: 1794823805390 })
+  assert.equal(done.length, 1)
+  const d = done[0]!
+  assert.ok(d.kind === 'meta')
+  assert.match(d.label, /会話を圧縮しました（6秒）|Conversation compacted \(6s\)/)
+  assert.equal(d.at, new Date(1794823799120).toISOString())
+  assert.equal(d.summary, '', 'no summary is made up')
+  // Not finished (its turn was interrupted): never "compacted"
+  const unfinished = e({ type: 'contextCompaction', id: 'c2', startedAtMs: 1794823799120, completedAtMs: null })
+  assert.ok(unfinished[0]?.kind === 'meta')
+  assert.match(unfinished[0].label, /終わっていません|did not finish/)
+  // No times at all: still says it happened, without a made-up length
+  const bare = e({ type: 'contextCompaction', id: 'c3', completedAtMs: 5 })
+  assert.ok(bare[0]?.kind === 'meta')
+  assert.match(bare[0].label, /^(会話を圧縮しました|Conversation compacted)$/)
+})
+
+test('a compaction item with times a Date cannot hold: no made-up length, never "Infinity" (codex review, low)', () => {
+  const e = (raw: Record<string, unknown>) => itemEntries(parseTurn({ id: 't', items: [raw] })!.items[0]!)
+  for (const [startedAtMs, completedAtMs] of [
+    [0, Infinity],
+    [-5, 1000],
+    [5000, 1000],
+    [1e300, 2e300],
+  ]) {
+    const [entry] = e({ type: 'contextCompaction', id: 'c', startedAtMs, completedAtMs })
+    assert.ok(entry?.kind === 'meta')
+    assert.ok(!/Infinity|NaN|-\d/.test(entry.label), entry.label)
+    assert.ok(!/（\d+秒）|\(\d+s\)/.test(entry.label), `${startedAtMs}/${completedAtMs}: ${entry.label}`)
+  }
+})
+
+test('"finished" and the compaction label use the one time check: an out-of-range time is unfinished in both (codex round 3, low)', () => {
+  for (const completedAtMs of [-1, 1e300, Infinity, null]) {
+    const turn = parseTurn({ id: 't', items: [{ type: 'contextCompaction', id: 'c', startedAtMs: 0, completedAtMs }] })!
+    assert.equal(turn.items[0]!.completed, false, String(completedAtMs))
+  }
+  const ok = parseTurn({ id: 't', items: [{ type: 'contextCompaction', id: 'c', startedAtMs: 1000, completedAtMs: 3000 }] })!
+  assert.equal(ok.items[0]!.completed, true)
+  const [entry] = itemEntries(ok.items[0]!)
+  assert.ok(entry?.kind === 'meta')
+  assert.match(entry.label, /（2秒）|\(2s\)/)
+})

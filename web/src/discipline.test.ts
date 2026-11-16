@@ -681,7 +681,7 @@ test('★★ table commands run "after going through confirmation" (never at the
 test('★★ the /exit confirmation includes "irreversible" wording (wording also in one place)', () => {
   // ⚠️ Writing the wording directly in Thread.tsx makes it disagree with `commands.ts`
   const src = stripComments(readFileSync(join(SRC, 'ui', 'Thread.tsx'), 'utf8'))
-  assert.match(src, /COMMAND_UI\[confirm\.id\]\.body/, 'the confirmation body is not taken from the table')
+  assert.match(src, /commandUi\(confirm\.id, session\)\.body/, 'the confirmation body is not taken from the table')
   assert.ok(!/承認待ちも消え/.test(src), 'the wording is written directly in Thread.tsx')
   const ui = readFileSync(join(SRC, 'ui', 'commands.ts'), 'utf8')
   assert.match(ui, /取り返しがつきません|取り返しがつかない/, 'commands.ts has no warning')
@@ -748,7 +748,7 @@ test('★★ pin the table-command wiring (send target and notes)', () => {
   //    `note={DRAFT_WARNING}` → `note={undefined}` (neither has behavioral TSX tests)
   const src = stripComments(readFileSync(join(SRC, 'ui', 'Thread.tsx'), 'utf8'))
   // ★ Notes are **per operation** ("the draft will be sent too" is irrelevant to `clear` / held in the table)
-  assert.match(src, /note=\{confirmNote\(confirm\.id\)\}/, 'the confirmation note is not taken from the table')
+  assert.match(src, /note=\{confirmNote\(confirm\.id, session\)\}/, 'the confirmation note is not taken from the table')
   // ⚠️ Mutation named by codex: fixing the menu's `sending` wiring to `'ready'`
   assert.match(
     src,

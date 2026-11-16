@@ -201,6 +201,13 @@ export interface CodexDaemonLine {
    */
   send(threadId: string, text: string): Promise<CodexSendResult>
   /**
+   * ★ Compact the thread's context (`thread/compact/start`; the TUI's own `/compact` / docs/CODEX.md §5.8).
+   * ⚠️⚠️ Only for a row that is idle right now: the daemon aborts any running or waiting turn to compact
+   *    (`abort_all_tasks(Replaced)`), so this is judged at the press and again right before the write (as `send`).
+   * ⚠️ It shares `send`'s hold: a second press (or a send) is `busy` until the status moves.
+   */
+  compact(threadId: string): Promise<CodexSendResult>
+  /**
    * ★ Stop the turn that runs on this thread now (measured: the TUI's turn ends `interrupted`, the TUI goes back to
    *   waiting and takes the next input / docs/CODEX.md §3).
    * ⚠️⚠️ Only **the turn that ran when asked**: `turn/interrupt` names it by id, so a turn that starts meanwhile is
@@ -651,6 +658,42 @@ export function startCodexDaemonLine(opts: DaemonOptions): CodexDaemonLine {
 
   const done = loop()
 
+  /**
+   * ★ Start something on a thread that is an idle row right now: a turn (`send`) or a compaction (`compact`).
+   * ⚠️⚠️ Both share one hold: a send and a compaction pressed at once are one press (the second is `busy`), and the
+   *    daemon would let either one replace the other (`thread/compact/start` aborts any running turn / docs/CODEX.md §5.8).
+   */
+  async function startOnIdle(threadId: string, method: string, params: Record<string, unknown>): Promise<CodexSendResult> {
+    const rpc = liveRpc
+    if (!rpc || !book.isRow(threadId)) return { ok: false, reason: 'not-listed' }
+    // ⚠️⚠️ Reserved **before the first await** (high #3): two phones sending at once both saw "idle", and the second
+    //    `turn/start` then went into the first one's running turn. Held until the status moves (or `SEND_HOLD_MS`).
+    const held = holds.get(threadId)
+    if (held && (held.until === undefined || deps.now() < held.until)) return { ok: false, reason: 'busy' }
+    if (!book.acceptsInput(threadId)) return { ok: false, reason: 'busy' }
+    const mine = { token: {}, until: deps.now() + SEND_HOLD_MS as number | undefined }
+    holds.set(threadId, mine)
+    const owns = (): boolean => holds.get(threadId) === mine
+    // ⚠️ Judged again right before the bytes go out (high #4): a turn/start queued behind a slow line is not
+    //    written once the thread is no longer an idle row of this connection, or after the call has timed out.
+    // ⚠️⚠️ And only while this send still owns the thread (second review, high #1): a status move ends the hold
+    //    for good, so a queued send that saw active → idle meanwhile is not written next to a newer send.
+    const res = await rpc.call(method, params, {
+      guard: () => owns() && liveRpc === rpc && book.isRow(threadId) && book.acceptsInput(threadId),
+    })
+    if (res.ok) return { ok: true }
+    const f = res.failure
+    if (owns()) {
+      // ★ Written and no answer: the daemon may have taken it. Time alone does not say it did not, so this hold
+      //   lapses only when the thread's status moves (or it closes, or the line ends) — fail closed.
+      if (f.type === 'timeout' && f.written) mine.until = undefined
+      else holds.delete(threadId)
+    }
+    // ⚠️ Only the kind and the code: the daemon's message could quote the text
+    const detail = failureDetail(f)
+    return { ok: false, reason: f.type === 'cancelled' ? 'busy' : 'failed', detail }
+  }
+
   return {
     label: home.label,
     sessionIdOf: (threadId) => idPrefix + threadId,
@@ -681,36 +724,8 @@ export function startCodexDaemonLine(opts: DaemonOptions): CodexDaemonLine {
       if (book.setOutcome(threadId, outcome, mark)) hooks.onChange?.()
     },
     mark: (threadId) => book.mark(threadId),
-    send: async (threadId, text) => {
-      const rpc = liveRpc
-      if (!rpc || !book.isRow(threadId)) return { ok: false, reason: 'not-listed' }
-      // ⚠️⚠️ Reserved **before the first await** (high #3): two phones sending at once both saw "idle", and the second
-      //    `turn/start` then went into the first one's running turn. Held until the status moves (or `SEND_HOLD_MS`).
-      const held = holds.get(threadId)
-      if (held && (held.until === undefined || deps.now() < held.until)) return { ok: false, reason: 'busy' }
-      if (!book.acceptsInput(threadId)) return { ok: false, reason: 'busy' }
-      const mine = { token: {}, until: deps.now() + SEND_HOLD_MS as number | undefined }
-      holds.set(threadId, mine)
-      const owns = (): boolean => holds.get(threadId) === mine
-      // ⚠️ Judged again right before the bytes go out (high #4): a turn/start queued behind a slow line is not
-      //    written once the thread is no longer an idle row of this connection, or after the call has timed out.
-      // ⚠️⚠️ And only while this send still owns the thread (second review, high #1): a status move ends the hold
-      //    for good, so a queued send that saw active → idle meanwhile is not written next to a newer send.
-      const res = await rpc.call('turn/start', { threadId, input: [{ type: 'text', text }] }, {
-        guard: () => owns() && liveRpc === rpc && book.isRow(threadId) && book.acceptsInput(threadId),
-      })
-      if (res.ok) return { ok: true }
-      const f = res.failure
-      if (owns()) {
-        // ★ Written and no answer: the daemon may have taken it. Time alone does not say it did not, so this hold
-        //   lapses only when the thread's status moves (or it closes, or the line ends) — fail closed.
-        if (f.type === 'timeout' && f.written) mine.until = undefined
-        else holds.delete(threadId)
-      }
-      // ⚠️ Only the kind and the code: the daemon's message could quote the text
-      const detail = failureDetail(f)
-      return { ok: false, reason: f.type === 'cancelled' ? 'busy' : 'failed', detail }
-    },
+    send: (threadId, text) => startOnIdle(threadId, 'turn/start', { threadId, input: [{ type: 'text', text }] }),
+    compact: (threadId) => startOnIdle(threadId, 'thread/compact/start', { threadId }),
     interrupt: async (threadId) => {
       const rpc = liveRpc
       if (!rpc || !book.isRow(threadId)) return { ok: false, reason: 'not-listed' }

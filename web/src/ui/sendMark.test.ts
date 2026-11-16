@@ -159,7 +159,7 @@ test('★★ the notices (send, stop, command) share one container', () => {
     // ★ 2026-09-23: switched by language, so it goes through functions (`stopSentNote()`)
     // ★ 2026-09-24: passes whether the input box was cleared too (`stopSentNote(res.cleared === true)`)
     ['stopSentNote\\(res\\.cleared === true', 'the stop notice'],
-    ['COMMAND_UI\\[target\\.id\\]\\.sent', 'the command notice'],
+    ['commandUi\\(target\\.id, session\\)\\.sent', 'the command notice'],
   ] as const) {
     assert.match(thread, new RegExp(`setNote\\([^)]*${text}`), `${what} does not go through setNote`)
   }
