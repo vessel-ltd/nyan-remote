@@ -539,6 +539,8 @@ type Raw =
  */
 const SUMMARY_FIELD: Record<string, readonly string[]> = {
   Bash: ['command'],
+  // ★ A Codex file change (`codex/fileChanges.ts`): the files and the diff as one text
+  ApplyPatch: ['patch'],
   Read: ['file_path'],
   Edit: ['file_path'],
   Write: ['file_path'],

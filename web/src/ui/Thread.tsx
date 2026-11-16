@@ -108,6 +108,8 @@ export function Thread({
     answers?: Record<string, string[]>,
     /** ★ "Please change it like this" attached to a denial */
     feedback?: string,
+    /** ★ Question text → a note (Codex questions) */
+    notes?: Record<string, string>,
   ) => Promise<{ ok: boolean; reason?: string }>
   /**
    * ★ What is waiting in **another thread** (just one / `alerts.ts`).

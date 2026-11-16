@@ -320,6 +320,18 @@ export class ThreadBook {
     return status?.type === 'active' && status.waitingOnApproval
   }
 
+  /** Whether this thread is a row whose status says it waits on an answer (a question) right now */
+  waitsOnUserInput(threadId: string): boolean {
+    const status = this.#threads.get(threadId)?.thread.status
+    return status?.type === 'active' && status.waitingOnUserInput
+  }
+
+  /** Whether this thread is a row whose status says it waits on an approval or on an answer right now */
+  waitsOnPerson(threadId: string): boolean {
+    const status = this.#threads.get(threadId)?.thread.status
+    return status?.type === 'active' && (status.waitingOnApproval || status.waitingOnUserInput)
+  }
+
   /**
    * ★ Whether the turn running on this thread may be stopped from the phone (`turn/interrupt`).
    * `working`: a turn runs and nothing waits on a person / `waiting`: it waits on an approval or an answer

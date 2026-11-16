@@ -1,0 +1,76 @@
+{
+  "id": 7,
+  "method": "item/tool/requestUserInput",
+  "params": {
+    "threadId": "01a1e222-c1a5-7012-bdc8-79dd60369023",
+    "turnId": "01a1e226-1448-7690-9942-d555ee46dff5",
+    "itemId": "call_17dd55b0c51e41218dd5fb4f64e83489",
+    "questions": [
+      {
+        "id": "purpose",
+        "header": "目的",
+        "question": "ブログを作る主な目的は何ですか？",
+        "isOther": true,
+        "isSecret": false,
+        "options": [
+          {
+            "label": "記事を書くこと（推奨）",
+            "description": "執筆と公開の手軽さを優先して技術を絞ります。"
+          },
+          {
+            "label": "開発の学習",
+            "description": "自分で実装しながら身につけたい技術を優先します。"
+          },
+          {
+            "label": "仕事や作品の発信",
+            "description": "独自デザインやポートフォリオとの統合を重視します。"
+          }
+        ]
+      },
+      {
+        "id": "experience",
+        "header": "経験",
+        "question": "Web開発の経験はどのくらいありますか？",
+        "isOther": true,
+        "isSecret": false,
+        "options": [
+          {
+            "label": "ほぼ初めて",
+            "description": "コードや運用の負担が少ない構成を中心に検討します。"
+          },
+          {
+            "label": "HTML・CSSは使える",
+            "description": "既存テーマの調整や静的サイトも候補にします。"
+          },
+          {
+            "label": "プログラミング経験あり",
+            "description": "慣れている言語やフレームワークを次に確認します。"
+          }
+        ]
+      },
+      {
+        "id": "editing",
+        "header": "書き方",
+        "question": "記事はどの方法で書きたいですか？",
+        "isOther": true,
+        "isSecret": false,
+        "options": [
+          {
+            "label": "ブラウザの編集画面（推奨）",
+            "description": "管理画面で文章や画像を編集して公開します。"
+          },
+          {
+            "label": "MarkdownとGit",
+            "description": "エディタで記事を書き、コードと一緒に管理します。"
+          },
+          {
+            "label": "まだ決まっていない",
+            "description": "使いやすさと学習目的を踏まえて一緒に選びます。"
+          }
+        ]
+      }
+    ],
+    "isBlocking": true,
+    "autoResolutionMs": null
+  }
+}

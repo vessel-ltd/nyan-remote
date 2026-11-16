@@ -617,6 +617,12 @@ export interface InteractionQuestion {
   header?: string
   multiSelect: boolean
   options: InteractionOption[]
+  /**
+   * ★ A note may be written for this question (Codex questions / 2026-11-16). `add` = next to a chosen option;
+   *   `answer` = also on its own, as the answer ("None of the above" + the note on the PC).
+   * ⚠️ Absent = labels only (Claude's `AskUserQuestion` has no free text; the agent refuses notes there).
+   */
+  note?: 'add' | 'answer'
 }
 
 /** One option */
@@ -665,6 +671,11 @@ export interface PermissionAnswer {
    * ⚠️ The limit is `MAX_MESSAGE_BYTES` (shared so that the UI and the agent do not drift)
    */
   feedback?: string
+  /**
+   * ★ Question text → a note written for it (Codex questions only / 2026-11-16 / `InteractionQuestion.note`).
+   * ⚠️ Text for the model, nothing else: the agent builds the answer itself (`agent/src/codex/questions.ts`).
+   */
+  notes?: Record<string, string>
 }
 
 /**

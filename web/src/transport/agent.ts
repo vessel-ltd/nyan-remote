@@ -115,12 +115,14 @@ export class AgentTransport implements Transport {
     behavior: 'allow' | 'deny',
     answers?: Record<string, string[]>,
     feedback?: string,
+    notes?: Record<string, string>,
   ): Promise<{ ok: boolean; reason?: string }> {
     return this.post<{ ok: boolean; reason?: string }>('/permission/answer', {
       key,
       behavior,
       ...(answers ? { answers } : {}),
       ...(feedback ? { feedback } : {}),
+      ...(notes ? { notes } : {}),
     })
   }
 

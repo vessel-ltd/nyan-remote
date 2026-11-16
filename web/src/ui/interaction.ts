@@ -82,6 +82,8 @@ export function tapAnswers(interaction: Interaction | undefined): boolean {
   const [q, ...rest] = interaction.questions
   if (!q || rest.length > 0) return false
   if (q.multiSelect) return false
+  // ★ A question that takes a note (Codex) is never answered on tap: the note is written after choosing
+  if (q.note) return false
   // ★ Questions with a diagram are not answered on tap (user decision, 2026-08-18).
   //   Diagrams make the card tall, so **a mistaken tap while scrolling becomes the answer**.
   //   Approval answers cannot be undone, so prefer being able to back out over speed
@@ -99,4 +101,42 @@ export function tapAnswers(interaction: Interaction | undefined): boolean {
 /** ★ Whether to show "Answer with this" (= questions not answered on tap) */
 export function needsSubmit(interaction: Interaction | undefined): boolean {
   return interaction?.kind === 'question' && !tapAnswers(interaction)
+}
+
+/**
+ * ★ A value kept under a question text. **Own keys only**: question texts come from the PC, and a question named
+ *   `toString` must not read `Object.prototype.toString` (codex review, 2026-11-16, low: the screen threw).
+ */
+export function byQuestion<T>(rec: Record<string, T> | undefined, question: string): T | undefined {
+  return rec && Object.prototype.hasOwnProperty.call(rec, question) ? rec[question] : undefined
+}
+
+/**
+ * ★ Whether every question has an answer the agent will take (the "Submit answer" button).
+ * A chosen option, or — where the question allows it (`note: 'answer'`) — a written note alone.
+ * ⚠️ The agent checks the same again (`agent/src/codex/questions.ts`); this only keeps the button honest.
+ */
+export function answerComplete(
+  interaction: Interaction | undefined,
+  picked: Record<string, string[]> | undefined,
+  notes: Record<string, string> | undefined,
+): boolean {
+  if (interaction?.kind !== 'question') return false
+  return interaction.questions.every(
+    (q) =>
+      (byQuestion(picked, q.question) ?? []).length > 0 ||
+      (q.note === 'answer' && (byQuestion(notes, q.question) ?? '').trim().length > 0),
+  )
+}
+
+/** ★ Only the notes worth sending (non-empty, for questions that take one). `undefined` when there are none. */
+export function notesToSend(
+  interaction: Interaction | undefined,
+  notes: Record<string, string> | undefined,
+): Record<string, string> | undefined {
+  if (interaction?.kind !== 'question' || !notes) return undefined
+  const pairs = interaction.questions
+    .filter((q) => q.note && (byQuestion(notes, q.question) ?? '').trim().length > 0)
+    .map((q) => [q.question, byQuestion(notes, q.question)!.trim()] as [string, string])
+  return pairs.length > 0 ? Object.fromEntries(pairs) : undefined
 }

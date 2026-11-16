@@ -12,7 +12,7 @@ import { basename, join, resolve } from 'node:path'
 import type { CodexLineHealth, LogPage, NotifyFields, SessionSummary } from '../../../shared/types.ts'
 import type { CodexConfig } from '../config.ts'
 import { autoApproveFor } from '../autoApprove.ts'
-import { offerCodexCard } from './cards.ts'
+import { askCodexQuestion, offerCodexCard, offerCodexFileChange } from './cards.ts'
 import { codexSessionPrefix, startCodexDaemonLine, type CodexDaemonLine, type CodexSendResult, type CodexInterruptResult, type CodexHome, type DaemonDeps, type DaemonHooks, type SocketLook } from './daemon.ts'
 import { CodexLogs, type CodexLogSource } from './log.ts'
 import { CodexNotifier } from './notify.ts'
@@ -111,6 +111,15 @@ const realDeps: DaemonDeps = {
     }),
   now: () => Date.now(),
   random: () => Math.random(),
+  // ⚠️ Metadata only (the path is the daemon's; nothing is read from the file)
+  fileSize: async (path) => {
+    try {
+      const st = await stat(path)
+      return st.isFile() ? st.size : undefined
+    } catch {
+      return undefined
+    }
+  },
 }
 
 let lines: CodexDaemonLine[] = []
@@ -188,7 +197,14 @@ export function startCodex(cfg: CodexConfig | undefined, opts: StartCodexOptions
           void notifier?.onStatus(change)
         },
         ...(opts.cardsChanged
-          ? { offerApproval: offerCodexCard({ generation: () => line.generation(), changed: opts.cardsChanged, now: () => new Date(), ...(opts.hooks?.log ? { log: opts.hooks.log } : {}) }) }
+          ? (() => {
+              const cardDeps = { generation: () => line.generation(), changed: opts.cardsChanged, now: () => new Date(), ...(opts.hooks?.log ? { log: opts.hooks.log } : {}) }
+              return {
+                offerApproval: offerCodexCard(cardDeps),
+                askQuestion: askCodexQuestion(cardDeps),
+                offerFileChange: offerCodexFileChange(cardDeps),
+              }
+            })()
           : {}),
       },
     })

@@ -49,6 +49,7 @@ import { threadUrl } from '../pushUrl.ts'
 import { HttpError, readJsonBody, type Ctx } from '../router.ts'
 
 import { buildUpdatedInput, describeInteraction, requiresInteraction } from '../claude/interaction.ts'
+import { buildCodexAnswers } from '../codex/questions.ts'
 import { actorOf } from '../auth.ts'
 import { autoApproveList, shouldAutoApprove } from '../autoApprove.ts'
 import { isCodexSessionId } from '../codex/daemon.ts'
@@ -288,6 +289,8 @@ interface AnswerBody {
   answers?: Record<string, string[]>
   /** ★ "Please change it like this" (a reason attached to a denial; the PC's `3. Tell Claude what to change`) */
   feedback?: string
+  /** ★ Question text → a note (Codex questions only). ⚠️ Text for the model; the answer is built here (`questions.ts`) */
+  notes?: Record<string, string>
 }
 
 /** The reply from the phone */
@@ -309,7 +312,19 @@ export async function permissionAnswer(ctx: Ctx): Promise<{ ok: boolean; reason?
   //    (§9.11 / interaction.ts). Being ignored means "I pressed it but the PC did nothing", so
   //    **if it cannot be built here, do not send the allow** (refusing is better than being silently dropped).
   let updatedInput: Record<string, unknown> | undefined
-  if (behavior === 'allow' && target && requiresInteraction(target.toolName)) {
+  const codexQuestion = target?.tool === 'codex' && target.interaction?.kind === 'question'
+  // ⚠️ Notes go to Codex questions only (Claude's questions have nowhere to put them: refuse rather than drop)
+  if (body.notes !== undefined && target && !codexQuestion) {
+    return { ok: false, reason: t('この質問には書き足せません', 'A note cannot be added to this question.') }
+  }
+  if (codexQuestion) {
+    // ★ Built from the request the agent holds (the ids never left the agent). Deny = stop the turn that asks.
+    if (behavior === 'allow') {
+      const built = buildCodexAnswers(found?.meta?.toolInput, body.answers, body.notes)
+      if (!built.ok) return { ok: false, reason: built.message }
+      updatedInput = built.result as unknown as Record<string, unknown>
+    }
+  } else if (behavior === 'allow' && target && requiresInteraction(target.toolName)) {
     const built = buildUpdatedInput(target.toolName, found?.meta?.toolInput, body.answers)
     if (!built.ok) return { ok: false, reason: built.message }
     updatedInput = built.updatedInput

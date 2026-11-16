@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import type { Interaction, InteractionOption } from '../../../shared/types.ts'
-import { needsSubmit, previewText, tapAnswers } from './interaction.ts'
+import { answerComplete, byQuestion, needsSubmit, notesToSend, previewText, tapAnswers } from './interaction.ts'
 
 // ★★ Decide in one place whether to "answer on tap" or "answer with a submit button" (2026-08-18).
 //
@@ -142,4 +142,48 @@ test('★★ for approvals with choices, exactly one of the two is always raised
   for (const i of cases) {
     assert.notEqual(tapAnswers(i), needsSubmit(i), `zero or two ways to answer: ${JSON.stringify(i)}`)
   }
+})
+
+// ── ★ Notes on a question (Codex / 2026-11-16) ──
+
+const noted = (note: 'add' | 'answer'): Interaction => ({
+  kind: 'question',
+  questions: [{ question: 'q', multiSelect: false, options: [{ label: 'a' }, { label: 'b' }], note }],
+})
+
+test('a question that takes a note is never answered on tap (the note comes after choosing)', () => {
+  assert.equal(tapAnswers(noted('add')), false)
+  assert.equal(needsSubmit(noted('add')), true)
+  assert.equal(tapAnswers(noted('answer')), false)
+})
+
+test('answerComplete: an option always; a note alone only where it may answer', () => {
+  assert.equal(answerComplete(noted('add'), { q: ['a'] }, undefined), true)
+  assert.equal(answerComplete(noted('add'), {}, { q: 'x' }), false)
+  assert.equal(answerComplete(noted('answer'), {}, { q: 'x' }), true)
+  assert.equal(answerComplete(noted('answer'), {}, { q: '   ' }), false, 'a blank note')
+  assert.equal(answerComplete(q([{ label: 'a' }]), {}, { q: 'x' }), false, 'a question without notes')
+})
+
+test('notesToSend: only non-empty notes for questions that take them, trimmed; nothing ⇒ undefined', () => {
+  assert.deepEqual(notesToSend(noted('add'), { q: '  x ' }), { q: 'x' })
+  assert.equal(notesToSend(noted('add'), { q: '  ' }), undefined)
+  assert.equal(notesToSend(q([{ label: 'a' }]), { q: 'x' }), undefined, 'a question without notes sends none')
+  assert.equal(notesToSend(noted('add'), undefined), undefined)
+})
+
+test('question texts that name prototype members are looked up as own keys only (codex review, low)', () => {
+  const two: Interaction = {
+    kind: 'question',
+    questions: [
+      { question: 'ordinary', multiSelect: false, options: [{ label: 'a' }], note: 'answer' },
+      { question: 'toString', multiSelect: false, options: [{ label: 'a' }], note: 'answer' },
+    ],
+  }
+  assert.doesNotThrow(() => notesToSend(two, { ordinary: 'x' }))
+  assert.deepEqual(notesToSend(two, { ordinary: 'x' }), { ordinary: 'x' })
+  assert.equal(answerComplete(two, {}, { ordinary: 'x' }), false, 'toString has no answer')
+  assert.equal(answerComplete(two, {}, { ordinary: 'x', toString: 'y' } as Record<string, string>), true)
+  assert.equal(byQuestion({}, 'toString'), undefined)
+  assert.equal(byQuestion({}, '__proto__'), undefined)
 })

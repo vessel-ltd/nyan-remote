@@ -3,7 +3,7 @@ import type { VNode } from 'preact'
 import type { PermissionRequest } from '../../../shared/types.ts'
 import { closePermissionNotification } from '../notifications.ts'
 import { hhmm } from '../time.ts'
-import { needsSubmit, previewText, tapAnswers } from './interaction.ts'
+import { answerComplete, byQuestion, needsSubmit, notesToSend, previewText, tapAnswers } from './interaction.ts'
 import { cells } from './previewCells.ts'
 import { t } from '../../../shared/i18n.ts'
 import { accountLabel, agentTypeLabel, suggestionTexts } from './agentText.ts'
@@ -92,6 +92,8 @@ export function Permissions({
     answers?: Record<string, string[]>,
     /** ★ "Please change it like this" attached to a denial */
     feedback?: string,
+    /** ★ Question text → a note (Codex questions) */
+    notes?: Record<string, string>,
   ) => Promise<{ ok: boolean; reason?: string }>
   /** Whether it is shown at the bottom of the thread (the same placement as Claude's Android app) */
   inThread?: boolean
@@ -110,6 +112,8 @@ export function Permissions({
    * ⚠️ Approvals exist only while waiting, so the draft is not saved (send it or discard it)
    */
   const [note, setNote] = useState<Record<string, string>>({})
+  /** ★ Notes written for questions (Codex). `approval key → question text → text`. Not saved, like `note` */
+  const [qnote, setQnote] = useState<Record<string, Record<string, string>>>({})
   /**
    * ★ Cards whose full text is open (`approval key` → open or not).
    *
@@ -131,7 +135,7 @@ export function Permissions({
   const pick = (key: string, question: string, label: string, multi: boolean): void => {
     setPicked((prev) => {
       const forKey = prev[key] ?? {}
-      const cur = forKey[question] ?? []
+      const cur = byQuestion(forKey, question) ?? []
       const next = multi
         ? cur.includes(label)
           ? cur.filter((l) => l !== label)
@@ -149,10 +153,11 @@ export function Permissions({
     behavior: 'allow' | 'deny',
     answers?: Record<string, string[]>,
     feedback?: string,
+    notes?: Record<string, string>,
   ) => {
     setBusy(item.key)
     try {
-      const res = await onAnswer(item.endpointId, item.key, behavior, answers, feedback)
+      const res = await onAnswer(item.endpointId, item.key, behavior, answers, feedback, notes)
       if (!res.ok) {
         setMsg((m) => ({ ...m, [item.key]: res.reason ?? t('もう有効ではありません', 'No longer valid') }))
         // ⚠️⚠️ **Do not dismiss the notification when it did not go through** (2026-08-20 codex high #1).
@@ -253,7 +258,7 @@ export function Permissions({
                 the CLI discard an allow without updatedInput, and the PC keeps waiting */}
             {p.interaction?.kind === 'question'
               ? p.interaction.questions.map((q) => {
-                  const chosen = picked[p.key]?.[q.question] ?? []
+                  const chosen = byQuestion(picked[p.key], q.question) ?? []
                   // ★ Whether a tap may answer immediately is decided by `tapAnswers` (do not copy the condition).
                   //   ⚠️ If the condition here and in "Submit answer" below drift, **a card that cannot be answered** results
                   const single = tapAnswers(p.interaction)
@@ -307,6 +312,25 @@ export function Permissions({
                       {q.multiSelect ? (
                         <span class="sub">{t('いくつでも選べます', 'Select any number')}</span>
                       ) : null}
+                      {/* ★ A note for this question (Codex). `answer`: also an answer on its own ("None of the above" on the PC) */}
+                      {q.note ? (
+                        <div class="permnote">
+                          <textarea
+                            rows={2}
+                            placeholder={
+                              q.note === 'answer'
+                                ? t('選択肢に無い答え・書き足すこと（任意）', 'Another answer, or something to add (optional)')
+                                : t('書き足すこと（任意）', 'Something to add (optional)')
+                            }
+                            value={byQuestion(qnote[p.key], q.question) ?? ''}
+                            disabled={busy === p.key}
+                            onInput={(e) => {
+                              const v = (e.target as HTMLTextAreaElement).value
+                              setQnote((m) => ({ ...m, [p.key]: { ...(m[p.key] ?? {}), [q.question]: v } }))
+                            }}
+                          />
+                        </div>
+                      ) : null}
                     </div>
                   )
                 })
@@ -343,13 +367,10 @@ export function Permissions({
                 needsSubmit(p.interaction) ? (
                   <button
                     class="permok"
-                    disabled={
-                      busy === p.key ||
-                      !p.interaction.questions.every(
-                        (q) => (picked[p.key]?.[q.question] ?? []).length > 0,
-                      )
+                    disabled={busy === p.key || !answerComplete(p.interaction, picked[p.key], qnote[p.key])}
+                    onClick={() =>
+                      void answer(p, 'allow', picked[p.key] ?? {}, undefined, notesToSend(p.interaction, qnote[p.key]))
                     }
-                    onClick={() => void answer(p, 'allow', picked[p.key] ?? {})}
                   >
                     {t('これで答える', 'Submit answer')}
                   </button>
@@ -368,7 +389,8 @@ export function Permissions({
                 disabled={busy === p.key}
                 onClick={() => void answer(p, 'deny')}
               >
-                {t('拒否', 'Deny')}
+                {/* ★ A Codex question has no "deny": the phone stops the turn that asks (ESC on the PC) */}
+                {p.tool === 'codex' && p.interaction?.kind === 'question' ? t('止める', 'Stop') : t('拒否', 'Deny')}
               </button>
             </div>
           </li>

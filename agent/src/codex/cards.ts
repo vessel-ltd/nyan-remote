@@ -9,7 +9,8 @@
 // ★★ Auto-approve mode applies here too (2026-11-14 / user decision): while the thread's entry is in effect, the
 //    command approval is answered "yes" without a card. The decision is `shouldAutoApprove`, the same one place as
 //    for Claude. ⚠️ Decided **before** the card is raised (a card that is answered at once would still be announced).
-//    ⚠️ Only what becomes a card can pass: file changes, network rules and questions never reach this file.
+//    ⚠️ Only what becomes a card can pass: a command, or a file change whose diff was found (2026-11-16). Network
+//       rules and extra permissions never reach this file, and a question is never auto-answered.
 // ⚠️ No notification is sent from here: the thread's status change already sends "needs you" (`notify.ts`), and a
 //    second one would only stack on iOS.
 
@@ -17,7 +18,10 @@ import { createHash } from 'node:crypto'
 import type { PermissionRequest, SessionSummary } from '../../../shared/types.ts'
 import { shouldAutoApprove } from '../autoApprove.ts'
 import { detailOf, hiddenIn, summarize, waitForDecision, withGeneration } from '../permission.ts'
-import type { CodexApproval, PhoneDecision } from './approvals.ts'
+import { ASK_USER_QUESTION } from '../claude/interaction.ts'
+import type { CodexApproval, PhoneDecision, QuestionReply } from './approvals.ts'
+import { questionInteraction, type CodexAnswers, type CodexQuestion } from './questions.ts'
+import { patchText, type CodexFileChange } from './fileChanges.ts'
 
 /** Shown as the tool of the card. The request is a shell command, and the display helpers know this name. */
 const TOOL_NAME = 'Bash'
@@ -31,16 +35,17 @@ const TOOL_NAME = 'Bash'
  * ⚠️⚠️ The card's `sessionId` is the **row's** (`codex-<home>-<thread>`), never the bare thread id: auto-approve is
  *    looked up by it, and a bare id could be a Claude session's (codex review, high #1).
  */
+function cardId(req: CodexApproval | CodexQuestion | CodexFileChange, row: SessionSummary, generation: number, kind: string): string {
+  return createHash('sha256')
+    .update([kind, row.sessionId, generation, typeof req.requestId, req.requestId, req.threadId, req.turnId, req.itemId].join('\0'), 'utf8')
+    .digest('hex')
+    .slice(0, 24)
+}
+
 export function codexCard(approval: CodexApproval, row: SessionSummary, generation: number, at: string): PermissionRequest {
   const input = { command: approval.command }
   const detail = detailOf(TOOL_NAME, input)
-  const id = createHash('sha256')
-    .update(
-      [row.sessionId, generation, typeof approval.requestId, approval.requestId, approval.threadId, approval.turnId, approval.itemId].join('\0'),
-      'utf8',
-    )
-    .digest('hex')
-    .slice(0, 24)
+  const id = cardId(approval, row, generation, 'command')
   return {
     key: withGeneration(`codex:${id}`),
     machine: row.machine,
@@ -83,6 +88,99 @@ export function offerCodexCard(
     deps.changed()
     if (!decision) return undefined
     // ⚠️ Only the behavior is read. `updatedInput` / `message` have nowhere to go and are dropped.
+    return decision.behavior === 'allow' ? 'yes' : 'no'
+  }
+}
+
+/**
+ * ★ The card for one question (`questions.ts`). Shown like Claude's `AskUserQuestion` (same tool name, so the display
+ *   helpers and auto-approve treat it as a question: ⚠️ auto-approve never answers it — `requiresInteraction`).
+ * ⚠️ The ids stay on the agent: the card carries texts and labels only.
+ */
+export function codexQuestionCard(question: CodexQuestion, row: SessionSummary, generation: number, at: string): PermissionRequest {
+  const input = { questions: question.questions.map((q) => ({ question: q.question })) }
+  const detail = detailOf(ASK_USER_QUESTION, input)
+  return {
+    key: withGeneration(`codex:${cardId(question, row, generation, 'question')}`),
+    machine: row.machine,
+    account: row.account,
+    project: row.project,
+    sessionId: row.sessionId,
+    toolName: ASK_USER_QUESTION,
+    tool: 'codex',
+    summary: summarize(ASK_USER_QUESTION, input),
+    ...(detail ? { detail: detail.text, detailClipped: detail.clipped } : {}),
+    interaction: questionInteraction(question),
+    at,
+  }
+}
+
+/** The `askQuestion` hook for a daemon line: show the card, wait, and pass on what the route built. */
+export function askCodexQuestion(
+  deps: CardDeps,
+): (question: CodexQuestion, row: SessionSummary, onWithdraw: (withdraw: () => void) => void) => Promise<QuestionReply | undefined> {
+  return async (question, row, onWithdraw) => {
+    const info = codexQuestionCard(question, row, deps.generation(), deps.now().toISOString())
+    // ★ The request itself is kept with the card: the route builds the answer from it (`buildCodexAnswers`), never
+    //   from anything the phone sends
+    const waiting = waitForDecision(info, onWithdraw, { toolInput: question })
+    deps.changed()
+    const decision = await waiting
+    deps.changed()
+    if (!decision) return undefined
+    if (decision.behavior === 'deny') return { type: 'stop' }
+    // ⚠️ An allow without what the route built is not an answer (an empty answer would resolve the question)
+    const result = decision.updatedInput as CodexAnswers | undefined
+    if (!result || typeof result.answers !== 'object' || result.answers === null) return undefined
+    return { type: 'answers', result }
+  }
+}
+
+/** Shown as the tool of a file-change card (`permission.ts` folds it to the patch text) */
+export const FILE_CHANGE_TOOL = 'ApplyPatch'
+
+/**
+ * ★ The card for one file change: the files and the diff as the PC shows them (`fileChanges.ts` rule 1: only built
+ *   when the diff was found). ⚠️ The whole text is checked for hidden characters; a long one is cut and flagged
+ *   (the phone asks once more before a yes on what was not all shown).
+ */
+export function codexFileChangeCard(change: CodexFileChange, row: SessionSummary, generation: number, at: string): PermissionRequest {
+  const input = { patch: patchText(change) }
+  const detail = detailOf(FILE_CHANGE_TOOL, input)
+  return {
+    key: withGeneration(`codex:${cardId(change, row, generation, 'file')}`),
+    machine: row.machine,
+    account: row.account,
+    project: row.project,
+    sessionId: row.sessionId,
+    toolName: FILE_CHANGE_TOOL,
+    tool: 'codex',
+    summary: summarize(FILE_CHANGE_TOOL, input),
+    ...(detail ? { detail: detail.text, detailClipped: detail.clipped } : {}),
+    ...(hiddenIn(FILE_CHANGE_TOOL, input) ? { hidden: true as const } : {}),
+    at,
+  }
+}
+
+/**
+ * The `offerFileChange` hook for a daemon line. ★ Auto-approve applies, as for a command (and as for Claude's Edit):
+ * a yes / no approval, decided in the same one place before the card is raised.
+ */
+export function offerCodexFileChange(
+  deps: CardDeps,
+): (change: CodexFileChange, row: SessionSummary, onWithdraw: (withdraw: () => void) => void) => Promise<PhoneDecision | undefined> {
+  return async (change, row, onWithdraw) => {
+    const info = codexFileChangeCard(change, row, deps.generation(), deps.now().toISOString())
+    if (shouldAutoApprove(info, deps.now().getTime())) {
+      // ⚠️ One line, no paths or diff
+      deps.log?.(`[codex] file change allowed by auto-approve thread=${change.threadId.slice(0, 8)}`)
+      return 'yes'
+    }
+    const waiting = waitForDecision(info, onWithdraw)
+    deps.changed()
+    const decision = await waiting
+    deps.changed()
+    if (!decision) return undefined
     return decision.behavior === 'allow' ? 'yes' : 'no'
   }
 }

@@ -192,6 +192,8 @@ export interface Transport {
     answers?: Record<string, string[]>,
     /** ★ "Please change it like this" attached to a denial (equivalent to the PC's `3. Tell Claude what to change`) */
     feedback?: string,
+    /** ★ Question text → a note (Codex questions only / `InteractionQuestion.note`) */
+    notes?: Record<string, string>,
   ): Promise<{ ok: boolean; reason?: string }>
 
   /**

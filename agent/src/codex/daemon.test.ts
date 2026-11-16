@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs'
 import assert from 'node:assert/strict'
 import { afterEach, test } from 'node:test'
 import { codexSessionPrefix, nextBackoff, POLL_MS, SEND_HOLD_MS, SETTLE_MS, startCodexDaemonLine, type DaemonDeps, type DaemonHooks, type SocketLook } from './daemon.ts'
@@ -24,6 +25,11 @@ function thread(id: string, over: Record<string, unknown> = {}): Record<string, 
 }
 
 /** One fake daemon process: answers like the app-server, and lets the test push notifications / drop the line. */
+function withoutTurns(t: Record<string, unknown>): Record<string, unknown> {
+  const { turns: _turns, ...rest } = t
+  return rest
+}
+
 class FakeDaemon {
   threads = new Map<string, Record<string, unknown>>()
   received: Array<Record<string, unknown>> = []
@@ -48,20 +54,39 @@ class FakeDaemon {
   gate: Promise<void> = Promise.resolve()
   /** `thread/read` answers wait for this (a read in flight) */
   readGate: Promise<void> = Promise.resolve()
-  #push: ((text: string) => void) | undefined
-  #end: ((why: WsClosed) => void) | undefined
+  /** Open connections, oldest first. ★ Notifications and `drop` go to the oldest (the line); answers to the asker. */
+  #open: Array<{ push: (text: string) => void; end: (why: WsClosed) => void }> = []
+  /** Every connection, in order (a side connection for a file-change diff included) */
+  log: Array<{ received: Array<Record<string, unknown>>; closed: boolean }> = []
+  /** A reply larger than this drops the connection that asked (the real line's 16 MB limit) */
+  maxReply = Infinity
+
+  get #push(): ((text: string) => void) | undefined {
+    return this.#open[0]?.push
+  }
 
   connect = async (_path: string, onMessage: (text: string) => void): Promise<WsUdsConnection> => {
     this.connections++
-    this.#push = onMessage
     let over = false
-    const closed = new Promise<WsClosed>((r) => {
-      this.#end = (why) => {
+    let resolveClosed: (why: WsClosed) => void = () => undefined
+    const closed = new Promise<WsClosed>((r) => (resolveClosed = r))
+    const record = { received: [] as Array<Record<string, unknown>>, closed: false }
+    this.log.push(record)
+    const me = {
+      push: (text: string) => {
+        if (over) return
+        if (text.length > this.maxReply) return me.end({ reason: 'violation', detail: 'too-long' })
+        onMessage(text)
+      },
+      end: (why: WsClosed) => {
         if (over) return
         over = true
-        r(why)
-      }
-    })
+        record.closed = true
+        this.#open = this.#open.filter((c) => c !== me)
+        resolveClosed(why)
+      },
+    }
+    this.#open.push(me)
     return {
       send: async (text, guard) => {
         await this.gate
@@ -69,20 +94,21 @@ class FakeDaemon {
         if (guard && !guard()) throw new Error('ws-cancelled')
         const msg = JSON.parse(text) as Record<string, unknown>
         this.received.push(msg)
-        queueMicrotask(() => this.#answer(msg))
+        record.received.push(msg)
+        queueMicrotask(() => this.#answer(msg, me.push))
       },
-      close: () => this.#end?.({ reason: 'local' }),
+      close: () => me.end({ reason: 'local' }),
       closed,
     }
   }
 
-  #answer(msg: Record<string, unknown>): void {
+  #answer(msg: Record<string, unknown>, push: (text: string) => void): void {
     if (typeof msg.method !== 'string' || !('id' in msg)) return
     const params = (msg.params ?? {}) as Record<string, unknown>
-    const reply = (result: unknown): void => this.#push?.(JSON.stringify({ id: msg.id, result }))
+    const reply = (result: unknown): void => push(JSON.stringify({ id: msg.id, result }))
     switch (msg.method) {
       case 'initialize':
-        if (this.initializeError) this.#push?.(JSON.stringify({ id: msg.id, error: { code: -32600, message: 'no' } }))
+        if (this.initializeError) push(JSON.stringify({ id: msg.id, error: { code: -32600, message: 'no' } }))
         else reply({ userAgent: 'x', codexHome: '/home/user/.codex', platformFamily: 'unix', platformOs: 'linux' })
         break
       case 'thread/loaded/list': {
@@ -96,34 +122,38 @@ class FakeDaemon {
       case 'thread/read': {
         // ★ What the daemon would serve now; the answer itself may be held back (`readGate`)
         const t = this.threads.get(String(params.threadId))
-        if (t) void this.readGate.then(() => reply({ thread: t }))
-        else this.#push?.(JSON.stringify({ id: msg.id, error: { code: -32600, message: 'not found' } }))
+        // ★ Like the real daemon: no turns without `includeTurns`
+        if (t) void this.readGate.then(() => reply({ thread: withoutTurns(t) }))
+        else push(JSON.stringify({ id: msg.id, error: { code: -32600, message: 'not found' } }))
         break
       }
-      case 'thread/resume':
-        reply({ thread: this.threads.get(String(params.threadId)) })
+      case 'thread/resume': {
+        const t = this.threads.get(String(params.threadId))
+        // ★ The history (with the running turn's snapshot) only when asked for
+        reply({ thread: t && params.excludeTurns !== false ? withoutTurns(t) : t })
         // ★ Like the real daemon: joining replays the requests that are waiting
-        for (const r of this.waitingRequests) this.#push?.(JSON.stringify(r))
+        for (const r of this.waitingRequests) push(JSON.stringify(r))
         break
+      }
       case 'thread/unsubscribe':
         reply({ status: 'unsubscribed' })
         break
       case 'thread/turns/list':
         this.onTurnsList?.()
         if (this.turnsPage) reply(this.turnsPage)
-        else this.#push?.(JSON.stringify({ id: msg.id, error: { code: -32601, message: 'unknown' } }))
+        else push(JSON.stringify({ id: msg.id, error: { code: -32601, message: 'unknown' } }))
         break
       case 'turn/interrupt':
-        if (this.interruptError) this.#push?.(JSON.stringify({ id: msg.id, error: this.interruptError }))
+        if (this.interruptError) push(JSON.stringify({ id: msg.id, error: this.interruptError }))
         else reply({})
         break
       case 'turn/start':
         if (this.silentTurnStart) break
-        if (this.turnStartError) this.#push?.(JSON.stringify({ id: msg.id, error: this.turnStartError }))
+        if (this.turnStartError) push(JSON.stringify({ id: msg.id, error: this.turnStartError }))
         else reply({ turn: { id: 'turn-new', status: 'inProgress', items: [] } })
         break
       default:
-        this.#push?.(JSON.stringify({ id: msg.id, error: { code: -32601, message: 'unknown' } }))
+        push(JSON.stringify({ id: msg.id, error: { code: -32601, message: 'unknown' } }))
     }
   }
 
@@ -133,8 +163,9 @@ class FakeDaemon {
   request(id: number | string, method: string, params: unknown): void {
     this.#push?.(JSON.stringify({ id, method, params }))
   }
+  /** Drops the line (the oldest open connection) */
   drop(why: WsClosed = { reason: 'eof' }): void {
-    this.#end?.(why)
+    this.#open[0]?.end(why)
   }
   methods(): string[] {
     return this.received.map((m) => String(m.method))
@@ -187,7 +218,14 @@ afterEach(() => {
   for (const l of started.splice(0)) l.stop()
 })
 
-type TestHooks = { changes?: StatusChange[]; onChange?: () => void; offerApproval?: DaemonHooks['offerApproval']; closed?: string[] }
+type TestHooks = {
+  changes?: StatusChange[]
+  onChange?: () => void
+  offerApproval?: DaemonHooks['offerApproval']
+  askQuestion?: DaemonHooks['askQuestion']
+  offerFileChange?: DaemonHooks['offerFileChange']
+  closed?: string[]
+}
 
 function start(w: World, hooks: TestHooks = {}) {
   const line = startLine(w, hooks)
@@ -207,6 +245,8 @@ function startLine(w: World, hooks: TestHooks = {}, rpcTimeoutMs?: number) {
       onStatus: (c) => hooks.changes?.push(c),
       ...(hooks.onChange ? { onChange: hooks.onChange } : {}),
       ...(hooks.offerApproval ? { offerApproval: hooks.offerApproval } : {}),
+      ...(hooks.askQuestion ? { askQuestion: hooks.askQuestion } : {}),
+      ...(hooks.offerFileChange ? { offerFileChange: hooks.offerFileChange } : {}),
       ...(hooks.closed ? { onClosed: (id: string) => hooks.closed!.push(id) } : {}),
     },
   })
@@ -496,6 +536,323 @@ test('approvals: requests that are not a plain command are still never answered,
   await line.done
 })
 
+const ASKING = { type: 'active', activeFlags: ['waitingOnUserInput'] }
+const questionRequest = (id: number, threadId: string) => ({
+  id,
+  method: 'item/tool/requestUserInput',
+  params: {
+    threadId,
+    turnId: 'turn-1',
+    itemId: 'call-1',
+    questions: [{ id: 'q1', header: 'H', question: 'Which?', isOther: true, isSecret: false, options: [{ label: 'A', description: '' }] }],
+    isBlocking: true,
+    autoResolutionMs: null,
+  },
+})
+
+test('questions: a thread that waits on an answer is joined only when questions are taken, and the answer goes back', async () => {
+  const w = world()
+  w.daemon.threads.set('t1', thread('t1', { status: ASKING }))
+  w.daemon.waitingRequests = [questionRequest(3, 't1')]
+  const asked: Array<(r: { type: 'answers'; result: { answers: Record<string, { answers: string[] }> } }) => void> = []
+  const line = start(w, {
+    offerApproval: () => new Promise(() => undefined),
+    askQuestion: (q, row) => {
+      assert.equal(row.project, 'proj')
+      assert.equal(q.questions[0]!.id, 'q1')
+      return new Promise((resolve) => asked.push(resolve))
+    },
+  })
+  await until(() => asked.length === 1, 'the card')
+  asked[0]!({ type: 'answers', result: { answers: { q1: { answers: ['A'] } } } })
+  await until(() => responsesOf(w).length === 1, 'the answer')
+  assert.deepEqual(responsesOf(w), [{ id: 3, result: { answers: { q1: { answers: ['A'] } } } }])
+  line.stop()
+  await line.done
+})
+
+test('questions off (approvals only): a thread that only waits on an answer is never joined', async () => {
+  const w = world()
+  w.daemon.threads.set('t1', thread('t1', { status: ASKING }))
+  w.daemon.waitingRequests = [questionRequest(3, 't1')]
+  const line = start(w, { offerApproval: () => new Promise(() => undefined) })
+  await until(() => line.rows().length === 1, 'the snapshot')
+  for (let i = 0; i < 20; i++) await new Promise((r) => setImmediate(r))
+  assert.ok(!w.daemon.methods().includes('thread/resume'))
+  assert.deepEqual(responsesOf(w), [])
+  line.stop()
+  await line.done
+})
+
+// ── File changes (2026-11-16 / `fileChanges.ts`) ──
+
+const FC = JSON.parse(readFileSync(new URL('./fixtures/file-change-0.169.0.json', import.meta.url), 'utf8')) as {
+  request: Record<string, unknown> & { params: Record<string, unknown> }
+  resumeResult: { thread: Record<string, unknown> }
+}
+const FC_THREAD = String(FC.request.params.threadId)
+
+function fileChangeWorld(size: number | undefined) {
+  const w = world()
+  w.deps.fileSize = async () => size
+  // ★ The real reply: the thread with the running turn's snapshot (and its rollout path)
+  w.daemon.threads.set(FC_THREAD, {
+    ...thread(FC_THREAD, { status: WAITING }),
+    path: '/home/user/.codex/sessions/rollout.jsonl',
+    turns: FC.resumeResult.thread.turns,
+  })
+  w.daemon.waitingRequests = [FC.request]
+  return w
+}
+/** How many times the line listed threads (only the line lists; a side connection does not) */
+const lists = (w: World) => w.daemon.methods().filter((m) => m === 'thread/loaded/list').length
+const resumes = (w: World) => w.daemon.received.filter((m) => m.method === 'thread/resume').map((m) => m.params)
+
+test('file change: the diff is read with one full-history join, the card shows it, and no is cancel', async () => {
+  const w = fileChangeWorld(150_000)
+  const offered: Array<{ changes: unknown; decide: (d: 'yes' | 'no' | undefined) => void }> = []
+  const line = start(w, {
+    offerApproval: () => new Promise(() => undefined),
+    offerFileChange: (change) => new Promise((decide) => offered.push({ changes: change.changes, decide })),
+  })
+  await until(() => offered.length === 1, 'the card')
+  assert.deepEqual(offered[0]!.changes, [{ path: '/home/user/nyan-probe/hello.txt', kind: 'add', diff: 'hi\n' }])
+  // ★ Joined as before, then once with the history (the replay it causes does not ask again)
+  await until(() => responsesOf(w).length === 0 && resumes(w).length >= 2, 'both joins')
+  for (let i = 0; i < 20; i++) await new Promise((r) => setImmediate(r))
+  assert.deepEqual(resumes(w), [
+    { threadId: FC_THREAD, excludeTurns: true },
+    { threadId: FC_THREAD, excludeTurns: false },
+  ])
+  offered.at(-1)!.decide('no')
+  await until(() => responsesOf(w).length === 1, 'the answer')
+  assert.deepEqual(responsesOf(w), [{ id: FC.request.id, result: { decision: 'cancel' } }])
+  line.stop()
+  await line.done
+})
+
+test('file change: a rollout over the limit is not joined with its history; no card, no answer', async () => {
+  const w = fileChangeWorld(5 * 1024 * 1024)
+  let offered = 0
+  const line = start(w, { offerApproval: () => new Promise(() => undefined), offerFileChange: () => new Promise(() => offered++) })
+  await until(() => w.daemon.methods().filter((m) => m === 'thread/read').length >= 2, 'the size check')
+  for (let i = 0; i < 20; i++) await new Promise((r) => setImmediate(r))
+  assert.deepEqual(resumes(w), [{ threadId: FC_THREAD, excludeTurns: true }])
+  assert.equal(offered, 0)
+  assert.deepEqual(responsesOf(w), [])
+  line.stop()
+  await line.done
+})
+
+test('file change: the size check\'s read says it no longer waits ⇒ no full-history join (codex review, medium)', async () => {
+  const w = fileChangeWorld(100)
+  let offered = 0
+  // ★ The PC answers between the join and the size check, and the status notice has not come yet: the daemon's
+  //   answers say idle from the size check's read on (snapshot read, join, then the size check's read)
+  const orig = w.daemon.threads.get(FC_THREAD)!
+  let gets = 0
+  const real = w.daemon.threads
+  w.daemon.threads = new Proxy(real, {
+    get(target, prop) {
+      if (prop === 'get') {
+        return (id: string) => {
+          if (id !== FC_THREAD) return target.get(id)
+          return ++gets >= 3 ? { ...orig, status: { type: 'idle' } } : orig
+        }
+      }
+      const v = Reflect.get(target, prop)
+      return typeof v === 'function' ? v.bind(target) : v
+    },
+  })
+  const line = start(w, { offerApproval: () => new Promise(() => undefined), offerFileChange: () => new Promise(() => offered++) })
+  await until(() => gets >= 3, 'the size check read')
+  for (let i = 0; i < 40; i++) await new Promise((r) => setImmediate(r))
+  assert.deepEqual(resumes(w), [{ threadId: FC_THREAD, excludeTurns: true }], 'no join with the history')
+  assert.equal(offered, 0)
+  line.stop()
+  await line.done
+})
+
+test('file change: after a reconnect the replayed request is not fetched again (once per request for the line)', async () => {
+  const w = fileChangeWorld(150_000)
+  let offered = 0
+  const line = start(w, { offerApproval: () => new Promise(() => undefined), offerFileChange: () => new Promise(() => offered++) })
+  await until(() => offered >= 1, 'the card')
+  const full = () => resumes(w).filter((p) => (p as { excludeTurns: boolean }).excludeTurns === false).length
+  assert.equal(full(), 1)
+  w.daemon.drop()
+  await until(() => lists(w) >= 2 && offered >= 2, 'the card again on the new connection')
+  assert.equal(full(), 1, 'the diff came from the line\'s memory')
+  line.stop()
+  await line.done
+})
+
+for (const how of ['finished', 'closed'] as const) {
+  test(`file change: a lookup whose thread ${how} while the line was down is forgotten on reconnect (codex round 2, medium)`, async () => {
+    const w = fileChangeWorld(150_000)
+    let offered = 0
+    const line = start(w, { offerApproval: () => new Promise(() => undefined), offerFileChange: () => new Promise(() => offered++) })
+    await until(() => offered >= 1, 'the card')
+    const full = () => resumes(w).filter((p) => (p as { excludeTurns: boolean }).excludeTurns === false).length
+    assert.equal(full(), 1)
+    // While the line is down the PC answers (idle), or the thread closes (not loaded any more)
+    const waiting = w.daemon.threads.get(FC_THREAD)!
+    w.daemon.waitingRequests = []
+    if (how === 'finished') w.daemon.threads.set(FC_THREAD, { ...waiting, status: { type: 'idle' } })
+    else w.daemon.threads.delete(FC_THREAD)
+    w.daemon.drop()
+    await until(() => lists(w) >= 2 && line.rows().length === (how === 'finished' ? 1 : 0), 'the snapshot after the reconnect')
+    // A new approval with the same ids (a fresh memo would fetch; a stale one would not)
+    w.daemon.threads.set(FC_THREAD, waiting)
+    w.daemon.waitingRequests = [FC.request]
+    if (how === 'finished') w.daemon.notify('thread/status/changed', { threadId: FC_THREAD, status: WAITING })
+    else w.daemon.notify('thread/started', { thread: waiting })
+    if (how === 'closed') w.daemon.notify('thread/status/changed', { threadId: FC_THREAD, status: WAITING })
+    await until(() => full() === 2, 'looked up again')
+    line.stop()
+    await line.done
+  })
+}
+
+test('file change: a thread listed on reconnect but whose read failed keeps its lookup (codex round 3, medium)', async () => {
+  const w = fileChangeWorld(150_000)
+  let offered = 0
+  const line = start(w, { offerApproval: () => new Promise(() => undefined), offerFileChange: () => new Promise(() => offered++) })
+  await until(() => offered >= 1, 'the card')
+  const full = () => resumes(w).filter((p) => (p as { excludeTurns: boolean }).excludeTurns === false).length
+  assert.equal(full(), 1)
+  // ★ After the reconnect the list names the thread, but reading it fails (the request is still waiting)
+  const waiting = w.daemon.threads.get(FC_THREAD)!
+  const real = w.daemon.threads
+  let failReads = true
+  w.daemon.threads = new Proxy(real, {
+    get(target, prop) {
+      if (prop === 'get') return (id: string) => (failReads && id === FC_THREAD ? undefined : target.get(id))
+      const v = Reflect.get(target, prop)
+      return typeof v === 'function' ? v.bind(target) : v
+    },
+  })
+  w.daemon.drop()
+  await until(() => lists(w) >= 2 && w.daemon.methods().filter((m) => m === 'thread/loaded/list').length >= 2, 'the snapshot after the reconnect')
+  for (let i = 0; i < 20; i++) await new Promise((r) => setImmediate(r))
+  // The status comes back: the thread is read, joined, and the request replayed
+  failReads = false
+  w.daemon.notify('thread/status/changed', { threadId: FC_THREAD, status: WAITING })
+  await until(() => offered >= 2, 'the card again')
+  assert.equal(full(), 1, 'the diff came from the memo, not a second full-history join')
+  void waiting
+  line.stop()
+  await line.done
+})
+
+test('file change: a thread that starts waiting during the snapshot keeps its lookup (codex round 4, medium)', async () => {
+  const w = fileChangeWorld(150_000)
+  const fcThread = w.daemon.threads.get(FC_THREAD)!
+  // ★ The list names only another thread, and its read is held: the snapshot is still running when FC starts waiting
+  w.daemon.threads.clear()
+  w.daemon.threads.set('other', thread('other'))
+  let release: () => void = () => undefined
+  w.daemon.readGate = new Promise<void>((r) => (release = r))
+  let offered = 0
+  const line = start(w, { offerApproval: () => new Promise(() => undefined), offerFileChange: () => new Promise(() => offered++) })
+  await until(() => w.daemon.methods().includes('thread/loaded/list'), 'the list')
+  w.daemon.threads.set(FC_THREAD, fcThread)
+  w.daemon.notify('thread/started', { thread: { ...fcThread, status: { type: 'idle' } } })
+  w.daemon.notify('thread/status/changed', { threadId: FC_THREAD, status: WAITING })
+  await until(() => resumes(w).length === 1, 'joined')
+  release()
+  await until(() => offered >= 1, 'the card')
+  for (let i = 0; i < 40; i++) await new Promise((r) => setImmediate(r))
+  const full = resumes(w).filter((p) => (p as { excludeTurns: boolean }).excludeTurns === false).length
+  assert.equal(full, 1, 'one full-history join for the one request')
+  line.stop()
+  await line.done
+})
+
+test('file change: answered on the PC while the size is checked ⇒ no full-history join (codex round 4, medium)', async () => {
+  const w = fileChangeWorld(0)
+  let sized: (n: number) => void = () => undefined
+  let asked = 0
+  w.deps.fileSize = () => {
+    asked++
+    return new Promise<number>((r) => (sized = r))
+  }
+  let offered = 0
+  const line = start(w, { offerApproval: () => new Promise(() => undefined), offerFileChange: () => new Promise(() => offered++) })
+  await until(() => asked === 1, 'the size check')
+  // The PC answers; the status notice has not come yet
+  w.daemon.waitingRequests = []
+  w.daemon.notify('serverRequest/resolved', { threadId: FC_THREAD, requestId: FC.request.id })
+  for (let i = 0; i < 10; i++) await new Promise((r) => setImmediate(r))
+  sized(100)
+  for (let i = 0; i < 40; i++) await new Promise((r) => setImmediate(r))
+  assert.deepEqual(resumes(w), [{ threadId: FC_THREAD, excludeTurns: true }])
+  assert.equal(offered, 0)
+  line.stop()
+  await line.done
+})
+
+test('★ file change: the full-history join is on a connection of its own, which leaves and closes (codex round 5, medium)', async () => {
+  const w = fileChangeWorld(150_000)
+  let offered = 0
+  const line = start(w, { offerApproval: () => new Promise(() => undefined), offerFileChange: () => new Promise(() => offered++) })
+  await until(() => offered >= 1, 'the card')
+  await until(() => w.daemon.log.length === 2 && w.daemon.log[1]!.closed, 'the side connection closed')
+  const [main, side] = w.daemon.log
+  assert.ok(!main!.received.some((m) => m.method === 'thread/resume' && (m.params as { excludeTurns: boolean }).excludeTurns === false), 'never on the line')
+  assert.deepEqual(side!.received.map((m) => m.method), ['initialize', 'initialized', 'thread/resume', 'thread/unsubscribe'])
+  assert.deepEqual(side!.received[2]!.params, { threadId: FC_THREAD, excludeTurns: false })
+  assert.equal(main!.closed, false)
+  line.stop()
+  await line.done
+})
+
+test('★ file change: a reply over the limit drops only the side connection; the line and its other cards stay', async () => {
+  const w = fileChangeWorld(150_000)
+  // ★ Another thread waits on a command at the same time (its card must survive)
+  w.daemon.threads.set('t2', thread('t2', { status: WAITING }))
+  w.daemon.waitingRequests = [FC.request, approvalRequest(3, 't2')]
+  // The full-history reply (a deleted large file's content) is over the limit; everything else is small
+  const fcThread = w.daemon.threads.get(FC_THREAD)!
+  const turns = structuredClone(fcThread.turns) as Array<{ items: Array<Record<string, unknown>> }>
+  for (const t of turns) for (const i of t.items) if (i.type === 'fileChange') i.changes = [{ path: '/big', kind: { type: 'delete' }, diff: 'x'.repeat(20_000) }]
+  w.daemon.threads.set(FC_THREAD, { ...fcThread, turns })
+  w.daemon.maxReply = 10_000
+  let commandCards = 0
+  let withdrawn = 0
+  let offered = 0
+  const line = start(w, {
+    offerApproval: (_a, _row, onWithdraw) =>
+      new Promise(() => {
+        commandCards++
+        onWithdraw(() => withdrawn++)
+      }),
+    offerFileChange: () => new Promise(() => offered++),
+  })
+  await until(() => commandCards >= 1 && w.daemon.log.length >= 2 && w.daemon.log[1]!.closed, 'the side connection dropped')
+  for (let i = 0; i < 40; i++) await new Promise((r) => setImmediate(r))
+  assert.equal(w.daemon.log[0]!.closed, false, 'the line is still up')
+  assert.equal(lists(w), 1, 'no reconnect')
+  assert.equal(withdrawn, 0, 'the command card stayed')
+  assert.equal(offered, 0, 'no diff, no card')
+  assert.equal(w.daemon.log.length, 2, 'not asked again')
+  line.stop()
+  await line.done
+})
+
+test('file change: no size reader (or no hook) ⇒ never fetched, never answered', async () => {
+  const w = fileChangeWorld(100)
+  delete w.deps.fileSize
+  let offered = 0
+  const line = start(w, { offerApproval: () => new Promise(() => undefined), offerFileChange: () => new Promise(() => offered++) })
+  await until(() => resumes(w).length === 1, 'joined')
+  for (let i = 0; i < 20; i++) await new Promise((r) => setImmediate(r))
+  assert.equal(resumes(w).length, 1)
+  assert.equal(offered, 0)
+  line.stop()
+  await line.done
+})
+
 test('a server request is never answered (no result, no error), only counted', async () => {
   const w = world()
   const line = start(w)
@@ -542,7 +899,7 @@ test('EOF: rows are dropped, it reconnects with growing waits, and the new gener
   // The daemon restarts: bare EOF, and afterwards the thread is idle
   w.daemon.threads.set('t1', thread('t1', { status: { type: 'idle' } }))
   w.daemon.drop()
-  await until(() => w.daemon.connections === 2 && line.rows().length === 1, 'the reconnect')
+  await until(() => lists(w) >= 2 && line.rows().length === 1, 'the reconnect')
   // ⚠️ Not "done": this connection never saw it active
   assert.equal(line.rows()[0]!.status, 'idle')
 
@@ -573,7 +930,7 @@ test('a line that stayed up long enough starts the backoff over', async () => {
   const line = start(w)
   await until(() => line.health().state === 'connected', 'connected')
   w.daemon.drop()
-  await until(() => w.daemon.connections === 2 && line.health().state === 'connected', 'reconnect 1')
+  await until(() => lists(w) >= 2 && line.health().state === 'connected', 'reconnect 1')
   w.clock.now += 31_000
   w.daemon.drop()
   await until(() => w.daemon.connections === 3, 'reconnect 2')
@@ -642,7 +999,7 @@ test('turns: read only for a thread that is a row, with explicit order and view;
 
   // A reconnect is a new generation
   w.daemon.drop()
-  await until(() => w.daemon.connections === 2 && line.rows().length === 1, 'the reconnect')
+  await until(() => lists(w) >= 2 && line.rows().length === 1, 'the reconnect')
   assert.equal(line.generation(), gen + 1)
   line.stop()
   await line.done
@@ -831,7 +1188,7 @@ test('★ a reconnect tells the notifier about threads that still wait (medium #
   await until(() => line.rows().length === 2, 'the snapshot')
   assert.equal(changes.length, 0, 'the agent just started: nothing was missed')
   w.daemon.drop()
-  await until(() => w.daemon.connections === 2 && line.rows().length === 2, 'the reconnect')
+  await until(() => lists(w) >= 2 && line.rows().length === 2, 'the reconnect')
   await until(() => changes.length === 1, 'the standing state')
   const c = changes[0]!
   assert.equal(c.type === 'changed' && c.thread.id, 't1')

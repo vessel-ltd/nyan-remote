@@ -1,0 +1,85 @@
+{
+  "request": {
+    "id": 16,
+    "method": "item/fileChange/requestApproval",
+    "params": {
+      "threadId": "01a1e346-2e00-7aa3-89dd-ab808dc66a18",
+      "turnId": "01a1e346-6070-7920-9de6-bf7914b5ecec",
+      "itemId": "exec-f23b5c2d-f50b-4aae-8145-642fdebbed45",
+      "startedAtMs": 1794814407052,
+      "reason": null,
+      "grantRoot": null
+    }
+  },
+  "resumeResult": {
+    "thread": {
+      "id": "01a1e346-2e00-7aa3-89dd-ab808dc66a18",
+      "status": {
+        "type": "active",
+        "activeFlags": [
+          "waitingOnApproval"
+        ]
+      },
+      "path": "/home/user/.codex/sessions/2026/11/16/rollout-2026-11-16T16-33-09-01a1e346-2e00-7aa3-89dd-ab808dc66a18.jsonl",
+      "cwd": "/home/user/nyan-probe",
+      "cliVersion": "0.169.0",
+      "source": "vscode",
+      "turns": [
+        {
+          "id": "01a1e346-6070-7920-9de6-bf7914b5ecec",
+          "rootTurnId": "01a1e346-6070-7920-9de6-bf7914b5ecec",
+          "items": [
+            {
+              "type": "userMessage",
+              "id": "01a1e346-627b-76a0-9bc7-7293affdf4e4",
+              "clientId": "0dcdc851-72a4-4ad5-befc-46dffbb32078",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "apply_patch を使って hello.txt に hi と書いて",
+                  "text_elements": []
+                }
+              ],
+              "startedAtMs": 1794814403197,
+              "completedAtMs": 1794814403197
+            },
+            {
+              "type": "agentMessage",
+              "moderation": null,
+              "id": "msg_08b11a3947c9a7fc016afab1c6b50887d09942304d3c010ed8",
+              "text": "apply_patch で `hello.txt` に `hi` を書き込みます。\n",
+              "phase": "commentary",
+              "memoryCitation": null,
+              "delivery": null,
+              "questions": null,
+              "startedAtMs": 1794814406189,
+              "completedAtMs": 1794814406342
+            },
+            {
+              "type": "fileChange",
+              "id": "exec-f23b5c2d-f50b-4aae-8145-642fdebbed45",
+              "changes": [
+                {
+                  "path": "/home/user/nyan-probe/hello.txt",
+                  "kind": {
+                    "type": "add"
+                  },
+                  "diff": "hi\n"
+                }
+              ],
+              "status": "inProgress",
+              "startedAtMs": 1794814407050,
+              "completedAtMs": null
+            }
+          ],
+          "itemsView": "full",
+          "status": "inProgress",
+          "error": null,
+          "startedAt": 1794814402,
+          "completedAt": null,
+          "durationMs": null
+        }
+      ]
+    }
+  }
+}

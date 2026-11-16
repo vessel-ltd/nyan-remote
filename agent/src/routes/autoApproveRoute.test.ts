@@ -34,6 +34,8 @@ import { sessionAutoApprove } from './autoApprove.ts'
 import { permissionAnswer, permissionRequest, permissions } from './permission.ts'
 import { hook } from './hook.ts'
 import { markAutoApprove } from './sessions.ts'
+import { askCodexQuestion } from '../codex/cards.ts'
+import type { CodexQuestion } from '../codex/questions.ts'
 
 const SESSION = '960cbcc3-0c6e-435d-b024-1867c146dfa8'
 const TRANSCRIPT = `/home/x/.claude-r/projects/-home-x-proj/${SESSION}.jsonl`
@@ -464,4 +466,87 @@ test('★ /permissions marks a Codex row\'s auto-approve entry as Codex, and onl
     marks.map((m) => [m.id, 'tool' in m ? m.tool : undefined]).sort(),
     [[SESSION, undefined], [codexId, 'codex']].sort(),
   )
+})
+
+// --- Codex questions (2026-11-16): the phone sends labels and notes, the agent builds the answer ---
+
+const CODEX_ROW = { machine: 'pc-a', account: '.codex', project: 'proj', sessionId: 'thread-q', tool: 'codex' } as SessionSummary
+const CODEX_Q: CodexQuestion = {
+  requestId: 7,
+  threadId: 'thread-q',
+  turnId: 'turn-q',
+  itemId: 'call-q',
+  questions: [
+    { id: 'purpose', question: '目的は？', header: '目的', options: [{ label: '学習' }, { label: '発信' }], other: true },
+    { id: 'editing', question: '書き方は？', options: [{ label: 'ブラウザ' }, { label: 'Git' }], other: false },
+  ],
+}
+
+function asking(t: { after: (fn: () => void) => void }) {
+  const ask = askCodexQuestion({ generation: () => 1, changed: () => undefined, now: () => new Date() })
+  let withdraw: () => void = () => undefined
+  const reply = ask(CODEX_Q, CODEX_ROW, (w) => (withdraw = w))
+  t.after(() => withdraw())
+  return reply
+}
+
+const answerCodex = (body: Record<string, unknown>) =>
+  permissionAnswer(bodyCtx('http://agent/permission/answer', {}, { key: listPending()[0]!.key, ...body }, PHONE_A))
+
+test('★★ a Codex question: labels and notes from the phone become the answer the agent builds (ids never sent)', async (t) => {
+  await withState(t)
+  const reply = asking(t)
+  const card = listPending()[0]!
+  assert.equal(card.tool, 'codex')
+  assert.equal(card.interaction?.kind, 'question')
+  assert.ok(!JSON.stringify(card).includes('purpose'), 'the question ids stay on the agent')
+  const res = await answerCodex({ behavior: 'allow', answers: { '書き方は？': ['Git'] }, notes: { '目的は？': '仕事で使う', '書き方は？': '画像も' } })
+  assert.deepEqual(res, { ok: true })
+  assert.deepEqual(await reply, {
+    type: 'answers',
+    result: {
+      answers: {
+        purpose: { answers: ['None of the above', 'user_note: 仕事で使う'] },
+        editing: { answers: ['Git', 'user_note: 画像も'] },
+      },
+    },
+  })
+})
+
+test('★★ a Codex question: an answer that does not fit is refused and the card stays', async (t) => {
+  await withState(t)
+  void asking(t)
+  const bad = await answerCodex({ behavior: 'allow', answers: { '目的は？': ['学習'] }, notes: { '書き方は？': 'なんでも' } })
+  assert.equal(bad.ok, false, 'a note alone where only an option may answer')
+  const shown = await answerCodex({ behavior: 'allow', answers: { '目的は？': ['学習'], '書き方は？': ['FTP'] } })
+  assert.equal(shown.ok, false, 'a label that was not shown')
+  assert.equal(listPending().length, 1)
+})
+
+test('★★ a Codex question: deny from the phone is "stop the turn", not an answer', async (t) => {
+  await withState(t)
+  const reply = asking(t)
+  assert.deepEqual(await answerCodex({ behavior: 'deny' }), { ok: true })
+  assert.deepEqual(await reply, { type: 'stop' })
+})
+
+test('★★★ auto-approve never answers a Codex question (the card is raised)', async (t) => {
+  await withState(t)
+  assert.equal((await setAutoApprove('thread-q', true, Date.now())).ok, true)
+  const reply = asking(t)
+  assert.equal(listPending().length, 1, 'a card, not an answer')
+  const out = await Promise.race([reply, new Promise((r) => setTimeout(() => r('pending'), 50))])
+  assert.equal(out, 'pending', 'nothing answered it')
+})
+
+test('★ notes are refused on a card that does not take them (a Codex command card here)', async (t) => {
+  await withState(t)
+  const waiting = waitForDecision(
+    { key: 'codex:abc#1', machine: 'pc-a', account: '.codex', project: 'proj', sessionId: 'thread-1', toolName: 'Bash', tool: 'codex', summary: 'touch x', at: '2026-11-14T12:00:00.000Z' },
+    () => undefined,
+  )
+  const res = await permissionAnswer(bodyCtx('http://agent/permission/answer', {}, { key: 'codex:abc#1', behavior: 'allow', notes: { x: 'y' } }, PHONE_A))
+  assert.equal(res.ok, false)
+  assert.equal(listPending().length, 1)
+  void waiting
 })
