@@ -106,6 +106,19 @@ test('★★ --purge looks inside: a personal tool in bin/, a subdirectory in pa
   assert.deepEqual(foreignEntries(s).sort(), ['bin/mytool', 'inflight/personal.csv', 'inflight/x.jsonl', 'panes/notes.txt', 'panes/sub', 'vapid.json'], '⚠️ codex round 4: any regular file used to pass')
 })
 
+test('★ --purge knows usage/: the relay\'s readings and a write cut short are ours, anything else is not (2026-11-17)', () => {
+  const s = mkdtempSync(join(tmpdir(), 'nyan-un-'))
+  writeFileSync(join(s, 'config.json'), '{}')
+  mkdirSync(join(s, 'usage'))
+  writeFileSync(join(s, 'usage', 'claude-.claude.json'), '{}')
+  writeFileSync(join(s, 'usage', 'claude-.claude-r.json'), '{}')
+  writeFileSync(join(s, 'usage', '.claude-.claude-r.1234.5678.tmp'), '')
+  assert.deepEqual(foreignEntries(s), [])
+  writeFileSync(join(s, 'usage', 'notes.txt'), '')
+  writeFileSync(join(s, 'usage', 'claude-other.json'), '')
+  assert.deepEqual(foreignEntries(s).sort(), ['usage/claude-other.json', 'usage/notes.txt'])
+})
+
 test('★★ after stopping: the port comes from config.json; refused = gone, no answer = unknown, any HTTP answer = running', async () => {
   const s = mkdtempSync(join(tmpdir(), 'nyan-un-'))
   writeFileSync(join(s, 'config.json'), '{"port":7788}')

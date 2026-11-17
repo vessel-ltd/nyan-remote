@@ -167,6 +167,63 @@ function shQuote(p) {
   return `'${String(p).replace(/'/g, `'\\''`)}'`
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// ★ Status line relay (`hooks/statusline.sh` / 2026-11-17 / agent/src/usage.ts).
+//
+// Claude Code hands the status line command the plan limits (`rate_limits`) after each API response. The relay keeps
+// them in `~/.nyan-remote/usage/` and then runs **the user's own command** with the same input:
+//     "command": "'<repo>/hooks/statusline.sh' --nyan-remote-relay '<the user's command>'"
+// ⚠️⚠️ **Only where the user already has a command status line** (what they see must not change: an empty status line
+//    still takes a row). No status line ⇒ untouched (no Claude limits on that profile).
+// ⚠️ Only `command` is rewritten; `padding` and anything else stay. Removing puts the user's command back exactly.
+// ⚠️ "Ours" = a quoted path ending in `/hooks/statusline.sh`, the mark `--nyan-remote-relay`, and exactly one quoted
+//    argument (a moved tree is still recognised, so it is never wrapped twice; someone else's `statusline.sh` is not ours).
+const SL_COMMAND = join(fileURLToPath(new URL('..', import.meta.url)), 'hooks', 'statusline.sh')
+
+/** The inverse of `shQuote`, only for exactly its output */
+function shUnquote(q) {
+  if (!/^'(?:[^']|'\\'')*'$/.test(q)) return undefined
+  const v = q.slice(1, -1).replace(/'\\''/g, "'")
+  return shQuote(v) === q ? v : undefined
+}
+
+/** ★ The argument that marks a status line command as ours (a file name alone is not proof / codex review 2026-11-17) */
+const SL_MARK = '--nyan-remote-relay'
+
+/** The user's command if this status line command is our relay in front of it, else undefined */
+export function unwrapStatusLine(cmd) {
+  if (typeof cmd !== 'string') return undefined
+  const m = /^('(?:[^']|'\\'')*') (\S+) ('(?:[^']|'\\'')*')$/.exec(cmd)
+  if (!m || m[2] !== SL_MARK) return undefined
+  const path = shUnquote(m[1])
+  // ⚠️ Any tree (a moved install is still ours): the mark is the proof, the path only has to be our file's name
+  if (!path || !path.endsWith('/hooks/statusline.sh')) return undefined
+  return shUnquote(m[3])
+}
+
+export function wrapStatusLine(userCommand) {
+  return `${shQuote(SL_COMMAND)} ${SL_MARK} ${shQuote(userCommand)}`
+}
+
+/** Apply (or remove) the relay on one settings object. Returns what it did, for the summary */
+function applyStatusLine(data, remove) {
+  const sl = data.statusLine
+  if (!sl || typeof sl !== 'object' || sl.type !== 'command' || typeof sl.command !== 'string' || sl.command.trim() === '') {
+    return 'none'
+  }
+  const inner = unwrapStatusLine(sl.command)
+  if (remove) {
+    if (inner === undefined) return 'not-ours'
+    data.statusLine = { ...sl, command: inner }
+    return 'removed'
+  }
+  // ★ Already ours: re-point at this tree (a moved install), keeping the user's command
+  const want = wrapStatusLine(inner === undefined ? sl.command : inner)
+  if (want === sl.command) return 'relayed'
+  data.statusLine = { ...sl, command: want }
+  return 'relayed'
+}
+
 function msgHookEntry() {
   return {
     matcher: '',
@@ -493,6 +550,15 @@ if (!REMOVE && !notifyOk) {
   console.warn(t('   ⚠️ これが無いと「ターンが終わった」「エラーで止まった」が**1通も出ません**', '   ⚠️ Without it, **no** "turn finished" or "stopped with an error" notifications are sent'))
 }
 
+// ★ Where the status line relay keeps the plan limits (0700: only we write and read it). ⚠️ The relay never creates it
+if (!REMOVE && !DRY) {
+  try {
+    mkdirSync(join(STATE_DIR, 'usage'), { recursive: true, mode: 0o700 })
+  } catch {
+    // ⚠️ Not fatal: the relay then keeps nothing, and the status line shows as before
+  }
+}
+
 for (const dir of dirs) {
   const path = join(dir, 'settings.json')
   let data = {}
@@ -509,15 +575,21 @@ for (const dir of dirs) {
   }
 
   const before = describe(data.hooks)
+  const slBefore = JSON.stringify(data.statusLine ?? null)
   data.hooks = applyOurs(data.hooks, { remove: REMOVE, msgReady, notifyOk })
   // If hooks becomes empty, remove the key too (do not leave an empty object)
   if (Object.keys(data.hooks).length === 0) delete data.hooks
+  // ★ The status line relay (plan limits / 2026-11-17). ⚠️ Only in front of a status line the user has
+  const sl = applyStatusLine(data, REMOVE)
+  const slChanged = JSON.stringify(data.statusLine ?? null) !== slBefore
+  if (sl === 'none' && !REMOVE) console.log(t(`・${dir}  ステータスラインが無いので、Claude の使用量は取りません（表示を変えないため）`, `- ${dir}  no status line, so Claude's plan limits are not read there (so nothing on screen changes)`))
   const after = describe(data.hooks)
-  if (before === after) {
+  if (before === after && !slChanged) {
     console.log(t(`・${dir}  変更なし（${after}）`, `- ${dir}  unchanged (${after})`))
     continue
   }
 
+  if (slChanged) console.log(t(`・${dir}  ステータスライン: ${REMOVE ? '元のコマンドに戻します' : '使用量の中継を前に挟みます（表示は今までどおり）'}`, `- ${dir}  status line: ${REMOVE ? 'putting the original command back' : 'the plan-limit relay goes in front (it shows the same as before)'}`))
   if (DRY) {
     console.log(t(`（dry-run）${dir}\n    前: ${before}\n    後: ${after}`, `(dry-run) ${dir}\n    before: ${before}\n    after:  ${after}`))
     continue

@@ -24,6 +24,7 @@ import type {
   RevokeResult,
   PermissionRequest,
   PushStatus,
+  UsageResponse,
   SessionsPage,
 } from '../../../shared/types.ts'
 import type { AgentEndpoint } from '../endpoints.ts'
@@ -269,6 +270,10 @@ export class AgentTransport implements Transport {
 
   handshake(init: string): Promise<HandshakeResult> {
     return this.post<HandshakeResult>('/handshake', { init })
+  }
+
+  usage(): Promise<UsageResponse> {
+    return this.get<UsageResponse>('/usage')
   }
 
   pushStatus(): Promise<PushStatus> {

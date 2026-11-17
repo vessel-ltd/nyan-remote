@@ -43,17 +43,21 @@ export const STATE_FILES = [
   'account.json', 'account.lock', 'license.json', 'auto-approve.json',
   'hooks.jsonl', 'sent.jsonl', 'traffic.jsonl', 'inflight.off',
 ]
-export const STATE_DIRS = ['bin', 'panes', 'inflight']
+export const STATE_DIRS = ['bin', 'panes', 'inflight', 'usage']
 /**
  * ★ The names written inside those directories (codex round 4: any regular file used to pass).
  *   panes/    `<pid>.json` (relay.py), its temp `<pid>.json.<pid>.tmp`, `<pid>.rejected`
  *   inflight/ `<session UUID>.jsonl` (hooks/message-display.sh only accepts a UUID)
+ *   usage/    `claude-<profile>.json` and its temp `.claude-<profile>.<pid>.<random>.tmp` (hooks/statusline.sh only accepts
+ *             a `.claude*` profile name / 2026-11-17)
  *   bin/      nothing: the removers take ours out before a purge
  */
 export const STATE_CHILD = {
   bin: /(?!)/,
   panes: /^\d+\.(json|rejected|json\.\d+\.tmp)$/,
   inflight: /^[0-9a-fA-F-]{36}\.jsonl$/,
+  // ★ And a relay write cut short before its rename (`.claude-<profile>.<pid>.<random>.tmp` / codex review)
+  usage: /^(claude-\.claude(-[A-Za-z0-9._-]+)?\.json|\.claude-\.claude(-[A-Za-z0-9._-]+)?\.\d+\.\d+\.tmp)$/,
 }
 /** ★ At least one of these must be there before anything is called "our state directory" */
 export const STATE_MARKERS = ['config.json', 'hook-token', 'device-key.json']

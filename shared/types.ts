@@ -265,6 +265,42 @@ export type AgentFeature =
    * ⚠️ `compact` only: `exit` is refused for Codex rows.
    */
   | 'codex-compact'
+  /** ★ `GET /usage`: each account's plan limits (5-hour / weekly windows), Claude and Codex (2026-11-17) */
+  | 'usage'
+
+/**
+ * ★ One plan-limit window as last read (2026-11-17). `minutes`: its length (300 = 5 hours, 10080 = a week).
+ * ⚠️ Which windows exist depends on the plan (some have no 5-hour window): never assume one is there.
+ */
+export interface UsageWindow {
+  minutes: number
+  /** 0–100 (above 100 once exceeded) */
+  usedPercent: number
+  /** ISO time the window resets */
+  resetsAt: string
+}
+
+/**
+ * ★ The limits of one Claude profile (`CLAUDE_CONFIG_DIR`) or Codex home, as last read (`GET /usage` / 2026-11-17).
+ * ⚠️ Limits belong to the **account**: two profiles logged in to one account show the same numbers (`accountKey`).
+ */
+export interface ToolUsage {
+  tool: 'claude' | 'codex'
+  /** The profile: `.claude-r` / `.codex` (the same label as the rows) */
+  account: string
+  /** A short hash of the account id (equal = one account and one set of limits). Never the id itself. Absent = unknown */
+  accountKey?: string
+  /** The plan as the tool names it (Codex: `plus` / `prolite` / `pro` …). Absent = unknown */
+  plan?: string
+  /** Windows whose reset has not passed. ⚠️ Empty = every known window reset since it was read (now unknown) */
+  windows: UsageWindow[]
+  /** When it was read (ISO). Claude: the last API response of a session of that profile */
+  at: string
+}
+
+export interface UsageResponse {
+  usage: ToolUsage[]
+}
 
 /** One Codex home's line to its app-server daemon (`agent/src/codex/daemon.ts`) */
 export interface CodexLineHealth {

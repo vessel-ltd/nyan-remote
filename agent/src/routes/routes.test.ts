@@ -151,8 +151,9 @@ test('★★★ feature flags correspond to the endpoints actually registered', 
     'device-handshake': '/handshake',
     // ★ A GET endpoint (⚠️ the method is in the METHOD table below)
     'log-follow': '/sessions/x/follow',
+    usage: '/usage',
   }
-  const METHOD: Record<string, string> = { 'log-follow': 'GET' }
+  const METHOD: Record<string, string> = { 'log-follow': 'GET', usage: 'GET' }
   for (const feature of AGENT_FEATURES) {
     const path = NEEDS[feature]
     assert.ok(path, `no endpoint in the table for flag ${feature} (fix this table too)`)

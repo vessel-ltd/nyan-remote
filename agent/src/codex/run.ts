@@ -9,7 +9,8 @@
 import { realpath, stat } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, join, resolve } from 'node:path'
-import type { CodexLineHealth, LogPage, NotifyFields, SessionSummary } from '../../../shared/types.ts'
+import type { CodexLineHealth, LogPage, NotifyFields, SessionSummary, ToolUsage } from '../../../shared/types.ts'
+import { codexUsageOf } from '../usage.ts'
 import type { CodexConfig } from '../config.ts'
 import { autoApproveFor } from '../autoApprove.ts'
 import { askCodexQuestion, offerCodexCard, offerCodexFileChange } from './cards.ts'
@@ -258,6 +259,50 @@ export async function codexRows(): Promise<SessionSummary[]> {
     return n === undefined ? r : { ...r, contextTokens: n }
   })
   return [...withContext, ...lines.flatMap((l) => l.historyRows())]
+}
+
+/**
+ * ★ How old a Codex limits reading may be before `/usage` asks again. ⚠️ Each read goes from the daemon to OpenAI
+ *   (measured ~0.5 s), so not on every list poll.
+ */
+export const CODEX_USAGE_TTL_MS = 60_000
+
+/** Per line: the last good reading, and the read in flight (one at a time) */
+const usageOf = new WeakMap<CodexDaemonLine, { readAt: number; value: ToolUsage | undefined; inflight?: Promise<void> }>()
+
+/** ★ Each Codex home's plan limits (`GET /usage`). A home that cannot be read now keeps its last good reading. */
+export async function codexUsage(nowMs: number = Date.now()): Promise<ToolUsage[]> {
+  await Promise.all(
+    lines.map(async (line) => {
+      let slot = usageOf.get(line)
+      if (!slot) {
+        slot = { readAt: 0, value: undefined }
+        usageOf.set(line, slot)
+      }
+      if (nowMs - slot.readAt < CODEX_USAGE_TTL_MS) return
+      const s = slot
+      s.inflight ??= (async () => {
+        try {
+          const got = codexUsageOf(await line.rateLimits(), Date.now())
+          s.readAt = Date.now()
+          if (got) s.value = { tool: 'codex', account: line.label, ...got, at: new Date(s.readAt).toISOString() }
+        } catch {
+          // ⚠️ Never throws into the route: the last reading stays
+        } finally {
+          s.inflight = undefined
+        }
+      })()
+      await s.inflight
+    }),
+  )
+  const out: ToolUsage[] = []
+  for (const line of lines) {
+    const v = usageOf.get(line)?.value
+    if (!v) continue
+    // ⚠️ Windows whose reset passed since the reading are no longer true
+    out.push({ ...v, windows: v.windows.filter((w) => Date.parse(w.resetsAt) > nowMs) })
+  }
+  return out
 }
 
 /** ★ How old the history may be when the phone opens it (it is also read again whenever a thread closes) */

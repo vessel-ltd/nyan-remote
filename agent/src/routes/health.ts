@@ -32,6 +32,8 @@ export const AGENT_FEATURES: AgentFeature[] = [
   'log-follow',
   // ★ 24 hours can be chosen as the auto-approve duration (`AUTO_APPROVE_DURATIONS` in `autoApprove.ts`)
   'auto-approve-24h',
+  // ★ `GET /usage` (plan limits per Claude profile / Codex home / 2026-11-17)
+  'usage',
 ]
 
 export async function health(): Promise<AgentHealth> {

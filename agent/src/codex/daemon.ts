@@ -218,6 +218,11 @@ export interface CodexDaemonLine {
    */
   compact(threadId: string): Promise<CodexSendResult>
   /**
+   * ★ The account's plan limits (`account/rateLimits/read`: no thread is joined or loaded; the daemon asks its server,
+   *   measured ~0.5 s). The raw result, or `undefined` when it cannot be read now (`usage.ts` parses it).
+   */
+  rateLimits(): Promise<unknown>
+  /**
    * ★ Stop the turn that runs on this thread now (measured: the TUI's turn ends `interrupted`, the TUI goes back to
    *   waiting and takes the next input / docs/CODEX.md §3).
    * ⚠️⚠️ Only **the turn that ran when asked**: `turn/interrupt` names it by id, so a turn that starts meanwhile is
@@ -742,6 +747,12 @@ export function startCodexDaemonLine(opts: DaemonOptions): CodexDaemonLine {
     mark: (threadId) => book.mark(threadId),
     send: (threadId, text) => startOnIdle(threadId, 'turn/start', { threadId, input: [{ type: 'text', text }] }),
     compact: (threadId) => startOnIdle(threadId, 'thread/compact/start', { threadId }),
+    rateLimits: async () => {
+      const rpc = liveRpc
+      if (!rpc) return undefined
+      const res = await rpc.call('account/rateLimits/read', {})
+      return res.ok ? res.result : undefined
+    },
     interrupt: async (threadId) => {
       const rpc = liveRpc
       if (!rpc || !book.isRow(threadId)) return { ok: false, reason: 'not-listed' }

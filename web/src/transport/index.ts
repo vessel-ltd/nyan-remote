@@ -20,6 +20,7 @@ import type {
   PeersResult,
   PermissionRequest,
   PushStatus,
+  UsageResponse,
   SessionSummary,
   SessionsPage,
   DevicesResult,
@@ -226,6 +227,9 @@ export interface Transport {
    *    (`finishHandshake` → `accept()`). Opening it confirms "we reached the same key".
    */
   handshake(init: string): Promise<HandshakeResult>
+
+  /** ★ Plan limits per Claude profile / Codex home (`GET /usage`). ⚠️ Only on agents with the `usage` feature */
+  usage(): Promise<UsageResponse>
 
   /** Push: VAPID public key and this device's subscription state */
   pushStatus(): Promise<PushStatus>
