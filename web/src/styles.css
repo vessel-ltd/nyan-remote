@@ -1871,6 +1871,20 @@ input.urlinput {
   flex-shrink: 0;
 }
 
+/* ★ The model · effort just left of ctx (2026-11-17). ⚠️ On a narrow screen it is the one that gives way (ellipsis),
+   after the state text, never ctx */
+.composerbusy .composermodel {
+  margin-left: auto;
+  min-width: 0;
+  flex-shrink: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.composerbusy .composermodel + .composerctx {
+  margin-left: 0;
+}
+
 /* ⚠️ On narrow screens (320px), with a long state (English `Needs you (permission prompt)`) next to ctx,
    the non-shrinking state text pushed ctx off the right edge (codex round 25, low #5) ⇒ the state text is truncated instead */
 .composerbusy .state {

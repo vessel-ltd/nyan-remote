@@ -19,7 +19,7 @@ import { renderMarkdown } from './markdown.tsx'
 import { Composer } from './Composer.tsx'
 import { followAction } from './follow.ts'
 import { alreadyInTranscript, type InflightMessage } from '../../../shared/types.ts'
-import { formatTokens } from './tokens.ts'
+import { ctxText, formatTokens, modelText } from './tokens.ts'
 import { beginSend, consumeAfterReload, finishSend, noteArrivals, type PendingSend } from './pending.ts'
 import { Permissions } from './Permissions.tsx'
 import { sendMark } from './sendMark.ts'
@@ -1195,8 +1195,9 @@ export function Thread({
         result={note}
         // ★ The cat-and-status line. ⚠️ Decided in one place, `composerBusy` (including run/stop)
         busy={composerBusy(session)}
-        // ★ Amount of context currently in use (same formatting as the list's `ctx`)
-        ctx={formatTokens(session?.contextTokens)}
+        // ★ Amount of context currently in use, and the model · effort (the same text as the list's chips)
+        ctx={ctxText(formatTokens(session?.contextTokens), session?.contextPercent)}
+        model={session ? modelText(session) : undefined}
         onSend={sendMessage}
       />
 

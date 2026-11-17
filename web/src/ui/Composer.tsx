@@ -36,6 +36,7 @@ export function Composer({
   result,
   busy,
   ctx,
+  model,
   onSend,
 }: {
   sessionId: string
@@ -67,10 +68,12 @@ export function Composer({
    */
   busy: { label: string; cls: string; running: boolean } | null
   /**
-   * ★ Amount of context currently in use (e.g. `1.2M` / user request 2026-09-24). Shown at the right end of the cat line.
-   * ⚠️ undefined if unknown (not shown). Formatted with the same `formatTokens` as the list (built by the caller).
+   * ★ Amount of context currently in use (e.g. `ctx 1.2M · 21%` / user request 2026-09-24). Shown at the right end of the
+   *   cat line. ⚠️ undefined if unknown (not shown). The same `ctxText` as the list (built by the caller).
    */
   ctx: string | undefined
+  /** ★ The model and effort (`Opus 5.5 · high` / 2026-11-17), the same `modelText` as the list. undefined ⇒ not shown */
+  model: string | undefined
   onSend: (text: string) => Promise<void>
 }) {
   const [text, setText] = useState('')
@@ -230,9 +233,10 @@ export function Composer({
         <p class="composerbusy">
           <Nyan running={busy.running} />
           <span class={`state ${busy.cls}`}>{busy.label}</span>
+          {model ? <span class="chip model composermodel">{model}</span> : null}
           {ctx ? (
             <span class="chip ctx composerctx" title={t('いま使っているコンテキストの量（最後の応答時点）', 'Context currently in use (as of the last response)')}>
-              ctx {ctx}
+              {ctx}
             </span>
           ) : null}
         </p>
