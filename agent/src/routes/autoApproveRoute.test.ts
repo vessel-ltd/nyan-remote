@@ -453,7 +453,7 @@ test('★ the list marks Codex rows too (a Codex approval passes while the entry
     .split('\n')
     .filter((l) => !l.trim().startsWith('//') && !l.trim().startsWith('*'))
     .join('\n')
-  assert.match(code, /markAutoApprove\(\[[^\]]*\.\.\.codexRows\(\)[^\]]*\], now\)/)
+  assert.match(code, /markAutoApprove\(\[[^\]]*\.\.\.\(await codexRows\(\)\)[^\]]*\], now\)/)
 })
 
 test('★ /permissions marks a Codex row\'s auto-approve entry as Codex, and only that one (codex review, medium #7)', async (t) => {

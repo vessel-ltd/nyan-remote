@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { isUserThread, parseStatus, parseThread, statusOf, ThreadBook, titleOf, type CodexThread } from './threads.ts'
+import { isUserThread, parseStatus, parseThread, statusOf, ThreadBook, titleOf, waitingForOf, type CodexThread } from './threads.ts'
 
 /** The fields measured on codex-cli 0.169.0 for a plain TUI's main thread (values are examples) */
 function raw(over: Record<string, unknown> = {}): Record<string, unknown> {
@@ -106,6 +106,25 @@ test('statusOf: idle is "done" only when this connection saw the thread active',
   assert.equal(statusOf(active(false, true), true), 'waiting')
   assert.equal(statusOf({ type: 'systemError' }, true), 'error')
   assert.equal(statusOf({ type: 'notLoaded' }, true), 'unknown')
+})
+
+test('waitingForOf: the reason a Codex row waits, in the CLI words (approval wins when both flags are up)', () => {
+  const active = (flags: string[]) => ({ type: 'active', activeFlags: flags })
+  const book = new ThreadBook()
+  book.upsert(raw({ id: 'a', status: active(['waitingOnApproval']) }))
+  book.upsert(raw({ id: 'q', status: active(['waitingOnUserInput']) }))
+  book.upsert(raw({ id: 'b', status: active(['waitingOnUserInput', 'waitingOnApproval']) }))
+  book.upsert(raw({ id: 'w', status: active([]) }))
+  book.upsert(raw({ id: 'i' }))
+  const by = new Map(book.rows(CTX).map((r) => [r.sessionId, r]))
+  assert.equal(by.get('a')!.waitingFor, 'permission prompt')
+  assert.equal(by.get('q')!.waitingFor, 'input needed')
+  assert.equal(by.get('b')!.waitingFor, 'permission prompt')
+  assert.equal(by.get('w')!.status, 'working')
+  assert.ok(!('waitingFor' in by.get('w')!), 'no reason is invented while it works')
+  assert.ok(!('waitingFor' in by.get('i')!))
+  assert.equal(waitingForOf({ type: 'idle' }), undefined)
+  assert.equal(waitingForOf({ type: 'notLoaded' }), undefined)
 })
 
 test('book: rows carry tool "codex", never the rollout path, and are ordered by activity', () => {
@@ -379,4 +398,13 @@ test('★ forgetting old events does not make an old read look fresh (second rev
   assert.equal(book.isRow('T'), false)
   // A read that started after the flood is news
   assert.equal(book.upsert(raw({ id: 'T' }), book.clock()), true)
+})
+
+test('book: the rollout path stays on the agent — given per row id for the context chip, never on a row', () => {
+  const book = new ThreadBook()
+  book.upsert(raw({ id: 't1' }))
+  book.upsert(raw({ id: 't2', path: null }))
+  const ctx = { ...CTX, idPrefix: 'codex:' }
+  assert.deepEqual([...book.rolloutPaths(ctx)], [['codex:t1', '/home/user/.codex/sessions/x.jsonl']])
+  assert.ok(!JSON.stringify(book.rows(ctx)).includes('.jsonl'))
 })

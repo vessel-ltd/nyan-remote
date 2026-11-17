@@ -1058,7 +1058,31 @@ export function Thread({
       ) : null}
       {showNoAnswerable ? (
         <p class="notice warn">
-          {wait.kind === 'other' ? (
+          {/* ★ A Codex row: the causes are not Claude's (no hook; a restarted agent gets the cards back by joining again).
+              ⚠️ Say only what we see — no card here — and name what the phone never shows (`approvals.ts` rule 2 /
+              `questions.ts` rule 4) without claiming this one is of that kind (a join can still be retrying / codex
+              review, low). The reason comes from the daemon's flags (`waitingForOf`) */}
+          {isCodex(session) && wait.kind !== 'unknown' ? (
+            session?.waitingFor === 'input needed' ? (
+              <>
+                {t('PCの画面で質問の答えを待っています。', 'The PC screen is waiting for an answer to a question. ')}
+                <strong>{t('スマホに答えるカードが出ていません', 'There is no card to answer it on the phone')}</strong>
+                {t(
+                  '（秘密の入力や選択肢の無い質問は、スマホには出ません）。PCで答えてください。',
+                  ' (a secret input or a question without options is never shown on the phone). Please answer on the PC.',
+                )}
+              </>
+            ) : (
+              <>
+                {t('PCの画面で承認を待っています。', 'The PC screen is waiting for an approval. ')}
+                <strong>{t('スマホに答えるカードが出ていません', 'There is no card to answer it on the phone')}</strong>
+                {t(
+                  '（スマホに出るのは、コマンドの承認と、差分が読めるファイル変更だけです）。PCで答えてください。',
+                  ' (the phone shows only command approvals and file changes whose diff can be read). Please answer on the PC.',
+                )}
+              </>
+            )
+          ) : wait.kind === 'other' ? (
             /* ⚠️ The reason is **a state word** like "input needed", so it goes in parentheses,
                to avoid broken Japanese grammar like "waiting for input needed" (noticed in a real browser) */
             <>

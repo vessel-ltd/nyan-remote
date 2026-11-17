@@ -141,13 +141,13 @@ const idleDeps: DaemonDeps = {
   random: () => 0,
 }
 
-test('start: turned off starts nothing and reports nothing; no section means on', () => {
+test('start: turned off starts nothing and reports nothing; no section means on', async () => {
   assert.equal(startCodex(undefined, { machine: 'pc-a', version: '1', deps: idleDeps, home: '/home/user' }), 1)
   stopCodex()
   assert.equal(startCodex({ enabled: false }, { machine: 'pc-a', version: '1', deps: idleDeps }), 0)
   assert.equal(codexEnabled(), false)
   assert.equal(codexHealth(), undefined)
-  assert.deepEqual(codexRows(), [])
+  assert.deepEqual(await codexRows(), [])
 })
 
 test('start: enabled starts one line per home; stop turns it off again', async () => {

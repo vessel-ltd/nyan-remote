@@ -35,6 +35,11 @@ export interface CodexThread {
   ephemeral: boolean
   gitBranch: string | null
   cliVersion: string | null
+  /**
+   * The rollout file on disk (the daemon's). ⚠️ Stays on the agent: read for the context chip only (`context.ts`),
+   *    never put on a row.
+   */
+  path: string | null
 }
 
 function isObject(v: unknown): v is Record<string, unknown> {
@@ -103,6 +108,7 @@ export function parseThread(raw: unknown): CodexThread | undefined {
     ephemeral,
     gitBranch: branch,
     cliVersion: typeof raw.cliVersion === 'string' ? raw.cliVersion : null,
+    path: typeof raw.path === 'string' && raw.path !== '' ? raw.path : null,
   }
 }
 
@@ -179,6 +185,20 @@ export function statusOf(status: CodexStatus, sawActive: boolean, outcome?: Turn
     case 'notLoaded':
       return 'unknown'
   }
+}
+
+/**
+ * ★ The reason for "needs you", in the words the CLI uses for a Claude row (`SessionSummary.waitingFor` /
+ *   `waitingReason`), so the list says why a Codex row waits the same way.
+ * The daemon's flags are exactly two in 0.169.0 (approvals of commands and file changes / a question), and both can be
+ * up at once: the approval is named then (it holds a command or a change back).
+ * ⚠️ Nothing when neither flag is up (no reason is invented).
+ */
+export function waitingForOf(status: CodexStatus): string | undefined {
+  if (status.type !== 'active') return undefined
+  if (status.waitingOnApproval) return 'permission prompt'
+  if (status.waitingOnUserInput) return 'input needed'
+  return undefined
 }
 
 /** What a status change meant (for the notifier). `unknown-thread` = the book has no such thread ⇒ the caller reads it. */
@@ -439,10 +459,19 @@ export class ThreadBook {
     this.#hidden.delete(threadId)
   }
 
+  /** Row id → rollout path, for the threads listed now (the context chip / `context.ts`) */
+  rolloutPaths(ctx: ThreadBookRowsContext): Map<string, string> {
+    const out = new Map<string, string>()
+    for (const { thread: t } of this.#threads.values()) if (t.path) out.set(ctx.idPrefix + t.id, t.path)
+    return out
+  }
+
   rows(ctx: ThreadBookRowsContext): SessionSummary[] {
     const out: SessionSummary[] = []
     for (const { thread: t, sawActive, outcome } of this.#threads.values()) {
-      out.push(threadRow(t, ctx, statusOf(t.status, sawActive, outcome), true))
+      const row = threadRow(t, ctx, statusOf(t.status, sawActive, outcome), true)
+      const why = waitingForOf(t.status)
+      out.push(why ? { ...row, waitingFor: why } : row)
     }
     return sortRows(out)
   }

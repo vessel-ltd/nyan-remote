@@ -215,6 +215,8 @@ export interface CodexDaemonLine {
    */
   interrupt(threadId: string): Promise<CodexInterruptResult>
   rows(): SessionSummary[]
+  /** Row id → the thread's rollout path (stays on the agent; the context chip reads its tail) */
+  rolloutPaths(): Map<string, string>
   health(): DaemonHealth
   stop(): void
   /** Resolves when the loop has ended (after `stop`) */
@@ -758,6 +760,7 @@ export function startCodexDaemonLine(opts: DaemonOptions): CodexDaemonLine {
       }
     },
     rows: () => book.rows(rowsCtx),
+    rolloutPaths: () => book.rolloutPaths(rowsCtx),
     health: () => {
       const d = book.diagnostics()
       return {

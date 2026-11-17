@@ -176,7 +176,7 @@ export async function sessions(ctx?: Ctx): Promise<SessionsPage> {
   //   ⚠️⚠️ They do get the auto-approve mark: a Codex command approval passes while the entry is in effect
   //      (`codex/cards.ts`), and "passing but not shown" is the worst state of that feature.
   //   ★ Closed Codex threads come as history rows (`live: false`, 2026-11-16 / `codex/closedThreads.ts`).
-  const marked = markAutoApprove([...markSend(sessions, await scanPanes(dirs)), ...codexRows()], now)
+  const marked = markAutoApprove([...markSend(sessions, await scanPanes(dirs)), ...(await codexRows())], now)
   // ⚠️⚠️ **Filtering comes after the cleanup** (`sweepInflight` / `sweepPanes` above decide on **all items**).
   //    Moving it earlier breaks two things:
   //      1) during periods with 0 active sessions (all idle) **the cleanup never runs**

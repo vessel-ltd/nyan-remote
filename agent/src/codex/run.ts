@@ -15,6 +15,7 @@ import { autoApproveFor } from '../autoApprove.ts'
 import { askCodexQuestion, offerCodexCard, offerCodexFileChange } from './cards.ts'
 import { codexSessionPrefix, startCodexDaemonLine, type CodexDaemonLine, type CodexSendResult, type CodexInterruptResult, type CodexHome, type DaemonDeps, type DaemonHooks, type SocketLook } from './daemon.ts'
 import { CodexLogs, type CodexLogSource } from './log.ts'
+import { ContextCache } from './context.ts'
 import { CodexNotifier } from './notify.ts'
 import { connectWsUds } from './wsUds.ts'
 import { t } from '../../../shared/i18n.ts'
@@ -241,9 +242,22 @@ export function codexEnabled(): boolean {
   return enabled
 }
 
-/** The Codex rows: live ones, then closed threads as history (`live: false` / `closedThreads.ts`) */
-export function codexRows(): SessionSummary[] {
-  return lines.flatMap((l) => [...l.rows(), ...l.historyRows()])
+const contexts = new ContextCache()
+
+/**
+ * The Codex rows: live ones, then closed threads as history (`live: false` / `closedThreads.ts`).
+ * ★ A live row gets `contextTokens` from its rollout's tail when it can be read (`context.ts`; otherwise no chip).
+ */
+export async function codexRows(): Promise<SessionSummary[]> {
+  const live = lines.flatMap((l) => l.rows())
+  const paths = new Map(lines.flatMap((l) => [...l.rolloutPaths()]))
+  const tokens = await contexts.lookup([...paths.values()])
+  const withContext = live.map((r) => {
+    const path = paths.get(r.sessionId)
+    const n = path === undefined ? undefined : tokens.get(path)
+    return n === undefined ? r : { ...r, contextTokens: n }
+  })
+  return [...withContext, ...lines.flatMap((l) => l.historyRows())]
 }
 
 /** ★ How old the history may be when the phone opens it (it is also read again whenever a thread closes) */
