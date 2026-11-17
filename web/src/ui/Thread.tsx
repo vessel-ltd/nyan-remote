@@ -18,7 +18,7 @@ import type { Transport } from '../transport/index.ts'
 import { renderMarkdown } from './markdown.tsx'
 import { Composer } from './Composer.tsx'
 import { followAction } from './follow.ts'
-import { alreadyInTranscript, type InflightMessage } from '../../../shared/types.ts'
+import { alreadyInTranscript, sendLimitBytes, type InflightMessage } from '../../../shared/types.ts'
 import { ctxText, formatTokens, modelText } from './tokens.ts'
 import { beginSend, consumeAfterReload, finishSend, noteArrivals, type PendingSend } from './pending.ts'
 import { Permissions } from './Permissions.tsx'
@@ -1198,6 +1198,8 @@ export function Thread({
         // ★ Amount of context currently in use, and the model · effort (the same text as the list's chips)
         ctx={ctxText(formatTokens(session?.contextTokens), session?.contextPercent)}
         model={session ? modelText(session) : undefined}
+        // ★ 64 KB where the agent takes it (`long-send`), else the old 4 KB (no 400 from an older agent)
+        maxBytes={sendLimitBytes(agentFeatures)}
         onSend={sendMessage}
       />
 

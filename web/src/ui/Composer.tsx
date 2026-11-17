@@ -10,23 +10,17 @@
 
 import { useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks'
 
-import { MAX_MESSAGE_BYTES, commandLikeMessage } from '../../../shared/types.ts'
+import { commandLikeMessage, sendTooLong } from '../../../shared/types.ts'
 import { t } from '../../../shared/i18n.ts'
 import { perMessageNote } from './sendMark.ts'
 import { Nyan } from './Nyan.tsx'
 
 const DRAFT_PREFIX = 'tmux-agent.draft.'
-/** ★ Uses the same value as the agent (separate copies drift into "sendable but rejected") */
-const MAX_BYTES = MAX_MESSAGE_BYTES
 /** Maximum height the input grows to (px). Keep in sync with the CSS max-height */
 const MAX_HEIGHT = 120
 
 export function draftKey(sessionId: string): string {
   return `${DRAFT_PREFIX}${sessionId}`
-}
-
-export function byteLength(text: string): number {
-  return new TextEncoder().encode(text).length
 }
 
 export function Composer({
@@ -37,6 +31,7 @@ export function Composer({
   busy,
   ctx,
   model,
+  maxBytes,
   onSend,
 }: {
   sessionId: string
@@ -74,6 +69,11 @@ export function Composer({
   ctx: string | undefined
   /** ★ The model and effort (`Opus 5.5 · high` / 2026-11-17), the same `modelText` as the list. undefined ⇒ not shown */
   model: string | undefined
+  /**
+   * ★ The longest instruction this agent takes (`sendLimitBytes` / 2026-11-17: 64 KB with `long-send`, else 4 KB).
+   * ⚠️ Required: a caller that forgot it must not get either limit by default
+   */
+  maxBytes: number
   onSend: (text: string) => Promise<void>
 }) {
   const [text, setText] = useState('')
@@ -188,7 +188,7 @@ export function Composer({
   }
   useEffect(grow, [text])
 
-  const tooLong = byteLength(text) > MAX_BYTES
+  const tooLong = sendTooLong(text, maxBytes)
   /**
    * ★★★ Text starting with `/` `!` **cannot be sent** (2026-11-10 / security audit).
    *    Free text never runs a command; the table commands are in the menu (`commands.ts`).
@@ -273,7 +273,7 @@ export function Composer({
         <p class={`notice composerhint${result.bad ? ' bad' : ''}`}>{result.text}</p>
       ) : null}
       {tooLong ? <p class="notice bad composererr">
-          {t(`長すぎます（${MAX_BYTES} バイトまで）`, `Too long (max ${MAX_BYTES} bytes)`)}
+          {t(`長すぎます（${maxBytes} バイトまで）`, `Too long (max ${maxBytes} bytes)`)}
         </p> : null}
       {/* ★ The point is to know before sending (previously you only noticed afterwards via the "from phone" tag) */}
       {hint ? <p class="notice warn composerhint">{hint}</p> : null}

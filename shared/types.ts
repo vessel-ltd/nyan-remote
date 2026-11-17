@@ -279,6 +279,29 @@ export type AgentFeature =
   | 'codex-compact'
   /** ★ `GET /usage`: each account's plan limits (5-hour / weekly windows), Claude and Codex (2026-11-17) */
   | 'usage'
+  /**
+   * ★ Instructions up to `MAX_SEND_BYTES` (64 KB; before: `MAX_MESSAGE_BYTES`) — long ones typed as a bracketed paste
+   *   (2026-11-17). ⚠️ Without it the screen keeps the old limit (an older agent would refuse with 400)
+   */
+  | 'long-send'
+
+/**
+ * ★ The most a send may take **as JSON** on the way (a request body is read up to 256 KB, a tunnel frame holds 256 KB):
+ *   quotes, backslashes and control characters grow when escaped (a control character: 6 bytes), so a text within
+ *   `MAX_SEND_BYTES` could still not travel (codex review). Room is left for the envelope and the encryption.
+ */
+export const MAX_SEND_JSON_BYTES = 192 * 1024
+
+/** Whether the screen must refuse `text` before sending it (its own limit, or too big once escaped) */
+export function sendTooLong(text: string, limitBytes: number): boolean {
+  const enc = new TextEncoder()
+  return enc.encode(text).length > limitBytes || enc.encode(JSON.stringify(text)).length > MAX_SEND_JSON_BYTES
+}
+
+/** The limit the screen allows for an instruction to an agent with these features */
+export function sendLimitBytes(features: readonly AgentFeature[] | undefined): number {
+  return features?.includes('long-send') ? MAX_SEND_BYTES : MAX_MESSAGE_BYTES
+}
 
 /**
  * ★ One plan-limit window as last read (2026-11-17). `minutes`: its length (300 = 5 hours, 10080 = a week).
@@ -754,6 +777,33 @@ export interface PermissionAnswer {
  *    (= retyping). It is not a tool for long texts, so short is fine.
  */
 export const MAX_MESSAGE_BYTES = 4096
+
+/**
+ * ★★ Limit for **instructions** sent from the phone (2026-11-17 / user request: "a lot of text, without losing
+ * stability"). The approval feedback and Codex notes keep `MAX_MESSAGE_BYTES`.
+ *
+ * Measured (Claude Code 2.1.326, through the relay, Japanese multi-line text):
+ *   - typed as is: clean up to 48 KB when idle, but **sent right as a turn ends, 16–24 KB was lost or split about
+ *     1 time in 8** (8 KB and below: never). From 64 KB it split even when idle.
+ *   - wrapped in bracketed paste: clean from 16 KB to 96 KB, also right as a turn ends (6–8 tries each).
+ *   - the inbox: clean up to 128 KB.
+ * ⇒ 64 KB, and a text over `MAX_MESSAGE_BYTES` is typed **as a bracketed paste** (`agent/src/claude/keys.ts`), only when
+ *   the relay saw the TUI turn bracketed paste on.
+ * ⚠️ The way there carries it with room: a request body is read up to 256 KB, a tunnel frame up to 256 KB.
+ */
+export const MAX_SEND_BYTES = 64 * 1024
+
+/**
+ * ★ A send this long waits longer for its answer (a weak mobile line: 64 KB at 100 kbps is ~5 s, and the default
+ * 10 s timeout would say "timed out" for a text that did arrive — then a resend types it twice).
+ */
+export const LONG_SEND_BYTES = 16 * 1024
+export const LONG_SEND_TIMEOUT_MS = 30_000
+
+/** The answer timeout for sending `text` (`undefined` = the route's default) */
+export function sendTimeoutMs(text: string): number | undefined {
+  return new TextEncoder().encode(text).length > LONG_SEND_BYTES ? LONG_SEND_TIMEOUT_MS : undefined
+}
 
 /**
  * Japanese state labels. **Both the list (PWA) and notifications (agent) use them, so they live here.**

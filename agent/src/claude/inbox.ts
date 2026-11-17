@@ -26,13 +26,13 @@ import { readFile } from 'node:fs/promises'
 import { connect } from 'node:net'
 import { hostname } from 'node:os'
 import { join } from 'node:path'
-import { MAX_MESSAGE_BYTES } from '../../../shared/types.ts'
+import { MAX_SEND_BYTES } from '../../../shared/types.ts'
 import type { ConfigDir } from './configDirs.ts'
 import { aliveProcStartFreshSync, readIndexEntries, sameProcStart } from './sessionIndex.ts'
 import { t } from '../../../shared/i18n.ts'
 
 /** Upper limit for a write. ★ Taken from shared so it does not drift from the screen side */
-export const MAX_TEXT_BYTES = MAX_MESSAGE_BYTES
+export const MAX_TEXT_BYTES = MAX_SEND_BYTES
 /** Limit for connecting and writing. No reply comes back, so cut it short */
 const CONNECT_TIMEOUT_MS = 2000
 

@@ -208,6 +208,133 @@ def proc_start(pid: int) -> str | None:
     return value or None
 
 
+class PasteWatch:
+    """★ Whether the child (the TUI) has bracketed paste on, from its own output (2026-11-17).
+
+    The agent types a long text as a bracketed paste (ESC[200~ … ESC[201~) only when this says the TUI asked for it:
+    sent to a program that has not turned it on, the leading ESC would be read as the Escape key (it stops a turn).
+    ⚠️ Only the mode switches are looked for (`ESC[?2004h` / `ESC[?2004l`); the newest one wins. A switch cut across
+       two reads is still found (the last few bytes are carried over). Nothing else of the output is kept.
+    """
+
+    ON = b"\x1b[?2004h"
+    OFF = b"\x1b[?2004l"
+
+    def __init__(self) -> None:
+        self.mode: bool | None = None
+        self._tail = b""
+
+    def feed(self, data: bytes) -> bool:
+        """Look at a chunk of output. True when the mode changed."""
+        s = self._tail + data
+        self._tail = s[-(len(self.ON) - 1):]
+        on = s.rfind(self.ON)
+        off = s.rfind(self.OFF)
+        if on < 0 and off < 0:
+            return False
+        mode = on > off
+        if mode == self.mode:
+            return False
+        self.mode = mode
+        return True
+
+
+# ★ The first byte of a keystroke connection that carries a paste (`pasteRequest` in agent/src/claude/keys.ts).
+#   A NUL never starts an ordinary keystroke connection (the agent drops control characters from text; the stop and
+#   clear keys are ESC and Ctrl-U), so the relay knows from one byte, however the stream is split (codex review).
+PASTE_REQUEST = b"\x00"
+PASTE_END = b"\x1b[201~"
+# ⚠️ A held paste never grows past this (the agent sends at most 64 KB; anything bigger is dropped and refused)
+MAX_HELD = 1024 * 1024
+
+
+def gate_chunk(state, chunk: bytes):
+    """★★ How a keystroke connection's bytes go on (2026-11-17 / codex review rounds 1–2).
+
+    A connection whose first byte is `PASTE_REQUEST` carries a long text framed as a bracketed paste (`ESC[200~ … ESC[201~`).
+    Its bytes are **held**, and judged only **right before they would be written to the child** (`release_paste` in
+    `main`): passed while the child has bracketed paste on at that moment (`PasteWatch.mode`, in memory — never the
+    registration), else dropped; the agent is told `+` / `-`. Any other connection passes exactly as before.
+
+    state: None (nothing read yet) / "held" / "pass" / "refused".
+    Returns (state, bytes for the child now, bytes to hold).
+    """
+    if state is None:
+        if chunk[:1] == PASTE_REQUEST:
+            return "held", b"", chunk[1:]
+        return "pass", chunk, b""
+    if state == "held":
+        return "held", b"", chunk
+    if state == "pass":
+        return "pass", chunk, b""
+    return "refused", b"", b""
+
+
+def release_paste(h: bytes, paste: "PasteWatch", read, write, screen: bytearray, max_buf: int):
+    """★★ Judge a complete held paste right before it goes to the child (codex review rounds 1–3).
+
+    First read **everything the child has already written** into `screen` (its newest paste mode) — ⚠️ never past
+    `max_buf` (the screen is backed up: then wait, the output and the paste both stay held). Then: off ⇒ "refused";
+    on ⇒ write it, and "passed" **only if the write took bytes** (one that takes nothing ⇒ "wait", judged again later).
+    Returns (verdict "wait" | "refused" | "passed", bytes written, child gone).
+    """
+    while True:
+        if len(screen) >= max_buf:
+            return "wait", 0, False
+        try:
+            data = read()
+        except BlockingIOError:
+            break
+        except OSError as e:
+            if e.errno in (errno.EIO, errno.EBADF):
+                return "wait", 0, True
+            raise
+        if not data:
+            return "wait", 0, True
+        screen += data
+        if paste.feed(data):
+            log(_t(f"貼り付けの印 {'on' if paste.mode else 'off'}", f"bracketed paste {'on' if paste.mode else 'off'}"))
+    if paste.mode is not True:
+        return "refused", 0, False
+    try:
+        n = write(h)
+    except BlockingIOError:
+        return "wait", 0, False
+    except OSError:
+        return "wait", 0, True
+    return ("passed", n, False) if n > 0 else ("wait", 0, False)
+
+
+def wants_child_write(to_child, held: dict, screen_full: bool) -> bool:
+    """Whether the loop waits for the child's input to be writable.
+    ⚠️ A held paste asks for it only while it could be released — not while the screen is backed up: a writable pty
+       would make `select` return at once, a busy loop (codex review round 4)."""
+    return bool(to_child) or (not screen_full and any(h.endswith(PASTE_END) for h in held.values()))
+
+
+def note_paste(reg_path: str | None, mode: bool) -> bool:
+    """Write the mode into the registration (`"paste": true|false`). ⚠️ Temp file → rename, like `register`.
+    ★ Only a hint for the agent (whether to try): what decides is the mode in memory right before a paste is written
+      (`gate_chunk`). A failed write is retried (`main`), and a stale `true` only means the agent is told `-`."""
+    if not reg_path:
+        return False
+    try:
+        with open(reg_path, encoding="utf-8") as f:
+            body = json.loads(f.read())
+        if not isinstance(body, dict):
+            return False
+        body["paste"] = mode
+        tmp = f"{reg_path}.{os.getpid()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(json.dumps(body))
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, reg_path)
+        return True
+    except (OSError, ValueError) as e:
+        log(_t(f"貼り付けの状態を書けなかった: {e}", f"could not record the paste mode: {e}"))
+        return False
+
+
 def register(child_pid: int, sock_path: str) -> str | None:
     """Register ourselves. ⚠️ Temp file → rename (never let a half-written file be read / §8.3)."""
     d = os.path.join(state_dir(), "panes")
@@ -531,6 +658,13 @@ def main() -> int:
         #    If it cannot register in `panes/`, the agent cannot find it = keystrokes do not work.
         #    ⇒ Put the registration result on the same line (the install script looks at this).
         log(_t(f"起動した pid={pid} 名乗り={'あり' if reg_path else 'なし'}", f"started pid={pid} registered={'yes' if reg_path else 'no'}"))
+        paste = PasteWatch()
+        # ★ What the registration says, and when a failed write may be tried again (every 5 s, idle or not)
+        published: bool | None = None
+        publish_next = 0.0
+        # ★ Per keystroke connection: how it goes on (`gate_chunk`), and the pastes held until judged (in arrival order)
+        gates: dict = {}
+        held: dict = {}
 
         while True:
             # ★ If a termination signal was received, break out here into finally (always restore the terminal)
@@ -553,7 +687,7 @@ def main() -> int:
                 rset.append(STDIN)
                 rset.extend(c.fileno() for c in conns)
             wset = []
-            if to_child:
+            if wants_child_write(to_child, held, screen_full):
                 wset.append(master)
             if to_screen:
                 wset.append(STDOUT)
@@ -620,9 +754,27 @@ def main() -> int:
                     except OSError:
                         chunk = b""
                     if chunk:
-                        log(_t(f"注入 {len(chunk)} バイト", f"injected {len(chunk)} bytes"))
-                        to_child += chunk
+                        state, out, hold = gate_chunk(gates.get(conn), chunk)
+                        gates[conn] = state
+                        if hold:
+                            h = held.setdefault(conn, bytearray())
+                            h.extend(hold)
+                            if len(h) > MAX_HELD:
+                                held.pop(conn, None)
+                                gates[conn] = "refused"
+                                log(_t("大きすぎる貼り付けを捨てた", "dropped a paste that was too large"))
+                                try:
+                                    conn.send(b"-")
+                                except OSError:
+                                    pass
+                        if out:
+                            log(_t(f"注入 {len(out)} バイト", f"injected {len(out)} bytes"))
+                            to_child += out
                     else:
+                        # ⚠️ A paste never judged (its sender went away before it was complete) is dropped
+                        if held.pop(conn, None) is not None:
+                            log(_t("届ききらなかった貼り付けを捨てた", "dropped an incomplete paste"))
+                        gates.pop(conn, None)
                         conns.remove(conn)
                         conn.close()
 
@@ -645,8 +797,49 @@ def main() -> int:
                         raise
                 if data:
                     to_screen += data
+                    # ★ Bracketed paste on/off (`PasteWatch`): judged right before a held paste is written (below)
+                    if paste.feed(data):
+                        log(_t(f"貼り付けの印 {'on' if paste.mode else 'off'}", f"bracketed paste {'on' if paste.mode else 'off'}"))
+                        publish_next = 0.0
                 elif data == b"":
                     child_gone = True
+
+            # ★ The mode in the registration, as a hint for the agent. ⚠️ A failed write is tried again after 5 s —
+            #   from here, so idle loops retry too, and never on every chunk of output (codex review)
+            if paste.mode is not None and paste.mode != published and time.monotonic() >= publish_next:
+                if note_paste(reg_path, bool(paste.mode)):
+                    published = paste.mode
+                else:
+                    publish_next = time.monotonic() + 5.0
+
+            # ★★ A held paste is judged **here**, right before its first byte goes to the child (codex review rounds 1–3):
+            #   only when nothing else is waiting to go in (so it is the very next input), the child can take input, the
+            #   screen is not backed up, and the paste is complete. First **everything the child has already written is
+            #   read** (its newest paste mode; ⚠️ never while the screen is backed up — that output stays held, and so
+            #   does the paste), then: off ⇒ dropped, `-`; on ⇒ written, and `+` **only once bytes went in** (a write
+            #   that takes nothing keeps it held, judged again next time).
+            #   ⚠️ Residual: the child can still turn paste off after the bytes are in its input (it has not read them).
+            reply = None
+            pasted = None
+            if not to_child and not stalled and master in w:
+                pasted = next((c for c, h in held.items() if h.endswith(PASTE_END)), None)
+            if pasted is not None:
+                verdict, n, gone = release_paste(bytes(held[pasted]), paste, lambda: os.read(master, 65536), lambda b: os.write(master, b), to_screen, max_buf)
+                if gone:
+                    child_gone = True
+                if verdict == "refused":
+                    held.pop(pasted)
+                    gates[pasted] = "refused"
+                    reply = b"-"
+                    log(_t("貼り付けを断った（いま貼り付けの印が off）", "refused a paste (bracketed paste is off now)"))
+                elif verdict == "passed":
+                    h = held.pop(pasted)
+                    gates[pasted] = "pass"
+                    to_child += h[n:]
+                    reply = b"+"
+                    log(_t(f"貼り付けを注入 {len(h)} バイト", f"injected a paste of {len(h)} bytes"))
+                else:
+                    pasted = None
 
             # Writing out (⚠️ carry over partial writes. Discarding them loses screen output)
             if to_child and master in w:
@@ -657,6 +850,13 @@ def main() -> int:
                     pass
                 except OSError:
                     child_gone = True
+            # ★ The agent hears it only now: `+` after the paste started into the child (best effort: a sender that went
+            #   away just does not hear it)
+            if reply is not None and pasted is not None:
+                try:
+                    pasted.send(reply)
+                except OSError:
+                    pass
             if to_screen and STDOUT in w:
                 try:
                     n = os.write(STDOUT, bytes(to_screen))

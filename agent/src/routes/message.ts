@@ -59,6 +59,9 @@ export function decideAfterKeys(reason: KeysFailure | undefined): RouteDecision 
     // ⚠️⚠️ Starts with `/` `!`: the inbox is **worse** (the receiving model runs it as a peer's request)
     case 'command-like':
       return { kind: 'error', status: 400 }
+    // ★ A long text this session's relay cannot take as a paste yet: said so (restart claude), not sent another way
+    case 'long-needs-paste':
+      return { kind: 'error', status: 409 }
     // Below here, "keystrokes were unavailable" only, so go to the inbox
     case 'pending-approval':
     // ★ The CLI shows a dialog and waits (`status:'waiting'`) → inbox.

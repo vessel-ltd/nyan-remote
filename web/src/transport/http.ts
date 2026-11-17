@@ -109,7 +109,7 @@ export function httpWire(baseUrl: string, now: () => number = Date.now): Wire {
   return {
     async request(r: WireRequest): Promise<WireResponse> {
       const ctrl = new AbortController()
-      const timer = setTimeout(() => ctrl.abort(), TIMEOUT_MS)
+      const timer = setTimeout(() => ctrl.abort(), Math.max(TIMEOUT_MS, r.timeoutMs ?? 0))
       try {
         let res: Response
         try {

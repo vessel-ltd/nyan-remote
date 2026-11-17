@@ -27,6 +27,7 @@ import type {
   UsageResponse,
   SessionsPage,
 } from '../../../shared/types.ts'
+import { sendTimeoutMs } from '../../../shared/types.ts'
 import type { AgentEndpoint } from '../endpoints.ts'
 import { httpWire } from './http.ts'
 import type { LogQuery, Transport } from './index.ts'
@@ -56,10 +57,15 @@ export class AgentTransport implements Transport {
    *
    * ⚠️⚠️ Failure text is built in this one place (writing it per endpoint always drifts).
    */
-  async #call<T>(method: 'GET' | 'POST', path: string, body?: Record<string, unknown>): Promise<T> {
+  async #call<T>(method: 'GET' | 'POST', path: string, body?: Record<string, unknown>, timeoutMs?: number): Promise<T> {
     // ★★ **Tell the agent the screen language** (2026-09-23 / `shared/i18n.ts`). For this request only, the agent
     //   returns text (error reasons etc.) in that language. ⚠️ Added **only here** (per-endpoint means someone forgets).
-    const res = await this.#wire.request({ method, path: withLang(path), ...(body === undefined ? {} : { body }) })
+    const res = await this.#wire.request({
+      method,
+      path: withLang(path),
+      ...(body === undefined ? {} : { body }),
+      ...(timeoutMs === undefined ? {} : { timeoutMs }),
+    })
     if (!wireOk(res)) throw new Error(wireErrorText(res))
     return res.body as T
   }
@@ -157,9 +163,12 @@ export class AgentTransport implements Transport {
 
   /** ★ Send an instruction (M4-2). The agent returns failure reasons as text, so show them as-is */
   sendMessage(sessionId: string, text: string): Promise<MessageSendResult> {
-    return this.post<MessageSendResult>(
+    // ★ A long one waits longer (a weak mobile line: "timed out" for a text that arrived invites a second send)
+    return this.#call<MessageSendResult>(
+      'POST',
       `/sessions/${encodeURIComponent(sessionId)}/message`,
       { text },
+      sendTimeoutMs(text),
     )
   }
 

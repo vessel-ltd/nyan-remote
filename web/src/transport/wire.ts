@@ -24,6 +24,11 @@ export interface WireRequest {
   path: string
   /** ★ POST body (JSON objects only) */
   body?: Record<string, unknown>
+  /**
+   * ★ How long to wait for the answer, when not the route's default (a long instruction on a weak mobile line /
+   *   `LONG_SEND_TIMEOUT_MS` / 2026-11-17). ⚠️ Only longer: the default is what everything else relies on
+   */
+  timeoutMs?: number
 }
 
 export interface WireResponse {

@@ -72,6 +72,12 @@ interface Pending {
   resolve(res: WireResponse): void
   reject(err: Error): void
   timer: ReturnType<typeof setTimeout>
+  /**
+   * ★ For a request that asked to wait longer than the default (`WireRequest.timeoutMs`): when it gives up. Another
+   *   request's timeout leaves the line alone while this is ahead. Absent = the default wait (⚠️ default requests never
+   *   hold the line up for each other: a steady stream of polls would otherwise keep a dead line forever)
+   */
+  longUntil?: number
 }
 
 export function relayWire(o: {
@@ -155,11 +161,17 @@ export function relayWire(o: {
     //    ★ Not `if (dead)` (**an empty-string reason** would turn into "not dead" / codex medium #5).
     if (dead !== undefined) throw new Error(dead)
     const id = nextId++
+    const waitMs = Math.max(timeoutMs, r.timeoutMs ?? 0)
     const wait = new Promise<WireResponse>((resolve, reject) => {
       const timer = setTimeout(() => {
         pending.delete(id)
         const reason = t('応答がありません（時間切れ）', 'No response (timed out)')
         reject(new Error(reason))
+        // ★ Another request may still be inside its own, longer wait (a long instruction on a weak line, sent before
+        //   this poll / codex review): the line is left to it — its own timeout throws the line away if it is dead
+        //   (bounded: the longest wait any request asked for). Only this request ends here.
+        const now = Date.now()
+        for (const other of pending.values()) if (other.longUntil !== undefined && other.longUntil > now) return
         // ★★ **A timeout throws away the whole line** (2026-09-24 / codex round 17, medium #2).
         //   ⚠️⚠️ If a line half-dies without a disconnect notice, not discarding it means **we keep sending to the same dead line**,
         //      and `eventsLive` keeps saying "alive" (= the list stays up to 5 min stale, approvals show late).
@@ -175,9 +187,10 @@ export function relayWire(o: {
             'Another request timed out, so the connection was reset (this action most likely did not run on the PC, but check the screen before sending it again)',
           ),
         )
-      }, timeoutMs)
+        // ★ A request may ask for longer, never shorter (a long instruction on a weak line / `WireRequest.timeoutMs`)
+      }, waitMs)
       // ⚠️ Shaped to work in both Node and the browser (`unref` isn't called)
-      pending.set(id, { resolve, reject, timer })
+      pending.set(id, { resolve, reject, timer, ...(waitMs > timeoutMs ? { longUntil: Date.now() + waitMs } : {}) })
     })
     // ★★ **Don't wait for the send to complete** (2026-09-15 / codex medium #2).
     //   ⚠️⚠️ Waiting means that while the carrier is stuck, **neither timeouts nor disconnects reach the caller**

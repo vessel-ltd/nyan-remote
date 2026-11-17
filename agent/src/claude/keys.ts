@@ -26,6 +26,7 @@ import { connect } from 'node:net'
 import { dirname, join } from 'node:path'
 import {
   MAX_MESSAGE_BYTES,
+  MAX_SEND_BYTES,
   isDroppedControl,
   commandLikeMessage,
   looksLikeCommand,
@@ -38,9 +39,36 @@ import type { ConfigDir } from './configDirs.ts'
 import { aliveProcStartFreshSync, aliveProcStartSync, readIndexEntriesDetailed, sameProcStart } from './sessionIndex.ts'
 
 /** Upper limit for a write. ★ Same value as the inbox (taken from shared so it does not drift from the UI) */
-export const MAX_KEYS_BYTES = MAX_MESSAGE_BYTES
+export const MAX_KEYS_BYTES = MAX_SEND_BYTES
+
+/**
+ * ★★ A long text is typed as **one bracketed paste** (2026-11-17 / measured: typed as is, 16–24 KB sent right as a turn
+ *   ends was lost or split about 1 time in 8; as a paste, 16–96 KB always arrived whole).
+ *   ⚠️ Only over `MAX_MESSAGE_BYTES` (what could be sent before is typed exactly as before), and only to a relay that
+ *      announced the TUI's paste mode (`PaneTarget.paste`; an older relay would type the frame as is).
+ *   ★★ The relay decides, right before writing it to the TUI, whether the TUI has paste on **then** (to a program that
+ *      has not, the leading ESC is the Escape key), and answers `+` / `-` (`gate_chunk` in `scripts/relay.py`).
+ *      The leading NUL (`PASTE_REQUEST`) tells it this connection is a paste — one byte no ordinary keystroke connection
+ *      starts with (control characters are dropped from text; the stop and clear keys are ESC and Ctrl-U).
+ *   ⚠️ The body cannot close the paste early: `sanitizeForKeys` dropped every ESC from it.
+ */
+export const PASTE_REQUEST = '\x00'
+
+export function pasteRequest(text: string): string {
+  return `${PASTE_REQUEST}\x1b[200~${text}\x1b[201~`
+}
+
+export function needsPaste(text: string): boolean {
+  return Buffer.byteLength(text, 'utf8') > MAX_MESSAGE_BYTES
+}
 /** Limit for connecting and writing. No reply comes back, so keep it short */
 const CONNECT_TIMEOUT_MS = 2000
+/**
+ * ★ …for a paste, which waits for the relay's answer: the relay holds it until the child can take it and the screen is
+ *   not backed up. ⚠️ Under the phone's own 10 s wait (texts of 4–16 KB keep the default). Given up ⇒ `partial`, and the
+ *   relay drops a paste whose connection closed before it was written
+ */
+const PASTE_TIMEOUT_MS = 5000
 /**
  * The gap between writing the body and **sending Enter (CR)**.
  *
@@ -101,6 +129,9 @@ export type KeysFailure =
   // ★★★ starts with `/` or `!` (2026-11-10: **refused**, never neutralized / see `sanitizeForKeys`).
   //    ⚠️⚠️ Never dropped into the inbox either (the receiving model runs it as a peer's request).
   | 'command-like'
+  // ★ A text over `MAX_MESSAGE_BYTES`, but the relay has not seen the TUI turn bracketed paste on (an older relay
+  //   process: restarting claude fixes it). ⚠️ Not dropped into the inbox (the user can act on it; see `decideAfterKeys`)
+  | 'long-needs-paste'
   // ⚠️ `too-soon` is a reason for control keys only (serializing is enough for keystrokes). Not part of `KeysFailure`
 
 export interface KeysResult {
@@ -132,6 +163,11 @@ export interface PaneTarget {
    * ⚠️ Not an input for display (the list is decided by `sessions.ts`).
    */
   busy?: boolean
+  /**
+   * ★ The relay saw the TUI turn bracketed paste on (`PasteWatch` in `scripts/relay.py` / 2026-11-17). Only then is a
+   *   long text typed as a paste. Absent = not seen (an older relay, or the mode is off) ⇒ long texts are refused.
+   */
+  paste?: boolean
 }
 
 /** `~/.nyan-remote/panes/<pid>.json` (written by `scripts/relay.py`) */
@@ -140,6 +176,8 @@ export interface PaneRecord {
   procStart?: unknown
   socket?: unknown
   startedAt?: unknown
+  /** ★ `true` once the relay saw `ESC[?2004h` from the TUI (rewritten when it changes) */
+  paste?: unknown
 }
 
 export interface KeysContext {
@@ -184,6 +222,11 @@ export function failureMessage(reason: KeysFailure): string {
       return t('承認を待っている間は打鍵しません', 'Keystrokes are not sent while an approval is pending.')
     case 'command-like':
       return commandLikeMessage()
+    case 'long-needs-paste':
+      return t(
+        `${MAX_MESSAGE_BYTES} バイトを超える文は、このセッションにはまだ送れません。PC で claude を起動し直すと送れます。`,
+        `Texts over ${MAX_MESSAGE_BYTES} bytes cannot be sent to this session yet. Restart claude on the PC to send them.`,
+      )
   }
 }
 
@@ -468,7 +511,14 @@ export async function scanPanes(
         e.unverified = true
         continue
       }
-      e.found.push({ sessionId: entry.sessionId, pid: entry.pid, socketPath, ...(entry.status === 'busy' ? { busy: true } : {}) })
+      e.found.push({
+        sessionId: entry.sessionId,
+        pid: entry.pid,
+        socketPath,
+        ...(entry.status === 'busy' ? { busy: true } : {}),
+        // ⚠️ Only the literal `true` (anything else is "not seen")
+        ...(rec.value.paste === true ? { paste: true } : {}),
+      })
     }
   }
 
@@ -519,7 +569,17 @@ export function writeKeys(
    *    The caller's check only happened before `connect`, so **an approval appearing in between was ignored**.
    * ★ `beforeSubmit` is right before the CR (that one existed before). **Two steps, so check twice**.
    */
-  opts: { submitDelayMs?: number; beforeWrite?: () => boolean; beforeSubmit?: () => boolean } = {},
+  opts: {
+    submitDelayMs?: number
+    beforeWrite?: () => boolean
+    beforeSubmit?: () => boolean
+    /**
+     * ★ The body is a paste request (`pasteRequest`): wait for the relay's answer before Enter — `+` it started into the
+     *   TUI, `-` refused because the TUI had paste off when it was about to be written (then nothing was typed). No
+     *   answer ⇒ `partial` (it may still be typed later). ⚠️ Only for a relay that announced `paste` (an older one never answers)
+     */
+    pasteAck?: boolean
+  } = {},
 ): Promise<KeysResult> {
   const delay = opts.submitDelayMs ?? SUBMIT_DELAY_MS
   return new Promise((resolve) => {
@@ -542,7 +602,7 @@ export function writeKeys(
           ? { ok: false, reason: 'partial', message: failureMessage('partial') }
           : { ok: false, reason: 'unreachable', message: failureMessage('unreachable') },
       )
-    }, CONNECT_TIMEOUT_MS)
+    }, opts.pasteAck ? PASTE_TIMEOUT_MS : CONNECT_TIMEOUT_MS)
 
     sock.on('error', () => {
       sock.destroy()
@@ -564,11 +624,33 @@ export function writeKeys(
         sock.destroy()
         return
       }
+      // ★ The relay's answer to a paste (only the first byte counts). ⚠️ It can come before the write callback: kept
+      let reply: string | undefined
+      let onReply: (() => void) | undefined
+      if (opts.pasteAck) {
+        sock.on('data', (d: Buffer) => {
+          if (reply !== undefined || d.length === 0) return
+          reply = d.subarray(0, 1).toString('latin1')
+          onReply?.()
+        })
+      }
+      const afterBody = (go: () => void): void => {
+        if (!opts.pasteAck) return go()
+        const decide = (): void => {
+          onReply = undefined
+          if (reply === '+') return go()
+          // ⚠️ Refused: not a byte reached the TUI (the relay drops the whole connection's data)
+          finish({ ok: false, reason: 'long-needs-paste', message: failureMessage('long-needs-paste') })
+          sock.destroy()
+        }
+        if (reply !== undefined) decide()
+        else onReply = decide
+      }
       sock.write(text, (err) => {
         if (err) return // picked up by the 'error' handler
         wrote = true
         // ★ Wait a little before Enter (so it is not absorbed by paste detection)
-        submit = setTimeout(() => {
+        afterBody(() => (submit = setTimeout(() => {
           // ★★ Check once more **right before** sending the CR (2026-08-23).
           //    ⚠️ If an approval card is showing here, **do not submit**. The body stays in the input box, so
           //       stop as `partial` (dropping to the inbox would deliver it twice)
@@ -581,7 +663,7 @@ export function writeKeys(
             sock.end()
             finish({ ok: true })
           })
-        }, delay)
+        }, delay)))
       })
     })
   })
@@ -713,9 +795,15 @@ async function sendKeysOnce(
   if (pending()) {
     return { ok: false, reason: 'pending-approval', message: failureMessage('pending-approval') }
   }
-  const res = await writeKeys(target.socketPath, clean.value.text, {
+  // ★ A long text goes as one paste, and only to a relay that announced the paste mode (`pasteRequest`)
+  const long = needsPaste(clean.value.text)
+  if (long && target.paste !== true) {
+    return { ok: false, reason: 'long-needs-paste', message: failureMessage('long-needs-paste') }
+  }
+  const res = await writeKeys(target.socketPath, long ? pasteRequest(clean.value.text) : clean.value.text, {
     beforeWrite: pending,
     beforeSubmit: pending,
+    pasteAck: long,
   })
   if (res.ok) {
     await noteSent(sessionId, clean.value.text.length, clean.value.dropped)

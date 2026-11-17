@@ -25,6 +25,8 @@ const EXPECTED: Record<KeysFailure, RouteDecision> = {
   'too-long': { kind: 'error', status: 400 },
   // ⚠️⚠️ Starts with `/` `!` (2026-11-10): refused. The inbox is worse (the receiving model runs it)
   'command-like': { kind: 'error', status: 400 },
+  // ★ A long text the relay cannot take as a paste yet: said so (restart claude), not sent another way
+  'long-needs-paste': { kind: 'error', status: 409 },
   // Keystrokes were merely unavailable → inbox (a frame is added, but it arrives)
   'pending-approval': { kind: 'fallback' },
   // ★ Also to the inbox while a dialog is open (keystrokes would become key input; the inbox does not)
@@ -44,7 +46,7 @@ test('★★ decideAfterKeys: pin every reason exhaustively', () => {
     checked += 1
   }
   // ★ Prevents "green with an empty table" (same trap as notify:check's `0 / 0`)
-  assert.equal(checked, 12, 'if reasons are added/removed, fix this count together with the table')
+  assert.equal(checked, 13, 'if reasons are added/removed, fix this count together with the table')
 })
 
 test('★★ decideAfterKeys: only partial never falls back to the inbox (it would arrive twice)', () => {

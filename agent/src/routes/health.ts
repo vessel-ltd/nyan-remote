@@ -34,6 +34,8 @@ export const AGENT_FEATURES: AgentFeature[] = [
   'auto-approve-24h',
   // ★ `GET /usage` (plan limits per Claude profile / Codex home / 2026-11-17)
   'usage',
+  // ★ Instructions up to 64 KB (`MAX_SEND_BYTES` / long ones as a bracketed paste / 2026-11-17)
+  'long-send',
 ]
 
 export async function health(): Promise<AgentHealth> {

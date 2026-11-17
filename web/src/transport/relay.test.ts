@@ -459,3 +459,28 @@ test('★★ eventsLive: false for a refused subscription, a close with ID, and 
   l.wire.fail('切れました')
   assert.equal(l.wire.eventsLive(), false, '⚠️⚠️ claims alive after the line dropped (60s stale)')
 })
+
+test('★★ a long request keeps its longer wait: a short one timing out meanwhile does not throw the line away (2026-11-17)', { timeout: 5000 }, async () => {
+  const l = await link({ timeoutMs: 20 })
+  // A long instruction asked to wait longer, then a poll that times out first
+  const long = l.wire.request({ method: 'POST', path: '/sessions/x/message', body: { text: 'x' }, timeoutMs: 200 })
+  await assert.rejects(() => l.wire.request({ method: 'GET', path: '/sessions' }), /時間切れ/)
+  // ★ The line is still there: the long one gets its answer
+  const { requests } = await received(l)
+  const id = requests.find((q) => q.path.startsWith('/sessions/x/message'))!.id
+  await reply(l, FRAME.response, encodeResponse({ id, status: 200, body: { ok: true } }))
+  assert.equal((await long).status, 200)
+  // A later poll still works on the same line
+  const next = l.wire.request({ method: 'GET', path: '/c' })
+  const again = await received(l)
+  await reply(l, FRAME.response, encodeResponse({ id: again.requests.at(-1)!.id, status: 200 }))
+  assert.equal((await next).status, 200)
+})
+
+test('★★ …and the long one, once past its own wait, throws the line away (failure stays bounded)', { timeout: 5000 }, async () => {
+  const l = await link({ timeoutMs: 20 })
+  const long = l.wire.request({ method: 'POST', path: '/sessions/x/message', body: { text: 'x' }, timeoutMs: 120 })
+  await assert.rejects(() => l.wire.request({ method: 'GET', path: '/a' }), /時間切れ/)
+  await assert.rejects(long, /時間切れ/)
+  await assert.rejects(() => l.wire.request({ method: 'GET', path: '/c' }), /張り直しました/, '⚠️ the dead line is still used')
+})

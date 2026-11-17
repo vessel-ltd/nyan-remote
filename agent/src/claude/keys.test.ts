@@ -64,13 +64,15 @@ async function fakeIndex(
  */
 function fakePane(
   path: string,
-  opts: { dieAfterBody?: boolean } = {},
+  opts: { dieAfterBody?: boolean; pasteReply?: '+' | '-' } = {},
 ): Promise<{ server: Server; chunks: string[] }> {
   const chunks: string[] = []
   const server = createServer((sock) => {
     sock.setEncoding('utf8')
     sock.on('data', (d: string) => {
       chunks.push(d)
+      // ★ Answer a paste the way the relay does (`gate_chunk`)
+      if (opts.pasteReply && d.startsWith('\x00')) sock.write(opts.pasteReply)
       // ★ Disconnect right after receiving the body = **the only way to produce `partial`**
       //   (review 2026-08-23: not a single test produced a `partial`)
       if (opts.dieAfterBody) sock.destroy()
@@ -606,4 +608,80 @@ test('★★ sweepPanes: removes only announcements and sockets of dead processe
   assert.deepEqual(panes, [`${live}.json`], 'removed a live announcement / failed to keep it')
   const socks = await readdir(sockDir)
   assert.deepEqual(socks, [`keys-${live}.sock`], 'removed a live socket / failed to keep it')
+})
+
+test('★★★ a long text goes as one bracketed paste, only once the relay saw the TUI ask for it (2026-11-17)', { skip: !hasPython }, async (t) => {
+  const pid = process.pid
+  const base = await fakeIndex(pid, 'sid-paste')
+  const state = await mkdtemp(join(tmpdir(), 'nyan-remote-paste-'))
+  const sock = join(state, 's.sock')
+  const { server, chunks } = await fakePane(sock, { pasteReply: '+' })
+  const prev = process.env['NYAN_REMOTE_STATE_DIR']
+  process.env['NYAN_REMOTE_STATE_DIR'] = state
+  t.after(async () => {
+    server.close()
+    if (prev === undefined) delete process.env['NYAN_REMOTE_STATE_DIR']
+    else process.env['NYAN_REMOTE_STATE_DIR'] = prev
+    await rm(base, { recursive: true, force: true })
+    await rm(state, { recursive: true, force: true })
+  })
+  const py = (code: string): void => {
+    execFileSync(
+      'python3',
+      ['-c', `import importlib.util as u; spec=u.spec_from_file_location('r', ${JSON.stringify(RELAY)}); m=u.module_from_spec(spec); spec.loader.exec_module(m)\n${code}`],
+      { env: { ...process.env, NYAN_REMOTE_STATE_DIR: state, PYTHONDONTWRITEBYTECODE: '1' } },
+    )
+  }
+  py(`m.register(${pid}, ${JSON.stringify(sock)})`)
+  const ctx = { hasPendingApproval: () => false }
+  const long = `${'あ'.repeat(Math.floor(MAX_MESSAGE_BYTES / 3))}x\nend`
+  // ⚠️ Not seen yet (an older relay): refused, not a single byte typed
+  const before = await sendKeysToSession([dirOf(base)], 'sid-paste', long, ctx)
+  assert.equal(before.ok, false)
+  if (!before.ok) assert.equal(before.reason, 'long-needs-paste')
+  assert.equal(chunks.join(''), '')
+  // The TUI turns bracketed paste on (the switch cut across two reads), the relay records it
+  py(`w=m.PasteWatch(); a=w.feed(b'abc\\x1b[?20'); b=w.feed(b'04hdef'); assert (a, b, w.mode) == (False, True, True); m.note_paste(${JSON.stringify(join(state, 'panes', `${pid}.json`))}, w.mode)`)
+  assert.equal((await sendKeysToSession([dirOf(base)], 'sid-paste', long, ctx)).ok, true)
+  // ★ A short one is typed exactly as before (no paste frame)
+  assert.equal((await sendKeysToSession([dirOf(base)], 'sid-paste', 'short', ctx)).ok, true)
+  await new Promise((res) => setTimeout(res, 80))
+  assert.equal(chunks.join(''), `\x00\x1b[200~${long}\x1b[201~\rshort\r`)
+  // Off again: refused again
+  py(`m.note_paste(${JSON.stringify(join(state, 'panes', `${pid}.json`))}, False)`)
+  const off = await sendKeysToSession([dirOf(base)], 'sid-paste', long, ctx)
+  assert.equal(off.ok ? 'ok' : off.reason, 'long-needs-paste')
+})
+
+test('★ PasteWatch: the newest switch wins; unrelated output changes nothing', { skip: !hasPython }, () => {
+  execFileSync('python3', [
+    '-c',
+    `import importlib.util as u; spec=u.spec_from_file_location('r', ${JSON.stringify(RELAY)}); m=u.module_from_spec(spec); spec.loader.exec_module(m)
+w=m.PasteWatch()
+assert w.feed(b'hello') is False and w.mode is None
+assert w.feed(b'\\x1b[?2004h') is True and w.mode is True
+assert w.feed(b'\\x1b[?2004h') is False
+assert w.feed(b'\\x1b[?2004h..\\x1b[?2004l') is True and w.mode is False
+assert w.feed(b'\\x1b[?2004l\\x1b[?2004h') is True and w.mode is True
+assert w.feed(b'\\x1b[?1004h\\x1b[?25l') is False and w.mode is True`,
+  ], { env: { ...process.env, PYTHONDONTWRITEBYTECODE: '1' } })
+})
+
+test('★★ writeKeys with a paste: the relay\'s `-` means nothing typed (no Enter); no answer means partial', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'nyan-remote-ack-'))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  const refused = await fakePane(join(dir, 'r.sock'), { pasteReply: '-' })
+  const silent = await fakePane(join(dir, 's.sock'))
+  t.after(() => {
+    refused.server.close()
+    silent.server.close()
+  })
+  const frame = '\x00\x1b[200~long\x1b[201~'
+  const r = await writeKeys(join(dir, 'r.sock'), frame, { pasteAck: true })
+  assert.equal(r.ok ? 'ok' : r.reason, 'long-needs-paste')
+  await new Promise((res) => setTimeout(res, 150))
+  assert.ok(!refused.chunks.join('').includes('\r'), 'Enter was sent after a refusal')
+  const s = await writeKeys(join(dir, 's.sock'), frame, { pasteAck: true })
+  assert.equal(s.ok ? 'ok' : s.reason, 'partial')
+  assert.ok(!silent.chunks.join('').includes('\r'), 'Enter was sent without an answer')
 })
