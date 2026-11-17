@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, rm, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
-import { accountKeyOf, claudeUsage, claudeUsagePath, claudeWindows, codexUsageOf } from './usage.ts'
+import { accountKeyOf, claudeLoginOf, claudeUsage, claudeUsagePath, claudeWindows, codexLoginBetween, codexLoginOf, codexUsageOf } from './usage.ts'
 
 const NOW = Date.parse('2026-11-17T02:00:00Z')
 const sec = (iso: string): number => Date.parse(iso) / 1000
@@ -137,4 +137,61 @@ test('Claude: a reading without a recorded account (an older relay, or a layout 
     ['.claude-c', undefined, 1],
     ['.claude-d', accountKeyOf(U1), 0],
   ])
+})
+
+/** The part of a Claude config that names the login (Claude Code 2.1.326; values replaced) */
+const configOf = (uuid: string, extra: Record<string, unknown> = {}) =>
+  JSON.stringify({ numStartups: 1, oauthAccount: { accountUuid: uuid, emailAddress: 'user@example.com', organizationName: 'Example Org', organizationType: 'claude_team', ...extra } })
+
+test('Claude: who is logged in, from the config that names the recorded account (the default profile reads ~/.claude.json)', async (t) => {
+  const dir = await stateDirFor(t)
+  const home = join(dir, 'home')
+  const profiles = [
+    { account: '.claude', dir: join(home, '.claude'), projectsDir: join(home, '.claude', 'projects') },
+    { account: '.claude-r', dir: join(home, '.claude-r'), projectsDir: join(home, '.claude-r', 'projects') },
+    { account: '.claude-s', dir: join(home, '.claude-s'), projectsDir: join(home, '.claude-s', 'projects') },
+  ]
+  for (const p of profiles) await mkdir(p.dir, { recursive: true })
+  // ★ The default profile: the real config is ~/.claude.json; ~/.claude/.claude.json is a stale leftover of another account
+  await writeFile(join(home, '.claude.json'), configOf(U1))
+  await writeFile(join(home, '.claude', '.claude.json'), configOf(U2, { emailAddress: 'stale@example.com' }))
+  await writeFile(join(home, '.claude-r', '.claude.json'), configOf(U1))
+  // ⚠️ s logged in to another account since its reading was recorded ⇒ no login shown (never another account's)
+  await writeFile(join(home, '.claude-s', '.claude.json'), configOf(U1))
+  await writeFile(claudeUsagePath('.claude'), wrap(U1, weekAt(9)))
+  await writeFile(claudeUsagePath('.claude-r'), wrap(U1, weekAt(10)))
+  await writeFile(claudeUsagePath('.claude-s'), wrap(U2, weekAt(80)))
+  const got = await claudeUsage(profiles, NOW, home)
+  assert.deepEqual(got.map((u) => [u.account, u.email, u.org, u.plan]), [
+    ['.claude', 'user@example.com', 'Example Org', 'claude_team'],
+    ['.claude-r', 'user@example.com', 'Example Org', 'claude_team'],
+    ['.claude-s', undefined, undefined, undefined],
+  ])
+  // A reading without a recorded account gets no login either
+  await writeFile(claudeUsagePath('.claude-r'), JSON.stringify(weekAt(10)))
+  assert.equal((await claudeUsage(profiles, NOW, home))[1]!.email, undefined)
+})
+
+test('Login names: dropped whole when they hold control, bidi or invisible characters, or are too long', () => {
+  assert.deepEqual(claudeLoginOf(JSON.parse(configOf(U1)), U1), { email: 'user@example.com', org: 'Example Org', plan: 'claude_team' })
+  assert.equal(claudeLoginOf(JSON.parse(configOf(U1)), U2), undefined)
+  for (const bad of ['Org\u202Egro', 'Org\u200B', 'Org\nX', 'x'.repeat(121), '', '  ', '\nOrg', 'Org\u2028', ' '.repeat(300) + 'Org', 'Org\t']) {
+    assert.equal(claudeLoginOf(JSON.parse(configOf(U1, { organizationName: bad })), U1)?.org, undefined, JSON.stringify(bad))
+  }
+  assert.equal(claudeLoginOf(JSON.parse(configOf(U1, { organizationType: '<b>' })), U1)?.plan, undefined)
+  // Codex: a ChatGPT login (codex-cli 0.169.0 shape; values replaced); an API key has nobody to show
+  assert.deepEqual(codexLoginOf({ account: { type: 'chatgpt', email: 'user@example.com', planType: 'prolite', workspaceName: null }, userId: 'u', requiresOpenaiAuth: true }), { email: 'user@example.com', plan: 'prolite' })
+  assert.deepEqual(codexLoginOf({ account: { type: 'apiKey' } }), {})
+  assert.deepEqual(codexLoginOf(undefined), {})
+})
+
+test('Codex: the login is kept only when the reads before and after the limits name the same login', () => {
+  const A = { account: { type: 'chatgpt', email: 'a@example.com', planType: 'prolite', workspaceName: null }, userId: 'ua', requiresOpenaiAuth: true }
+  const B = { account: { type: 'chatgpt', email: 'b@example.com', planType: 'plus', workspaceName: null }, userId: 'ub', requiresOpenaiAuth: true }
+  assert.deepEqual(codexLoginBetween(A, structuredClone(A)), { email: 'a@example.com', plan: 'prolite' })
+  assert.deepEqual(codexLoginBetween(A, B), {})
+  assert.deepEqual(codexLoginBetween(A, { ...A, userId: 'other' }), {})
+  assert.deepEqual(codexLoginBetween(A, undefined), {})
+  assert.deepEqual(codexLoginBetween(undefined, A), {})
+  assert.deepEqual(codexLoginBetween({ account: { type: 'apiKey' } }, { account: { type: 'apiKey' } }), {})
 })

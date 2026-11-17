@@ -290,8 +290,18 @@ export interface ToolUsage {
   account: string
   /** A short hash of the account id (equal = one account and one set of limits). Never the id itself. Absent = unknown */
   accountKey?: string
-  /** The plan as the tool names it (Codex: `plus` / `prolite` / `pro` …). Absent = unknown */
+  /**
+   * The plan as the tool names it (Codex: `plus` / `prolite` / `pro` …; Claude: the organization type, `claude_team` /
+   * `claude_max` …). Absent = unknown
+   */
   plan?: string
+  /**
+   * ★ Who is logged in, as the tool's `/status` shows it (2026-11-17): the e-mail and the organization (Claude) or the
+   * ChatGPT workspace (Codex). Display only. Absent = unknown.
+   * ⚠️ Claude: only when the profile's config names the same account the reading was recorded with.
+   */
+  email?: string
+  org?: string
   /** Windows whose reset has not passed. ⚠️ Empty = every known window reset since it was read (now unknown) */
   windows: UsageWindow[]
   /** When it was read (ISO). Claude: the last API response of a session of that profile */

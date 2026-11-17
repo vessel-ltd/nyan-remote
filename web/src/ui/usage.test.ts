@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import type { ToolUsage } from '../../../shared/types.ts'
-import { groupUsage, windowName } from './usage.ts'
+import { groupUsage, planLabel, windowName } from './usage.ts'
 
 const NOW = Date.parse('2026-11-17T02:00:00Z')
 const week = (pct: number, resetsAt = '2026-11-22T02:00:00.000Z') => ({ minutes: 10080, usedPercent: pct, resetsAt })
@@ -34,4 +34,17 @@ test('window names: a week, hours, days', () => {
   assert.match(windowName(10080), /週|Week/)
   assert.match(windowName(300), /5/)
   assert.match(windowName(2880), /2/)
+})
+
+test('who is logged in comes with the freshest reading; plan names as /status shows them', () => {
+  const old: ToolUsage = { tool: 'claude', account: '.claude', accountKey: 'a1', email: 'old@example.com', windows: [week(9)], at: '2026-11-17T01:00:00.000Z' }
+  const fresh: ToolUsage = { tool: 'claude', account: '.claude-r', accountKey: 'a1', plan: 'claude_team', org: 'Example Org', email: 'user@example.com', windows: [week(10)], at: '2026-11-17T01:30:00.000Z' }
+  const [g] = groupUsage([{ machine: 'pc-a', usage: [old, fresh] }], NOW)
+  assert.deepEqual([g!.email, g!.org, g!.plan], ['user@example.com', 'Example Org', 'claude_team'])
+  assert.equal(planLabel('claude', 'claude_team'), 'Team')
+  assert.equal(planLabel('claude', 'claude_max'), 'Max')
+  assert.equal(planLabel('codex', 'prolite'), 'Pro 100')
+  // Not seen in /status: shown as sent
+  assert.equal(planLabel('codex', 'plus'), 'plus')
+  assert.equal(planLabel('claude', 'something-else'), 'something-else')
 })

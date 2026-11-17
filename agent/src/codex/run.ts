@@ -10,7 +10,7 @@ import { realpath, stat } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, join, resolve } from 'node:path'
 import type { CodexLineHealth, LogPage, NotifyFields, SessionSummary, ToolUsage } from '../../../shared/types.ts'
-import { codexUsageOf } from '../usage.ts'
+import { codexLoginBetween, codexUsageOf } from '../usage.ts'
 import type { CodexConfig } from '../config.ts'
 import { autoApproveFor } from '../autoApprove.ts'
 import { askCodexQuestion, offerCodexCard, offerCodexFileChange } from './cards.ts'
@@ -266,6 +266,8 @@ export async function codexRows(): Promise<SessionSummary[]> {
  *   (measured ~0.5 s), so not on every list poll.
  */
 export const CODEX_USAGE_TTL_MS = 60_000
+/** How long `GET /usage` waits for a Codex read before answering with the last one (well under the phone's 10 s) */
+export const CODEX_USAGE_WAIT_MS = 4_000
 
 /** Per line: the last good reading, and the read in flight (one at a time) */
 const usageOf = new WeakMap<CodexDaemonLine, { readAt: number; value: ToolUsage | undefined; inflight?: Promise<void> }>()
@@ -283,16 +285,31 @@ export async function codexUsage(nowMs: number = Date.now()): Promise<ToolUsage[
       const s = slot
       s.inflight ??= (async () => {
         try {
-          const got = codexUsageOf(await line.rateLimits(), Date.now())
+          // ★ Who is logged in, beside the numbers (as `/status` shows it). ⚠️⚠️ The limits answer names no login
+          //    (`accountId` is not `account/read`'s `userId`) ⇒ the login is read **before and after** the limits and
+          //    kept only when both reads agree (codex review: a login switch in between paired A's numbers with B).
+          //    ⚠️ Not readable or not the same ⇒ the numbers alone.
+          //    ⚠️ Residual (accepted): a switch A → B → A inside the ~0.5 s of the limits read still pairs B's numbers
+          //       with A (the protocol has no login id on the limits answer).
+          //    ★ Both go out at once (the "before" is sent first on the one line; the limits do not wait for it)
+          const beforeP = line.account().catch(() => undefined)
+          const limits = await line.rateLimits()
+          const before = await beforeP
+          const after = before === undefined ? undefined : await line.account().catch(() => undefined)
+          const got = codexUsageOf(limits, Date.now())
           s.readAt = Date.now()
-          if (got) s.value = { tool: 'codex', account: line.label, ...got, at: new Date(s.readAt).toISOString() }
+          if (got) s.value = { tool: 'codex', account: line.label, ...got, ...codexLoginBetween(before, after), at: new Date(s.readAt).toISOString() }
         } catch {
           // ⚠️ Never throws into the route: the last reading stays
         } finally {
           s.inflight = undefined
         }
       })()
-      await s.inflight
+      // ★ The phone's request waits at most `CODEX_USAGE_WAIT_MS` (codex review: a slow read pushed the whole answer,
+      //   Claude's numbers included, past the phone's own 10 s timeout). The read goes on and is there next time.
+      let timer: ReturnType<typeof setTimeout> | undefined
+      await Promise.race([s.inflight, new Promise<void>((r) => (timer = setTimeout(r, CODEX_USAGE_WAIT_MS)))])
+      clearTimeout(timer)
     }),
   )
   const out: ToolUsage[] = []

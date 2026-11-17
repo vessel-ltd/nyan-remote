@@ -14,9 +14,13 @@
 // ⚠️ Limits belong to the account, and two profiles can be one account (measured: `.claude-r` and `.claude-rs`) ⇒
 //    `accountKey`, a short hash (the id itself never leaves the machine).
 // ⚠️ A window whose reset has passed is dropped: its number is no longer true, and the next one is unknown.
+// ★ Who is logged in is shown too, as each tool's `/status` does (2026-11-17): Claude from the profile's config
+//   (`oauthAccount`: e-mail, organization, organization type) **only when it names the account the relay recorded**;
+//   Codex from `account/read` (e-mail, plan, workspace). Display only.
 
 import { createHash } from 'node:crypto'
 import { readFile, stat } from 'node:fs/promises'
+import { homedir } from 'node:os'
 import { join } from 'node:path'
 import type { ToolUsage, UsageWindow } from '../../shared/types.ts'
 import type { ConfigDir } from './claude/configDirs.ts'
@@ -85,13 +89,75 @@ export function codexUsageOf(result: unknown, nowMs: number): Pick<ToolUsage, 'w
   return { windows, ...(plan ? { plan } : {}), ...(accountKey ? { accountKey } : {}) }
 }
 
+/**
+ * A name to show as it is, or nothing. ⚠️ It comes from a file or a server: no control, format (bidi, invisible) or
+ * line-separator character, and not longer than `max` (a value that fails is dropped whole, never cleaned up).
+ */
+function shownText(v: unknown, max: number): string | undefined {
+  // ⚠️ Judged on the string as sent, before any trim (codex review: trimming first let a newline or 300 spaces through)
+  if (typeof v !== 'string' || v.length > max || /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(v)) return undefined
+  const s = v.trim()
+  return s !== '' ? s : undefined
+}
+
+/** A plan / type id as the tools spell them (`prolite`, `claude_team`) */
+function planId(v: unknown): string | undefined {
+  return typeof v === 'string' && /^[A-Za-z0-9_-]{1,40}$/.test(v) ? v : undefined
+}
+
+/** Who is logged in to a Codex home, from `account/read` (a ChatGPT login only; an API key has no e-mail) */
+export function codexLoginOf(result: unknown): Pick<ToolUsage, 'email' | 'org' | 'plan'> {
+  if (!isObject(result) || !isObject(result.account) || result.account.type !== 'chatgpt') return {}
+  const a = result.account
+  const email = shownText(a.email, 254)
+  const org = shownText(a.workspaceName, 120)
+  const plan = planId(a.planType)
+  return { ...(email ? { email } : {}), ...(org ? { org } : {}), ...(plan ? { plan } : {}) }
+}
+
+/**
+ * The login read before and after the limits, if both reads name the same login (same user, e-mail, plan, workspace).
+ * Anything else ⇒ nothing (the numbers are shown without a login rather than with someone else's).
+ */
+export function codexLoginBetween(before: unknown, after: unknown): Pick<ToolUsage, 'email' | 'org' | 'plan'> {
+  const a = codexLoginOf(before)
+  const b = codexLoginOf(after)
+  const userOf = (r: unknown): unknown => (isObject(r) ? r.userId : undefined)
+  const same = a.email !== undefined && a.email === b.email && a.org === b.org && a.plan === b.plan && userOf(before) === userOf(after)
+  return same ? a : {}
+}
+
+/** Who is logged in, from a Claude config (`oauthAccount`), only when it is the account `uuid` */
+export function claudeLoginOf(config: unknown, uuid: string): Pick<ToolUsage, 'email' | 'org' | 'plan'> | undefined {
+  if (!isObject(config) || !isObject(config.oauthAccount)) return undefined
+  const o = config.oauthAccount
+  // ⚠️⚠️ The same account the reading was recorded with, or nothing (the config may have moved on to another login)
+  if (o.accountUuid !== uuid) return undefined
+  const email = shownText(o.emailAddress, 254)
+  const org = shownText(o.organizationName, 120)
+  const plan = planId(o.organizationType)
+  return { ...(email ? { email } : {}), ...(org ? { org } : {}), ...(plan ? { plan } : {}) }
+}
+
+/** A Claude config is ~200 KB (measured); a bigger one is not read (the same cap as `configDirs.ts`) */
+const MAX_CONFIG_BYTES = 5 * 1024 * 1024
+
+/**
+ * The configs a profile may use: `<dir>/.claude.json`, and for the default profile (`~/.claude`, run without
+ * `CLAUDE_CONFIG_DIR`) `~/.claude.json` first. ⚠️ Which one the session used is not known here ⇒ the account id decides.
+ */
+function configCandidates(d: ConfigDir, home: string): string[] {
+  const own = join(d.dir, '.claude.json')
+  return d.dir.replace(/\/+$/, '') === join(home, '.claude') ? [join(home, '.claude.json'), own] : [own]
+}
+
 /** Reads, kept while the file is unchanged (the list asks often) */
 const cache = new Map<string, { size: number; mtimeMs: number; value: unknown }>()
 
-async function readJsonCached(path: string): Promise<{ value: unknown; mtimeMs: number } | undefined> {
+async function readJsonCached(path: string, maxBytes: number = MAX_BYTES): Promise<{ value: unknown; mtimeMs: number } | undefined> {
   try {
     const st = await stat(path)
-    if (!st.isFile() || st.size > MAX_BYTES) return undefined
+    if (!st.isFile() || st.size > maxBytes) return undefined
     const known = cache.get(path)
     if (known && known.size === st.size && known.mtimeMs === st.mtimeMs) return { value: known.value, mtimeMs: known.mtimeMs }
     let value: unknown
@@ -109,11 +175,11 @@ async function readJsonCached(path: string): Promise<{ value: unknown; mtimeMs: 
   }
 }
 
-export async function claudeUsage(dirs: readonly ConfigDir[], nowMs: number = Date.now()): Promise<ToolUsage[]> {
+export async function claudeUsage(dirs: readonly ConfigDir[], nowMs: number = Date.now(), home: string = homedir()): Promise<ToolUsage[]> {
   const out: ToolUsage[] = []
   for (const d of dirs) {
     try {
-      const u = await profileUsage(d, nowMs)
+      const u = await profileUsage(d, nowMs, home)
       if (u) out.push(u)
     } catch {
       // ⚠️ One profile never fails the others
@@ -122,7 +188,7 @@ export async function claudeUsage(dirs: readonly ConfigDir[], nowMs: number = Da
   return out
 }
 
-async function profileUsage(d: ConfigDir, nowMs: number): Promise<ToolUsage | undefined> {
+async function profileUsage(d: ConfigDir, nowMs: number, home: string): Promise<ToolUsage | undefined> {
   const path = claudeUsagePath(d.account)
   let got: { value: unknown; mtimeMs: number } | undefined
   try {
@@ -140,5 +206,16 @@ async function profileUsage(d: ConfigDir, nowMs: number): Promise<ToolUsage | un
   if (!windows) return undefined
   const uuid = wrapped && typeof wrapped.nyanAccount === 'string' && UUID.test(wrapped.nyanAccount) ? wrapped.nyanAccount : undefined
   const accountKey = accountKeyOf(uuid)
-  return { tool: 'claude', account: d.account, ...(accountKey ? { accountKey } : {}), windows, at: new Date(got.mtimeMs).toISOString() }
+  // ★ Who that account is (`/status`'s login and organization), from a config that names the same account
+  let login: Pick<ToolUsage, 'email' | 'org' | 'plan'> = {}
+  if (uuid) {
+    for (const path of configCandidates(d, home)) {
+      const found = claudeLoginOf((await readJsonCached(path, MAX_CONFIG_BYTES))?.value, uuid)
+      if (found) {
+        login = found
+        break
+      }
+    }
+  }
+  return { tool: 'claude', account: d.account, ...(accountKey ? { accountKey } : {}), ...login, windows, at: new Date(got.mtimeMs).toISOString() }
 }

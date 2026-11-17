@@ -46,6 +46,8 @@ const SETTLED_MS = 30_000
  * this long passes (codex review, high #3). Longer than an RPC timeout.
  */
 export const SEND_HOLD_MS = 15_000
+/** `account/read` answers from the daemon's own auth (measured 3 ms); longer than this ⇒ shown without the login */
+export const ACCOUNT_READ_TIMEOUT_MS = 2_000
 /** Bounds for the snapshot (hostile input: never follow cursors forever) */
 const MAX_PAGES = 20
 const MAX_THREADS = 500
@@ -222,6 +224,11 @@ export interface CodexDaemonLine {
    *   measured ~0.5 s). The raw result, or `undefined` when it cannot be read now (`usage.ts` parses it).
    */
   rateLimits(): Promise<unknown>
+  /**
+   * ★ Who is logged in (`account/read` with `refreshToken: false`: answered from the daemon's own auth, no network —
+   *   measured 3 ms). The raw result, or `undefined` when it cannot be read now (`usage.ts` parses it).
+   */
+  account(): Promise<unknown>
   /**
    * ★ Stop the turn that runs on this thread now (measured: the TUI's turn ends `interrupted`, the TUI goes back to
    *   waiting and takes the next input / docs/CODEX.md §3).
@@ -751,6 +758,14 @@ export function startCodexDaemonLine(opts: DaemonOptions): CodexDaemonLine {
       const rpc = liveRpc
       if (!rpc) return undefined
       const res = await rpc.call('account/rateLimits/read', {})
+      return res.ok ? res.result : undefined
+    },
+    account: async () => {
+      const rpc = liveRpc
+      if (!rpc) return undefined
+      // ⚠️ Never a token refresh from here (that is the TUI's business). ⚠️ A short deadline: it is extra, and the
+      //    numbers must not wait behind it (codex review: the default 10 s equals the phone's own timeout)
+      const res = await rpc.call('account/read', { refreshToken: false }, { timeoutMs: ACCOUNT_READ_TIMEOUT_MS })
       return res.ok ? res.result : undefined
     },
     interrupt: async (threadId) => {
