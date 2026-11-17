@@ -10,6 +10,7 @@ import {
   parseLines,
   contextTokensOf,
   metaCacheSize,
+  modelOf,
   readTranscriptMeta,
   tailIsEnough,
 } from './transcript.ts'
@@ -584,4 +585,12 @@ test('★ tailIsEnough: needs a conversation record, and the context size unless
   assert.equal(judge([user, apiRequest(10)]), false, 'no assistant yet: keep looking for the context size')
   assert.equal(judge([user, asst, apiRequest(10)]), true)
   assert.equal(judge([boundary, user, apiRequest(10)]), true, 'right after compaction "unknown" is the answer')
+})
+
+test('modelOf: the newest main-chain response; not a subagent, not <synthetic>', () => {
+  const a = (model: unknown, extra: Rec = {}): Rec => ({ type: 'assistant', message: { model, usage: {} }, ...extra })
+  assert.equal(modelOf([a('claude-old'), a('claude-opus-5-5'), { type: 'user', message: { content: 'x' } }]), 'claude-opus-5-5')
+  assert.equal(modelOf([a('claude-opus-5-5'), a('claude-haiku-5-5', { isSidechain: true })]), 'claude-opus-5-5')
+  assert.equal(modelOf([a('claude-opus-5-5'), a('<synthetic>')]), 'claude-opus-5-5')
+  assert.equal(modelOf([{ type: 'user' }]), undefined)
 })

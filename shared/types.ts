@@ -89,6 +89,18 @@ export interface SessionSummary {
    */
   contextTokens?: number
   /**
+   * ★ The model a live session uses now (2026-11-17): Claude's status line `model.display_name` ("Opus 5.5"), else the
+   * transcript's model id; Codex's newest `turn_context`. Absent = unknown.
+   */
+  model?: string
+  /** ★ Its reasoning effort (Claude's status line `effort.level`; Codex's `turn_context.effort`). Absent = unknown */
+  effort?: string
+  /**
+   * ★ Context used, in % of the window — **only as the tool reports it** (Claude's status line
+   * `context_window.used_percentage`). ⚠️ Never computed here (the window is not known otherwise / `contextTokens`).
+   */
+  contextPercent?: number
+  /**
    * ★★ **How what is sent from the phone arrives** (2026-08-24 / HANDOFF "per-session marker").
    *
    *   `keys`  … keystrokes. **No English frame** (indistinguishable from what a human typed)

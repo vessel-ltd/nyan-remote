@@ -49,7 +49,8 @@ export const STATE_DIRS = ['bin', 'panes', 'inflight', 'usage']
  *   panes/    `<pid>.json` (relay.py), its temp `<pid>.json.<pid>.tmp`, `<pid>.rejected`
  *   inflight/ `<session UUID>.jsonl` (hooks/message-display.sh only accepts a UUID)
  *   usage/    `claude-<profile>.json` and its temp `.claude-<profile>.<pid>.<random>.tmp` (hooks/statusline.sh only accepts
- *             a `.claude*` profile name / 2026-11-17)
+ *             a `.claude*` profile name / 2026-11-17), and each session's `session-<session UUID>.json` with its temp
+ *             `.session-<session UUID>.<pid>.<random>.tmp`
  *   bin/      nothing: the removers take ours out before a purge
  */
 export const STATE_CHILD = {
@@ -57,7 +58,7 @@ export const STATE_CHILD = {
   panes: /^\d+\.(json|rejected|json\.\d+\.tmp)$/,
   inflight: /^[0-9a-fA-F-]{36}\.jsonl$/,
   // ★ And a relay write cut short before its rename (`.claude-<profile>.<pid>.<random>.tmp` / codex review)
-  usage: /^(claude-\.claude(-[A-Za-z0-9._-]+)?\.json|\.claude-\.claude(-[A-Za-z0-9._-]+)?\.\d+\.\d+\.tmp)$/,
+  usage: /^(claude-\.claude(-[A-Za-z0-9._-]+)?\.json|\.claude-\.claude(-[A-Za-z0-9._-]+)?\.\d+\.\d+\.tmp|session-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\.json|\.session-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\.\d+\.\d+\.tmp)$/,
 }
 /** ★ At least one of these must be there before anything is called "our state directory" */
 export const STATE_MARKERS = ['config.json', 'hook-token', 'device-key.json']

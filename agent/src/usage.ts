@@ -93,7 +93,7 @@ export function codexUsageOf(result: unknown, nowMs: number): Pick<ToolUsage, 'w
  * A name to show as it is, or nothing. ⚠️ It comes from a file or a server: no control, format (bidi, invisible) or
  * line-separator character, and not longer than `max` (a value that fails is dropped whole, never cleaned up).
  */
-function shownText(v: unknown, max: number): string | undefined {
+export function shownText(v: unknown, max: number): string | undefined {
   // ⚠️ Judged on the string as sent, before any trim (codex review: trimming first let a newline or 300 spaces through)
   if (typeof v !== 'string' || v.length > max || /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(v)) return undefined
   const s = v.trim()
@@ -152,9 +152,18 @@ function configCandidates(d: ConfigDir, home: string): string[] {
 }
 
 /** Reads, kept while the file is unchanged (the list asks often) */
+const CACHE_MAX = 256
 const cache = new Map<string, { size: number; mtimeMs: number; value: unknown }>()
 
-async function readJsonCached(path: string, maxBytes: number = MAX_BYTES): Promise<{ value: unknown; mtimeMs: number } | undefined> {
+/**
+ * `keepLast`: on a parse failure, answer with the last good value (the relay used to write in place). False ⇒ nothing
+ * (a file renamed into place is never half-written, so a bad one is bad / codex review).
+ */
+export async function readJsonCached(
+  path: string,
+  maxBytes: number = MAX_BYTES,
+  keepLast = true,
+): Promise<{ value: unknown; mtimeMs: number } | undefined> {
   try {
     const st = await stat(path)
     if (!st.isFile() || st.size > maxBytes) return undefined
@@ -165,9 +174,13 @@ async function readJsonCached(path: string, maxBytes: number = MAX_BYTES): Promi
       value = JSON.parse(await readFile(path, 'utf8'))
     } catch {
       // ⚠️ Caught half-written (the relay writes in place): the last good reading stays (no flicker on the phone)
-      return known ? { value: known.value, mtimeMs: known.mtimeMs } : undefined
+      if (!keepLast) cache.delete(path)
+      return known && keepLast ? { value: known.value, mtimeMs: known.mtimeMs } : undefined
     }
+    // ⚠️ Bounded (session files come and go): the oldest entry goes first
+    cache.delete(path)
     cache.set(path, { size: st.size, mtimeMs: st.mtimeMs, value })
+    if (cache.size > CACHE_MAX) cache.delete(cache.keys().next().value!)
     return { value, mtimeMs: st.mtimeMs }
   } catch {
     // ⚠️ Missing: no reading

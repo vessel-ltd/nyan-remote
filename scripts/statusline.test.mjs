@@ -3,7 +3,7 @@
 
 import assert from 'node:assert/strict'
 import { execFileSync, spawnSync } from 'node:child_process'
-import { existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
@@ -204,4 +204,34 @@ test('relay: a command that does not read its input still shows, with nothing of
   const r = spawnSync('bash', [RELAY, '--nyan-remote-relay', 'echo shown'], { input: big, encoding: 'utf8', timeout: 5000, env: { PATH: process.env.PATH, HOME: h } })
   assert.equal(r.stdout, 'shown\n')
   assert.equal(r.stderr, '')
+})
+
+test('relay: each session keeps its own latest input (model, effort, context for the list), named by its id only', (t) => {
+  const h = home()
+  t.after(() => rmSync(h, { recursive: true, force: true }))
+  const SID = 'e608fc6c-0000-4000-8000-000000000000'
+  const first = JSON.stringify({ session_id: SID, model: { id: 'claude-x', display_name: 'X' }, effort: { level: 'high' } })
+  // ★ Without rate_limits too (the first calls of a session): its own copy, but the profile's reading is not touched
+  relay(h, ['true'], first, { CLAUDE_CONFIG_DIR: join(h, '.claude-r') })
+  assert.equal(readFileSync(join(h, '.nyan-remote', 'usage', `session-${SID}.json`), 'utf8'), first)
+  assert.ok(!existsSync(join(h, '.nyan-remote', 'usage', 'claude-.claude-r.json')))
+  // The newest input replaces it
+  const next = JSON.stringify({ session_id: SID, effort: { level: 'max' }, rate_limits: JSON.parse(INPUT).rate_limits })
+  relay(h, ['true'], next, { CLAUDE_CONFIG_DIR: join(h, '.claude-r') })
+  assert.equal(readFileSync(join(h, '.nyan-remote', 'usage', `session-${SID}.json`), 'utf8'), next)
+  assert.ok(existsSync(join(h, '.nyan-remote', 'usage', 'claude-.claude-r.json')))
+  // ⚠️ An id that is not a UUID never becomes a file name
+  for (const bad of ['../../x', '-'.repeat(36), 'e608fc6c']) {
+    relay(h, ['true'], JSON.stringify({ session_id: bad }), { CLAUDE_CONFIG_DIR: join(h, '.claude-r') })
+  }
+  // ⚠️ Only the first key names the file: a session id nested further on never does (codex review)
+  const B = 'bbbbbbbb-0000-4000-8000-000000000000'
+  relay(h, ['true'], JSON.stringify({ nested: { session_id: B }, session_id: SID }), { CLAUDE_CONFIG_DIR: join(h, '.claude-r') })
+  relay(h, ['true'], JSON.stringify({ model: { id: 'x' }, session_id: B }), { CLAUDE_CONFIG_DIR: join(h, '.claude-r') })
+  assert.deepEqual(readdirSync(join(h, '.nyan-remote', 'usage')).sort(), ['claude-.claude-r.json', `session-${SID}.json`])
+  // ⚠️ Not into a directory that is not ours
+  const h2 = mkdtempSync(join(tmpdir(), 'nyan-sl-'))
+  t.after(() => rmSync(h2, { recursive: true, force: true }))
+  relay(h2, ['true'], first)
+  assert.ok(!existsSync(join(h2, '.nyan-remote')))
 })

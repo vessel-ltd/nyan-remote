@@ -51,9 +51,27 @@ export interface TranscriptMeta {
   awaySummary?: string
   /** ★ How much context (tokens) is currently in use. undefined if unknown */
   contextTokens?: number
+  /** ★ The model id of the newest main-chain response (`message.model`). undefined if unknown */
+  model?: string
 }
 
 type Rec = Record<string, unknown>
+
+/**
+ * ★ The model of the newest response in these records (2026-11-17 / the list, when the status line gives nothing).
+ * ⚠️ Main chain only (not a subagent's), and only an id-shaped value (`<synthetic>` marks a local error, not a model).
+ */
+export function modelOf(records: Rec[]): string | undefined {
+  for (let i = records.length - 1; i >= 0; i--) {
+    const r = records[i]!
+    if (r['type'] !== 'assistant' || r['isSidechain'] === true) continue
+    const message = r['message']
+    if (!message || typeof message !== 'object') continue
+    const m = (message as Rec)['model']
+    if (typeof m === 'string' && /^[A-Za-z0-9._:-]{1,64}$/.test(m)) return m
+  }
+  return undefined
+}
 
 /**
  * Turn JSONL text into an array of records.
@@ -161,6 +179,8 @@ export interface Derived {
   awaySummary?: string
   /** ★ How much context (tokens) is currently in use. undefined if unknown */
   contextTokens?: number
+  /** ★ The model id of the newest main-chain response (`message.model`). undefined if unknown */
+  model?: string
 }
 
 /**
@@ -321,6 +341,7 @@ export function derive({ sessionId, headRecords, tailRecords }: DeriveInput): De
     awaySummary: away ? clipTo(away, 160) : undefined,
     // ⚠️ Look only at the tail (usage in the first 8KB is the value "right after start", not the current amount)
     contextTokens: contextTokensOf(tailRecords),
+    model: modelOf(tailRecords),
   }
 }
 

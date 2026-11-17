@@ -256,7 +256,14 @@ export async function codexRows(): Promise<SessionSummary[]> {
   const withContext = live.map((r) => {
     const path = paths.get(r.sessionId)
     const n = path === undefined ? undefined : tokens.get(path)
-    return n === undefined ? r : { ...r, contextTokens: n }
+    // ★ The model and effort of its newest turn (2026-11-17)
+    const set = path === undefined ? undefined : contexts.settingsOf(path)
+    return {
+      ...r,
+      ...(n === undefined ? {} : { contextTokens: n }),
+      ...(set?.model ? { model: set.model } : {}),
+      ...(set?.effort ? { effort: set.effort } : {}),
+    }
   })
   return [...withContext, ...lines.flatMap((l) => l.historyRows())]
 }

@@ -1901,6 +1901,8 @@ input.urlinput {
   --pad-h: calc(var(--composer-h) + var(--busy-h) + env(safe-area-inset-bottom));
 }
 /* ★ Context amount chip (2026-08-19). ⚠️ Don't indicate levels by color (the window size is unknown) */
+/* ★ The model · effort chip (2026-11-17): as quiet as ctx */
+.chip.model,
 .chip.ctx {
   font-variant-numeric: tabular-nums;
   opacity: 0.85;

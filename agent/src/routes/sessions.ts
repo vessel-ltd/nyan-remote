@@ -4,6 +4,7 @@ import { isHistorySession, type LogPage, type SessionSummary, type SessionsPage 
 import { config } from '../config.ts'
 import { discoverConfigDirs } from '../claude/configDirs.ts'
 import { alreadyInTranscript, readInflight, sweepInflight, type Inflight } from '../claude/inflight.ts'
+import { SESSION_LINE_MAX_AGE_MS, sweepSessionLines } from '../claude/sessionLine.ts'
 import { scanPanes, sweepPanes, type PaneScan } from '../claude/keys.ts'
 import { hasPendingForSession, listPending } from '../permission.ts'
 import { parseTranscriptPath } from './hook.ts'
@@ -152,7 +153,7 @@ export function historyRev(rows: readonly SessionSummary[]): string {
 export async function sessions(ctx?: Ctx): Promise<SessionsPage> {
   const cfg = config()
   const dirs = await discoverConfigDirs(cfg.configDirs)
-  const { machine, sessions } = await collectSessions(dirs, cfg.maxSessionsPerAccount)
+  const { machine, sessions, liveIds, liveComplete } = await collectSessions(dirs, cfg.maxSessionsPerAccount)
   // ★ Discard inflight entries that are no longer needed (those of live sessions are kept).
   //   ⚠️ It is done here because **this is the only place holding the list of live sessions**
   const now = Date.now()
@@ -167,6 +168,10 @@ export async function sessions(ctx?: Ctx): Promise<SessionsPage> {
     const keep = new Set(sessions.map((s) => s.sessionId))
     for (const p of listPending()) if (p.sessionId) keep.add(p.sessionId)
     void sweepInflight(keep, now)
+    // ★ The status line copies of sessions that ended (`claude/sessionLine.ts`). ⚠️ By the live set itself (an idle
+    //   live session can fall off the capped list; a listed history row is not live / codex review). When a profile's
+    //   live sessions could not be read, no session file goes (only temp files)
+    void sweepSessionLines(liveIds, now, undefined, liveComplete ? SESSION_LINE_MAX_AGE_MS : Number.POSITIVE_INFINITY)
     // ★ Also clean up registrations nobody removed (leftovers of relays killed with SIGKILL).
     //   ⚠️ Only those whose "process is gone" are removed (`sweepPanes` in `keys.ts`)
     void sweepPanes()

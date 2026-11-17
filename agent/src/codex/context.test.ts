@@ -4,7 +4,7 @@ import { mkdtemp, rm, writeFile, appendFile, symlink } from 'node:fs/promises'
 import { execFileSync } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { ContextCache, contextFromTail, isRolloutPath, readContextTokens, readTailText } from './context.ts'
+import { ContextCache, contextFromTail, isRolloutPath, readContextTokens, readTailText, readTurnSettings } from './context.ts'
 
 // The shape measured in a 0.169.0 rollout (numbers changed)
 function tokenCount(last: unknown, info: 'ok' | 'null' = 'ok'): string {
@@ -104,7 +104,7 @@ test('ContextCache: reads again only when size or time changed, and forgets path
   const cache = new ContextCache(
     async () => {
       reads++
-      return { size, mtimeMs: 1, tokens: size * 100 }
+      return { size, mtimeMs: 1, tokens: size * 100, readFrom: 0, doneTo: size }
     },
     async () => ({ size, mtimeMs: 1 }),
   )
@@ -119,4 +119,63 @@ test('ContextCache: reads again only when size or time changed, and forgets path
   await cache.lookup([p])
   assert.equal(reads, 3, 'a forgotten path is read again')
   assert.equal((await cache.lookup(['relative.jsonl'])).size, 0)
+})
+
+/** The shape measured in a 0.169.0 rollout (other fields left out) */
+const turnContext = (model: unknown, effort: unknown) =>
+  JSON.stringify({ timestamp: '2026-11-17T04:11:14.864Z', type: 'turn_context', payload: { turn_id: 't', cwd: '/home/user/p', model, effort, summary: 'none' } })
+
+test('readTurnSettings: the newest turn_context gives the model and effort; odd values are left out', () => {
+  assert.deepEqual(readTurnSettings(lines(turnContext('gpt-a', 'low'), message('x'), turnContext('gpt-b', 'medium'), tokenCount(5)), false), { model: 'gpt-b', effort: 'medium' })
+  assert.equal(readTurnSettings(lines(message('x'), tokenCount(5)), false), undefined)
+  assert.deepEqual(readTurnSettings(lines(turnContext('<b>', null)), false), {})
+  assert.deepEqual(readTurnSettings(lines(turnContext('gpt-b', 'HIGH!')), false), { model: 'gpt-b' })
+  // A cut first line is not read; an unfinished last one neither
+  assert.equal(readTurnSettings(lines(turnContext('gpt-a', 'low')), true), undefined)
+  assert.equal(readTurnSettings(turnContext('gpt-a', 'low'), false), undefined)
+})
+
+test('readContextTokens: the settings come from as far back as 1 MB; the cache keeps the last ones when a long turn pushes them out', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'nyan-ctx-'))
+  try {
+    const path = join(dir, 'rollout.jsonl')
+    await writeFile(path, lines(turnContext('gpt-a', 'high'), message('x'.repeat(200 * 1024)), tokenCount(100)))
+    assert.deepEqual(await readContextTokens(path).then((r) => [r?.tokens, r?.settings]), [100, { model: 'gpt-a', effort: 'high' }])
+    const cache = new ContextCache()
+    await cache.lookup([path])
+    assert.deepEqual(cache.settingsOf(path), { model: 'gpt-a', effort: 'high' })
+    // A turn growing past 1 MB, looked at as it grows: the settings leave the tail, the last seen stay
+    for (const n of [150, 200]) {
+      await appendFile(path, lines(message('y'.repeat(600 * 1024)), tokenCount(n)))
+      assert.equal((await cache.lookup([path])).get(path), n)
+    }
+    assert.equal((await readContextTokens(path))?.settings, undefined)
+    assert.deepEqual(cache.settingsOf(path), { model: 'gpt-a', effort: 'high' })
+    // ⚠️ A new turn with other settings, pushed out of the tail before the next look: unknown, not the old ones
+    await appendFile(path, lines(turnContext('gpt-c', 'xhigh'), message('z'.repeat(1100 * 1024)), tokenCount(250)))
+    await cache.lookup([path])
+    assert.equal(cache.settingsOf(path), undefined)
+    // ⚠️ The boundary: exactly 1 MiB appended, starting with a new turn_context — the tail starts at that record and
+    //    cuts it as a partial line, so it was never looked at ⇒ unknown, not the old ones (round 2)
+    await cache.lookup([path])
+    await appendFile(path, lines(turnContext('gpt-a', 'high'), tokenCount(260)))
+    await cache.lookup([path])
+    assert.deepEqual(cache.settingsOf(path), { model: 'gpt-a', effort: 'high' })
+    const head = `${turnContext('gpt-d', 'low')}\n`
+    const tail = `${tokenCount(270)}\n`
+    const filler = `${message('w'.repeat(1024 * 1024 - head.length - tail.length - message('').length - 1))}\n`
+    await appendFile(path, head + filler + tail)
+    assert.equal(Buffer.byteLength(head + filler + tail), 1024 * 1024)
+    await cache.lookup([path])
+    assert.equal(cache.settingsOf(path), undefined)
+    // A new turn with other settings replaces them
+    await appendFile(path, lines(turnContext('gpt-b', 'low'), tokenCount(300)))
+    await cache.lookup([path])
+    assert.deepEqual(cache.settingsOf(path), { model: 'gpt-b', effort: 'low' })
+    // Forgotten with the path
+    await cache.lookup([])
+    assert.equal(cache.settingsOf(path), undefined)
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
 })

@@ -113,10 +113,14 @@ test('★ --purge knows usage/: the relay\'s readings and a write cut short are 
   writeFileSync(join(s, 'usage', 'claude-.claude.json'), '{}')
   writeFileSync(join(s, 'usage', 'claude-.claude-r.json'), '{}')
   writeFileSync(join(s, 'usage', '.claude-.claude-r.1234.5678.tmp'), '')
+  writeFileSync(join(s, 'usage', 'session-11111111-1111-4111-8111-111111111111.json'), '{}')
+  writeFileSync(join(s, 'usage', '.session-11111111-1111-4111-8111-111111111111.1234.5678.tmp'), '')
   assert.deepEqual(foreignEntries(s), [])
+  writeFileSync(join(s, 'usage', 'session-notes.json'), '')
+  writeFileSync(join(s, 'usage', `session-${'-'.repeat(36)}.json`), '')
   writeFileSync(join(s, 'usage', 'notes.txt'), '')
   writeFileSync(join(s, 'usage', 'claude-other.json'), '')
-  assert.deepEqual(foreignEntries(s).sort(), ['usage/claude-other.json', 'usage/notes.txt'])
+  assert.deepEqual(foreignEntries(s).sort(), ['usage/claude-other.json', 'usage/notes.txt', `usage/session-${'-'.repeat(36)}.json`, 'usage/session-notes.json'])
 })
 
 test('★★ after stopping: the port comes from config.json; refused = gone, no answer = unknown, any HTTP answer = running', async () => {

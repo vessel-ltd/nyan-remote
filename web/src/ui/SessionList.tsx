@@ -1,5 +1,5 @@
 import type { SessionSummary } from '../../../shared/types.ts'
-import { formatTokens } from './tokens.ts'
+import { ctxText, formatTokens, modelText } from './tokens.ts'
 import { sessionHash } from '../route.ts'
 import { statusView } from './status.ts'
 import { currentLang, t } from '../../../shared/i18n.ts'
@@ -82,9 +82,11 @@ export function SessionList({
                       ⚠️⚠️ **Put the meaning on screen.** `title` **cannot be read by a finger**, so
                          on the phone nobody could tell what "673k" meant
                          (2026-08-19 `/code-review`, low #2) */}
-                  {ctx ? (
+                  {/* ★ The model and effort of a live session (2026-11-17). Absent ⇒ no chip */}
+                  {modelText(s) ? <span class="chip model">{modelText(s)}</span> : null}
+                  {ctxText(ctx, s.contextPercent) ? (
                     <span class="chip ctx" title={t('いま使っているコンテキストの量（最後の応答時点）', 'Context currently in use (as of the last response)')}>
-                      ctx {ctx}
+                      {ctxText(ctx, s.contextPercent)}
                     </span>
                   ) : null}
                 </span>

@@ -366,9 +366,10 @@ test('★ what the screen means is written on the screen (`title` can\'t be read
   //    (`/code-review` low #2, 2026-08-19). With the explanation only in the `title` attribute,
   //    **it can't be read on phones, the main battlefield**
   const t = stripComments(readFileSync(join(SRC, 'ui', 'SessionList.tsx'), 'utf8'))
-  assert.match(t, /ctx \{ctx\}/, 'the context amount has no on-screen explanation')
+  // ★ 2026-11-17: the chip's text is built by `ctxText` (it starts with `ctx `: `tokens.test.ts`)
+  assert.match(t, /\{ctxText\(ctx, s\.contextPercent\)\}/, 'the context amount has no on-screen explanation')
   // ⚠️ When unknown, don't show the chip at all (don't write `0`)
-  assert.match(t, /\{ctx \?/, 'showing the chip when unknown')
+  assert.match(t, /\{ctxText\(ctx, s\.contextPercent\) \?/, 'showing the chip when unknown')
 })
 
 test('★★ with an approval card, the landing point is "the boundary between record and card" (wiring checked mechanically)', () => {

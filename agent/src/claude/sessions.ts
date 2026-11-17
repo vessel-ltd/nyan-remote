@@ -8,6 +8,7 @@ import { liveSessions } from './sessionIndex.ts'
 import { hooksFor, type SessionHooks } from './hookState.ts'
 import { listPending } from '../permission.ts'
 import { readTranscriptMeta } from './transcript.ts'
+import { readSessionLine } from './sessionLine.ts'
 import { machineName } from '../machine.ts'
 
 /** Threshold for hiding empty "just started" sessions from the list (measured: many were 1520B) */
@@ -19,6 +20,10 @@ export interface CollectResult {
   machine: string
   sessions: SessionSummary[]
   accounts: AccountInfo[]
+  /** ★ Every live session id of every profile (not capped by the list) */
+  liveIds: Set<string>
+  /** False when a profile's live sessions could not be read (`liveIds` may then miss some) */
+  liveComplete: boolean
 }
 
 export async function collectSessions(dirs: ConfigDir[], maxPerAccount: number): Promise<CollectResult> {
@@ -33,8 +38,12 @@ export async function collectSessions(dirs: ConfigDir[], maxPerAccount: number):
       .filter((id): id is string => Boolean(id)),
   )
 
+  const liveIds = new Set<string>()
+  let liveKnown = true
   for (const dir of dirs) {
     const live = await liveSessions(dir)
+    if (!live.available) liveKnown = false
+    for (const a of live.agents) liveIds.add(a.sessionId)
     const liveById = new Map(live.agents.map((a) => [a.sessionId, a]))
 
     const files = await listTranscripts(dir.projectsDir)
@@ -68,6 +77,9 @@ export async function collectSessions(dirs: ConfigDir[], maxPerAccount: number):
         // ★ Whether there is an actual pending-approval card. More reliable than the guess from Notification
         pendingSessions.has(meta.sessionId),
       )
+      // ★ A live session's model, effort and context % (its status line), else the model from the transcript
+      const line = isLive ? await readSessionLine(meta.sessionId) : undefined
+      const model = isLive ? (line?.model ?? meta.model) : undefined
       sessions.push({
         machine,
         account: dir.account,
@@ -98,6 +110,9 @@ export async function collectSessions(dirs: ConfigDir[], maxPerAccount: number):
         awaySummary: meta.awaySummary,
         // ★ Amount of context currently in use (omitted if unknown / 2026-08-19)
         ...(meta.contextTokens === undefined ? {} : { contextTokens: meta.contextTokens }),
+        ...(model ? { model } : {}),
+        ...(line?.effort ? { effort: line.effort } : {}),
+        ...(line?.contextPercent === undefined ? {} : { contextPercent: line.contextPercent }),
       })
       count++
     }
@@ -112,7 +127,7 @@ export async function collectSessions(dirs: ConfigDir[], maxPerAccount: number):
   }
 
   sessions.sort(compare)
-  return { machine, sessions, accounts }
+  return { machine, sessions, accounts, liveIds, liveComplete: liveKnown }
 }
 
 /**
