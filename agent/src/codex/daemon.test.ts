@@ -237,6 +237,7 @@ type TestHooks = {
   askQuestion?: DaemonHooks['askQuestion']
   offerFileChange?: DaemonHooks['offerFileChange']
   closed?: string[]
+  snapshots?: Array<{ prefix: string; loaded: string[] }>
 }
 
 function start(w: World, hooks: TestHooks = {}) {
@@ -261,6 +262,9 @@ function startLine(w: World, hooks: TestHooks = {}, rpcTimeoutMs?: number, histo
       ...(hooks.askQuestion ? { askQuestion: hooks.askQuestion } : {}),
       ...(hooks.offerFileChange ? { offerFileChange: hooks.offerFileChange } : {}),
       ...(hooks.closed ? { onClosed: (id: string) => hooks.closed!.push(id) } : {}),
+      ...(hooks.snapshots
+        ? { onLoadedSnapshot: (prefix: string, loaded: ReadonlySet<string>) => hooks.snapshots!.push({ prefix, loaded: [...loaded].sort() }) }
+        : {}),
     },
   })
 }
@@ -1085,10 +1089,13 @@ test('turns: read only for a thread that is a row, with explicit order and view;
   // The fake daemon does not know the method (as a real one says right after creating a thread): undefined, and we may ask again
   assert.equal(await line.turns('t1', { limit: 5 }), undefined)
   assert.equal(await line.turns('t1', { limit: 5, cursor: 'opaque' }), undefined)
+  // ★ Headers only: a reader that does not show the conversation never asks for the items (a big turn ends the line)
+  assert.equal(await line.turns('t1', { limit: 1, headersOnly: true }), undefined)
   const sent = w.daemon.received.slice(before).map((m) => m.params)
   assert.deepEqual(sent, [
     { threadId: 't1', limit: 5, sortDirection: 'desc', itemsView: 'full' },
     { threadId: 't1', limit: 5, sortDirection: 'desc', itemsView: 'full', cursor: 'opaque' },
+    { threadId: 't1', limit: 1, sortDirection: 'desc', itemsView: 'notLoaded' },
   ])
 
   // A reconnect is a new generation
@@ -1531,6 +1538,32 @@ test('★ unloaded ends the row like a close does, exactly once, so auto-approve
     line.stop()
     await line.done
   }
+})
+
+test('★ a complete list of loaded threads is told on every connect, so a thread closed while the line was down ends its auto-approve (codex review 2026-11-17, high)', async () => {
+  const w = world()
+  w.daemon.threads.set('t1', thread('t1'))
+  w.daemon.threads.set('t2', thread('t2'))
+  const snapshots: Array<{ prefix: string; loaded: string[] }> = []
+  const line = start(w, { snapshots })
+  await until(() => snapshots.length === 1, 'the first snapshot')
+  const prefix = line.sessionIdOf('')
+  assert.deepEqual(snapshots[0], { prefix, loaded: [line.sessionIdOf('t1'), line.sessionIdOf('t2')] })
+  // t1 closes while the line is down: no `thread/closed` reaches us, the next complete list says it
+  w.daemon.drop()
+  w.daemon.threads.delete('t1')
+  await until(() => snapshots.length === 2, 'the snapshot after the reconnect')
+  assert.deepEqual(snapshots[1], { prefix, loaded: [line.sessionIdOf('t2')] })
+
+  // ⚠️ An incomplete list says nothing (it would end threads that are open)
+  const u = world()
+  u.daemon.threads.set('t1', thread('t1'))
+  u.daemon.stuckCursor = true
+  const none: Array<{ prefix: string; loaded: string[] }> = []
+  start(u, { snapshots: none })
+  await until(() => lists(u) >= 1, 'the list')
+  for (let i = 0; i < 50; i++) await new Promise((r) => setImmediate(r))
+  assert.deepEqual(none, [])
 })
 
 // ── stop (turn/interrupt / 2026-11-15) ─────────────────────────────────────────────────────────────────────────

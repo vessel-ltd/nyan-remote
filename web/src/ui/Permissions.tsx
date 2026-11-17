@@ -211,6 +211,13 @@ export function Permissions({
                 ) : (
                   <span class="sub mono"><Revealed text={p.summary} /></span>
                 )}
+                {/* ★★ Where it runs, when the request says (Codex / security review 2026-11-17): a third-party string */}
+                {p.cwd ? (
+                  <span class="sub mono permcwd">
+                    {t('場所: ', 'In: ')}
+                    <Revealed text={p.cwd} />
+                  </span>
+                ) : null}
                 {/* ★ If even the full text is partial, say so **whether or not it is opened** (2026-11-10 / codex:
                     shown only after opening, the warning was missed). Cutting silently makes you
                     press Allow believing "I saw it all" */}
@@ -223,7 +230,7 @@ export function Permissions({
                   </span>
                 ) : null}
                 {/* ★★ `p.hidden` is checked by the agent on the uncut input (the character may lie past the cut) */}
-                {p.hidden || hasHidden(p.summary, p.detail) ? (
+                {p.hidden || hasHidden(p.summary, p.detail, p.cwd) ? (
                   <span class="permmsg">
                     {t(
                       '⚠️ 見えない文字・文字の向きを変える文字が入っています（U+… の印で表示しています）。意図したものか確かめてください',

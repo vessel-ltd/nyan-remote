@@ -130,6 +130,13 @@ export interface DaemonHooks {
   ) => Promise<QuestionReply | undefined>
   /** A listed thread was closed by the daemon (the Codex counterpart of a session ending). Gets the row's `sessionId`. */
   onClosed?: (sessionId: string) => void
+  /**
+   * ★ A complete list of the loaded threads was read (each connect, the first included). `prefix`: this home's row ids;
+   * `loaded`: the row ids of every thread loaded now. Anything of this home that is not in it was closed — maybe while
+   * the line was down or the agent was off, when no `thread/closed` could reach us (codex review 2026-11-17, high).
+   * ⚠️ Only from a complete list (a partial one would end threads that are open).
+   */
+  onLoadedSnapshot?: (prefix: string, loaded: ReadonlySet<string>) => void
   /** The line has connected (initialized) to the daemon — each time, reconnects included */
   onConnected?: () => void
   log?: (line: string) => void
@@ -184,8 +191,11 @@ export interface CodexDaemonLine {
    * Read the newest turns of a thread (or the page behind `cursor`). `undefined` when it cannot be read now.
    * ⚠️ Only for a thread that is **a row or a history row right now**: an id from outside never reaches the daemon.
    *    (Measured: `thread/turns/list` on a closed thread does not load it.)
+   * `headersOnly`: the turns without their items (ids and statuses only). ⚠️⚠️ Used by every reader that does not show
+   *    the conversation (codex review 2026-11-17, medium): a full newest turn can be megabytes, and one over the frame
+   *    cap ends the whole line (every approval card with it) just to word a notification.
    */
-  turns(threadId: string, opts: { limit: number; cursor?: string }): Promise<TurnsPage | undefined>
+  turns(threadId: string, opts: { limit: number; cursor?: string; headersOnly?: boolean }): Promise<TurnsPage | undefined>
   /**
    * Record how the turn that just ended really ended (read back from the history). Tells `onChange` if the row changed.
    * `mark`: the status change it was settled for (`StatusChange.mark`); a newer status of the thread refuses it.
@@ -602,6 +612,10 @@ export function startCodexDaemonLine(opts: DaemonOptions): CodexDaemonLine {
         const gone = !book.waitsOnApproval(threadId) && (!listed.has(threadId) || book.has(threadId))
         if (gone) forgetDiffs(threadId)
       }
+      // ⚠️ The threads that became rows during the snapshot count as loaded too (the list may predate them)
+      const loaded = new Set<string>([...listed].map((id) => idPrefix + id))
+      for (const r of book.rows(rowsCtx)) loaded.add(r.sessionId)
+      hooks.onLoadedSnapshot?.(idPrefix, loaded)
     }
     hooks.onChange?.()
     // ★ A reconnect: a "needs you" that could not be sent while the line was down has no status change to carry it
@@ -716,7 +730,7 @@ export function startCodexDaemonLine(opts: DaemonOptions): CodexDaemonLine {
         limit: o.limit,
         // ★ Both stated explicitly (the defaults differ between turns and items; measured)
         sortDirection: 'desc',
-        itemsView: 'full',
+        itemsView: o.headersOnly === true ? 'notLoaded' : 'full',
         ...(o.cursor === undefined ? {} : { cursor: o.cursor }),
       })
       // ⚠️ A refusal is not remembered: right after a thread is created this method answers -32601 and works later

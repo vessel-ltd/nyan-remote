@@ -35,7 +35,7 @@ export const AUTO_GRACE_MS = 2000
 export interface CodexNotifyDeps {
   /** The row as the list shows it **now** (`undefined` = not listed any more) */
   row(threadId: string): SessionSummary | undefined
-  turns(threadId: string, opts: { limit: number }): Promise<TurnsPage | undefined>
+  turns(threadId: string, opts: { limit: number; headersOnly: true }): Promise<TurnsPage | undefined>
   /** `mark`: the change it was settled for (refused if the thread's status moved since) */
   setOutcome(threadId: string, outcome: TurnOutcome, mark: number): void
   /** Which status of the thread is current (`StatusChange.mark`); `undefined` = not listed */
@@ -88,7 +88,7 @@ export class CodexNotifier {
   }
 
   async #newestTurn(threadId: string): Promise<{ id: string; status: string | undefined } | undefined> {
-    const page = await this.#deps.turns(threadId, { limit: 1 })
+    const page = await this.#deps.turns(threadId, { limit: 1, headersOnly: true })
     const t = page?.turns[0]
     return t ? { id: t.id, status: t.status } : undefined
   }

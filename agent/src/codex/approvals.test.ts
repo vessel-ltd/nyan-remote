@@ -65,6 +65,7 @@ function setup(waiting: string[] = [T]) {
   const state = {
     waiting: new Set(waiting),
     resumeOk: true,
+    leaveOk: true,
     gate: Promise.resolve() as Promise<void>,
     immediate: undefined as PhoneDecision | undefined,
     /** A retry's wait: never over unless a test says so (so the other tests see exactly the joins they make) */
@@ -78,6 +79,7 @@ function setup(waiting: string[] = [T]) {
       if (guard && !guard()) return { ok: false, failure: { type: 'cancelled' } }
       calls.push({ method, params })
       if (method === 'thread/resume' && !state.resumeOk) return { ok: false, failure: { type: 'timeout', written: true } }
+      if (method === 'thread/unsubscribe' && !state.leaveOk) return { ok: false, failure: { type: 'timeout', written: false } }
       return { ok: true, result: {} }
     },
     respond: async (id, result, guard) => {
@@ -185,6 +187,46 @@ test('the thread stops waiting: cards go without an answer, then we leave the th
   assert.deepEqual(s.responses, [])
   assert.deepEqual(s.calls.map((c) => c.method), ['thread/resume', 'thread/unsubscribe'])
   assert.deepEqual(s.calls[1]!.params, { threadId: T })
+})
+
+test('★ a leave that fails is tried again, a bounded number of times; a new wait joins again meanwhile (codex review 2026-11-17, medium)', async () => {
+  const s = setup()
+  s.state.sleep = () => new Promise<void>((r) => setImmediate(r))
+  s.a.sync(T)
+  await tick()
+  s.state.leaveOk = false
+  s.state.waiting.delete(T)
+  s.a.sync(T)
+  for (let i = 0; i < 10; i++) await tick()
+  assert.equal(s.calls.filter((c) => c.method === 'thread/unsubscribe').length, JOIN_TRIES, 'tried again, but not forever')
+
+  // One failed leave, then it succeeds on the retry: no more leaves
+  const r = setup()
+  let wake!: () => void
+  r.state.sleep = () => new Promise<void>((w) => (wake = w))
+  r.a.sync(T)
+  await tick()
+  r.state.leaveOk = false
+  r.state.waiting.delete(T)
+  r.a.sync(T)
+  await tick()
+  r.state.leaveOk = true
+  wake()
+  await tick()
+  assert.deepEqual(r.calls.map((c) => c.method), ['thread/resume', 'thread/unsubscribe', 'thread/unsubscribe'])
+
+  // A failed leave is not "still joined": the thread waits again ⇒ joined again (the old membership may be gone)
+  const j = setup()
+  j.a.sync(T)
+  await tick()
+  j.state.leaveOk = false
+  j.state.waiting.delete(T)
+  j.a.sync(T)
+  await tick()
+  j.state.waiting.add(T)
+  j.a.sync(T)
+  await tick()
+  assert.deepEqual(j.calls.map((c) => c.method), ['thread/resume', 'thread/unsubscribe', 'thread/resume'])
 })
 
 test('stays joined while the thread still waits (a second approval needs no second join)', async () => {

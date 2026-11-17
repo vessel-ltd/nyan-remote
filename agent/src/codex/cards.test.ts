@@ -46,9 +46,22 @@ test('the card: a Codex yes/no card for the thread, with the row identity and th
       toolName: 'Bash',
       tool: 'codex',
       summary: 'touch /home/user/x',
+      cwd: '/home/user/elsewhere',
       at: AT,
     },
   )
+})
+
+test('★ the card says where the command runs; hidden characters there are flagged; a long one is cut and said (security review 2026-11-17, medium)', () => {
+  assert.equal(codexCard(approval({ cwd: '/home/user/secrets' }), row, 1, AT).cwd, '/home/user/secrets')
+  assert.notDeepEqual(codexCard(approval({ cwd: '/home/user/a' }), row, 1, AT), codexCard(approval({ cwd: '/home/user/b' }), row, 1, AT))
+  const noCwd = approval()
+  delete noCwd.cwd
+  assert.equal('cwd' in codexCard(noCwd, row, 1, AT), false)
+  assert.equal(codexCard(approval({ cwd: '/home/user/\u202Eatad' }), row, 1, AT).hidden, true)
+  const long = codexCard(approval({ cwd: '/' + 'a'.repeat(2000) }), row, 1, AT)
+  assert.equal(long.cwd?.length, 1000)
+  assert.equal(long.detailClipped, true)
 })
 
 test('the card: a long or multi-line command keeps its full text, and hidden characters are flagged', () => {

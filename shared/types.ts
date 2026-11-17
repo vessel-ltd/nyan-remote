@@ -585,6 +585,12 @@ export interface PermissionRequest {
    */
   hidden?: true
   /**
+   * ★★ Where the command runs, when the request says (a Codex command approval carries its own `cwd` / 2026-11-17 /
+   *    security review, medium). ⚠️ Without it, `rm -rf ./data` in a sensitive directory looked the same as in the
+   *    project. Third-party text: drawn through `Revealed`, and counted in `hidden`. Absent = not stated (Claude).
+   */
+  cwd?: string
+  /**
    * ⚠️ **Legacy**. Sentences like "このディレクトリを許可: …" that the agent turned into **Japanese sentences**.
    *    New UIs use {@link suggestionItems} and read this **only when that is absent (old agents)**.
    * ★ New agents keep sending it too (decided 2026-09-24): old UIs only read this field, and

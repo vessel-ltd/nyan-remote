@@ -24,7 +24,7 @@
 //   ⚠️ This is not fail-open (the dangerous side is "on", so falling back to off is the safe direction).
 //   ⚠️ When broken, **do not write** (keep the evidence / CLAUDE.md §2). ⇒ Turning it on is refused too.
 
-import { shortSessionId } from './codex/ids.ts'
+import { isCodexSessionId, shortSessionId } from './codex/ids.ts'
 import type { Interaction, PermissionRequest } from '../../shared/types.ts'
 import { requiresInteraction } from './claude/interaction.ts'
 import { readJsonFile, writeJson } from './state.ts'
@@ -317,6 +317,30 @@ export async function setAutoApprove(
   if (!sessionId) return { ok: false, reason: t('セッションが指定されていません', 'No session was specified.'), saved: false }
   // ★ When this toggle was asked (a session end after it cancels an "on" that is still waiting — see `endSessionAutoApprove`)
   const askedAt = ++seq
+  // ★ An "on" on its way is known at once (a Codex snapshot must be able to cancel it / `endCodexAutoApproveOutside`)
+  if (on) pendingOn.set(sessionId, (pendingOn.get(sessionId) ?? 0) + 1)
+  try {
+    return await toggle(sessionId, on, now, duration, who, askedAt)
+  } finally {
+    if (on) {
+      const n = (pendingOn.get(sessionId) ?? 1) - 1
+      if (n > 0) pendingOn.set(sessionId, n)
+      else pendingOn.delete(sessionId)
+    }
+  }
+}
+
+/** "On" toggles asked and not finished yet, per session (how many) */
+const pendingOn = new Map<string, number>()
+
+async function toggle(
+  sessionId: string,
+  on: boolean,
+  now: number,
+  duration: AutoApproveDuration,
+  who: string,
+  askedAt: number,
+): Promise<SetResult> {
   // ★★ **Serialize the whole toggle** (2026-09-07 codex, high #1).
   //
   // ⚠️⚠️ Only saving was serialized, and it broke like this:
@@ -405,6 +429,30 @@ export async function endSessionAutoApprove(sessionId: string): Promise<{ had: b
     const saved = await writeState([...state.active.values()].map((a) => a.entry))
     return saved.ok ? { ok: true, had: true } : { ok: false, had: true, reason: saved.reason }
   })
+}
+
+/**
+ * ★ A Codex home's loaded threads were listed in full (`onLoadedSnapshot`): end the entries of its threads that are not
+ * loaded. ⚠️⚠️ A thread that closed while the agent's line was down (or the agent was off) sent its `thread/closed` to
+ * nobody, so its entry outlived it and came back with the thread when it was opened again (codex review 2026-11-17, high).
+ * ⚠️ `prefix` must be a Codex row prefix (a Claude session is never ended here).
+ */
+export async function endCodexAutoApproveOutside(
+  prefix: string,
+  loaded: ReadonlySet<string>,
+): Promise<{ ended: number; failed: string | undefined }> {
+  if (state.kind !== 'ok' || !isCodexSessionId(prefix + 'x')) return { ended: 0, failed: undefined }
+  // ⚠️⚠️ An "on" still queued or saving counts too (round 2, high): it has no entry yet, and would install itself for
+  //    the closed thread after this ran. Ending it here cancels it (`cancelledBy`); one asked after this is not touched.
+  const candidates = new Set([...state.active.keys(), ...pendingOn.keys()])
+  const stale = [...candidates].filter((id) => id.startsWith(prefix) && !loaded.has(id))
+  let ended = 0
+  let failed: string | undefined
+  for (const r of await Promise.all(stale.map((id) => endSessionAutoApprove(id)))) {
+    if (r.had) ended++
+    if (!r.ok) failed = r.reason
+  }
+  return { ended, failed }
 }
 
 /** Ticks for every toggle asked and every session end (orders them; see `endSessionAutoApprove`) */

@@ -17,6 +17,7 @@
 import { createHash } from 'node:crypto'
 import type { PermissionRequest, SessionSummary } from '../../../shared/types.ts'
 import { shouldAutoApprove } from '../autoApprove.ts'
+import { hasHidden } from '../../../shared/reveal.ts'
 import { detailOf, hiddenIn, summarize, waitForDecision, withGeneration } from '../permission.ts'
 import { ASK_USER_QUESTION } from '../claude/interaction.ts'
 import type { CodexApproval, PhoneDecision, QuestionReply } from './approvals.ts'
@@ -46,6 +47,8 @@ export function codexCard(approval: CodexApproval, row: SessionSummary, generati
   const input = { command: approval.command }
   const detail = detailOf(TOOL_NAME, input)
   const id = cardId(approval, row, generation, 'command')
+  const cwd = approval.cwd
+  const cwdClipped = cwd !== undefined && cwd.length > CWD_MAX
   return {
     key: withGeneration(`codex:${id}`),
     machine: row.machine,
@@ -56,12 +59,18 @@ export function codexCard(approval: CodexApproval, row: SessionSummary, generati
     toolName: TOOL_NAME,
     tool: 'codex',
     summary: summarize(TOOL_NAME, input),
-    ...(detail ? { detail: detail.text, detailClipped: detail.clipped } : {}),
-    // ★ Checked on the whole command (invisible / direction-changing characters; `shared/reveal.ts`)
-    ...(hiddenIn(TOOL_NAME, input) ? { hidden: true as const } : {}),
+    ...(detail ? { detail: detail.text, detailClipped: detail.clipped || cwdClipped } : cwdClipped ? { detailClipped: true } : {}),
+    // ★★ Where it runs (security review 2026-11-17, medium): the request's own directory, which can be anywhere —
+    //    the row's project alone made a command in a sensitive directory look like one in the project.
+    ...(cwd === undefined ? {} : { cwd: cwd.slice(0, CWD_MAX) }),
+    // ★ Checked on the whole command and the whole directory (invisible / direction-changing characters; `shared/reveal.ts`)
+    ...(hiddenIn(TOOL_NAME, input) || (cwd !== undefined && hasHidden(cwd)) ? { hidden: true as const } : {}),
     at,
   }
 }
+
+/** A directory longer than this is cut, and the card says it is not all there (`detailClipped`) */
+const CWD_MAX = 1000
 
 export interface CardDeps {
   generation(): number

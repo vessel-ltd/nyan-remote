@@ -403,6 +403,14 @@ export function openTunnel(o: {
       return { ok: false, fatal: true, reason: decoded.reason }
     }
     const request = decoded.value
+    // ⚠️⚠️ A number still in use is a broken peer (security review 2026-11-17, medium): the phone numbers its requests
+    //    upwards and never reuses one, and a second `/events` under a live number replaced the first in `streams`
+    //    without closing it — a subscription no cleanup could reach any more. ⇒ The tunnel is closed.
+    if (inflight.has(request.id) || streams.has(request.id)) {
+      const reason = t('使用中の番号の要求です', 'A request reused a number still in use')
+      await enqueueSend(FRAME.close, encodeClose({ reason })).catch(() => undefined)
+      return { ok: false, fatal: true, reason }
+    }
 
     // ★★ if revoked mid-subscription, stop there (per-request authentication alone
     //   **does not apply revocation to a long-open `/events`** / continuation of §14.1.2.21)

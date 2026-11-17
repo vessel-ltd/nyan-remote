@@ -10,7 +10,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import { hostAllowed } from './hostCheck.ts'
 import { watchServe } from './tailscale.ts'
 import { devMode } from './auth.ts'
-import { autoApproveList, endSessionAutoApprove, loadAutoApprove, setAutoApproveExpiryHandler } from './autoApprove.ts'
+import { autoApproveList, endCodexAutoApproveOutside, endSessionAutoApprove, loadAutoApprove, setAutoApproveExpiryHandler } from './autoApprove.ts'
 import { discoverConfigDirs } from './claude/configDirs.ts'
 import { seedHookState } from './claude/hookState.ts'
 import { startSessionWatch } from './claude/sessionWatch.ts'
@@ -144,6 +144,15 @@ async function main(): Promise<void> {
             .then((r) => {
               if (r.had) broadcast({ type: 'sessions-changed', at: new Date().toISOString() })
               if (!r.ok) console.warn(`[auto] ⚠️ could not save the end of auto-approve for a closed Codex thread (${r.reason})`)
+            })
+            .catch(() => undefined)
+        },
+        // ★ Threads that closed while nobody listened (line down, agent off): their entries end too
+        onLoadedSnapshot: (prefix, loaded) => {
+          void endCodexAutoApproveOutside(prefix, loaded)
+            .then((r) => {
+              if (r.ended > 0) broadcast({ type: 'sessions-changed', at: new Date().toISOString() })
+              if (r.failed) console.warn(`[auto] ⚠️ could not save the end of auto-approve for a closed Codex thread (${r.failed})`)
             })
             .catch(() => undefined)
         },

@@ -44,7 +44,9 @@ function world() {
   }
   const notifier = new CodexNotifier({
     row: (id) => book.rows({ machine: 'pc-a', account: '.codex', idPrefix: '' }).find((r) => r.sessionId === id),
-    turns: async (): Promise<TurnsPage | undefined> => {
+    turns: async (_id, o): Promise<TurnsPage | undefined> => {
+      // ★ The notifier never asks for the conversation (codex review 2026-11-17, medium)
+      assert.equal(o.headersOnly, true)
       const t = w.history[Math.min(w.reads, w.history.length - 1)]
       w.reads++
       return t ? { turns: [{ id: t.id, status: t.status as never, items: [], skipped: 0 }], nextCursor: null, skipped: 0 } : undefined

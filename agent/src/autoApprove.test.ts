@@ -38,6 +38,7 @@ import {
   autoApproveBroken,
   autoApproveFor,
   autoApproveList,
+  endCodexAutoApproveOutside,
   endSessionAutoApprove,
   loadAutoApprove,
   resetAutoApprove,
@@ -614,4 +615,43 @@ test('an end that arrives while the "on" is being written: not taken, and the fi
   assert.equal(autoApproveFor(SESSION), undefined)
   const stored = JSON.parse(await readFile(join(process.env['NYAN_REMOTE_STATE_DIR']!, AUTO_APPROVE_FILE), 'utf8')) as { entries: Array<{ id: string }> }
   assert.deepEqual(stored.entries, [], 'a restart would revive it')
+})
+
+test('★★ a complete list of a Codex home ends the entries of its threads that are not loaded, and nothing else (codex review 2026-11-17, high)', async (t) => {
+  await withStateDir(t)
+  const prefix = 'codex-0123456789abcdef-'
+  const open = prefix + 'open'
+  const gone = prefix + 'gone'
+  const otherHome = 'codex-fedcba9876543210-gone'
+  for (const id of [open, gone, otherHome, SESSION]) assert.equal((await setAutoApprove(id, true)).ok, true)
+  const r = await endCodexAutoApproveOutside(prefix, new Set([open]))
+  assert.deepEqual(r, { ended: 1, failed: undefined })
+  assert.equal(autoApproveFor(gone), undefined)
+  assert.ok(autoApproveFor(open), 'a loaded thread keeps it')
+  assert.ok(autoApproveFor(otherHome), 'another home is not this list')
+  assert.ok(autoApproveFor(SESSION), 'a Claude session is never ended here')
+  // ⚠️ A prefix that is not a Codex one ends nothing (a Claude id would match an empty prefix)
+  assert.deepEqual(await endCodexAutoApproveOutside('', new Set()), { ended: 0, failed: undefined })
+  assert.ok(autoApproveFor(SESSION))
+  const stored = JSON.parse(await readFile(join(process.env['NYAN_REMOTE_STATE_DIR']!, AUTO_APPROVE_FILE), 'utf8')) as { entries: Array<{ id: string }> }
+  assert.deepEqual(stored.entries.map((e) => e.id).sort(), [SESSION, open, otherHome].sort())
+})
+
+test('★★ an "on" still saving when a Codex snapshot leaves its thread out is cancelled; one asked after it is kept (codex review 2026-11-17, round 2, high)', async (t) => {
+  await withStateDir(t)
+  const prefix = 'codex-0123456789abcdef-'
+  const gone = prefix + 'gone'
+  const later = prefix + 'later'
+  // Asked, not awaited: queued or saving when the snapshot comes
+  const on = setAutoApprove(gone, true)
+  const r = endCodexAutoApproveOutside(prefix, new Set())
+  // An "on" asked after the snapshot is the phone's new wish (the thread was loaded again meanwhile)
+  const onLater = setAutoApprove(later, true)
+  assert.equal((await on).ok, true)
+  assert.deepEqual(await r, { ended: 1, failed: undefined })
+  assert.equal((await onLater).ok, true)
+  assert.equal(autoApproveFor(gone), undefined, '⚠️⚠️ the pending "on" installed itself for the closed thread')
+  assert.ok(autoApproveFor(later))
+  const stored = JSON.parse(await readFile(join(process.env['NYAN_REMOTE_STATE_DIR']!, AUTO_APPROVE_FILE), 'utf8')) as { entries: Array<{ id: string }> }
+  assert.deepEqual(stored.entries.map((e) => e.id), [later])
 })

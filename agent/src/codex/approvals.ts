@@ -156,6 +156,8 @@ export class CodexApprovals {
   readonly #cards = new Map<string, Card>()
   /** Per thread: how many joins in a row failed */
   readonly #joinFailures = new Map<string, number>()
+  /** Leaves (`thread/unsubscribe`) that failed, per thread: tried again like a join */
+  readonly #leaveFailures = new Map<string, number>()
   #disposed = false
 
   constructor(deps: ApprovalsDeps) {
@@ -191,6 +193,7 @@ export class CodexApprovals {
       if (res.ok) {
         this.#joined.add(threadId)
         this.#joinFailures.delete(threadId)
+        this.#leaveFailures.delete(threadId)
         return
       }
       this.#deps.log?.(`[codex] could not join a thread waiting on an approval (${res.failure.type})`)
@@ -207,9 +210,27 @@ export class CodexApprovals {
       void this.#deps.sleep(JOIN_RETRY_MS * n).then(() => this.sync(threadId))
       return
     }
-    if (!waiting && this.#joined.has(threadId) && !this.#hasCard(threadId)) {
+    // ★ A leave that failed earlier is a membership we may still hold: left again (below)
+    if (!waiting && (this.#joined.has(threadId) || this.#leaveFailures.has(threadId)) && !this.#hasCard(threadId)) {
       this.#joined.delete(threadId)
-      await this.#deps.call('thread/unsubscribe', { threadId })
+      const res = await this.#deps.call('thread/unsubscribe', { threadId })
+      if (res.ok || res.failure.type === 'cancelled' || this.#disposed) {
+        this.#leaveFailures.delete(threadId)
+        return
+      }
+      // ⚠️⚠️ Not known to be left (codex review 2026-11-17, medium): a leave that timed out behind a slow line was never
+      //    written, and while we stay subscribed the daemon keeps the thread loaded after the PC closes it (its close,
+      //    and the end of its auto-approve, never come). ⇒ Tried again, bounded like a join.
+      // ⚠️ Not counted as joined meanwhile: a new wait joins again (a second join only replays the requests), never
+      //    "already joined" on a membership that may be gone.
+      const n = (this.#leaveFailures.get(threadId) ?? 0) + 1
+      this.#deps.log?.(`[codex] could not leave a thread after its approval (${res.failure.type})`)
+      if (n >= JOIN_TRIES) {
+        this.#leaveFailures.delete(threadId)
+        return
+      }
+      this.#leaveFailures.set(threadId, n)
+      void this.#deps.sleep(JOIN_RETRY_MS * n).then(() => this.sync(threadId))
     }
   }
 

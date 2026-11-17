@@ -578,6 +578,25 @@ test('★★★ close (with a number) stops the subscription', async (t) => {
   assert.deepEqual((await drain(w)).events, [])
 })
 
+test('★★★★ a request under a number still in use closes the tunnel, and no subscription is left out of reach (security review 2026-11-17, medium)', async (t) => {
+  await boot(t)
+  const w = await wire(t)
+  await ask(w, { id: 3, method: 'GET', path: '/events' })
+  assert.equal(w.tunnel.openStreams, 1)
+  await drain(w)
+
+  const res = await ask(w, { id: 3, method: 'GET', path: '/events' })
+  assert.equal(res.ok, false)
+  assert.ok(!res.ok && res.fatal)
+  // ★ The second one never became a subscription; the first one is still the one cleanup reaches
+  assert.equal(w.tunnel.openStreams, 1)
+  w.tunnel.abandon()
+  assert.equal(w.tunnel.openStreams, 0)
+  broadcast({ type: 'sessions-changed', at: '2026-09-08T00:00:00.000Z' })
+  await w.tunnel.flush()
+  assert.deepEqual((await drain(w)).events, [], '⚠️⚠️ a subscription outlived the tunnel')
+})
+
 test('★★★ close (without a number) closes the whole tunnel', async (t) => {
   await boot(t)
   const w = await wire(t)
