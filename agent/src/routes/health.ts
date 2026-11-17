@@ -36,6 +36,8 @@ export const AGENT_FEATURES: AgentFeature[] = [
   'usage',
   // ★ Instructions up to 64 KB (`MAX_SEND_BYTES` / long ones as a bracketed paste / 2026-11-17)
   'long-send',
+  // ★ Files from the phone (`POST /uploads` … / 2026-11-17)
+  'uploads',
 ]
 
 export async function health(): Promise<AgentHealth> {

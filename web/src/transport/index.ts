@@ -21,6 +21,8 @@ import type {
   PermissionRequest,
   PushStatus,
   UsageResponse,
+  UploadFinishResult,
+  UploadStartResult,
   SessionSummary,
   SessionsPage,
   DevicesResult,
@@ -102,7 +104,15 @@ export interface Transport {
    *    a `via:'inbox'` message appearing in the thread (ARCHITECTURE §9.10).
    */
   /** ★ Returns `route` (used by the screen for matching / `ui/pending.ts`) */
-  sendMessage(sessionId: string, text: string): Promise<MessageSendResult>
+  sendMessage(sessionId: string, text: string, attachments?: readonly string[]): Promise<MessageSendResult>
+  /**
+   * ★ Files from the phone (2026-11-17 / agent `uploads.ts`): start → chunks in order → finish ⇒ an id to send with the
+   *   next instruction. ⚠️ Only with the `uploads` feature
+   */
+  uploadStart(name: string, size: number, sha256: string): Promise<UploadStartResult>
+  uploadChunk(id: string, offset: number, data: string): Promise<{ received: number }>
+  uploadFinish(id: string): Promise<UploadFinishResult>
+  uploadCancel(id: string): Promise<{ ok: true }>
   /**
    * ★ Stop the response (send ESC once / HANDOFF hole 1).
    *

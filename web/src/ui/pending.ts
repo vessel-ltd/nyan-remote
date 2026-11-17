@@ -173,11 +173,12 @@ export function noteArrivals(pending: PendingSend[], arrivals: readonly ArrivedE
  * ★ The send reply came back. ⚠️ On failure (`route === null`) drop it (not sent = do not leave it stacked).
  *   If it already arrived (a route-compatible record is noted), drop it. Otherwise attach the route and wait.
  */
-export function finishSend(pending: PendingSend[], id: number, route: PendingSend['route'] | null): PendingSend[] {
+export function finishSend(pending: PendingSend[], id: number, route: PendingSend['route'] | null, delivered?: string): PendingSend[] {
   const i = pending.findIndex((p) => p.id === id)
   if (i < 0) return pending
   const p = pending[i]!
-  const settled: PendingSend = { text: p.text, at: p.at, id: p.id, ...(route ? { route } : {}) }
+  // ★ The agent may have added to the text (attachment lines): the record will hold that (2026-11-17)
+  const settled: PendingSend = { text: delivered ?? p.text, at: p.at, id: p.id, ...(route ? { route } : {}) }
   // ★★ The noted records are **offered to every settled send**, not only this one (codex round 2, medium #1):
   //   a record noted here by an exact fit may belong to an older keystroke send (`ok` joined to a PC draft `looks `)
   //   while this reply says `inbox`; it is already marked `used`, so nothing else would ever offer it again.

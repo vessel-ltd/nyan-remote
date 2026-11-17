@@ -350,3 +350,18 @@ test('★ without a terminal and without --yes it asks nothing and changes nothi
   assert.equal(r.status, 1)
   assert.match(r.stdout, /--yes/)
 })
+
+test('★ --purge removes the folder for attachments only when it holds nothing but the agent\'s names (2026-11-17)', async () => {
+  const { uploadsDirProblem } = await import('./uninstall.mjs')
+  const d = mkdtempSync(join(tmpdir(), 'nyan-up-'))
+  try {
+    assert.equal(uploadsDirProblem(join(d, 'missing')), 'absent')
+    writeFileSync(join(d, `20261117-000000-${'a'.repeat(32)}.pdf`), '')
+    writeFileSync(join(d, `.part-${'b'.repeat(32)}`), '')
+    assert.equal(uploadsDirProblem(d), undefined)
+    writeFileSync(join(d, 'notes.txt'), '')
+    assert.match(uploadsDirProblem(d) ?? '', /notes\.txt/)
+  } finally {
+    rmSync(d, { recursive: true, force: true })
+  }
+})

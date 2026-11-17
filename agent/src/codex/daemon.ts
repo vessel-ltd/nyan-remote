@@ -67,6 +67,14 @@ export function codexSessionPrefix(homeId: string): string {
 
 export { isCodexSessionId } from './ids.ts'
 
+/**
+ * ★ The input of a turn sent from the phone. Images come **first**: the thread shows them as `[localImage]` lines, so
+ *   the record still ends with what was typed (the phone's "sending" bubble matches it / codex review round 10)
+ */
+export function codexInput(text: string, images: readonly string[] = []): Array<Record<string, unknown>> {
+  return [...images.map((path) => ({ type: 'localImage', path })), { type: 'text', text }]
+}
+
 export type SocketLook =
   | { type: 'absent' }
   /** `ageMs`: how long ago the socket itself was created; `key`: identity of this socket (changes when the daemon restarts) */
@@ -211,7 +219,7 @@ export interface CodexDaemonLine {
    *    override (each of those lasts beyond this turn).
    * ⚠️ Only for a row that is idle right now. The caller validates the text.
    */
-  send(threadId: string, text: string): Promise<CodexSendResult>
+  send(threadId: string, text: string, images?: readonly string[]): Promise<CodexSendResult>
   /**
    * ★ Compact the thread's context (`thread/compact/start`; the TUI's own `/compact` / docs/CODEX.md §5.8).
    * ⚠️⚠️ Only for a row that is idle right now: the daemon aborts any running or waiting turn to compact
@@ -752,7 +760,9 @@ export function startCodexDaemonLine(opts: DaemonOptions): CodexDaemonLine {
       if (book.setOutcome(threadId, outcome, mark)) hooks.onChange?.()
     },
     mark: (threadId) => book.mark(threadId),
-    send: (threadId, text) => startOnIdle(threadId, 'turn/start', { threadId, input: [{ type: 'text', text }] }),
+    // ★ Images from the phone go as `localImage` items (measured: the TUI shows `[Image #1]` and the model sees it).
+    //   ⚠️ The paths are the agent's own (`uploads.ts`), never from the phone
+    send: (threadId, text, images = []) => startOnIdle(threadId, 'turn/start', { threadId, input: codexInput(text, images) }),
     compact: (threadId) => startOnIdle(threadId, 'thread/compact/start', { threadId }),
     rateLimits: async () => {
       const rpc = liveRpc

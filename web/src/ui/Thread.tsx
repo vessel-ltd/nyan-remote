@@ -20,6 +20,7 @@ import { Composer } from './Composer.tsx'
 import { followAction } from './follow.ts'
 import { alreadyInTranscript, sendLimitBytes, type InflightMessage } from '../../../shared/types.ts'
 import { ctxText, formatTokens, modelText } from './tokens.ts'
+import { prepareFile, uploadFile } from './attach.ts'
 import { beginSend, consumeAfterReload, finishSend, noteArrivals, type PendingSend } from './pending.ts'
 import { Permissions } from './Permissions.tsx'
 import { sendMark } from './sendMark.ts'
@@ -617,7 +618,7 @@ export function Thread({
     return () => clearInterval(t)
   }, [needsClock])
 
-  const sendMessage = async (text: string): Promise<void> => {
+  const sendMessage = async (text: string, attachments: string[] = []): Promise<void> => {
     // ★★ **Stack at the moment of sending** (2026-09-24 / codex round 25). The same text arriving while awaiting the reply is noted by `noteArrivals`,
     //   and `finishSend` confirms once the reply reveals the route (keystrokes or inbox).
     //   ⚠️⚠️ Do not go back to stacking after the reply (searching a buffer): the buffer cap, reloads and arrivals before the reply left "Sending…" behind.
@@ -626,7 +627,7 @@ export function Thread({
     requestAnimationFrame(() => bottomRef.current?.scrollIntoView({ behavior: 'smooth' }))
     let res: Awaited<ReturnType<typeof transport.sendMessage>>
     try {
-      res = await transport.sendMessage(sessionId, text)
+      res = await transport.sendMessage(sessionId, text, attachments)
     } catch (err) {
       // ⚠️ Not sent ⇒ remove what was stacked (the input box shows the error)
       setPending((prev) => finishSend(prev, id, null))
@@ -634,7 +635,7 @@ export function Thread({
     }
     setNote(undefined)
     // ★ Confirmed by `route`. Keystroke deliveries carry no `via`, so without it matching fails (pending.ts)
-    setPending((prev) => finishSend(prev, id, res.route))
+    setPending((prev) => finishSend(prev, id, res.route, typeof res.delivered === 'string' ? res.delivered : undefined))
   }
 
   /**
@@ -1200,6 +1201,12 @@ export function Thread({
         model={session ? modelText(session) : undefined}
         // ★ 64 KB where the agent takes it (`long-send`), else the old 4 KB (no 400 from an older agent)
         maxBytes={sendLimitBytes(agentFeatures)}
+        // ★ Files (2026-11-17): only where the agent takes them (`uploads`) and this session can be sent to
+        attach={
+          agentFeatures?.includes('uploads') && canSend && canSendTo(session, agentFeatures)
+            ? { upload: (file, onProgress, control) => prepareFile(file).then((p) => uploadFile(transport, p, onProgress, control)) }
+            : undefined
+        }
         onSend={sendMessage}
       />
 

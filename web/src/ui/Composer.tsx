@@ -10,10 +10,23 @@
 
 import { useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks'
 
-import { commandLikeMessage, sendTooLong } from '../../../shared/types.ts'
+import { commandLikeMessage, MAX_ATTACHMENTS, sendTooLong, type UploadFinishResult } from '../../../shared/types.ts'
+import { acceptAttr, type UploadControl } from './attach.ts'
+
 import { t } from '../../../shared/i18n.ts'
 import { perMessageNote } from './sendMark.ts'
 import { Nyan } from './Nyan.tsx'
+
+/** One file next to the input box */
+interface AttachItem {
+  key: number
+  name: string
+  state: 'uploading' | 'ready' | 'failed'
+  progress: number
+  id?: string
+  error?: string
+  control: UploadControl
+}
 
 const DRAFT_PREFIX = 'tmux-agent.draft.'
 /** Maximum height the input grows to (px). Keep in sync with the CSS max-height */
@@ -32,6 +45,7 @@ export function Composer({
   ctx,
   model,
   maxBytes,
+  attach,
   onSend,
 }: {
   sessionId: string
@@ -74,10 +88,20 @@ export function Composer({
    * ⚠️ Required: a caller that forgot it must not get either limit by default
    */
   maxBytes: number
-  onSend: (text: string) => Promise<void>
+  /**
+   * ★ Files (2026-11-17 / `ui/attach.ts`): absent ⇒ no 📎 (an agent without `uploads`, or a session it cannot take).
+   *   `upload` prepares and sends one file and resolves with the agent's id for it.
+   */
+  attach?: {
+    upload(file: File, onProgress: (fraction: number) => void, control: UploadControl): Promise<UploadFinishResult>
+  }
+  /** `attachments`: ids of files already uploaded (only finished ones) */
+  onSend: (text: string, attachments: string[]) => Promise<void>
 }) {
   const [text, setText] = useState('')
   const [sending, setSending] = useState(false)
+  const [files, setFiles] = useState<AttachItem[]>([])
+  const fileSeq = useRef(0)
   const [error, setError] = useState<string>()
   const area = useRef<HTMLTextAreaElement | null>(null)
   const box = useRef<HTMLDivElement | null>(null)
@@ -196,14 +220,43 @@ export function Composer({
   // ★ Decided in one place, `ui/sendMark.ts` (⚠️ same shape as the agent = strip control chars, then look at the start)
   const note = perMessageNote(text)
   // ⚠️⚠️ `/` `!` at the start: never sendable (the agent refuses it too / `commandLikeMessage`)
-  const canSend = !disabled && !sending && text.trim().length > 0 && !tooLong && note === null
+  const ready = files.filter((f) => f.state === 'ready' && f.id !== undefined)
+  // ★ Files alone may go (with a short line); never while one is still on its way or failed (remove it first)
+  const filesOk = files.every((f) => f.state === 'ready')
+  const canSend = !disabled && !sending && (text.trim().length > 0 || ready.length > 0) && filesOk && !tooLong && note === null
+
+  const pick = (list: FileList | null): void => {
+    if (!attach || !list) return
+    const room = MAX_ATTACHMENTS - files.length
+    if (list.length > room) setError(t(`添付は ${MAX_ATTACHMENTS} 個までです`, `Up to ${MAX_ATTACHMENTS} attachments.`))
+    for (const file of [...list].slice(0, Math.max(0, room))) {
+      const item: AttachItem = { key: ++fileSeq.current, name: file.name || 'file', state: 'uploading', progress: 0, control: { cancelled: false } }
+      setFiles((prev) => [...prev, item])
+      const update = (patch: Partial<AttachItem>): void => setFiles((prev) => prev.map((f) => (f.key === item.key ? { ...f, ...patch } : f)))
+      attach
+        .upload(file, (progress) => update({ progress }), item.control)
+        .then((done) => update({ state: 'ready', progress: 1, id: done.id, name: done.name }))
+        .catch((err: unknown) => {
+          if (!item.control.cancelled) update({ state: 'failed', error: err instanceof Error ? err.message : String(err) })
+        })
+    }
+  }
+
+  const unpick = (key: number): void => {
+    // ⚠️ Stops one on its way (the agent drops what arrived); a finished one is just not attached
+    const f = files.find((x) => x.key === key)
+    if (f) f.control.cancelled = true
+    setFiles((prev) => prev.filter((x) => x.key !== key))
+  }
 
   const send = async () => {
     if (!canSend) return
     setSending(true)
     setError(undefined)
     try {
-      await onSend(text)
+      const ids = ready.map((f) => f.id as string)
+      await onSend(text.trim() === '' && ids.length > 0 ? t('添付したファイルを見てください。', 'Please look at the attached files.') : text, ids)
+      setFiles([])
       setText('')
       try {
         localStorage.removeItem(draftKey(sessionId))
@@ -241,7 +294,40 @@ export function Composer({
           ) : null}
         </p>
       ) : null}
+      {/* ★ Files waiting to go with the next instruction (name, progress, ×). The name is shown as text only */}
+      {files.length > 0 ? (
+        <ul class="attachlist">
+          {files.map((f) => (
+            <li key={f.key} class={`attachitem ${f.state}`}>
+              <span class="attachname">{f.name}</span>
+              <span class="attachstate">
+                {f.state === 'uploading' ? `${Math.round(f.progress * 100)}%` : f.state === 'ready' ? '✓' : f.error}
+              </span>
+              <button type="button" class="attachremove" aria-label={t('外す', 'Remove')} onClick={() => unpick(f.key)}>
+                ×
+              </button>
+            </li>
+          ))}
+        </ul>
+      ) : null}
       <div class="composerrow">
+        {attach ? (
+          <label class={`composerattach${disabled || sending || files.length >= MAX_ATTACHMENTS ? ' off' : ''}`} aria-label={t('ファイルを添付', 'Attach files')}>
+            📎
+            <input
+              type="file"
+              multiple
+              accept={acceptAttr()}
+              disabled={disabled || sending || files.length >= MAX_ATTACHMENTS}
+              onChange={(e) => {
+                const input = e.currentTarget as HTMLInputElement
+                pick(input.files)
+                // ⚠️ Cleared so the same file can be picked again
+                input.value = ''
+              }}
+            />
+          </label>
+        ) : null}
         <textarea
           ref={area}
           class="composerinput"

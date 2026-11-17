@@ -27,7 +27,7 @@ import type {
   UsageResponse,
   SessionsPage,
 } from '../../../shared/types.ts'
-import { sendTimeoutMs } from '../../../shared/types.ts'
+import { sendTimeoutMs, UPLOAD_CHUNK_TIMEOUT_MS, type UploadFinishResult, type UploadStartResult } from '../../../shared/types.ts'
 import type { AgentEndpoint } from '../endpoints.ts'
 import { httpWire } from './http.ts'
 import type { LogQuery, Transport } from './index.ts'
@@ -162,14 +162,31 @@ export class AgentTransport implements Transport {
   }
 
   /** ★ Send an instruction (M4-2). The agent returns failure reasons as text, so show them as-is */
-  sendMessage(sessionId: string, text: string): Promise<MessageSendResult> {
+  sendMessage(sessionId: string, text: string, attachments: readonly string[] = []): Promise<MessageSendResult> {
     // ★ A long one waits longer (a weak mobile line: "timed out" for a text that arrived invites a second send)
     return this.#call<MessageSendResult>(
       'POST',
       `/sessions/${encodeURIComponent(sessionId)}/message`,
-      { text },
+      // ⚠️ Ids only (the agent owns the paths); no key at all without files (an older agent sees what it always saw)
+      { text, ...(attachments.length > 0 ? { attachments: [...attachments] } : {}) },
       sendTimeoutMs(text),
     )
+  }
+
+  uploadStart(name: string, size: number, sha256: string): Promise<UploadStartResult> {
+    return this.post<UploadStartResult>('/uploads', { name, size, sha256 })
+  }
+
+  uploadChunk(id: string, offset: number, data: string): Promise<{ received: number }> {
+    return this.#call<{ received: number }>('POST', `/uploads/${encodeURIComponent(id)}/chunk`, { offset, data }, UPLOAD_CHUNK_TIMEOUT_MS)
+  }
+
+  uploadFinish(id: string): Promise<UploadFinishResult> {
+    return this.post<UploadFinishResult>(`/uploads/${encodeURIComponent(id)}/finish`)
+  }
+
+  uploadCancel(id: string): Promise<{ ok: true }> {
+    return this.post<{ ok: true }>(`/uploads/${encodeURIComponent(id)}/cancel`)
   }
 
   /**

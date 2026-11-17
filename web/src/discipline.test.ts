@@ -641,7 +641,7 @@ test('★★ Thread.tsx passes the send result\'s `route` to the optimistic row 
   // ★ Matching what arrived while sending (2026-08-23; without it "can't confirm" lingers)
   // ★★ Queue at the moment of sending and settle on the reply (2026-09-24 / codex round 25 / pending.ts)
   assert.match(thread.text, /setPending\(\(prev\) => beginSend\(prev, id, text, Date\.now\(\)\)\)/, 'not queued at the moment of sending')
-  assert.match(thread.text, /finishSend\(prev, id, res\.route\)/, 'not settled on the reply')
+  assert.match(thread.text, /finishSend\(prev, id, res\.route[,)]/, 'not settled on the reply')
   assert.match(thread.text, /finishSend\(prev, id, null\)/, 'not removed when sending failed')
   assert.match(thread.text, /noteArrivals\(prev, page\.entries, usedRef\.current\)/, 'not matched against arrivals')
   assert.doesNotMatch(thread.text, /registerPending\(|arrivalsRef/, '⚠️⚠️ back to queuing after the reply')

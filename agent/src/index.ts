@@ -14,6 +14,7 @@ import { autoApproveList, endCodexAutoApproveOutside, endSessionAutoApprove, loa
 import { discoverConfigDirs } from './claude/configDirs.ts'
 import { seedHookState } from './claude/hookState.ts'
 import { startSessionWatch } from './claude/sessionWatch.ts'
+import { uploads } from './uploads.ts'
 import { CODEX_FOLLOW_TICK_MS, codexFollowTick, startCodex } from './codex/run.ts'
 import { codexPayload } from './codex/notify.ts'
 import { sendToAll } from './push.ts'
@@ -212,6 +213,8 @@ async function main(): Promise<void> {
     socket.end('HTTP/1.1 400 Bad Request\r\n\r\n')
   })
 
+  // ★ Files from the phone: expired uploads and week-old files go on a timer, not only when someone uploads (uploads.ts)
+  uploads.startSweeping()
   server.listen(cfg.port, cfg.host, () => {
     console.log(`[agent] nyan-remote ${AGENT_VERSION} on ${machineName()}`)
     const badName = machineNameProblem(config().machineName)

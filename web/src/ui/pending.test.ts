@@ -255,3 +255,21 @@ test('★★ a failed send gives back what it noted (codex round 4, medium #1)',
   // ★ A failure with nothing noted just drops the send
   assert.deepEqual(finishSend([{ id: 1, text: 'a', at: 1, route: 'keys' }, ...beginSend([], 2, 'b', 2)], 2, null).map((x) => x.id), [1])
 })
+
+test('★ attachments: an inbox delivery of the text the agent added to is matched by what it delivered (codex review)', () => {
+  const delivered = 'スマホから添付したファイル:\n- /home/user/.local/share/nyan-remote/uploads/x.pdf （PDF・1 KB）\n\nlook'
+  // The record arrives after the reply
+  let p = beginSend([], 1, 'look', 1000)
+  p = finishSend(p, 1, 'inbox', delivered)
+  p = noteArrivals(p, [{ kind: 'user', via: 'inbox', text: delivered, at: '2026-11-17T00:00:01.000Z' }])
+  assert.deepEqual(p, [], 'still "sending" after it arrived')
+  // …or while the reply is on its way
+  let q = beginSend([], 2, 'look', 1000)
+  q = noteArrivals(q, [{ kind: 'user', via: 'inbox', text: delivered, at: '2026-11-17T00:00:01.000Z' }])
+  q = finishSend(q, 2, 'inbox', delivered)
+  assert.deepEqual(q, [])
+  // ⚠️ Without `delivered`, the inbox stays an exact match (the typed text alone does not clear it)
+  let r = finishSend(beginSend([], 3, 'look', 1000), 3, 'inbox')
+  r = noteArrivals(r, [{ kind: 'user', via: 'inbox', text: delivered, at: '2026-11-17T00:00:02.000Z' }])
+  assert.equal(r.length, 1)
+})

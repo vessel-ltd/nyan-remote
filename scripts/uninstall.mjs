@@ -25,6 +25,7 @@ import { basename, dirname, join, resolve, sep } from 'node:path'
 import { createInterface } from 'node:readline/promises'
 import { fileURLToPath } from 'node:url'
 import { t } from '../shared/i18n.ts'
+import { isUploadName, uploadsDirFor } from '../shared/uploadNames.ts'
 import { initCliLang } from './lib/lang.mjs'
 import { isMain } from './lib/isMain.mjs'
 import { launchdLogPath, launchdPlistPath, serviceKind } from './lib/service.mjs'
@@ -176,6 +177,26 @@ export function oldTrees({ root, stateDir, home, list = readdirSync, exists = ex
 /** ★ Is this entry of the state directory one we write? (a temp/backup copy of one counts) */
 export function isStateEntry(name) {
   return [...STATE_FILES, ...STATE_DIRS].some((k) => name === k || name.startsWith(`${k}.tmp`) || name.startsWith(`${k}.bak`) || name.startsWith(`${k}.new-`))
+}
+
+/**
+ * ★ May the folder for attachments be removed with `--purge`? A real directory (not a link) holding only names the
+ *   agent writes. Returns `'absent'`, a reason to keep it, or `undefined` (= remove).
+ */
+export function uploadsDirProblem(dir) {
+  let st
+  try {
+    st = lstatSync(dir)
+  } catch {
+    return 'absent'
+  }
+  if (!st.isDirectory() || st.isSymbolicLink()) return t('フォルダではありません', 'not a folder')
+  try {
+    const foreign = readdirSync(dir).filter((n) => !isUploadName(n) || !lstatSync(join(dir, n)).isFile())
+    return foreign.length > 0 ? t(`ほかのものが入っています: ${foreign.slice(0, 3).join(', ')}`, `holds other things: ${foreign.slice(0, 3).join(', ')}`) : undefined
+  } catch {
+    return t('中を読めません', 'cannot read it')
+  }
 }
 
 /**
@@ -543,6 +564,32 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
         ? t(`▸ 状態ディレクトリ ${stateDir} は残しました`, `▸ Kept the state directory ${stateDir}`)
         : t(`▸ 状態ディレクトリ ${stateDir} は残しました（消すなら: rm -rf ${shq(stateDir)}）`, `▸ Kept the state directory ${stateDir} (to delete it: rm -rf ${shq(stateDir)})`),
     )
+  }
+
+  // ⑨b Files sent from the phone (2026-11-17 / `agent/src/uploads.ts`): with `--purge`, and only when every entry is a
+  //    name the agent writes (a folder someone else put things in is kept and said so)
+  if (purge) {
+    const up = uploadsDirFor(env, home)
+    const why = uploadsDirProblem(up)
+    if (why === 'absent') {
+      // nothing to say
+    } else if (why) {
+      console.log(t(`▸ ⚠️ 添付の置き場 ${up} は残しました（${why}）`, `▸ ⚠️ Kept the folder for attachments ${up} (${why})`))
+    } else {
+      try {
+        rmSync(up, { recursive: true, force: true })
+        // Its parent, if we made it and it is empty now
+        try {
+          if (readdirSync(dirname(up)).length === 0) rmSync(dirname(up), { recursive: true })
+        } catch {
+          /* not ours or not empty */
+        }
+        console.log(t(`▸ ✔ スマホから送ったファイル ${up} を消しました`, `▸ ✔ Deleted the files sent from the phone ${up}`))
+      } catch (err) {
+        leftovers.push(up)
+        console.error(t(`✗ 添付の置き場を消しきれませんでした: ${err.message}`, `✗ Could not delete all of the folder for attachments: ${err.message}`))
+      }
+    }
   }
 
   // ⑩ The tree (⚠️ last: the steps above run scripts from it. ⚠️ checked again right before deleting)

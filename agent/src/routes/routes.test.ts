@@ -154,6 +154,8 @@ test('★★★ feature flags correspond to the endpoints actually registered', 
     usage: '/usage',
     // ★ A longer limit on the existing message endpoint (2026-11-17)
     'long-send': '/sessions/x/message',
+    // ★ Files from the phone (2026-11-17)
+    uploads: '/uploads',
   }
   const METHOD: Record<string, string> = { 'log-follow': 'GET', usage: 'GET' }
   for (const feature of AGENT_FEATURES) {

@@ -21,17 +21,43 @@ import { commandLikeMessage, type MessageSendResult } from '../../../shared/type
 import { config } from '../config.ts'
 import { discoverConfigDirs } from '../claude/configDirs.ts'
 import { failureMessage, sendToSession, validateText } from '../claude/inbox.ts'
-import { isCodexSessionId, type CodexSendResult } from '../codex/daemon.ts'
+import { codexInput, isCodexSessionId, type CodexSendResult } from '../codex/daemon.ts'
+import { userText } from '../codex/history.ts'
 import { shortSessionId } from '../codex/ids.ts'
 import { codexLists, codexSend } from '../codex/run.ts'
 import { sanitizeForKeys, sendKeysToSession, type KeysFailure } from '../claude/keys.ts'
 import { broadcast } from '../events.ts'
 import { hasPendingForSession } from '../permission.ts'
 import { HttpError, readJsonBody, type Ctx } from '../router.ts'
+import { ownerOf } from '../auth.ts'
+import { attachmentLines, UploadError, uploads, type Attachment, type Reserved } from '../uploads.ts'
 import { t } from '../../../shared/i18n.ts'
 
 interface Body {
   text?: unknown
+  /** ★ Ids of files this device uploaded (`POST /uploads` … / `uploads.ts`). ⚠️ Ids only: the paths are the agent's */
+  attachments?: unknown
+}
+
+/**
+ * ★ The instruction with its files (2026-11-17). The files are named **before** the person's text (`attachmentLines`).
+ * ⚠️ The person's own text is judged on its own first: `/` `!` at its start stays refused, even behind the file lines.
+ */
+export function withAttachments(text: string, files: readonly Attachment[]): string {
+  if (files.length === 0) return text
+  if (inboxRefusal(text)) throw new HttpError(400, commandLikeMessage())
+  const said = text.trim() === '' ? t('添付したファイルを見てください。', 'Please look at the attached files.') : text
+  return `${attachmentLines(files)}${said}`
+}
+
+/** ★ This device's files for this send, reserved (single use / `uploads.ts` rule 8) */
+function reserveFiles(ctx: Ctx, ids: unknown): Reserved {
+  try {
+    return uploads.reserve(ownerOf(ctx.identity), ids)
+  } catch (e) {
+    if (e instanceof UploadError) throw new HttpError(e.status, e.message)
+    throw e
+  }
 }
 
 /** ★ The type lives in one place, `shared/types.ts` (so it never disagrees with the UI) */
@@ -106,10 +132,12 @@ export async function codexMessage(
   sessionId: string,
   text: string,
   /** ★ Injected in tests */
-  codex: { lists(id: string): boolean; send(id: string, text: string): Promise<CodexSendResult | undefined> } = {
+  codex: { lists(id: string): boolean; send(id: string, text: string, images?: readonly string[]): Promise<CodexSendResult | undefined> } = {
     lists: codexLists,
     send: codexSend,
   },
+  /** ★ Files with it (`uploads.ts`): images as `localImage`, the others named in the text */
+  files: readonly Attachment[] = [],
 ): Promise<MessageResult | undefined> {
   if (!codex.lists(sessionId)) {
     // ⚠️ A Codex row id that no line lists now (the thread closed, the line is down) is "not open" — never handed to
@@ -117,12 +145,16 @@ export async function codexMessage(
     if (isCodexSessionId(sessionId)) throw new HttpError(409, t('この Codex のセッションは、いま開かれていません。', 'This Codex session is not open right now.'))
     return undefined
   }
+  if (inboxRefusal(text)) throw new HttpError(400, commandLikeMessage())
+  const images = files.filter((f) => f.kind === 'image').map((f) => f.path)
+  const others = files.filter((f) => f.kind !== 'image')
+  text = withAttachments(text, others)
+  if (images.length > 0 && others.length === 0 && text.trim() === '') text = t('添付した画像を見てください。', 'Please look at the attached images.')
   const bad = validateText(text)
   if (bad) throw new HttpError(400, failureMessage(bad))
-  if (inboxRefusal(text)) throw new HttpError(400, commandLikeMessage())
   const short = shortSessionId(sessionId)
   // ⚠️ The row can vanish between the two looks: that is "not open", never a fall-through to the Claude routes
-  const res: CodexSendResult = (await codex.send(sessionId, text)) ?? { ok: false, reason: 'not-listed' }
+  const res: CodexSendResult = (await codex.send(sessionId, text, images)) ?? { ok: false, reason: 'not-listed' }
   if (!res.ok) {
     console.log(`[codex] not sent thread=${short} reason=${res.reason}${res.detail ? ` (${res.detail})` : ''}`)
     switch (res.reason) {
@@ -145,18 +177,33 @@ export async function codexMessage(
   console.log(`[codex] sent to thread=${short} ${text.length} chars`)
   // ★ `keys`: in the thread it has the same shape as a keystroke send — a plain message of the person, no `via`
   //   (`web/src/ui/pending.ts` matches the sent bubble by this; an unknown value would never match).
-  return { ok: true, at, route: 'keys' }
+  // ★ As the thread will show it (the same function the history uses: images become `[localImage]` lines)
+  return { ok: true, at, route: 'keys', ...(files.length > 0 ? { delivered: userText(codexInput(text, images)) } : {}) }
 }
 
 export async function sessionMessage(ctx: Ctx): Promise<MessageResult> {
   const sessionId = ctx.params['id']
   if (!sessionId) throw new HttpError(400, t('session id が必要です', 'A session id is required.'))
   const body = await readJsonBody<Body>(ctx.req)
-  const text = typeof body.text === 'string' ? body.text : ''
+  const said = typeof body.text === 'string' ? body.text : ''
+  // ★ Files with it: this device's finished uploads, reserved for this send (a concurrent send cannot use them too).
+  //   Taken once the send went through; a failed send releases them for the retry
+  const reserved = reserveFiles(ctx, body.attachments)
+  try {
+    const res = await deliver(sessionId, said, reserved.files)
+    reserved.consume()
+    return res
+  } finally {
+    reserved.release()
+  }
+}
 
+async function deliver(sessionId: string, said: string, files: readonly Attachment[]): Promise<MessageResult> {
   // ★ A Codex thread goes to its daemon (`codexMessage`); `undefined` = not a Codex row, so the Claude routes follow
-  const viaCodex = await codexMessage(sessionId, text)
+  const viaCodex = await codexMessage(sessionId, said, undefined, files)
   if (viaCodex) return viaCodex
+  // ★ Claude reads a file given by its path in the text (measured: images and PDF, with its own Read tool)
+  const text = withAttachments(said, files)
 
   const dirs = await discoverConfigDirs(config().configDirs)
   const short = sessionId.slice(0, 8)
@@ -176,7 +223,7 @@ export async function sessionMessage(ctx: Ctx): Promise<MessageResult> {
         `[keys] Sent as keystrokes session=${short} ${text.length} chars${extra}`,
       ),
     )
-    return { ok: true, at, route: 'keys' }
+    return { ok: true, at, route: 'keys', ...(files.length > 0 ? { delivered: text } : {}) }
   }
   const decision = decideAfterKeys(keys.reason)
   if (decision.kind === 'error') throw new HttpError(decision.status, keys.message ?? t('送れませんでした', 'Could not send.'))
@@ -204,5 +251,5 @@ export async function sessionMessage(ctx: Ctx): Promise<MessageResult> {
   const at = new Date().toISOString()
   broadcast({ type: 'sessions-changed', at })
   console.log(t(`[inbox] メッセージを送りました session=${short} ${text.length}文字`, `[inbox] Sent a message session=${short} ${text.length} chars`))
-  return { ok: true, at, route: 'inbox' }
+  return { ok: true, at, route: 'inbox', ...(files.length > 0 ? { delivered: text } : {}) }
 }

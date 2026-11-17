@@ -124,7 +124,8 @@ export function parseTurnsPage(result: unknown): TurnsPage | undefined {
   return { turns, nextCursor: typeof next === 'string' && next !== '' ? next : null, skipped }
 }
 
-function userText(content: unknown): string {
+/** ★ A user message's text as the thread shows it (also used to say what a send from the phone will look like) */
+export function userText(content: unknown): string {
   if (!Array.isArray(content)) return ''
   const parts: string[] = []
   for (const c of content) {

@@ -284,6 +284,11 @@ export type AgentFeature =
    *   (2026-11-17). ⚠️ Without it the screen keeps the old limit (an older agent would refuse with 400)
    */
   | 'long-send'
+  /**
+   * ★ Files from the phone (`POST /uploads` … / 2026-11-17 / `agent/src/uploads.ts`): images, PDF and plain text up to
+   *   `MAX_UPLOAD_BYTES`, handed to a session with its next instruction (`attachments`). ⚠️ No mark ⇒ no 📎 button
+   */
+  | 'uploads'
 
 /**
  * ★ The most a send may take **as JSON** on the way (a request body is read up to 256 KB, a tunnel frame holds 256 KB):
@@ -1097,11 +1102,77 @@ export interface PushFailure {
  *    the thread element gets no `via`. **Unless the sender remembers the route,
  *    "cannot confirm it arrived" never goes away** (seen on a real device on 2026-08-23).
  */
+/* ==================== Files from the phone (2026-11-17 / `agent/src/uploads.ts`) ==================== */
+
+/** ★ One file at most this big (after the phone shrank an image) */
+export const MAX_UPLOAD_BYTES = 10 * 1024 * 1024
+/**
+ * ★ One chunk carries this many bytes (base64 in JSON: ~171 KB, under `MAX_SEND_JSON_BYTES` and the tunnel's 256 KB).
+ * ⚠️ The agent refuses a bigger one.
+ */
+export const UPLOAD_CHUNK_BYTES = 128 * 1024
+/** ★ At most this many files with one instruction */
+export const MAX_ATTACHMENTS = 5
+/** ★ A chunk waits this long for its answer (a weak mobile line: 171 KB at 100 kbps is ~14 s) */
+export const UPLOAD_CHUNK_TIMEOUT_MS = 30_000
+
+/**
+ * ★★ The kinds of file the agent takes, by the name's extension — and the agent **checks the content** against it
+ *   (magic bytes, or strict UTF-8 without NUL for text). One table for both sides (the phone's file picker uses it).
+ */
+export const UPLOAD_KINDS = {
+  png: { kind: 'image', mime: 'image/png' },
+  jpg: { kind: 'image', mime: 'image/jpeg' },
+  jpeg: { kind: 'image', mime: 'image/jpeg' },
+  gif: { kind: 'image', mime: 'image/gif' },
+  webp: { kind: 'image', mime: 'image/webp' },
+  pdf: { kind: 'pdf', mime: 'application/pdf' },
+  txt: { kind: 'text', mime: 'text/plain' },
+  md: { kind: 'text', mime: 'text/markdown' },
+  csv: { kind: 'text', mime: 'text/csv' },
+  tsv: { kind: 'text', mime: 'text/tab-separated-values' },
+  json: { kind: 'text', mime: 'application/json' },
+  yaml: { kind: 'text', mime: 'application/yaml' },
+  yml: { kind: 'text', mime: 'application/yaml' },
+  xml: { kind: 'text', mime: 'application/xml' },
+  log: { kind: 'text', mime: 'text/plain' },
+} as const satisfies Record<string, { kind: 'image' | 'pdf' | 'text'; mime: string }>
+
+export type UploadExt = keyof typeof UPLOAD_KINDS
+export type UploadKind = (typeof UPLOAD_KINDS)[UploadExt]['kind']
+
+/** The extension of a file name, if it is one we take (lower-cased) */
+export function uploadExtOf(name: string): UploadExt | undefined {
+  const m = /\.([A-Za-z0-9]{1,8})$/.exec(name)
+  const ext = m?.[1]?.toLowerCase()
+  return ext !== undefined && Object.hasOwn(UPLOAD_KINDS, ext) ? (ext as UploadExt) : undefined
+}
+
+/** `POST /uploads` → the id to send the chunks to */
+export interface UploadStartResult {
+  id: string
+  chunkBytes: number
+}
+
+/** `POST /uploads/:id/finish` → the file is kept; its id goes with the next instruction (`attachments`) */
+export interface UploadFinishResult {
+  id: string
+  /** The name as the agent will show it (cleaned) */
+  name: string
+  kind: UploadKind
+  size: number
+}
+
 export interface MessageSendResult {
   ok: true
   at: string
   /** `keys` = keystrokes (no frame) / `inbox` = inbox (gets an English frame) */
   route: 'keys' | 'inbox'
+  /**
+   * ★ The text as it was delivered, when the agent added to it (the attachment lines / 2026-11-17): the phone matches
+   *   its "sending" bubble against this, not what was typed (codex review: an inbox delivery is matched exactly)
+   */
+  delivered?: string
 }
 
 /**

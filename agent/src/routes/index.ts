@@ -15,6 +15,7 @@ import { peers } from './peers.ts'
 import { permissionAnswer, permissionRequest, permissions } from './permission.ts'
 import { pushStatus, pushSubscribe, pushTest, pushUnsubscribe } from './push.ts'
 import { sessionFollow, sessionLog, sessions } from './sessions.ts'
+import { uploadRoutes } from './uploads.ts'
 
 export function buildRouter(): Router {
   const router = new Router()
@@ -43,6 +44,13 @@ export function buildRouter(): Router {
   //   ⚠️⚠️ **POST only** (with GET, merely getting someone to follow a link could enable auto-approve)
   router.post('/sessions/:id/auto-approve', sessionAutoApprove)
   router.post('/hook', hook)
+  // ★ Files from the phone (2026-11-17 / `uploads.ts`): start → chunks in order → finish (checked) → attached by id
+  //   with the next instruction. ⚠️ POST only; bound to the device that started it
+  const up = uploadRoutes()
+  router.post('/uploads', up.start)
+  router.post('/uploads/:id/chunk', up.chunk)
+  router.post('/uploads/:id/finish', up.finish)
+  router.post('/uploads/:id/cancel', up.cancel)
 
   router.get('/peers', peers)
 

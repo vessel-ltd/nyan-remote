@@ -368,10 +368,10 @@ export function codexLists(sessionId: string): boolean {
 }
 
 /** Send to a Codex row, or `undefined` if no line lists it right now (= not ours; the caller goes on). */
-export async function codexSend(sessionId: string, text: string): Promise<CodexSendResult | undefined> {
+export async function codexSend(sessionId: string, text: string, images: readonly string[] = []): Promise<CodexSendResult | undefined> {
   const found = locate(sessionId)
   if (!found) return undefined
-  return found.line.send(found.threadId, text)
+  return found.line.send(found.threadId, text, images)
 }
 
 /** Compact an idle Codex row, or `undefined` if no line lists it right now (= not ours). */

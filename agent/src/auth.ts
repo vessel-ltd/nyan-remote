@@ -65,6 +65,14 @@ export function actorOf(id: Identity): string {
   }
 }
 
+/**
+ * ★ Who owns something a device made (uploads / 2026-11-17): the **full** identity, by how it was proven.
+ * ⚠️ Not `actorOf` (its 8-character fingerprint head is for the log: two devices could share it / codex review).
+ */
+export function ownerOf(id: Identity): string {
+  return `${id.via}:${id.via === 'local-hook' ? id.login : id.deviceId}`
+}
+
 export type AuthResult =
   | { ok: true; identity: Identity; rememberLogin?: string }
   | { ok: false; status: number; message: string }

@@ -9,7 +9,7 @@
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { test } from 'node:test'
-import { codexMessage, decideAfterKeys, inboxRefusal, type RouteDecision } from './message.ts'
+import { codexMessage, decideAfterKeys, inboxRefusal, withAttachments, type RouteDecision } from './message.ts'
 import { HttpError } from '../router.ts'
 import type { CodexSendResult } from '../codex/daemon.ts'
 import type { KeysFailure } from '../claude/keys.ts'
@@ -100,12 +100,15 @@ function codexWorld(...given: [(CodexSendResult | undefined)?]) {
   // ⚠️ `undefined` passed on purpose is a result too (a default parameter would swallow it)
   const result: CodexSendResult | undefined = given.length > 0 ? given[0] : { ok: true }
   const sent: Array<[string, string]> = []
+  const images: string[][] = []
   return {
     sent,
+    images,
     codex: {
       lists: (id: string) => id === 'thread-1',
-      send: async (id: string, text: string) => {
+      send: async (id: string, text: string, imgs: readonly string[] = []) => {
         sent.push([id, text])
+        images.push([...imgs])
         return result
       },
     },
@@ -163,4 +166,47 @@ test('codex: busy, gone, and refused by the daemon are 409 (the state of the oth
   ] as Array<CodexSendResult | undefined>) {
     assert.equal(await status(codexMessage('thread-1', 'hi', codexWorld(r).codex)), 409, JSON.stringify(r))
   }
+})
+
+const IMG = { path: '/home/user/.local/share/nyan-remote/uploads/20261117-000000-' + 'a'.repeat(32) + '.png', kind: 'image' as const, size: 2048 }
+const DOC = { path: '/home/user/.local/share/nyan-remote/uploads/20261117-000000-' + 'b'.repeat(32) + '.pdf', kind: 'pdf' as const, size: 4096 }
+
+test('★★ codex with files: images go as localImage (the agent\'s paths), others are named before the text', async () => {
+  const w = codexWorld()
+  await codexMessage('thread-1', 'look', w.codex, [IMG, DOC])
+  assert.deepEqual(w.images, [[IMG.path]])
+  const [[, text]] = w.sent as [[string, string]]
+  assert.ok(text.includes(DOC.path) && !text.includes(IMG.path), 'the PDF is named in the text, the image is not')
+  assert.ok(text.endsWith('look'), 'the person\'s text comes last')
+  // Images only, no text: still a turn with something to say
+  const v = codexWorld()
+  await codexMessage('thread-1', '', v.codex, [IMG])
+  assert.deepEqual(v.images, [[IMG.path]])
+  assert.notEqual(v.sent[0]![1].trim(), '')
+})
+
+test('★★★ with files, a `/` `!` text is still refused (the file lines in front must not let it through)', async () => {
+  for (const body of ['/compact', '!ls', ' /exit']) {
+    const w = codexWorld()
+    assert.equal(await status(codexMessage('thread-1', body, w.codex, [DOC])), 400, body)
+    assert.equal(await status(codexMessage('thread-1', body, w.codex, [IMG])), 400, body)
+    assert.deepEqual(w.sent, [])
+  }
+})
+
+test('★★ claude with files: the file lines first, then the person\'s text; `/` `!` still refused; no files ⇒ unchanged', () => {
+  const text = withAttachments('この PDF を要約して', [DOC])
+  assert.ok(text.startsWith(text.split('\n')[0]!) && text.includes(DOC.path) && text.endsWith('この PDF を要約して'))
+  assert.equal(withAttachments('plain', []), 'plain')
+  assert.notEqual(withAttachments('', [DOC]).trim().split('\n').at(-1), '', 'files only: still something to say')
+  for (const body of ['/compact', '!ls']) assert.throws(() => withAttachments(body, [DOC]), (e: unknown) => e instanceof HttpError && e.status === 400)
+})
+
+test('★ codex with an image: `delivered` is what the thread will show (the history parser\'s own text), ending with the typed text', async () => {
+  const { userText } = await import('../codex/history.ts')
+  const { codexInput } = await import('../codex/daemon.ts')
+  const w = codexWorld()
+  const res = await codexMessage('thread-1', 'look', w.codex, [IMG])
+  assert.equal(res?.delivered, userText(codexInput('look', [IMG.path])))
+  assert.ok(res?.delivered?.endsWith('look'), 'images first: the record still ends with what was typed')
 })
