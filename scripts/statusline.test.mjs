@@ -11,6 +11,7 @@ import { test } from 'node:test'
 const RELAY = new URL('../hooks/statusline.sh', import.meta.url).pathname
 const INSTALL = new URL('./install-permission-hook.mjs', import.meta.url).pathname
 const q = (s) => `'${s.replace(/'/g, `'\\''`)}'`
+const wrapped = (account, input) => `{"nyanAccount":"${account}","input":${input}}`
 const INPUT = JSON.stringify({ model: { id: 'x' }, rate_limits: { seven_day: { used_percentage: 9, resets_at: 1795312800 } } })
 
 function home() {
@@ -31,7 +32,54 @@ test('relay: keeps the reading for the profile, and the user status line gets th
   assert.equal(r.status, 0)
   // ★ The exact bytes (no newline added)
   assert.equal(r.stdout, `${INPUT} | mine\n`)
-  assert.equal(readFileSync(join(h, '.nyan-remote', 'usage', 'claude-.claude-s.json'), 'utf8'), INPUT)
+  // No config for that profile here: no account recorded
+  assert.equal(readFileSync(join(h, '.nyan-remote', 'usage', 'claude-.claude-s.json'), 'utf8'), wrapped('', INPUT))
+})
+
+const U = '88c9fbd1-0000-4000-8000-000000000000'
+/** Claude Code's own layout (2.1.326): `accountUuid` is the first key of `oauthAccount` */
+const config = (uuid) => JSON.stringify({ numStartups: 3, oauthAccount: { accountUuid: uuid, emailAddress: 'user@example.com' }, cachedUsageUtilization: { accountUuid: 'ffffffff-0000-4000-8000-000000000000' } }, null, 2)
+
+test('relay: records the account from the config the session uses — $CLAUDE_CONFIG_DIR/.claude.json, else ~/.claude.json (not ~/.claude/.claude.json)', (t) => {
+  const h = home()
+  t.after(() => rmSync(h, { recursive: true, force: true }))
+  mkdirSync(join(h, '.claude-r'))
+  writeFileSync(join(h, '.claude-r', '.claude.json'), config(U))
+  relay(h, ['true'], INPUT, { CLAUDE_CONFIG_DIR: join(h, '.claude-r') })
+  assert.equal(readFileSync(join(h, '.nyan-remote', 'usage', 'claude-.claude-r.json'), 'utf8'), wrapped(U, INPUT))
+
+  // The default profile: ~/.claude.json is the live one; a stale ~/.claude/.claude.json is not read
+  const other = '0976d2ee-0000-4000-8000-000000000000'
+  mkdirSync(join(h, '.claude'))
+  writeFileSync(join(h, '.claude', '.claude.json'), config(other))
+  writeFileSync(join(h, '.claude.json'), config(U))
+  relay(h, ['true'], INPUT)
+  assert.equal(readFileSync(join(h, '.nyan-remote', 'usage', 'claude-.claude.json'), 'utf8'), wrapped(U, INPUT))
+
+  // ⚠️ A nested oauthAccount earlier in the file (e.g. under a project) is not the top-level one (codex review round 4)
+  const nested = JSON.stringify({ projects: { '/home/user/p': { oauthAccount: { accountUuid: other } } }, oauthAccount: { accountUuid: U } }, null, 2)
+  writeFileSync(join(h, '.claude.json'), nested)
+  relay(h, ['true'], INPUT)
+  assert.equal(readFileSync(join(h, '.nyan-remote', 'usage', 'claude-.claude.json'), 'utf8'), wrapped(U, INPUT))
+  // Not a UUID (36 hyphens): no account
+  writeFileSync(join(h, '.claude.json'), config('-'.repeat(36)))
+  relay(h, ['true'], INPUT)
+  assert.equal(readFileSync(join(h, '.nyan-remote', 'usage', 'claude-.claude.json'), 'utf8'), wrapped('', INPUT))
+  // Past the first 1 MB in **bytes** (multibyte padding, NUL padding): not read, so no account (codex review round 5)
+  for (const pad of ['あ'.repeat(400_000), '\0'.repeat(1_100_000)]) {
+    writeFileSync(join(h, '.claude.json'), `{\n  "pad": "${pad}",\n  "oauthAccount": {\n    "accountUuid": "${U}"\n  }\n}\n`)
+    relay(h, ['true'], INPUT)
+    assert.equal(readFileSync(join(h, '.nyan-remote', 'usage', 'claude-.claude.json'), 'utf8'), wrapped('', INPUT))
+  }
+  // Past the first 1 MB: not read (the render path stays quick), so no account
+  writeFileSync(join(h, '.claude.json'), JSON.stringify({ pad: 'x'.repeat(1_100_000), oauthAccount: { accountUuid: U } }, null, 2))
+  relay(h, ['true'], INPUT)
+  assert.equal(readFileSync(join(h, '.nyan-remote', 'usage', 'claude-.claude.json'), 'utf8'), wrapped('', INPUT))
+
+  // A layout it does not know: no account, rather than a wrong one
+  writeFileSync(join(h, '.claude.json'), JSON.stringify({ oauthAccount: { emailAddress: 'user@example.com', accountUuid: U } }))
+  relay(h, ['true'], INPUT)
+  assert.equal(readFileSync(join(h, '.nyan-remote', 'usage', 'claude-.claude.json'), 'utf8'), wrapped('', INPUT))
 })
 
 test('relay: the default profile, and a call without rate_limits keeps the last reading', (t) => {
@@ -39,10 +87,10 @@ test('relay: the default profile, and a call without rate_limits keeps the last 
   t.after(() => rmSync(h, { recursive: true, force: true }))
   relay(h, ['true'], INPUT)
   const f = join(h, '.nyan-remote', 'usage', 'claude-.claude.json')
-  assert.equal(readFileSync(f, 'utf8'), INPUT)
+  assert.equal(readFileSync(f, 'utf8'), wrapped('', INPUT))
   // The first calls of a session have no limits yet: the last reading must not be wiped
   relay(h, ['true'], JSON.stringify({ model: { id: 'x' } }))
-  assert.equal(readFileSync(f, 'utf8'), INPUT)
+  assert.equal(readFileSync(f, 'utf8'), wrapped('', INPUT))
 })
 
 test('relay: never writes through what is at the name (a link, a hard link, a FIFO), never without our directory, never for a name that is not a profile', (t) => {
@@ -59,7 +107,7 @@ test('relay: never writes through what is at the name (a link, a hard link, a FI
     assert.equal(r.stdout, 'shown\n', 'the status line still shows')
     assert.equal(readFileSync(target, 'utf8'), 'keep')
     // ★ Replaced by a new file of ours
-    assert.equal(readFileSync(f, 'utf8'), INPUT)
+    assert.equal(readFileSync(f, 'utf8'), wrapped('', INPUT))
   }
 
   relay(h, ['true'], INPUT, { CLAUDE_CONFIG_DIR: join(h, 'not-a-profile') })

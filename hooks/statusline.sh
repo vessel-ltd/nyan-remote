@@ -29,8 +29,28 @@ if [[ $input == *'"rate_limits"'* ]]; then
     name=${name##*/}
     # ⚠️ Only into our own directory (made by the installer, 0700), never through a link
     [[ $name =~ ^\.claude(-[A-Za-z0-9._-]+)?$ && -d $dir && ! -L $dir && -O $dir ]] || exit 0
+    # ★ Which account this reading is, read **now** from the config this session uses (codex review: a time comparison
+    #   in the agent could not prove it, and the default profile's config is `~/.claude.json`, not `~/.claude/.claude.json`).
+    # ⚠️ Only the **top-level** `oauthAccount` (Claude Code 2.1.326 writes the file with 2-space indentation, so a
+    #    top-level key is the only one at exactly two spaces after a newline; a nested copy is deeper, and a newline
+    #    cannot appear inside a JSON string), and only when `accountUuid` is its first key. Anything else ⇒ no account
+    #    (the reading is shown under its profile alone, never merged into a wrong account).
+    # ⚠️ At most 1 MB is read (render path: ~5 ms for the usual 200 KB). A bigger config ⇒ maybe no account.
+    # ⚠️ Not a JSON parser: a config the user rewrote by hand in another layout could fool it (Claude Code itself always
+    #    writes this layout). Accepted: the worst case is one profile's numbers shown under another account's row.
+    cfg=${CLAUDE_CONFIG_DIR:+${CLAUDE_CONFIG_DIR%/}/.claude.json}
+    cfg=${cfg:-$HOME/.claude.json}
+    acct=
+    if [[ -f $cfg ]]; then
+      conf=
+      # ⚠️ Bytes are capped before bash sees them (`read -N` counts characters and skips NULs / codex review round 5);
+      #    a NUL ends the read early (no account, never a wrong one)
+      IFS= read -r -d '' conf < <(head -c 1048576 -- "$cfg" 2>/dev/null) || :
+      re=$'\n  "oauthAccount": \\{\n    "accountUuid": "([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"'
+      [[ $conf =~ $re ]] && acct=${BASH_REMATCH[1]}
+    fi
     tmp=$dir/.claude-$name.$$.$RANDOM.tmp
-    printf '%s' "$input" >"$tmp" || {
+    printf '{"nyanAccount":"%s","input":%s}' "$acct" "$input" >"$tmp" || {
       rm -f -- "$tmp"
       exit 0
     }

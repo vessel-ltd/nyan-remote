@@ -2,8 +2,9 @@
 //
 // Where the numbers come from (measured 2026-11-17, Claude Code 2.1.326 / codex-cli 0.169.0):
 //   - Claude: the status line command gets `rate_limits.five_hour` / `.seven_day` (`used_percentage`, `resets_at`) after
-//     each API response — a documented field. Our relay (`hooks/statusline.sh`) writes that input to
-//     `~/.nyan-remote/usage/claude-<profile>.json`, then runs the user's own status line command unchanged.
+//     each API response — a documented field. Our relay (`hooks/statusline.sh`) writes that input, with the account
+//     the session is logged in to, to `~/.nyan-remote/usage/claude-<profile>.json`, then runs the user's own status
+//     line command unchanged.
 //     ⚠️ Only while a session of that profile runs: the reading is "as of" the file's time.
 //     ⚠️ `.claude.json`'s `cachedUsageUtilization` is written only when `/usage` is opened (days old) ⇒ not used.
 //     ⚠️⚠️ Never Claude's OAuth token: calling the usage API with it is not ours to do.
@@ -16,7 +17,6 @@
 
 import { createHash } from 'node:crypto'
 import { readFile, stat } from 'node:fs/promises'
-import { homedir } from 'node:os'
 import { join } from 'node:path'
 import type { ToolUsage, UsageWindow } from '../../shared/types.ts'
 import type { ConfigDir } from './claude/configDirs.ts'
@@ -26,6 +26,9 @@ import { stateDir } from './state.ts'
 export function claudeUsagePath(account: string, dir: string = stateDir()): string {
   return join(dir, 'usage', `claude-${account}.json`)
 }
+
+/** The shape of an account id as the relay records it */
+const UUID = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/
 
 /** The status line input is small (measured ~2 KB); a bigger file is not one of ours */
 const MAX_BYTES = 256 * 1024
@@ -88,7 +91,7 @@ const cache = new Map<string, { size: number; mtimeMs: number; value: unknown }>
 async function readJsonCached(path: string): Promise<{ value: unknown; mtimeMs: number } | undefined> {
   try {
     const st = await stat(path)
-    if (!st.isFile() || st.size > MAX_BYTES * 20) return undefined
+    if (!st.isFile() || st.size > MAX_BYTES) return undefined
     const known = cache.get(path)
     if (known && known.size === st.size && known.mtimeMs === st.mtimeMs) return { value: known.value, mtimeMs: known.mtimeMs }
     let value: unknown
@@ -104,23 +107,6 @@ async function readJsonCached(path: string): Promise<{ value: unknown; mtimeMs: 
     // ⚠️ Missing: no reading
     return undefined
   }
-}
-
-/**
- * The account a profile is logged in to (`oauthAccount.accountUuid` in its `.claude.json`), and when Claude Code last
- * fetched that profile (`profileFetchedAt`, ms).
- */
-async function claudeAccount(d: ConfigDir): Promise<{ key: string | undefined; fetchedAtMs: number | undefined }> {
-  // ★ The default profile can keep it in `~/.claude.json` (CLAUDE.md §5)
-  for (const path of [join(d.dir, '.claude.json'), ...(d.account === '.claude' ? [join(homedir(), '.claude.json')] : [])]) {
-    const got = await readJsonCached(path)
-    if (!got || !isObject(got.value)) continue
-    const oa = got.value.oauthAccount
-    if (!isObject(oa)) continue
-    const at = oa.profileFetchedAt
-    return { key: accountKeyOf(oa.accountUuid), fetchedAtMs: typeof at === 'number' && Number.isFinite(at) ? at : undefined }
-  }
-  return { key: undefined, fetchedAtMs: undefined }
 }
 
 export async function claudeUsage(dirs: readonly ConfigDir[], nowMs: number = Date.now()): Promise<ToolUsage[]> {
@@ -146,13 +132,13 @@ async function profileUsage(d: ConfigDir, nowMs: number): Promise<ToolUsage | un
     got = undefined
   }
   if (!got) return undefined
-  const windows = claudeWindows(got.value, nowMs)
+  // ★★ The relay writes `{ nyanAccount, input }`: the account read from the session's own config **at the moment it
+  //    wrote** (codex review rounds 1–3: the agent could not prove it afterwards from times or the profile's files).
+  //    A file without it (an older relay) is the bare input, shown under its profile alone, never merged.
+  const wrapped = isObject(got.value) && isObject(got.value.input) ? got.value : undefined
+  const windows = claudeWindows(wrapped ? wrapped.input : got.value, nowMs)
   if (!windows) return undefined
-  // ★★ Which account the reading belongs to (codex review rounds 1–2). The status line input does not say, and a profile
-  //    can switch account after a reading was written. ⇒ The account is the reading's only when the profile was fetched
-  //    **before** the reading (a login fetches the profile). Otherwise it is shown under the profile alone, never merged
-  //    into an account it may not belong to (a later reading fixes it).
-  const acct = await claudeAccount(d)
-  const verified = acct.key !== undefined && acct.fetchedAtMs !== undefined && got.mtimeMs >= acct.fetchedAtMs
-  return { tool: 'claude', account: d.account, ...(verified ? { accountKey: acct.key } : {}), windows, at: new Date(got.mtimeMs).toISOString() }
+  const uuid = wrapped && typeof wrapped.nyanAccount === 'string' && UUID.test(wrapped.nyanAccount) ? wrapped.nyanAccount : undefined
+  const accountKey = accountKeyOf(uuid)
+  return { tool: 'claude', account: d.account, ...(accountKey ? { accountKey } : {}), windows, at: new Date(got.mtimeMs).toISOString() }
 }
