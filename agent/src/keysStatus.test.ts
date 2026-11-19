@@ -16,7 +16,7 @@ import { test } from 'node:test'
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 // @ts-expect-error — plain .mjs (no types)
-import { inspect, summarize } from '../../scripts/keys-status.mjs'
+import { inspect, shimCheck, summarize } from '../../scripts/keys-status.mjs'
 import { aliveProcStartSync } from './claude/sessionIndex.ts'
 import type { ConfigDir } from './claude/configDirs.ts'
 
@@ -109,4 +109,18 @@ test('★★ inspect: asks findPane for the decision (does not own it)', { skip:
     if (prev === undefined) delete process.env['NYAN_REMOTE_STATE_DIR']
     else process.env['NYAN_REMOTE_STATE_DIR'] = prev
   }
+})
+
+test('★ shimCheck: inside a checking shell it does not start shells again (an rc that runs `nyan status`)', (t) => {
+  const was = process.env['NYAN_REMOTE_SHIM_PROBE']
+  process.env['NYAN_REMOTE_SHIM_PROBE'] = '1'
+  t.after(() => {
+    if (was === undefined) delete process.env['NYAN_REMOTE_SHIM_PROBE']
+    else process.env['NYAN_REMOTE_SHIM_PROBE'] = was
+  })
+  const started = Date.now()
+  const lines = shimCheck() as string[]
+  assert.equal(lines.length, 1)
+  assert.match(lines[0] ?? '', /skipped|飛ばしました/)
+  assert.ok(Date.now() - started < 1000, 'it still ran a shell')
 })

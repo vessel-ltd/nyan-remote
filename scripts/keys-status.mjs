@@ -18,7 +18,6 @@
 //
 // Usage: nyan keys (= node scripts/keys-status.mjs = npm run keys)
 
-import { execFileSync } from 'node:child_process'
 import { readdirSync, readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
@@ -26,12 +25,14 @@ import { findPane } from '../agent/src/claude/keys.ts'
 import { discoverConfigDirs } from '../agent/src/claude/configDirs.ts'
 import { aliveProcStartSync, readIndexEntries } from '../agent/src/claude/sessionIndex.ts'
 import { config } from '../agent/src/config.ts'
-import { shellFor } from './install-relay.mjs'
+import { probeClaude, shellFor } from './install-relay.mjs'
 import { recentLogLines, serviceKind } from './lib/service.mjs'
 import { t } from '../shared/i18n.ts'
 import { initCliLang } from './lib/lang.mjs'
 
 const stateDir = process.env['NYAN_REMOTE_STATE_DIR'] ?? join(homedir(), '.nyan-remote')
+/** Set in the shells `shimCheck` starts (an rc that runs `nyan status` must not recurse) */
+const PROBE_ENV = 'NYAN_REMOTE_SHIM_PROBE'
 
 /** Assessment of one session. ★ Ask `findPane` whether it accepts keystrokes (never decide here) */
 export async function inspect(dirs, entry) {
@@ -127,7 +128,9 @@ export function summarize(rows) {
   return lines
 }
 
-function shimCheck() {
+/** Does a new shell's `claude` reach the shim (a live check: it starts the user's shell). Returns lines (✅ / ⚠️ first) */
+export function shimCheck() {
+  if (process.env[PROBE_ENV]) return [t('（確認のためのシェルの中なので、shim の確認は飛ばしました）', '(inside a checking shell: the shim check was skipped)')]
   const shim = join(stateDir, 'bin', 'claude')
   // ⚠️ Ask with **a PATH that excludes the shim directory** (inheriting the parent's PATH
   //    gives ✅ even with no rc block at all / same reason as install-relay.mjs)
@@ -135,41 +138,26 @@ function shimCheck() {
     .split(':')
     .filter((d) => d && resolve(d) !== resolve(join(stateDir, 'bin')))
     .join(':')
-  // ⚠️ Wrap with sentinels so it does not mix with text rc files print to stdout (sudo hints etc.).
-  //    ⚠️ Never write raw control characters in source (git treats the file as binary / CLAUDE.md §5)
-  const MARK = '\u0001'
   // ★★ **Check with the user's shell** (2026-09-23 / it lied on mac).
   //   ⚠️⚠️ It used to hard-code `bash` ⇒ on mac (which writes `.zshrc`) it **always said ⚠️ even when it worked**.
   //   ⇒ Use **the same decision** as the writer (`install-relay.mjs`) (`shellFor` = derived from `rcPathFor`).
   const sh = shellFor(process.env['SHELL'], process.platform)
-  const probe = (flags) => {
-    try {
-      const out = execFileSync(
-        sh,
-        [...flags, '-c', `printf "${MARK}%s${MARK}" "$(command -v claude)"`],
-        {
-          encoding: 'utf8',
-          timeout: 15_000,
-          stdio: ['ignore', 'pipe', 'ignore'],
-          env: { ...process.env, PATH: cleanPath },
-        },
-      )
-      return new RegExp(`${MARK}([^${MARK}]*)${MARK}`).exec(out)?.[1]?.trim() ?? ''
-    } catch {
-      return ''
-    }
-  }
+  // ★ The probe itself is `probeClaude` (shared with the installer: pty, timeouts, delimiters)
+  const probe = (flags) => probeClaude(sh, flags, { ...process.env, PATH: cleanPath, [PROBE_ENV]: '1' })
   // ⚠️ Check with **login + interactive** (non-login only lies because of `.profile` ordering)
   const login = probe(['-l', '-i'])
   const plain = probe(['-i'])
   // ★ **Say what it was measured with** (in the affirmative. ⚠️ never rely on something invisible / CLAUDE.md §2)
   if (login === shim && plain === shim) {
-    return [t(`✅ claude → ${shim}（shim。打鍵の入口 / ${sh} で確認）`, `✅ claude → ${shim} (shim, the keystroke entry / checked with ${sh})`)]
+    // ⚠️ What the rc leaves on PATH before the first prompt: PROMPT_COMMAND / direnv hooks are not run (round 10)
+    return [t(`✅ claude → ${shim}（shim。打鍵の入口 / ${sh} で確認。最初のプロンプトより前の PATH）`, `✅ claude → ${shim} (shim, the keystroke entry / checked with ${sh}; PATH before the first prompt)`)]
   }
   // ⚠️⚠️ **Never conclude "not reached" from "could not measure"** (2026-09-23).
   //    When it comes back empty because the shell cannot start or the rc is too slow, say **unknown**
   //    (concluding would tell people to "run it again" on a working install, creating needless work).
-  if (!login && !plain) {
+  // ⚠️ One unknown and one shim is not "reached" either way: say unknown (round 5). A non-shim answer is definite.
+  const missed = [login, plain].some((v) => v && v !== shim)
+  if (!missed && (!login || !plain)) {
     return [
       t(`⚠️ shim に届いているかを測れませんでした（${sh} を起動できませんでした）。`, `⚠️ Could not check whether the shim is reached (could not start ${sh}).`),
       t('   ⇒ 下の「打鍵できるセッション」が ✅ なら、実際には届いています', '   ⇒ If "Sessions that accept keystrokes" below shows ✅, it is actually reached'),
@@ -183,7 +171,7 @@ function shimCheck() {
       `   Login + interactive (real term.) : ${login || '(could not check)'}`,
     ),
     t(`   対話のみ                  : ${plain || '（測れませんでした）'}`, `   Interactive only                 : ${plain || '(could not check)'}`),
-    t('   ⇒ node scripts/install-relay.mjs を流し直してください', '   ⇒ Run node scripts/install-relay.mjs again'),
+    t('   ⇒ nyan update を流してください（後から入れた道具が PATH を書き足していれば、rc の末尾に shim を先頭へ戻す短いブロックを足します）', '   ⇒ Run nyan update (if a tool installed later appended to PATH, it adds a short block at the end of the rc that puts the shim first again)'),
   ]
 }
 

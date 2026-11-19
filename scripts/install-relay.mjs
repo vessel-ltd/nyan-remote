@@ -54,13 +54,17 @@
 // ⚠️ **Always keep the bypass** (`NYAN_REMOTE_NO_RELAY=1`).
 
 import { installCli, removeCli } from './lib/cli.mjs'
-import { execFileSync } from 'node:child_process'
+import { execFileSync, spawnSync } from 'node:child_process'
+import { randomBytes } from 'node:crypto'
 import {
   accessSync,
   constants,
   existsSync,
   linkSync,
   lstatSync,
+  openSync,
+  readSync,
+  closeSync,
   readlinkSync,
   realpathSync,
   statSync,
@@ -79,6 +83,9 @@ export const BEGIN = '# >>> nyan-remote relay >>>'
  */
 export const SHIM_MARK = '# nyan-remote: 打鍵で渡す経路'
 export const END = '# <<< nyan-remote relay <<<'
+/** ★ Markers of the tail block (`buildTail`). ⚠️ Different whole lines from BEGIN / END (`findMark` matches whole lines) */
+export const TAIL_BEGIN = '# >>> nyan-remote relay: keep the shim first >>>'
+export const TAIL_END = '# <<< nyan-remote relay: keep the shim first <<<'
 
 /** Where the shim goes. ⚠️ Same rule as relay.py's `state_dir()` */
 export function binDirFor(home, env = {}) {
@@ -102,6 +109,55 @@ function shq(s) {
   return `'${String(s).replace(/'/g, `'\\''`)}'`
 }
 
+/** The `case` that puts `d` first on PATH (removing other copies). Shared by the block and the tail */
+function pathFront(d) {
+  return `case ":\${PATH-}:" in
+  ":${d}:"*) ;;
+  *":${d}:"*)
+    _nyan_remote_path=":\$PATH:"
+    while :; do
+      case $_nyan_remote_path in
+        *":${d}:"*) _nyan_remote_path="\${_nyan_remote_path%%":${d}:"*}:\${_nyan_remote_path#*":${d}:"}" ;;
+        *) break ;;
+      esac
+    done
+    _nyan_remote_path="\${_nyan_remote_path#:}"; _nyan_remote_path="\${_nyan_remote_path%:}"
+    PATH="${d}\${_nyan_remote_path:+:\$_nyan_remote_path}"
+    unset _nyan_remote_path ;;
+  # ⚠️ PATH が空のとき ":$PATH" は**末尾コロン ＝ 空エントリ ＝ cwd** になる（Q2）
+  *) PATH="${d}\${PATH:+:\$PATH}" ;;
+esac`
+}
+
+/**
+ * ★ The tail block: puts the shim first again at the end of the rc (when and where: "The tail block" section below).
+ *
+ * The body is deliberately tiny — each line answers a codex finding (2026-11-19):
+ * - only **prepends** the shim when it is not already first (a second copy later on PATH is harmless). No loop, no
+ *   `[`, no `return`/`exit`: loops hung (nocasematch, DEBUG traps, a function named `[`), `return` skipped the lines
+ *   below, and `exit` ran aliases / zsh's TRAPEXIT. A skipped command can only mean "no repair", never a hang.
+ * - nothing for an empty / unset PATH (a trailing ":" = the current directory) or a readonly one (`set -e` would end
+ *   the shell); no assignment when the shim is already first (an assignment clears bash's command hash).
+ * - keeps the rc's exact exit status: `f N && …` is an AND list, so a non-zero N does not trip `set -e` / ERR_EXIT.
+ *   After a failing rc `_nyan_remote_s` and `_nyan_remote_r` stay set.
+ * ⚠️ Known limits: a pin set with `hash -p` in a file the rc sources is dropped; a `[ -t 0 ]`-only PATH line is not
+ *   seen by the checks.
+ */
+export function buildTail(binDir) {
+  const q = shq(binDir)
+  const d = shd(binDir)
+  return `${TAIL_BEGIN}
+# ブロックの後ろに足された行が PATH を変えても、最後に shim を先頭へ戻す（scripts/install-relay.mjs が管理する）。
+_nyan_remote_s=$?
+case ":\${PATH-}:" in
+  "::" | ":${d}:"*) ;;
+  *) if ( PATH="\$PATH" ) 2>/dev/null; then PATH=${q}":\$PATH"; fi ;;
+esac
+_nyan_remote_r() { return "\$1"; }
+_nyan_remote_r "\$_nyan_remote_s" && unset -f _nyan_remote_r && unset _nyan_remote_s
+${TAIL_END}`
+}
+
 /**
  * The block added to the rc. ★ It only adds one entry to PATH (defines no function).
  *
@@ -120,22 +176,7 @@ export function buildBlock(binDir) {
 #   「在るなら何もしない」にすると**悪い順番がそのまま残る**（2026-08-23 に実測）。
 #   ⇒ **先頭でなければ、取り除いてから先頭に置く**（重複も増やさない）。
 # ⚠️ \${PATH-} にする（set -u の rc で PATH が未設定のときに落ちないように / A7）
-case ":\${PATH-}:" in
-  ":${d}:"*) ;;
-  *":${d}:"*)
-    _nyan_remote_path=":\$PATH:"
-    while :; do
-      case $_nyan_remote_path in
-        *":${d}:"*) _nyan_remote_path="\${_nyan_remote_path%%":${d}:"*}:\${_nyan_remote_path#*":${d}:"}" ;;
-        *) break ;;
-      esac
-    done
-    _nyan_remote_path="\${_nyan_remote_path#:}"; _nyan_remote_path="\${_nyan_remote_path%:}"
-    PATH="${d}\${_nyan_remote_path:+:\$_nyan_remote_path}"
-    unset _nyan_remote_path ;;
-  # ⚠️ PATH が空のとき ":$PATH" は**末尾コロン ＝ 空エントリ ＝ cwd** になる（Q2）
-  *) PATH="${d}\${PATH:+:\$PATH}" ;;
-esac
+${pathFront(d)}
 ${END}`
 }
 
@@ -250,22 +291,22 @@ exec python3 "$relay" -- "$real" "$@"
  *    Because of that **install left the old one and `--uninstall` left one behind** =
  *    **a block that keeps putting a removed shim directory first on PATH stays forever**.
  */
-function findBlocks(rc) {
+function findBlocks(rc, open = BEGIN, close = END) {
   const spans = []
   let pos = 0
   for (;;) {
-    const b = findMark(rc, BEGIN, pos)
-    const e = findMark(rc, END, pos)
+    const b = findMark(rc, open, pos)
+    const e = findMark(rc, close, pos)
     if (b < 0 && e < 0) return spans
     if (b < 0 || (e >= 0 && e < b)) return null // END comes first / an END without a start
     if (e < 0) return null // not closed
-    const nested = findMark(rc, BEGIN, b + BEGIN.length)
+    const nested = findMark(rc, open, b + open.length)
     if (nested >= 0 && nested < e) return null // nested
     // ⚠️ The end runs **to the end of the line** (leaving whitespace or CR after the marker makes us lose it on the next read)
-    let end = e + END.length
-    while (end < rc.length && (rc[end] === ' ' || rc[end] === '\t' || rc[end] === '\r')) end++
-    spans.push({ start: b, end })
-    pos = end
+    let stop = e + close.length
+    while (stop < rc.length && (rc[stop] === ' ' || rc[stop] === '\t' || rc[stop] === '\r')) stop++
+    spans.push({ start: b, end: stop })
+    pos = stop
   }
 }
 
@@ -298,12 +339,12 @@ function findMark(rc, mark, from) {
  *   ⚠️ Do not make this "leave it alone". **Then `--uninstall` would leave it alone too, and
  *      there would be no way to remove the real harm (the leftover block)**.
  */
-export function applyBlock(rc, block) {
-  const spans = findBlocks(rc)
+export function applyBlock(rc, block, open = BEGIN, close = END) {
+  const spans = findBlocks(rc, open, close)
   if (spans === null) return null // ⚠️ only one side / nested = broken by hand (fail-closed)
   if (spans.length > 1) {
-    const cleaned = removeBlock(rc)
-    return cleaned === null ? null : applyBlock(cleaned, block)
+    const cleaned = removeBlock(rc, open, close)
+    return cleaned === null ? null : applyBlock(cleaned, block, open, close)
   }
   if (spans.length === 1) {
     const { start, end } = spans[0]
@@ -324,10 +365,10 @@ export function applyBlock(rc, block) {
  *   - conversely, eating both sides **joins lines** when removing a block in the middle (`A=1B=2`)
  *   ⇒ `applyBlock` adds "one blank line + the block + one newline". **Return exactly that.**
  */
-export function removeBlock(rc) {
+export function removeBlock(rc, open = BEGIN, close = END) {
   let out = rc
   for (;;) {
-    const spans = findBlocks(out)
+    const spans = findBlocks(out, open, close)
     if (spans === null) return null
     if (spans.length === 0) return out
     const { start, end } = spans[0]
@@ -339,6 +380,98 @@ export function removeBlock(rc) {
     const after = out.slice(end).startsWith('\n') ? out.slice(end + 1) : out.slice(end)
     out = `${before}${after}`
   }
+}
+
+// ─── The tail block (2026-11-19) ───────────────────────────────────────────────────────────────────────────────
+// A tool installed after us can append its own PATH line after our block (the Antigravity CLI installer appends
+// `export PATH="/home/<user>/.local/bin:$PATH"`); the real claude then wins and typing silently falls back to the
+// inbox. `nyan update` runs this installer and repairs it, so nobody has to edit an rc by hand (user decision).
+//
+// ⚠️⚠️ The rules below each came from a codex review (13 rounds, 2026-11-19). Do not loosen them:
+// 1. Nothing we wrote ever moves, and a written tail is never rewritten or removed (only uninstall removes tails):
+//    lines after them may rely on the shim being first. When more lines appear, another tail is appended.
+// 2. A tail follows ANY command line after our last block. Listing "PATH-changing" forms kept missing some
+//    (`nvm use`, a function from a sourced file). The tail does nothing when the shim is already first.
+// 3. Nothing is written where appending could change the file's meaning or would never run: the last line continues
+//    (`&&`, `|`, `\`…), a return / exit / exec follows our last block, the rc uses debugger hooks or command pins
+//    (`hash -p`, BASH_CMDS), or it does not parse / ends inside a here-document (`parses`, checked in `main`).
+//    The installer then warns.
+// 4. Diagnostics name `file:line` only, never the line's text (an rc can hold API keys).
+// The tail's own body is explained at `buildTail`.
+
+const isCommand = (line) => !/^[ \t]*(?:#.*)?$/.test(line)
+/** Drop trailing comments (good enough for the keyword checks below; a `#` inside quotes errs towards declining) */
+const uncomment = (text) => text.replace(/(^|[ \t])#.*$/gm, '$1')
+/** A `return` / `exit` / `exec` / `logout` command */
+const ENDS_EARLY = /(?:^|[;&|({ \t])(?:return|exit|exec|logout)(?:[ \t;)]|$)/m
+/** Debugger hooks can skip the tail's commands; a PATH assignment drops command pins later lines may use (not zsh's `hash -d` named directories) */
+const UNSAFE_HOOKS = /\bextdebug\b|\btrap\b[^\n]*\b(?:DEBUG|RETURN)\b|\bfunctrace\b|\bset[ \t]+-[A-Za-z]*T|\bhash\b(?![^\n]*[ \t]["']?-[A-Za-z]*d)[^\n]*(?:[ \t]["']?-[A-Za-z]*p|=)|\bBASH_CMDS\b/
+/**
+ * The last command line continues into whatever is appended. ⚠️ Checked without its comment only (round 15: Ubuntu's
+ * `… # For locally installed tools!` ends in `!`); a really unfinished file fails `parses()` in `main` anyway.
+ */
+const UNFINISHED = /(?:&&|\|\||\|&?|\\|\(|\{|\bthen|\bdo|\belse|\belif|\bin|;;|!)[ \t]*$/
+
+/** Where our last block (the main block or the last tail) ends; `undefined` = no single main block / broken markers */
+function lastBlockEnd(rc) {
+  const spans = findBlocks(rc)
+  const tails = findBlocks(rc, TAIL_BEGIN, TAIL_END)
+  if (!spans || spans.length !== 1 || !tails) return undefined
+  return tails.length ? tails.at(-1).end : spans[0].end
+}
+
+/**
+ * ★ The 1-based numbers of the command lines after our last block (what a new tail would cover). `null` = no block.
+ *   Used for warnings and by `nyan status`, which only reads the file (running the rc started the user's own
+ *   startup programs). ⚠️ Numbers only: the text may hold secrets.
+ */
+export function linesAfterLastBlock(rc) {
+  const from = lastBlockEnd(rc)
+  if (from === undefined) return null
+  const head = rc.slice(0, from).split('\n').length
+  return rc
+    .slice(from)
+    .split('\n')
+    .flatMap((line, i) => (isCommand(line) ? [head + i] : []))
+}
+
+/** A return / exit / exec after the main block (outside our tails) can skip the tail: `nyan status` cannot tell */
+export function mayEndBeforeTail(rc) {
+  const spans = findBlocks(rc)
+  if (!spans || spans.length !== 1) return false
+  const after = removeBlock(rc.slice(spans[0].end), TAIL_BEGIN, TAIL_END) ?? ''
+  return ENDS_EARLY.test(uncomment(after))
+}
+
+/** `tailState(rc, tail).rc` */
+export function applyTail(rc, tail) {
+  return tailState(rc, tail).rc
+}
+
+/**
+ * ★ Append a tail when command lines follow our last block (rules at the top of this section). Idempotent.
+ *   ⚠️ Run on the rc **after** `applyBlock`; uninstall removes tails with `removeBlock` and the tail markers.
+ * @returns `{ rc, declined }`: `rc` null when the tail markers are broken (fail-closed, like the main block);
+ *   `declined` when a tail was needed but not written (the caller warns)
+ */
+export function tailState(rc, tail) {
+  const tails = findBlocks(rc, TAIL_BEGIN, TAIL_END)
+  if (tails === null) return { rc: null, declined: false }
+  const from = lastBlockEnd(rc)
+  if (from === undefined) return { rc, declined: false }
+  const after = rc.slice(from)
+  // A last tail for another shim directory (the state directory moved) would leave the old shim first
+  const staleLast = tails.length > 0 && rc.slice(tails.at(-1).start, tails.at(-1).end) !== tail
+  if (!after.split('\n').some(isCommand) && !staleLast) return { rc, declined: false }
+  const lastLine = rc.split('\n').filter(isCommand).at(-1) ?? ''
+  if (
+    ENDS_EARLY.test(uncomment(after)) ||
+    UNSAFE_HOOKS.test(rc.replace(/\\\r?\n/g, ' ')) ||
+    UNFINISHED.test(uncomment(lastLine))
+  ) {
+    return { rc, declined: true }
+  }
+  return { rc: `${rc}${rc.endsWith('\n') ? '' : '\n'}\n${tail}\n`, declined: false }
 }
 
 /** Which rc to touch. ⚠️ mac defaults to zsh */
@@ -430,6 +563,36 @@ export function stateDirProblem(dir) {
  * ⚠️ On Linux `-c` is one string, so **quote it** (paths with spaces split / B2 measured).
  *    On mac the arguments are **listed as is** (no shell involved, so quoting would pass the quotes along).
  */
+/**
+ * ★ What `claude` resolves to in a new `shell` started with `flags` (`-l -i` = a real terminal / `-i`). '' = unknown.
+ *   Shared by the installer and `nyan status` / `nyan keys` (never written twice).
+ * ⚠️⚠️ On a pipe, not a pty (round 8): with a pty the rc's terminal-only startup ran too — an rc that starts tmux
+ *    in a terminal started it on every `nyan status`. ⚠️ Known limit: an rc line guarded by `[ -t 0 ]` that changes
+ *    PATH is not seen.
+ * - A fresh nonce ties the result frame to this probe (an rc can print `\001…\001` itself / round 6); the
+ *   delimiters are `\\001` escapes for printf, not raw bytes (with `set -v` the echoed command would match first).
+ * - `killSignal: SIGKILL` (an interactive bash ignores SIGTERM).
+ * @param env the env for the shell (PATH without the shim directory, so the rc has to put it back)
+ */
+export function probeClaude(shell, flags, env) {
+  const nonce = randomBytes(8).toString('hex')
+  const argv = [...flags, '-c', `printf "\\001%s\\001%s\\001" ${nonce} "$(command -v claude)"`]
+  // ⚠️ rc files print things to stdout (Ubuntu's sudo hint, fastfetch…) ⇒ take only our frame
+  // ⚠️ Not a path (an alias or a function: `alias claude='ANTHROPIC_API_KEY=… …'`) ⇒ a fixed label, never its text
+  const read = (out) => {
+    const found = new RegExp(`\u0001${nonce}\u0001([^\u0001]*)\u0001`).exec(out)?.[1]?.trim()
+    return found && !found.startsWith('/') ? t('（alias か関数）', '(an alias or a function)') : found
+  }
+  // ⚠️ `-i` still runs autostart snippets that check only `$-` (round 9: tmux started a session per `nyan status`)
+  //    ⇒ look as if already inside tmux / screen / zellij, and switch off oh-my-zsh's tmux autostart
+  const quiet = { ...env, TMUX: env['TMUX'] || 'nyan-remote-probe', STY: env['STY'] || 'nyan-remote-probe', ZELLIJ: env['ZELLIJ'] || '0', ZSH_TMUX_AUTOSTART: 'false' }
+  try {
+    return read(execFileSync(shell, argv, { encoding: 'utf8', timeout: 15_000, stdio: ['ignore', 'pipe', 'ignore'], killSignal: 'SIGKILL', env: quiet })) ?? ''
+  } catch {
+    return ''
+  }
+}
+
 export function ptyProbeArgv(plat, cmd, args) {
   if (plat === 'darwin') return ['-q', '/dev/null', cmd, ...args]
   return ['-qec', [cmd, ...args].map(shq).join(' '), '/dev/null']
@@ -463,9 +626,28 @@ export function resolveRealClaude(pathEnv, excludeDir, isExecutable = isExecutab
     const p = join(dir, 'claude')
     if (!isExecutable(p)) continue
     if (isSameFile(p, shim)) continue
+    // ⚠️ Another nyan shim (an old state directory still on PATH, e.g. through an old tail) is not the real one
+    //    (round 9: the next update chained the new shim through the old one)
+    if (isOurShim(p)) continue
     return p
   }
   return undefined
+}
+
+/** A shim we wrote (line 2 is `SHIM_MARK`)? ⚠️ Unreadable ⇒ no (no basis to exclude it) */
+function isOurShim(p) {
+  // ⚠️ Read only the head: the real claude is a ~350 MB binary (round 10: reading it whole peaked at 1.1 GB)
+  let fd
+  try {
+    fd = openSync(p, 'r')
+    const buf = Buffer.alloc(400)
+    const n = readSync(fd, buf, 0, buf.length, 0)
+    return buf.subarray(0, n).toString('utf8').split('\n')[1]?.startsWith(SHIM_MARK) === true
+  } catch {
+    return false
+  } finally {
+    if (fd !== undefined) closeSync(fd)
+  }
 }
 
 /** Same underlying file? (dev + inode). ⚠️ If unreadable, lean to "different" (no basis to exclude it) */
@@ -576,25 +758,49 @@ async function main() {
   const shimPath = join(binDir, 'claude')
 
   const block = buildBlock(binDir)
+  const tail = buildTail(binDir)
   /** @type {{path: string, before: string, after: string}[]} */
   const plans = []
   for (const path of targets) {
     let before = ''
+    let existed = true
     try {
-      before = await readFile(path, 'utf8')
+      const raw = await readFile(path)
+      before = raw.toString('utf8')
+      // ⚠️ Not UTF-8 (e.g. Latin-1 in old dotfiles): writing it back would turn those bytes into U+FFFD and change
+      //    what the shell reads (codex round 16) ⇒ leave this file alone and say so
+      if (!Buffer.from(before, 'utf8').equals(raw)) {
+        console.error(t(`⚠️ ${path} は UTF-8 ではないので触りません（書き戻すと文字が化けます）。打鍵の経路は別の rc に頼ります。`, `⚠️ ${path} is not UTF-8, so it is left alone (writing it back would garble it). Typing relies on the other rc.`))
+        continue
+      }
     } catch (err) {
+      existed = false
       if (err.code !== 'ENOENT') {
         console.error(t(`⚠️ ${path} を読めませんでした（${err.code}）。何もしていません。`, `⚠️ Could not read ${path} (${err.code}). Nothing was changed.`))
         process.exit(1)
       }
     }
-    const after = uninstall ? removeBlock(before) : applyBlock(before, block)
+    // ★ Uninstall removes the tail too. Install: the main block, then the tail at the end when needed (`applyTail`)
+    const main = uninstall ? removeBlock(before) : applyBlock(before, block)
+    let tailed = main === null || uninstall ? undefined : tailState(main, tail)
+    // ★ Only append to an rc that already parses: appending can complete a broken last command (round 6:
+    //   `… && # unfinished` with a `#` inside quotes slipped past the text checks)
+    if (tailed && !tailed.declined && tailed.rc !== main && !parses(checkerFor(path), main)) tailed = { rc: main, declined: true }
+    const after = main === null ? null : uninstall ? removeBlock(main, TAIL_BEGIN, TAIL_END) : tailed.rc
+    if (tailed?.declined) {
+      console.log(t(`⚠️ ${path}: ブロックの後ろに行が足されていますが、末尾に安全に足せませんでした（続きのある最後の行・閉じていない here-doc・後ろの return / exit / exec・デバッグ用のフックやコマンドの固定・構文エラー）。行番号:`, `⚠️ ${path}: lines were added after the block, but the short block could not be appended safely (an unfinished last line, an open here-document, a return / exit / exec after it, debugger hooks or command pins, or a syntax error). Lines:`))
+      const nos = linesAfterLastBlock(findBlocks(before)?.length === 1 ? before : (main ?? '')) ?? []
+      if (nos.length) console.log(`      ${path}: ${nos.slice(0, 5).join(', ')}`)
+    }
+    if (!uninstall && after !== null && findBlocks(after, TAIL_BEGIN, TAIL_END)?.length && !findBlocks(before, TAIL_BEGIN, TAIL_END)?.length) {
+      console.log(t(`★ ${path}: ブロックの後ろに行が足されているので（PATH を変えているかもしれない）、末尾に「shim を先頭へ戻す」短いブロックを足します`, `★ ${path}: lines were added after the block (they may change PATH), so a short block that keeps the shim first goes at the end`))
+    }
     if (after === null) {
       console.error(t(`⚠️ ${path} の区切り（${BEGIN} / ${END}）が片方だけ在ります。`, `⚠️ ${path} has only one of the markers (${BEGIN} / ${END}).`))
       console.error(t('   手で直してから流し直してください。何もしていません。', '   Fix it by hand, then run this again. Nothing was changed.'))
       process.exit(1)
     }
-    plans.push({ path, before, after })
+    plans.push({ path, before, after, existed })
   }
 
   if (uninstall) {
@@ -637,7 +843,18 @@ async function main() {
     console.log(wrapper)
     for (const { path, before, after } of plans) {
       console.log(t(`--- ${path} に足すもの ---`, `--- to be added to ${path} ---`))
-      console.log(after === before ? t('（すでに同じ形です）', '(already in this form)') : block)
+      if (after === before) console.log(t('（すでに同じ形です）', '(already in this form)'))
+      else {
+        // ★ Show what actually changes: the main block, the tail at the end, or both
+        if (removeBlock(after, TAIL_BEGIN, TAIL_END) !== removeBlock(before, TAIL_BEGIN, TAIL_END)) console.log(block)
+        // what follows the tail (null = no tail): a different value = the tail was added, moved or removed
+        const trailing = (rc) => {
+          const sp = findBlocks(rc, TAIL_BEGIN, TAIL_END) ?? []
+          return sp.length ? rc.slice(sp[0].end) : null
+        }
+        const tails = (rc) => (findBlocks(rc, TAIL_BEGIN, TAIL_END) ?? []).map((x) => rc.slice(x.start, x.end)).join('\0')
+        if (trailing(after) !== trailing(before) || tails(after) !== tails(before)) console.log(trailing(after) !== null ? tail : t('（末尾のブロックを外す）', '(the tail block is removed)'))
+      }
     }
     console.log(t('--- ここまで（--dry-run なので書いていません） ---', '--- end (--dry-run, nothing written) ---'))
     // ★ **Print it even with `--dry-run`** (pointless if you cannot notice before installing / Q4)
@@ -816,32 +1033,13 @@ async function main() {
     .split(':')
     .filter((d) => d && resolve(d) !== resolve(binDir))
     .join(':')
-  // ⚠️ rc files sometimes print things to stdout (Ubuntu's sudo hint, fastfetch etc.).
-  //   ⇒ **Wrap with sentinels and extract** (`.trim()` and comparing whole gives false warnings / measured).
-  //   ⚠️ Never write raw control characters in source (git treats the file as binary / CLAUDE.md §5)
-  const MARK = '\u0001'
-  const probe = (flags) => {
-    try {
-      const out = execFileSync(
-        probeShell,
-        [...flags, '-c', `printf "${MARK}%s${MARK}" "$(command -v claude)"`],
-        {
-          encoding: 'utf8',
-          timeout: 15_000,
-          stdio: ['ignore', 'pipe', 'ignore'],
-          env: childEnv({ PATH: cleanPath }),
-        },
-      )
-      const m = new RegExp(`${MARK}([^${MARK}]*)${MARK}`).exec(out)
-      return m?.[1]?.trim() ?? ''
-    } catch {
-      return ''
-    }
-  }
+  const probe = (flags) => probeClaude(probeShell, flags, childEnv({ PATH: cleanPath, NYAN_REMOTE_SHIM_PROBE: '1' }))
   const login = probe(['-l', '-i'])
   const plain = probe(['-i'])
   const ok = (v) => v && resolve(v) === resolve(shimPath)
-  if (!login && !plain) {
+  // ⚠️ One unknown and one shim is inconclusive; a non-shim answer is definite (round 5)
+  const missed = [login, plain].some((v) => v && !ok(v))
+  if (!missed && (!login || !plain)) {
     console.log(t('⬜ 新しいシェルでの解決先を確認できませんでした。手で確かめてください:', '⬜ Could not check what claude resolves to in a new shell. Check it by hand:'))
     console.log("   bash -l -i -c 'command -v claude'")
   } else if (ok(login) && ok(plain)) {
@@ -852,8 +1050,13 @@ async function main() {
     console.log(t(`   ログイン+対話（＝実際の端末）: ${login || unmeasured}`, `   login + interactive (= a real terminal): ${login || unmeasured}`))
     console.log(t(`   対話のみ                    : ${plain || unmeasured}`, `   interactive only                        : ${plain || unmeasured}`))
     console.log(t('   ⇒ shim より**後**に PATH を書き換えているものがあります。', '   ⇒ Something rewrites PATH **after** the shim.'))
+    // ★ Point at the lines (after our block) that may do it, so the fix is concrete
+    for (const { path, after } of plans) {
+      const nos = linesAfterLastBlock(after ?? '') ?? []
+      if (nos.length) console.log(`      ${path}: ${nos.slice(0, 5).join(', ')}`)
+    }
     console.log(t(`      置いたファイル: ${plans.map((x) => x.path).join(' / ')}`, `      files written: ${plans.map((x) => x.path).join(' / ')}`))
-    console.log(t('      その設定（mise / nvm / direnv / .zlogin など）より後ろにブロックを移してください。', '      Move the block after that setting (mise / nvm / direnv / .zlogin, etc.).'))
+    console.log(t('      よくある形（後から足された PATH の行）は自動で直します。直せなかったときは、下の行が原因です（上に理由が出ています）。', '      The common case (a PATH line added later) is repaired automatically. If it could not be, the lines below are the cause (the reason is printed above).'))
   }
   // ★★ Place the `nyan` / `nyan-remote` commands in the same directory (2026-09-24 / `lib/cli.mjs`).
   //   ⚠️ The directory's safety (owned by us, not a symlink, not writable by others) was checked above
@@ -875,11 +1078,13 @@ async function main() {
  */
 function warnAbsoluteCalls(plans) {
   for (const { path, before } of plans) {
-    const abs = absoluteClaudeCalls(before)
+    // ⚠️ Line numbers only: such a line can carry a key (`alias claude='ANTHROPIC_API_KEY=… /opt/bin/claude'`)
+    const abs = String(before ?? '')
+      .split('\n')
+      .flatMap((line, i) => (absoluteClaudeCalls(line).length ? [i + 1] : []))
     if (!abs.length) continue
     console.log(t('⚠️ **shim を通らない呼び方があります**（パス付きで claude を起こしています）:', '⚠️ **Some calls bypass the shim** (they start claude by path):'))
-    for (const line of abs.slice(0, 5)) console.log(`   ${path}: ${line}`)
-    if (abs.length > 5) console.log(t(`   （ほか ${abs.length - 5} 行）`, `   (${abs.length - 5} more lines)`))
+    console.log(`   ${path}: ${abs.slice(0, 5).join(', ')}${abs.length > 5 ? t(`（ほか ${abs.length - 5} 行）`, ` (${abs.length - 5} more lines)`) : ''}`)
     console.log(t('   （打鍵で渡したいなら、その行を `claude` に直してください）', '   (to type from the phone, change that line to plain `claude`)'))
   }
 }
@@ -909,6 +1114,32 @@ function warnAbsoluteCalls(plans) {
  *    **bash** was chosen, rejected valid zsh syntax (`repeat 3; do …; done` etc.), and
  *    installing became impossible.
  */
+/** Does `text` pass `<shell> -n`? ⚠️ false when the shell cannot run either (then we do not append) */
+function parses(shell, text) {
+  // ★ bash parses `!(…)` patterns only with extglob on, and `-n` never runs the rc's `shopt -s extglob` (round 11)
+  //   ⇒ try plain, then with extglob; the lone-`)` check below uses the same mode
+  const flags = [['-n'], ...(/(^|\/)bash$/.test(shell) ? [['-O', 'extglob', '-n']] : [])]
+  let mode = flags[0]
+  const check = (input) => {
+    try {
+      return spawnSync(shell, mode, { input, encoding: 'utf8', stdio: ['pipe', 'ignore', 'pipe'], timeout: 10_000 })
+    } catch {
+      return undefined
+    }
+  }
+  let r = check(text)
+  if ((!r || r.status !== 0) && flags[1]) {
+    mode = flags[1]
+    r = check(text)
+  }
+  // ⚠️ bash accepts a here-document left open at the end with only a warning (round 7) ⇒ treat it as broken
+  if (!r || r.status !== 0 || /here-document/i.test(r.stderr ?? '')) return false
+  // ★ Is the end of the file at the top level? A lone `)` there is a syntax error; inside an open here-document it
+  //   is just data (round 10: zsh says nothing about an open here-document) ⇒ it must NOT parse
+  const probe = check(`${text}${text.endsWith('\n') ? '' : '\n'})\n`)
+  return probe !== undefined && probe.status !== 0
+}
+
 export function checkerFor(rcPath) {
   return rcPath.endsWith('.zshrc') || rcPath.endsWith('.zprofile') ? 'zsh' : 'bash'
 }
@@ -940,7 +1171,7 @@ async function stageRcFiles(plans, { syntaxCheck }) {
   const cleanup = async () => {
     for (const st of staged) await rm(st.tmp, { force: true })
   }
-  for (const { path, before, after } of plans) {
+  for (const { path, before, after, existed: planned } of plans) {
     if (after === before) {
       console.log(t(`変更なし: ${path}（すでにこの形です）`, `Unchanged: ${path} (already in this form)`))
       continue
@@ -994,18 +1225,27 @@ async function stageRcFiles(plans, { syntaxCheck }) {
       //    Using `sh -n` here would make a single bashism in the user's rc block the install
       const checker = checkerFor(path)
       try {
-        execFileSync(checker, ['-n', tmp], { stdio: 'pipe' })
+        try {
+          execFileSync(checker, ['-n', tmp], { stdio: 'pipe' })
+        } catch (plain) {
+          // ★ `!(…)` parses only with extglob on, and `-n` never runs the rc's `shopt -s extglob` (round 11)
+          if (checker !== 'bash') throw plain
+          execFileSync(checker, ['-O', 'extglob', '-n', tmp], { stdio: 'pipe' })
+        }
       } catch (err) {
         await cleanup()
         await rm(tmp, { force: true })
-        const detail = String(err.stderr ?? err.message).slice(0, 400)
+        // ⚠️ Line numbers only: the shell echoes the offending line, which can carry a key
+        const nos = [...new Set([...String(err.stderr ?? '').matchAll(/line (\d+)/g)].map((m) => m[1]))].slice(0, 5)
+        const detail = nos.length ? t(`   行: ${nos.join(', ')}`, `   line: ${nos.join(', ')}`) : ''
         return { staged: [], error: t(`${path} の内容が ${checker} の構文検査で落ちました\n${detail}`, `${path} failed the ${checker} syntax check\n${detail}`) }
       }
     }
     // ⚠️ **Do not reuse `before` (the contents) as an existence flag** (review B6).
     //    If the original is **a 0-byte file**, it is judged "did not exist", no backup is taken, and
     //    the rollback **deletes it**. ⇒ Keep `existed` separately
-    staged.push({ path, target, tmp, before, existed: existsSync(target) })
+    // ★ Existence as seen **when the plan was read** (the preflight in `commitStaged` compares against it)
+    staged.push({ path, target, tmp, before, existed: planned ?? existsSync(target) })
   }
   return { staged, relinks }
 }
@@ -1041,10 +1281,26 @@ async function relinkAll(relinks) {
  * @returns {error, restored} only on failure
  */
 async function commitStaged(staged, verb) {
+  // ★ Someone saved an rc while we ran the checks ⇒ replace nothing (do not write our older snapshot over it).
+  //   ⚠️ Checked for **every** file before the first rename, so it never starts a rollback (codex 2026-11-19).
+  //   ⚠️ A save between this check and the rename can still be lost (no lock is shared with editors).
+  for (const { path, target, before, existed } of staged) {
+    let now
+    let unreadable = false
+    try {
+      now = await readFile(target, 'utf8')
+    } catch (err) {
+      now = undefined
+      unreadable = err.code !== 'ENOENT'
+    }
+    if (unreadable || (existed ? now !== before : now !== undefined)) {
+      for (const s of staged) await rm(s.tmp, { force: true })
+      return { error: t(`${path} が確認の途中で書き換えられました。流し直してください`, `${path} changed while we were checking; run this again`), restored: [], lost: [] }
+    }
+  }
   const done = []
   for (const [i, st] of staged.entries()) {
     const { path, target, tmp, before, existed } = st
-    void before
     const backup = `${target}.nyan-remote-backup-${stamp()}`
     try {
       if (existed) await copyFile(target, backup)

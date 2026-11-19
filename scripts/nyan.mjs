@@ -569,7 +569,48 @@ async function status() {
   // ⚠️ Loaded only here: every other command (uninstall, help…) must not depend on the agent's sources being there
   const { inspectConfig } = await import('../agent/src/config.ts')
   for (const line of codexStatusLines(await inspectConfig(), recent)) console.log(line)
+  for (const line of await typingStatusLines(homedir())) console.log(line)
   return 0
+}
+
+/**
+ * ★ The typing line of `nyan status` (2026-11-19): a tool installed after us can append a PATH line after our rc
+ *   block, and typing then silently falls back to the inbox. ⚠️ Read the rc files only — running them from `status`
+ *   started the user's own startup programs (codex round 11). The live check stays in `nyan keys`.
+ */
+export async function typingStatusLines(home, shell = process.env['SHELL'], os = platform()) {
+  const { linesAfterLastBlock, loginProfileFor, mayEndBeforeTail, rcPathFor } = await import('./install-relay.mjs')
+  const files = [...new Set([rcPathFor(shell, home, os), loginProfileFor(shell, home, os)].filter(Boolean))]
+  const found = []
+  const unsure = []
+  let installed = false
+  for (const file of files) {
+    let rc
+    try {
+      rc = readFileSync(file, 'utf8')
+    } catch {
+      continue
+    }
+    const nos = linesAfterLastBlock(rc)
+    if (nos === null) continue
+    installed = true
+    // ⚠️ Line numbers only: the text may hold secrets (codex round 13: an exported API key was printed)
+    if (nos.length) found.push(`${file}: ${nos.slice(0, 5).join(', ')}`)
+    if (mayEndBeforeTail(rc)) unsure.push(file)
+  }
+  if (!installed) return [t('打鍵:       rc に nyan のブロックがありません（打鍵は受信箱に落ちます）⇒ nyan update', 'Typing:     no nyan block in the rc (typing falls back to the inbox) ⇒ nyan update')]
+  // ⚠️ A return / exit / exec after the block: the file alone cannot tell, and nyan update adds no tail after one
+  if (unsure.length) {
+    return [
+      t(`打鍵:       ⬜ ファイルからは判断できません（${unsure.join(' / ')} の nyan のブロックの後ろに return / exit / exec があります）⇒ nyan keys で確かめてください`, `Typing:     ⬜ cannot tell from the file (a return / exit / exec follows the nyan block in ${unsure.join(' / ')}) ⇒ check with nyan keys`),
+      ...found.slice(0, 5).map((l) => `            ${l}`),
+    ]
+  }
+  if (!found.length) return [t('打鍵:       ✅ rc の nyan のブロックの後ろに足された行はありません（実際に確かめるなら nyan keys）', 'Typing:     ✅ nothing was added after the nyan block in the rc (live check: nyan keys)')]
+  return [
+    t('打鍵:       ⚠️ nyan のブロックの後ろに行が足されています（PATH を変えると、新しいセッションは英文の枠つきで届きます）⇒ nyan update で直ります', 'Typing:     ⚠️ lines were added after the nyan block (if they change PATH, new sessions get the English frame) ⇒ nyan update repairs it'),
+    ...found.slice(0, 5).map((l) => `            ${l}`),
+  ]
 }
 
 /** = `CODEX_START_MARK` in `agent/src/codex/marks.ts` (a test keeps the two equal; not imported, see above) */

@@ -18,6 +18,7 @@ import { execFileSync, spawnSync } from 'node:child_process'
 import {
   chmodSync,
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
@@ -38,6 +39,14 @@ import {
   buildBlock,
   buildWrapper,
   loginProfileFor,
+  applyTail,
+  linesAfterLastBlock,
+  mayEndBeforeTail,
+  probeClaude,
+  tailState,
+  buildTail,
+  TAIL_BEGIN,
+  TAIL_END,
   rcPathFor,
   ptyProbeArgv,
   shellFor,
@@ -49,6 +58,7 @@ import {
 const BIN = '/home/who/.nyan-remote/bin'
 const RELAY = '/home/who/nyan-remote/scripts/relay.py'
 const block = (): string => buildBlock(BIN) as string
+const count = (text: string, needle: string): number => text.split(needle).length - 1
 
 test('buildBlock: only prepends to PATH; defines no function or alias', () => {
   const b = block()
@@ -88,6 +98,165 @@ test('applyBlock: does not break an rc that does not end with a newline', () => 
 test('★★ applyBlock: null when only one marker exists (do not touch = fail-closed)', () => {
   assert.equal(applyBlock(`x\n${BEGIN}\nこわれた\n`, block()), null)
   assert.equal(applyBlock(`x\n${END}\n`, block()), null)
+})
+
+const tail = (): string => buildTail(BIN) as string
+
+test('★★ applyTail: a PATH line appended after the block (another installer) ⇒ a tail block goes at the very end; the block stays', () => {
+  // ★ The real machine (2026-11-19): gcloud's lines, a literal export, then the Antigravity CLI installer's line
+  const later =
+    "\nif [ -f '/home/user/google-cloud-sdk/path.bash.inc' ]; then . '/home/user/google-cloud-sdk/path.bash.inc'; fi\nexport PLAUD_TELEMETRY_DISABLED=1\n\n# Added by Antigravity CLI installer\nexport PATH=\"/home/user/.local/bin:$PATH\"\n"
+  const rc = `${applyBlock('A=1\n', block())}${later}`
+  const out = applyTail(rc, tail()) as string
+  assert.ok(out.startsWith(rc), 'everything before stays byte for byte (the main block is not moved)')
+  assert.ok(out.trimEnd().endsWith(TAIL_END), 'the tail is last')
+  assert.equal(count(out, TAIL_BEGIN), 1)
+  assert.equal(applyTail(out, tail()), out, 'idempotent')
+  assert.equal(removeBlock(out, TAIL_BEGIN, TAIL_END), rc, 'removing the tail gives the rc back')
+})
+
+test('★ applyTail: append-only — a second tail after new PATH lines; none when nothing after the block changes PATH', () => {
+  const withTail = applyTail(`${applyBlock('A=1\n', block())}export PATH="/x:$PATH"\n`, tail()) as string
+  // ★ Append-only (codex round 6): the first tail stays where it is, a second one goes after the new line
+  const grown = `${withTail}export PATH="/y:$PATH"\n`
+  const again = applyTail(grown, tail()) as string
+  assert.ok(again.startsWith(grown), 'the existing text (and the first tail) did not stay byte for byte')
+  assert.ok(again.trimEnd().endsWith(TAIL_END), 'no tail at the end')
+  assert.equal(count(again, TAIL_BEGIN), 2)
+  assert.equal(applyTail(again, tail()), again, 'idempotent')
+  // ⚠️ An older tail (another shim directory) is kept byte for byte (round 7) and a current one goes after it so the
+  //    current shim wins (round 8)
+  const at = withTail.indexOf(TAIL_BEGIN)
+  const old = withTail.slice(0, at) + withTail.slice(at).split(BIN).join('/old/.nyan-remote/bin')
+  assert.ok(old.slice(at).includes('/old/.nyan-remote/bin') && !old.slice(at).includes(BIN))
+  const fixed = applyTail(old, tail()) as string
+  assert.ok(fixed.startsWith(old), 'the old tail changed')
+  assert.ok(fixed.trimEnd().endsWith(tail()), 'no current tail at the end')
+  assert.equal(applyTail(fixed, tail()), fixed, 'idempotent')
+  // ★ Common rc text that must not block the repair (round 15): Ubuntu's comment ending in `!`, zsh named directories
+  for (const rc of [
+    `${applyBlock('A=1\n', block())}export PATH="$HOME/.local/bin:$PATH" # For locally installed tools!\n`,
+    `${applyBlock('hash -d work="$HOME/work"\n', block())}export PATH="/later:$PATH"\n`,
+  ]) {
+    assert.equal(tailState(rc, tail()).declined, false, rc.split('\n').at(-2))
+  }
+  // ★ A closed here-document or a finished line continuation in the middle does not block the repair (round 9)
+  for (const mid of ["cat <<'EOF' >/dev/null\nbody\nEOF\n", 'export A="one \\\n  two"\n']) {
+    const rc = `${applyBlock('A=1\n', block())}${mid}export PATH="/later:$PATH"\n`
+    assert.equal(tailState(rc, tail()).declined, false, JSON.stringify(mid))
+  }
+  // a blank line or a comment after the tail adds nothing
+  assert.equal(applyTail(`${withTail}\n# note\n`, tail()), `${withTail}\n# note\n`)
+  // nothing after the block that can change PATH ⇒ no tail
+  for (const after of ['', '\n\n', '# a comment\n']) {
+    const rc = `${applyBlock('A=1\n', block())}${after}`
+    assert.equal(applyTail(rc, tail()), rc, `no tail for ${JSON.stringify(after)}`)
+  }
+  // things that may change PATH ⇒ a tail
+  // ★ Any command after the block (round 12: `nvm use` changed PATH without naming it) — the tail is a no-op otherwise
+  for (const after of ['PATH=/usr/bin\n', '. "$HOME/.cargo/env"\n', 'source ~/.nvm/nvm.sh\n', 'eval "$(mise activate bash)"; export PATH\n', '[ -f x ] && . x\n', 'nvm use 24\n', 'alias ll="ls -l"\n']) {
+    const rc = `${applyBlock('A=1\n', block())}${after}`
+    assert.ok((applyTail(rc, tail()) as string).trimEnd().endsWith(TAIL_END), `a tail for ${JSON.stringify(after)}`)
+  }
+  assert.equal(applyTail(`A=1\n${TAIL_BEGIN}\n`, tail()), null, 'broken tail markers: do not touch')
+})
+
+test('★★ applyTail: a working tail is not moved below a later `return`; unsafe file ends get no tail (declined)', () => {
+  const withTail = applyTail(`${applyBlock('A=1\n', block())}export PATH="/x:$PATH"\n`, tail()) as string
+  // ⚠️ Moving it below the return would stop it from running (codex round 4)
+  const returned = `${withTail}return 0\n`
+  assert.equal(applyTail(returned, tail()), returned, 'the tail moved')
+  // ★ A working tail is never moved (round 5–6), and none is added after a return (it would never run / round 12)
+  const crossing = `${withTail}return 0\nexport PATH="/z:$PATH"\n`
+  assert.deepEqual(tailState(crossing, tail()), { rc: crossing, declined: true })
+  // ⚠️ Debugger hooks can skip the tail's commands (round 6: an endless loop) ⇒ nothing is written
+  for (const hook of ['shopt -s extdebug\n', "trap 'false' DEBUG\n", 'set -T\n', 'hash -p /bin/true helper\n', 'hash -rp /bin/true helper\n', 'BASH_CMDS[helper]=/bin/true\n', 'hash helper=/bin/true\n', 'hash "-p" /bin/true helper\n', 'hash \\\n  -p /bin/true helper\n']) {
+    const rc = `${applyBlock(`A=1\n${hook}`, block())}export PATH="/x:$PATH"\n`
+    assert.deepEqual(tailState(rc, tail()), { rc, declined: true }, JSON.stringify(hook))
+  }
+  for (const end of [
+    'export PATH="/x:$PATH" &&\n',
+    'export PATH="/x:$PATH" |\n',
+    'export PATH="/x:$PATH" \\\n',
+    // round 5: `|&`, an operator followed by a comment (open here-documents are caught by `parses()` in main)
+    'export PATH="/x:$PATH" |&\n',
+    'export PATH="/x:$PATH" && # note\n',
+  ]) {
+    const rc = `${applyBlock('A=1\n', block())}${end}`
+    const st = tailState(rc, tail())
+    assert.equal(st.rc, rc, `wrote after ${JSON.stringify(end)}`)
+    assert.equal(st.declined, true, `did not say it declined for ${JSON.stringify(end)}`)
+  }
+  // zsh's tied array and eval also change PATH
+  for (const after of ['path=("$HOME/.local/bin" $path)\n', 'path+=(/opt/x)\n', 'eval "$(/opt/homebrew/bin/brew shellenv)"\n', 'command source "$HOME/paths"\n']) {
+    const rc = `${applyBlock('A=1\n', block())}${after}`
+    assert.ok((applyTail(rc, tail()) as string).trimEnd().endsWith(TAIL_END), `no tail for ${JSON.stringify(after)}`)
+  }
+})
+
+/** Runs `rc` + the tail in `shell` and prints the status and PATH. ⚠️ Every run has a timeout (a loop must not hang the test) */
+function runTail(shell: string, rc: string, after = 'printf "%s|%s" "$?" "${PATH-unset}"'): string {
+  const dir = mkdtempSync(join(tmpdir(), 'nyan-tail-'))
+  try {
+    writeFileSync(join(dir, 'rc'), `${rc}\n${tail()}\n`)
+    const r = spawnSync(shell, ['-c', `. ${join(dir, 'rc')}; ${after}`], { encoding: 'utf8', timeout: 10_000 })
+    assert.notEqual(r.error?.message.includes('ETIMEDOUT'), true, 'the tail hung')
+    return r.stdout
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+}
+
+test('★ buildTail: never calls exit (zsh runs TRAPEXIT on any explicit exit, even in a subshell / round 11)', () => {
+  assert.doesNotMatch(tail(), /\bexit\b/)
+})
+
+test('★★ buildTail: puts the shim first, ends under nocasematch, keeps the status, leaves readonly / empty PATH alone (POSIX sh)', () => {
+  execFileSync('sh', ['-n'], { input: tail() })
+  // ⚠️ High in codex round 4: a differently cased copy under nocasematch made the old `case` loop spin forever
+  const upper = BIN.toUpperCase()
+  assert.equal(runTail('bash', `shopt -s nocasematch; PATH="/other:${upper}:$PATH"`, 'printf %s "${PATH%%:*}"'), BIN)
+  // ★ It only prepends (no loop to hang): another copy later on PATH stays, empty entries stay
+  assert.equal(runTail('bash', `PATH="/x::${BIN}:/y"`, 'printf %s "$PATH"'), `${BIN}:/x::${BIN}:/y`)
+  // ⚠️ round 7: a function named `[` made the old loop spin forever
+  assert.equal(runTail('bash', 'function [ { return 0; }; PATH="/x:$PATH"', 'printf %s "${PATH%%:*}"'), BIN)
+  // ⚠️ round 6–7: an extdebug DEBUG trap that skips commands made the old loop endless (runTail fails on a timeout)
+  runTail('bash', `shopt -s extdebug; trap 'false' DEBUG; PATH="/x:$PATH"`, 'true')
+  assert.match(runTail('bash', 'PATH="/x:$PATH"; false'), /^1\|/, 'the rc ended with a failure: the tail must keep 1')
+  assert.match(runTail('bash', 'PATH="/x:$PATH"; (exit 7) && :'), /^7\|/, 'the exact status (round 6: 7 became 1)')
+  // ⚠️ round 8: an `exit` alias / function ran instead of the builtin
+  assert.match(runTail('bash', 'shopt -s expand_aliases\nalias exit="false &&"\nPATH="/x:$PATH"'), /^0\|/, 'an exit alias')
+  assert.match(runTail('bash', 'PATH="/x:$PATH"'), new RegExp(`^0\\|${BIN.replace(/[.]/g, '\\.')}:`))
+  assert.equal(runTail('bash', 'set -u; unset PATH'), '0|unset', 'an unset PATH stays unset (no ":" = no current directory)')
+  assert.match(runTail('bash', 'PATH="/x:$PATH"; readonly PATH; set -e', 'printf %s "${PATH%%:*}"'), /^\/x$/, 'a readonly PATH under set -e must not end the shell')
+  assert.equal(runTail('bash', 'PATH="/x:$PATH"', 'set | grep -c "^_nyan_remote" || true').trim(), '0', 'no variables left behind')
+  if (spawnSync('dash', ['-c', 'true']).status === 0) assert.match(runTail('dash', 'PATH="/x:$PATH"'), new RegExp(`^0\\|${BIN.replace(/[.]/g, '\\.')}:`))
+  assert.equal(runTail('bash', `PATH="${BIN}:$PATH"; hash -p /bin/true mytool`, 'hash -t mytool').trim(), '/bin/true', 'an unchanged PATH is not assigned (keeps the hash)')
+})
+
+test('★★ buildTail: lines added below it still run, it works when the file is executed, and set -e behaves as without it (round 5)', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'nyan-tail-'))
+  try {
+    const both = (rc: string, below = '') => {
+      const out: string[] = []
+      for (const withTail of [false, true]) {
+        writeFileSync(join(dir, 'rc'), `${rc}\n${withTail ? `${tail()}\n` : ''}${below}\n`)
+        const r = spawnSync('bash', ['-c', `. ${join(dir, 'rc')}; printf "%s|%s" "$?" "\${EDITOR-}"`], { encoding: 'utf8', timeout: 10_000 })
+        out.push(`${r.status}:${r.stdout}`)
+      }
+      return out
+    }
+    // ⚠️ The tail used to end with `return`: a line appended below it never ran
+    assert.deepEqual(both('PATH="/x:$PATH"', 'export EDITOR=nvim'), ['0:0|nvim', '0:0|nvim'])
+    const [plain, tailed] = both('set -e; PATH="/x:$PATH"; false && :')
+    assert.equal(tailed, plain, 'set -e with an exempt failure at the end')
+    const [p2, t2] = both('PATH="/x:$PATH"; false')
+    assert.equal(t2, p2, 'the status of an rc that ends with a failure')
+    writeFileSync(join(dir, 'rc'), `PATH="/x:$PATH"\n${tail()}\n`)
+    assert.equal(spawnSync('bash', [join(dir, 'rc')], { timeout: 10_000 }).status, 0, 'running the file directly')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
 })
 
 test('removeBlock: removing restores the original (surrounding lines remain)', () => {
@@ -820,4 +989,45 @@ test('★★ keys-status.mjs does not hard-code the shell (⚠️ do not revert 
     .join('\n')
   assert.doesNotMatch(code, /execFileSync\(\s*'bash'/, '⚠️⚠️ launches bash hard-coded')
   assert.match(code, /shellFor\(/, 'the shell to inspect is not chosen by shellFor')
+})
+
+test('★ probeClaude: an rc printing its own frame does not fool it; a hanging rc gives "unknown" in bounded time', () => {
+  const home = mkdtempSync(join(tmpdir(), 'nyan-probe-'))
+  try {
+    mkdirSync(join(home, 'bin'))
+    writeFileSync(join(home, 'bin', 'claude'), '#!/bin/sh\n')
+    chmodSync(join(home, 'bin', 'claude'), 0o755)
+    // ⚠️ round 6: the parser took the first \001 pair, so a tty-only printf won
+    writeFileSync(join(home, '.bashrc'), "printf '\\001x\\001/bin/true\\001'\n")
+    const env = { ...process.env, HOME: home, PATH: `${join(home, 'bin')}:/usr/bin:/bin`, NYAN_REMOTE_SHIM_PROBE: '1' }
+    assert.equal(probeClaude('bash', ['-i'], env), join(home, 'bin', 'claude'))
+    // ⚠️ round 9: an interactive rc that autostarts tmux when `$TMUX` is empty ran on every probe
+    writeFileSync(join(home, '.bashrc'), 'case $- in *i*) [ -z "$TMUX" ] && touch "$HOME/autostarted" ;; esac\n')
+    probeClaude('bash', ['-i'], env)
+    assert.ok(!existsSync(join(home, 'autostarted')), 'the probe ran a tmux-style autostart')
+    // ⚠️ round 14: an alias that carries a key was returned as text
+    writeFileSync(join(home, '.bashrc'), "alias claude='ANTHROPIC_API_KEY=secret-value /bin/true'\n")
+    assert.doesNotMatch(probeClaude('bash', ['-i'], env), /secret-value/)
+    writeFileSync(join(home, '.bashrc'), 'sleep 20\n')
+    const started = Date.now()
+    assert.equal(probeClaude('bash', ['-i'], env), '')
+    assert.ok(Date.now() - started < 40_000, 'it waited too long')
+  } finally {
+    rmSync(home, { recursive: true, force: true })
+  }
+})
+
+test('★ linesAfterLastBlock: line numbers (never text) of the command lines after our last block', () => {
+  const withTail = applyTail(`${applyBlock('A=1\n', block())}export PATH="/x:$PATH"\n`, tail()) as string
+  assert.deepEqual(linesAfterLastBlock(withTail), [], 'repaired: nothing after the tail')
+  const later = `${withTail}# note\nexport ANTHROPIC_API_KEY=secret\n`
+  const nos = linesAfterLastBlock(later) as number[]
+  assert.deepEqual(nos.map((n) => later.split('\n')[n - 1]), ['export ANTHROPIC_API_KEY=secret'])
+  assert.equal(linesAfterLastBlock('export PATH="/y:$PATH"\n'), null, 'no block = not installed')
+})
+
+test('★ mayEndBeforeTail: a return / exit / exec after the main block makes the read-only status unsure (round 12)', () => {
+  const withTail = applyTail(`${applyBlock('A=1\n', block())}export PATH="/x:$PATH"\nreturn 0\n`, tail()) as string
+  assert.equal(mayEndBeforeTail(withTail), true)
+  assert.equal(mayEndBeforeTail(applyTail(`${applyBlock('return 0\n', block())}export PATH="/x:$PATH"\n`, tail()) as string), false, 'a return before the block does not matter')
 })

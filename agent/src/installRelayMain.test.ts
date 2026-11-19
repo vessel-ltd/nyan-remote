@@ -29,7 +29,7 @@ import { join } from 'node:path'
 import { test } from 'node:test'
 import { fileURLToPath } from 'node:url'
 // @ts-expect-error — plain .mjs (no types)
-import { BEGIN, END } from '../../scripts/install-relay.mjs'
+import { BEGIN, END, TAIL_END, ptyProbeArgv } from '../../scripts/install-relay.mjs'
 
 const INSTALLER = join(fileURLToPath(new URL('../../scripts/', import.meta.url)), 'install-relay.mjs')
 const BASHRC = 'export FOO=1\nalias ll="ls -l"\n'
@@ -246,8 +246,10 @@ test('★★ main(): warns about invocations that bypass the shim by checking **
   //    ⚠️⚠️ At first `/絶対パス/` and `/\.profile/` were matched separately, but **both hit the
   //       shim's own comments and the `--- … .profile に足すもの ---` header and passed**
   //       (= a false green; not noticed until the check became an "observable difference")
-  const warned = (out: string) =>
-    out.split('\n').filter((l) => l.includes('.profile') && l.includes(offender))
+  // ★ Line numbers only (round 14: such a line can carry an API key) — the offender is the last line of .profile
+  const no = `${PROFILE}${offender}\n`.split('\n').length - 1
+  const warned = (out: string) => out.split('\n').filter((l) => l.includes(`.profile: ${no}`))
+  assert.ok(!run('--dry-run').out.includes(offender), 'the line text was printed')
   const HEAD = 'shim を通らない呼び方'
 
   // ★ Also shown with `--dry-run` (pointless unless noticed before installing)
@@ -789,4 +791,132 @@ test('★★ main(): rc permissions are not reduced by umask (A5)', (t) => {
   assert.equal(statSync(join(home, '.bashrc')).mode & 0o777, 0o644, 'install changed the permissions')
   assert.equal(run('--uninstall').status, 0)
   assert.equal(statSync(join(home, '.bashrc')).mode & 0o777, 0o644, 'uninstall changed the permissions')
+})
+
+/** ★ An independent check, not the installer's verdict: what a login + interactive bash finds, on a pty when possible */
+function terminalClaude(home: string): string {
+  const env: Record<string, string | undefined> = { ...process.env, HOME: home, SHELL: '/bin/sh', PATH: `${join(home, 'bin')}:/usr/bin:/bin`, NYAN_REMOTE_STATE_DIR: join(home, '.nyan-remote') }
+  delete env['BASH_ENV']
+  const argv = ptyProbeArgv(process.platform, 'bash', ['-l', '-i', '-c', 'command -v claude'])
+  const r = spawnSync('script', argv, { encoding: 'utf8', timeout: 30_000, env })
+  const out = r.status === 0 ? r.stdout : spawnSync('bash', ['-l', '-i', '-c', 'command -v claude'], { encoding: 'utf8', timeout: 30_000, env }).stdout
+  return (out.trim().split(/\r?\n/).at(-1) ?? '').trim()
+}
+
+test('★★ main(): a PATH line appended after the block (another installer) ⇒ a tail block makes the shim win again; uninstall gives the rc back', (t) => {
+  const { home, run } = sandbox()
+  t.after(() => rmSync(home, { recursive: true, force: true }))
+  assert.equal(run().status, 0)
+  // ★ What the Antigravity CLI installer did on a real machine (2026-11-19): append its own PATH line after ours
+  const later = '\n# Added by another installer\nexport PATH="$HOME/bin:$PATH"\n'
+  const original: Record<string, string> = {}
+  for (const f of ['.bashrc', '.profile']) {
+    original[f] = readFileSync(join(home, f), 'utf8') + later
+    writeFileSync(join(home, f), original[f])
+  }
+  assert.equal(terminalClaude(home), join(home, 'bin', 'claude'), 'precondition: the appended line wins')
+  const again = run()
+  assert.equal(again.status, 0, again.out)
+  assert.match(again.out, /shim を先頭へ戻す/, again.out)
+  assert.match(again.out, /新しい端末では claude → .*shim に届いています/, again.out)
+  for (const f of ['.bashrc', '.profile']) {
+    const body = readFileSync(join(home, f), 'utf8')
+    assert.ok(body.startsWith(original[f] ?? '\0'), `${f}: lines before the tail changed (the main block must not move)`)
+    assert.ok(body.trimEnd().endsWith(TAIL_END), `${f}: the tail is not last`)
+  }
+  assert.equal(terminalClaude(home), join(home, '.nyan-remote', 'bin', 'claude'))
+  const third = run()
+  assert.match(third.out, /変更なし/, 'idempotent')
+  const off = run('--uninstall')
+  assert.equal(off.status, 0, off.out)
+  for (const f of ['.bashrc', '.profile']) {
+    assert.equal(readFileSync(join(home, f), 'utf8'), f === '.bashrc' ? BASHRC + later : PROFILE + later, `${f}: uninstall left something`)
+  }
+})
+
+test('★★ main(): an rc saved while the installer runs its checks is not overwritten', (t) => {
+  const { home, run } = sandbox()
+  t.after(() => rmSync(home, { recursive: true, force: true }))
+  // ★ The fake claude edits .bashrc the moment the installer runs it (after the plan was read, before the commit)
+  const edit = `#!/bin/sh\nprintf 'alias saved=1\\n' >> "${join(home, '.bashrc')}"\necho "2.1.999 (Fake Claude)"\n`
+  writeFileSync(join(home, 'bin', 'claude'), edit)
+  const r = run()
+  assert.notEqual(r.status, 0, r.out)
+  assert.match(r.out, /確認の途中で書き換えられました/, r.out)
+  assert.ok(readFileSync(join(home, '.bashrc'), 'utf8').includes('alias saved=1'), 'the edit was lost')
+  assert.equal(count(readFileSync(join(home, '.profile'), 'utf8'), BEGIN), 0, 'the other rc was changed anyway')
+})
+
+test('★★ main(): an rc that does not parse gets no tail (appending could complete its broken last command)', (t) => {
+  const { home, run } = sandbox()
+  t.after(() => rmSync(home, { recursive: true, force: true }))
+  assert.equal(run().status, 0)
+  // ⚠️ round 6: the `#` inside the quotes hid the dangling `&&` from the text checks; the tail would have completed it
+  const broken = `export PATH="$HOME/bin:$PATH"\nprintf '%s\\n' " # label" && # unfinished\n`
+  writeFileSync(join(home, '.profile'), readFileSync(join(home, '.profile'), 'utf8') + broken)
+  const before = readFileSync(join(home, '.profile'))
+  const again = run()
+  assert.match(again.out, /末尾に安全に足せませんでした/, again.out)
+  assert.ok(readFileSync(join(home, '.profile')).equals(before), 'the broken rc was changed')
+})
+
+test('★★ main(): a here-document left open at the end gets no tail (bash only warns; the tail would become its data)', (t) => {
+  const { home, run } = sandbox()
+  t.after(() => rmSync(home, { recursive: true, force: true }))
+  assert.equal(run().status, 0)
+  // ⚠️ round 5 / 7: split with a line continuation so text checks miss it
+  const open = `export PATH="$HOME/bin:$PATH"\ncat <\\\n<'EOF' >/dev/null\nbody\n`
+  writeFileSync(join(home, '.profile'), readFileSync(join(home, '.profile'), 'utf8') + open)
+  const before = readFileSync(join(home, '.profile'))
+  const again = run()
+  assert.match(again.out, /末尾に安全に足せませんでした/, again.out)
+  assert.ok(readFileSync(join(home, '.profile')).equals(before), 'the rc was changed')
+})
+
+test('★ main(): an old shim still on PATH is not taken as the real claude', (t) => {
+  const { home, run } = sandbox()
+  t.after(() => rmSync(home, { recursive: true, force: true }))
+  assert.equal(run().status, 0)
+  // ⚠️ round 9: an old state directory's shim (kept first by an old tail) became "the real claude" on the next update
+  const oldBin = join(home, 'old-state', 'bin')
+  mkdirSync(oldBin, { recursive: true })
+  writeFileSync(join(oldBin, 'claude'), readFileSync(join(home, '.nyan-remote', 'bin', 'claude')))
+  chmodSync(join(oldBin, 'claude'), 0o755)
+  const again = runWith(home, { PATH: `${oldBin}:${join(home, 'bin')}:${join(process.execPath, '..')}:/usr/bin:/bin` })
+  assert.equal(again.status, 0, again.out)
+  assert.match(again.out, new RegExp(`(?:本物|real): ${join(home, 'bin', 'claude').replace(/[.]/g, '\\.')}`), again.out)
+})
+
+test('★ main(): an rc using extglob patterns still gets the repair (`bash -n` does not run its `shopt -s extglob`)', (t) => {
+  const { home, run } = sandbox()
+  t.after(() => rmSync(home, { recursive: true, force: true }))
+  assert.equal(run().status, 0)
+  // ⚠️ round 11: the plain syntax check rejected `!(…)` and the PATH line after the block stayed first
+  const later = 'shopt -s extglob\nclean() { rm -f !(*.log); }\nexport PATH="$HOME/bin:$PATH"\n'
+  writeFileSync(join(home, '.bashrc'), readFileSync(join(home, '.bashrc'), 'utf8') + later)
+  const again = run()
+  assert.equal(again.status, 0, again.out)
+  assert.ok(readFileSync(join(home, '.bashrc'), 'utf8').trimEnd().endsWith(TAIL_END), again.out)
+})
+
+test('★★ main(): a syntax error in the rc is reported by line number, not by the line (it can hold a key)', (t) => {
+  const { home, run } = sandbox()
+  t.after(() => rmSync(home, { recursive: true, force: true }))
+  // ⚠️ bash echoes the offending line in its error (`line 3: \`… if then'`)
+  writeFileSync(join(home, '.bashrc'), `${BASHRC}export ANTHROPIC_API_KEY=secret-value; if then\n`)
+  const r = run()
+  assert.notEqual(r.status, 0, r.out)
+  assert.doesNotMatch(r.out, /secret-value/, r.out)
+})
+
+test('★★ main(): an rc that is not UTF-8 is left byte for byte (writing it back would garble it)', (t) => {
+  const { home, run } = sandbox()
+  t.after(() => rmSync(home, { recursive: true, force: true }))
+  assert.equal(run().status, 0)
+  // ⚠️ codex round 16: Latin-1 bytes became U+FFFD when the rc was rewritten for the tail
+  const latin1 = Buffer.concat([readFileSync(join(home, '.bashrc')), Buffer.from('export NAME="caf'), Buffer.from([0xe9]), Buffer.from('"\nexport PATH="$HOME/bin:$PATH"\n')])
+  writeFileSync(join(home, '.bashrc'), latin1)
+  const again = run()
+  assert.match(again.out, /UTF-8 ではない/, again.out)
+  assert.ok(readFileSync(join(home, '.bashrc')).equals(latin1), 'the non-UTF-8 rc changed')
 })
