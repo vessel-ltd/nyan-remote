@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import { cliShim, commandElsewhere, installCli, isOurs, removeCli } from './lib/cli.mjs'
-import { ACCOUNT_COMMANDS, cliLang, codexStatusLines, DISTRIBUTION_ORIGIN, helpDetail, helpText, main, PASSTHROUGH, pendingDecision, ROOT, restartArgv, updatePlan, wantsHelp } from './nyan.mjs'
+import { ACCOUNT_COMMANDS, afterPullArgv, cliLang, codexStatusLines, DISTRIBUTION_ORIGIN, helpDetail, helpText, main, PASSTHROUGH, pendingDecision, ROOT, restartArgv, updatePlan, wantsHelp } from './nyan.mjs'
 import { setLang } from '../shared/i18n.ts'
 
 test('★★ update: installer machines always pass "the install location" to install.sh (machine C), starting from home', () => {
@@ -303,4 +303,16 @@ test('the start mark nyan status looks for is the one the agent logs', async () 
   const { CODEX_START_MARK } = await import('../agent/src/codex/marks.ts')
   const src = readFileSync(new URL('./nyan.mjs', import.meta.url), 'utf8')
   assert.ok(src.includes(`const CODEX_START_MARK = '${CODEX_START_MARK}'`))
+})
+
+test('★★ a git update hands the rest to the pulled nyan.mjs (a setup step added by the pulled commit runs in that same update)', () => {
+  const argv = afterPullArgv('/r', ['--force', '--other'])
+  assert.deepEqual(argv.slice(1), ['/r/scripts/nyan.mjs', 'update', '--after-pull', '--force'])
+  assert.equal(argv[0], process.execPath)
+  assert.deepEqual(afterPullArgv('/r', []).slice(1), ['/r/scripts/nyan.mjs', 'update', '--after-pull'])
+})
+
+test('★ the install is the only lockfile-conditional step (the parent runs it before the hand-over; the child skips them all)', () => {
+  const plan = updatePlan({ root: '/r', isGit: true, kind: 'systemd', home: '/home/user' })
+  assert.deepEqual(plan.filter((s) => s.onlyIfLockChanged).map((s) => s.id), ['deps'])
 })

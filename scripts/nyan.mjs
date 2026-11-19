@@ -9,7 +9,8 @@
 
 import { spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { request as httpRequest } from 'node:http'
 import { homedir, platform } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -306,7 +307,7 @@ export function updatePlan({ root, isGit, kind, home }) {
       { label: 'git pull', argv: ['git', '-C', root, 'pull', '--ff-only'], cwd: root },
       // ★ Reinstall dependencies only when the lockfile (package-lock.json) changed with the pull (codex round 20, medium #3)
       //   ⚠️ Without reinstalling, it restarts with parts the new version needs missing, and the agent crashes
-      { label: t('依存の入れ直し', 'Reinstall dependencies'), argv: ['npm', 'install'], cwd: root, onlyIfLockChanged: true },
+      { id: 'deps', label: t('依存の入れ直し', 'Reinstall dependencies'), argv: ['npm', 'install'], cwd: root, onlyIfLockChanged: true },
       { label: t('承認待ちの確認', 'Check pending approvals'), argv: [process.execPath, join(root, 'scripts', 'pending.mjs')], cwd: root, pendingCheck: true },
       { label: t('ビルド', 'Build'), argv: ['npm', 'run', 'build'], cwd: root },
       ...(restart
@@ -383,21 +384,130 @@ function run(argv, opts = {}) {
   return r.status ?? 1
 }
 
-function update(args) {
+/**
+ * ★★ The command line that hands the rest of a git update to the **pulled** `nyan.mjs` (2026-11-19 / found on a second
+ *    machine: `/nyan-team`'s skill was not placed). The plan used to be built before `git pull`, so a setup step added
+ *    by the very commit being pulled never ran in that update. ⇒ After the pull, the new code builds and runs its own plan.
+ * The parent has already installed the dependencies, so the child skips every lockfile-conditional step.
+ */
+/**
+ * ★ Whether **our** agent answers on its port: GET /health with the hook token returns JSON naming an agent version.
+ *   Anything else (refused, no answer, another server's page) is "not up".
+ */
+export function isOurAgent(stateDir, timeoutMs = 3000) {
+  let port = Number(process.env.NYAN_REMOTE_PORT)
+  if (!port) {
+    try {
+      port = Number(JSON.parse(readFileSync(join(stateDir, 'config.json'), 'utf8')).port) || 7777
+    } catch {
+      port = 7777
+    }
+  }
+  let token = ''
+  try {
+    token = readFileSync(join(stateDir, 'hook-token'), 'utf8').trim()
+  } catch {
+    // without the token /health is refused: then "not up" cannot be told from "up" ⇒ not up (the caller says so)
+  }
+  return new Promise((resolveP) => {
+    // ★ One overall time limit for connecting and reading the body (a trickling or half-closed answer cannot hold it
+    //   past the deadline / codex review r3); settled once
+    let settled = false
+    const done = (v) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      resolveP(v)
+    }
+    const req = httpRequest({ host: '127.0.0.1', port, path: '/health', method: 'GET', headers: token ? { 'x-nyan-remote-token': token } : {} }, (res) => {
+      const chunks = []
+      res.on('data', (c) => chunks.push(c))
+      res.on('error', () => done(false))
+      res.on('aborted', () => done(false))
+      res.on('end', () => {
+        try {
+          const j = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+          done(res.statusCode === 200 && typeof j?.agentVersion === 'string')
+        } catch {
+          done(false)
+        }
+      })
+    })
+    const timer = setTimeout(() => {
+      req.destroy()
+      done(false)
+    }, timeoutMs)
+    req.on('error', () => done(false))
+    req.end()
+  })
+}
+
+export function afterPullArgv(root, args) {
+  return [process.execPath, join(root, 'scripts', 'nyan.mjs'), 'update', '--after-pull', ...args.filter((a) => a === '--force')]
+}
+
+async function update(args) {
   const force = args.includes('--force')
   const kind = serviceKind(platform(), homedir())
-  const plan = updatePlan({ root: ROOT, isGit: existsSync(join(ROOT, '.git')), kind, home: homedir() })
-  const lockBefore = lockHash(ROOT)
-  for (const step of plan) {
-    if (step.onlyIfLockChanged && lockHash(ROOT) === lockBefore) continue
+  const isGit = existsSync(join(ROOT, '.git'))
+  const plan = updatePlan({ root: ROOT, isGit, kind, home: homedir() })
+  if (isGit && !args.includes('--after-pull')) {
+    const lockBefore = lockHash(ROOT)
+    // ★ The pull only; then the pulled code takes over (`afterPullArgv`)
+    const pull = plan[0]
+    console.log(`▸ ${pull.label}`)
+    const code = run(pull.argv, pull)
+    if (code !== 0) {
+      console.error(t(`✗ 「${pull.label}」で止まりました（終了コード ${code}）`, `✗ Stopped at "${pull.label}" (exit code ${code})`))
+      return code
+    }
+    // ★ Dependencies here, before the hand-over (codex review: a pulled older nyan.mjs would not know the hand-over and
+    //   compare the lockfile with itself; and a newer one may import a dependency the pull added)
+    // ⚠️ An install that failed last time is still owed (codex review r2: the retry found the lockfile already pulled and
+    //    skipped it) ⇒ a marker in .git, written before npm runs and removed only on success
+    const deps = plan.find((st) => st.id === 'deps')
+    //    ⚠️ The git directory is asked of git (in a linked worktree `.git` is a file / codex review r3)
+    const gitDir = String(spawnSync('git', ['-C', ROOT, 'rev-parse', '--absolute-git-dir'], { encoding: 'utf8' }).stdout ?? '').trim()
+    const owed = gitDir ? join(gitDir, 'nyan-deps-pending') : undefined
+    if (deps && (lockHash(ROOT) !== lockBefore || (owed !== undefined && existsSync(owed)))) {
+      console.log(`▸ ${deps.label}`)
+      try {
+        if (owed) writeFileSync(owed, `${new Date().toISOString()}\n`)
+      } catch {
+        // no marker: the recovery line below still says what to do
+      }
+      const dc = run(deps.argv, deps)
+      if (dc !== 0) {
+        console.error(t(`✗ 「${deps.label}」で止まりました（終了コード ${dc}）`, `✗ Stopped at "${deps.label}" (exit code ${dc})`))
+        // ★ Said explicitly (an older CLI pulled by a rollback would not know the marker / codex review r3)
+        const q = `'${ROOT.replaceAll("'", `'\\''`)}'`
+        console.error(t(`  直してから: cd ${q} && npm install && nyan update`, `  After fixing it: cd ${q} && npm install && nyan update`))
+        return dc
+      }
+      if (owed) rmSync(owed, { force: true })
+    }
+    const argv = afterPullArgv(ROOT, args)
+    const r = spawnSync(argv[0], argv.slice(1), { cwd: ROOT, stdio: 'inherit' })
+    return r.status ?? 1
+  }
+  for (const step of isGit ? plan.slice(1) : plan) {
+    // ★ The parent ran the install before the hand-over. ⚠️ Keep the install the only lockfile-conditional step: a second
+    //   one would be skipped here (a retry after a stop would no longer see the lockfile change / codex review r5)
+    if (step.onlyIfLockChanged) continue
     console.log(`▸ ${step.label}`)
     if (step.waitAlive) {
-      // ⚠️ 2 = cannot reach the agent. Wait up to 30 seconds for it to come up (any other answer means it is up)
+      // ★ Up = it answers an HTTP request (codex review: the pending check's "could not check" (3) was taken for "up"
+      //   even with the agent dead). Wait up to 30 seconds.
+      //   ⚠️ And it must be **our agent** (codex review r2: another server on the port answered 404): its /health, read
+      //      with the hook token, names an agent version. One 30-second deadline for probes and pauses together.
+      const stateDir = process.env.NYAN_REMOTE_STATE_DIR ?? join(homedir(), '.nyan-remote')
+      const deadline = Date.now() + 30_000
       let alive = false
-      for (let i = 0; i < 30 && !alive; i++) {
-        const r = spawnSync(step.argv[0], step.argv.slice(1), { cwd: step.cwd, stdio: 'ignore' })
-        alive = r.status !== 2
-        if (!alive) spawnSync('sleep', ['1'])
+      while (!alive && Date.now() < deadline) {
+        // ★ A connected probe may use the whole remaining budget (/health can take seconds on a large set of sessions / r4)
+        alive = await isOurAgent(stateDir, Math.max(500, deadline - Date.now()))
+        const left = deadline - Date.now()
+        if (!alive && left > 0) spawnSync('sleep', [String(Math.min(1, left / 1000))])
       }
       if (!alive) {
         console.error(t('✗ 再起動したあと agent が起きません。ログを見てください: nyan logs', '✗ The agent did not come back after the restart. Check the logs: nyan logs'))
