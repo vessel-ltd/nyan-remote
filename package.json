@@ -30,6 +30,7 @@
     "dev:stop": "node scripts/dev-stop.mjs",
     "notify:check": "node scripts/notify-check.mjs",
     "keys": "node scripts/keys-status.mjs",
+    "team": "node scripts/team.mjs",
     "site:deploy": "node scripts/site-stage.mjs && (cd relay && npx wrangler deploy -c ../site/wrangler.jsonc) && node scripts/site-verify.mjs",
     "site:verify": "node scripts/site-verify.mjs",
     "site:stage": "node scripts/site-stage.mjs",

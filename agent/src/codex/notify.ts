@@ -41,7 +41,8 @@ export interface CodexNotifyDeps {
   /** Which status of the thread is current (`StatusChange.mark`); `undefined` = not listed */
   mark(threadId: string): number | undefined
   /** Build the payload from the fields (the one text builder) and send it. Returns how many devices got it. */
-  send(row: SessionSummary, fields: NotifyFields): Promise<number>
+  /** @param turn the turn this change is about, when known (teams read that turn's last words / `teamHooks.ts`) */
+  send(row: SessionSummary, fields: NotifyFields, turn?: string, current?: () => boolean): Promise<number>
   sleep(ms: number): Promise<void>
   /** Whether auto-approve is in effect for this thread right now (rule 7). Absent = never. */
   autoApproving?(threadId: string): boolean
@@ -158,7 +159,7 @@ export class CodexNotifier {
       machine: row.machine,
       account: row.account,
       label,
-    })
+    }, turn, () => this.#deps.mark(id) === change.mark)
     this.#deps.log?.(`[codex] ${row.account} ${row.project} — ${label} (push=${sent})`)
     if (sent > 0) {
       this.#sent.delete(id)

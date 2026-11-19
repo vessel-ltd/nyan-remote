@@ -55,6 +55,8 @@ export interface SendResult {
 export interface InboxTarget {
   sessionId: string
   pid: number
+  /** ★ The process start time the index recorded (verified against the live process by `findTarget`) */
+  procStart?: string
   socketPath: string
   /** sessions directory used to find the key file */
   sessionsDir: string
@@ -116,6 +118,7 @@ export async function findTarget(
       found.push({
         sessionId,
         pid: entry.pid,
+        procStart: entry.procStart,
         socketPath: entry.messagingSocketPath,
         sessionsDir: join(dir.dir, 'sessions'),
       })
@@ -188,7 +191,7 @@ export function validateText(text: unknown): SendFailure | null {
  * ⚠️ Always set a timeout so a dead socket does not hang us
  *    (do not repeat CLAUDE.md §4 "a dead port does not fail immediately").
  */
-export function writeToSocket(socketPath: string, payload: string): Promise<SendResult> {
+export function writeToSocket(socketPath: string, payload: string, guard?: () => boolean): Promise<SendResult> {
   return new Promise((resolve) => {
     let done = false
     const finish = (r: SendResult): void => {
@@ -207,8 +210,21 @@ export function writeToSocket(socketPath: string, payload: string): Promise<Send
       finish({ ok: false, reason: 'unreachable', message: t(`受信箱に繋がりません（${err.message}）`, `Cannot connect to the inbox (${err.message}).`) })
     })
     sock.on('connect', () => {
-      sock.write(payload, () => {
+      // ★ Asked right before the bytes go out (teams: the member may have left meanwhile / r5 medium #2)
+      if (guard && !guard()) {
         clearTimeout(timer)
+        sock.destroy()
+        finish({ ok: false, reason: 'not-found', message: failureMessage('not-found') })
+        return
+      }
+      sock.write(payload, (err) => {
+        clearTimeout(timer)
+        // ⚠️ The callback carries the write error (it comes before 'error'): never report it as sent (r9 medium #3)
+        if (err) {
+          sock.destroy()
+          finish({ ok: false, reason: 'unreachable', message: t(`受信箱に書けません（${err.message}）`, `Cannot write to the inbox (${err.message}).`) })
+          return
+        }
         sock.end()
         finish({ ok: true })
       })
@@ -241,6 +257,9 @@ export async function sendToSession(
   dirs: ConfigDir[],
   sessionId: string,
   text: string,
+  // ★ Who the receiver sees as the sender (`origin.from`). Default: this agent (the phone's sends).
+  //   Teams send as `nyan-team` (`teamHooks.ts`) so the leader can tell our notices from the phone's instructions.
+  opts: { from?: string; pid?: number; procStart?: string; guard?: () => boolean } = {},
 ): Promise<SendResult> {
   const bad = validateText(text)
   if (bad) return { ok: false, reason: bad, message: failureMessage(bad) }
@@ -249,6 +268,12 @@ export async function sendToSession(
   if ('reason' in target) {
     return { ok: false, reason: target.reason, message: failureMessage(target.reason) }
   }
+  // ★ Only to that process (teams: a resumed session with the same id is another leader / codex review r3, medium #2)
+  if (opts.pid !== undefined && target.pid !== opts.pid) return { ok: false, reason: 'not-found', message: failureMessage('not-found') }
+  // ⚠️ …and that process's start time (a reused pid is another process / r4 medium #11)
+  if (opts.procStart !== undefined && !(target.procStart && sameProcStart(target.procStart, opts.procStart))) {
+    return { ok: false, reason: 'not-found', message: failureMessage('not-found') }
+  }
   const token = await readPeerToken(target.sessionsDir, target.pid, target.socketPath)
-  return writeToSocket(target.socketPath, buildLines(text, { token }))
+  return writeToSocket(target.socketPath, buildLines(text, { token, ...(opts.from ? { from: opts.from } : {}) }), opts.guard)
 }

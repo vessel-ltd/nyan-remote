@@ -87,6 +87,10 @@ interface Pending {
    *   (the failure this tool most wants to avoid). → **Wait silently for a few seconds, and show it if it is still there.**
    */
   quietUntil?: number
+  /** ★ Replaced by a re-entry of the same request (its first-seen time is kept) */
+  replaced?: boolean
+  /** ★ Its connection was lost (the request may come back: nothing is retired) */
+  transportLost?: boolean
 }
 
 /**
@@ -221,11 +225,20 @@ function stableJson(v: unknown): string {
  * ⚠️ **Those waiting quietly (`quietUntil`) are not shown** (read the notes on Pending).
  */
 export function listPending(now = Date.now()): PermissionRequest[] {
-  return [...pending.values()].filter((p) => !isQuiet(p, now)).map((p) => p.info)
+  return [...pending.values()].filter((p) => !isQuiet_(p, now)).map((p) => p.info)
 }
 
-function isQuiet(p: Pending, now: number): boolean {
+function isQuiet_(p: Pending, now: number): boolean {
   return p.quietUntil !== undefined && p.quietUntil > now
+}
+
+/**
+ * ★ Whether this exact card is still quiet — its marker is present until `promoteQuiet` clears it after cleanup, not
+ *   merely until its time is up (r31 medium #1: promotion may still be settling it)
+ */
+export function isQuiet(key: string): boolean {
+  const entry = pending.get(baseKey(key))
+  return entry !== undefined && entry.info.key === key && !entry.settled && entry.quietUntil !== undefined
 }
 
 /**
@@ -237,7 +250,7 @@ function isQuiet(p: Pending, now: number): boolean {
  *    That is exactly the accident CLAUDE.md calls "the worst accident".
  */
 export function quietCount(now = Date.now()): number {
-  return [...pending.values()].filter((p) => !p.settled && isQuiet(p, now)).length
+  return [...pending.values()].filter((p) => !p.settled && isQuiet_(p, now)).length
 }
 
 /**
@@ -284,6 +297,99 @@ export function promoteQuiet(key: string): boolean {
   return true
 }
 
+// ─── First seen ──────────────────────────────────────────────────────────────────────────────────────────────────
+// ★ When a request was first registered, by its identity across replays (`PermissionRequest.origin`, else the key
+//   without its generation). Teams compare this — not the card's own `at` — with the moment approvals were delegated,
+//   so a request that was waiting before the grant stays with the human even when it is replayed (codex review r2, high #3).
+// ⚠️ Bounded (oldest dropped): an entry only needs to outlive its request.
+
+const FIRST_SEEN_MAX = 4000
+/**
+ * History older than this goes (in bulk), unless it is waiting now. ⚠️ Longer than the longest grant (24 h): a request
+ * whose connection was lost before a grant may come back at any time during it, and must still date from before it
+ * (r16 high #1).
+ */
+const FIRST_SEEN_KEEP_MS = 25 * 60 * 60 * 1000
+const firstSeen = new Map<string, number>()
+
+/** The identity a request keeps across replays */
+export function originOf(info: Pick<PermissionRequest, 'key' | 'origin'>): string {
+  return info.origin ?? baseKey(info.key)
+}
+
+function noteSeen(info: PermissionRequest): void {
+  const at = Date.parse(info.at)
+  noteFirstSeen(originOf(info), Number.isFinite(at) ? at : Date.now())
+}
+
+/**
+ * ★ Record when a request was first seen, by its origin — as early as it is known (codex review r3, high #3: a Codex
+ *   file change is accepted, then its diff is read, and only then does it become a card; a grant in between must
+ *   not make it "new"). The first time wins.
+ * ⚠️ Kept: anything waiting now, and anything seen within the last hour (a request accepted but not yet a card / r4).
+ *    Pruned **in bulk** when over the bound (r7 low #1: one-at-a-time eviction kept a burst's peak forever and scanned
+ *    the whole map on every insert). Bounded work: at most one sweep per `FIRST_SEEN_MAX` insertions.
+ */
+let insertsSincePrune = 0
+export function noteFirstSeen(origin: string, at = Date.now()): void {
+  if (firstSeen.has(origin)) return
+  firstSeen.set(origin, at)
+  if (firstSeen.size <= FIRST_SEEN_MAX || ++insertsSincePrune < FIRST_SEEN_MAX / 4) return
+  insertsSincePrune = 0
+  const waiting = new Set([...pending.values()].map((p) => originOf(p.info)))
+  const old = Date.now() - FIRST_SEEN_KEEP_MS
+  // ⚠️ Nothing seen before an active grant's start goes while that grant lasts (r17 medium #3): a request lost before it
+  //    may come back at any time during it, and must still date from before it
+  const pinBefore = firstSeenPin?.() ?? Number.NEGATIVE_INFINITY
+  for (const [k, seenAt] of firstSeen) if (seenAt < old && seenAt >= pinBefore && !waiting.has(k)) firstSeen.delete(k)
+  // ★ Lost origins go with their history (r36 low #1: a session killed without `Stop` kept them forever)
+  for (const [sid, set] of lostOrigins) {
+    for (const o of [...set]) if (!firstSeen.has(o)) set.delete(o)
+    if (set.size === 0) lostOrigins.delete(sid)
+  }
+}
+
+/** ★ The latest start of an active grant (teams): history seen before it is kept while it lasts */
+let firstSeenPin: (() => number | undefined) | undefined
+export function setFirstSeenPin(fn: () => number | undefined): void {
+  firstSeenPin = fn
+}
+
+/** Whether a request (by its origin) is still alive in the first-seen history (retirement removes it) */
+export function hasFirstSeen(origin: string): boolean {
+  return firstSeen.has(origin)
+}
+
+/** When this request (by its identity across replays) was first seen; its own `at` if unknown */
+export function firstSeenAt(info: Pick<PermissionRequest, 'key' | 'origin' | 'at'>): string {
+  const ms = firstSeen.get(originOf(info))
+  return ms === undefined ? info.at : new Date(ms).toISOString()
+}
+
+/** Requests whose connection was lost, by session: retired when that session's turn ends (`abandonSession`) */
+const lostOrigins = new Map<string, Set<string>>()
+
+function retireOrigin(origin: string): void {
+  firstSeen.delete(origin)
+  for (const fn of overListeners) fn(origin)
+}
+
+/** ★ Told when a request is over (the same moment its first-seen lifetime ends): teams retire it from a grant */
+const overListeners: ((origin: string) => void)[] = []
+export function onRequestOver(fn: (origin: string) => void): void {
+  overListeners.push(fn)
+}
+
+/** ★ Count this request as shown once (a team member's subagent card, announced without a quiet period) */
+export function markPromoted(key: string): void {
+  promotedOnce.add(baseKey(key))
+}
+
+/** ★ Whether this request (by its key without generation) was already shown once */
+export function wasPromoted(key: string): boolean {
+  return promotedOnce.has(baseKey(key))
+}
+
 export function pendingCount(): number {
   return pending.size
 }
@@ -309,8 +415,13 @@ export function waitForDecision(
   //    setting it first makes finish return early and **the Promise never resolves**
   //    (my own test hung on this during implementation)
   const existing = pending.get(key)
-  if (existing && !existing.settled) existing.resolve(undefined)
+  if (existing && !existing.settled) {
+    // ★ Replaced by its own re-entry: the request lives on, so its first-seen time must too (`finish` below)
+    existing.replaced = true
+    existing.resolve(undefined)
+  }
 
+  noteSeen(info)
   return new Promise<Decision | undefined>((resolve) => {
     const entry: Pending = { info, resolve, settled: false, meta }
     pending.set(key, entry)
@@ -318,11 +429,26 @@ export function waitForDecision(
     const finish = (decision: Decision | undefined): void => {
       if (entry.settled) return
       entry.settled = true
+      // ★ A request that is over starts a new first-seen lifetime (codex review r11, medium #2: the same command asked
+      //   again in the same prompt shares the fingerprint, and inherited a settled card's time). Kept when it was
+      //   replaced by its own re-entry, or when a Codex card only went away without an answer (a reconnect replays it).
+      if (!entry.replaced && !entry.transportLost && (decision !== undefined || !info.origin)) {
+        retireOrigin(originOf(info))
+      } else if (entry.transportLost && !entry.replaced && info.sessionId && !info.origin && !info.agentType) {
+        // ★ Remembered by session: its turn's end retires it (r14 medium #2), unless it comes back first.
+        //   ⚠️ Main-agent Claude requests only: a subagent keeps running after its parent's turn ends (r15 high #1), and
+        //      a Codex card's withdrawal (answered in the TUI, or a reconnect) must keep its replay protection (r15 low);
+        //      those age out with the first-seen history
+        let set = lostOrigins.get(info.sessionId)
+        if (!set) lostOrigins.set(info.sessionId, (set = new Set()))
+        set.add(originOf(info))
+      }
       // remove only if we are still the latest registrant (do not touch if replaced)
       if (pending.get(key) === entry) {
         pending.delete(key)
-        // ⚠️ discard the "shown once" marker too (keeping it grows memory forever)
-        promotedOnce.delete(key)
+        // ⚠️ discard the "shown once" marker too (keeping it grows memory forever) — but not when the request lives on in
+        //    its own re-entry (r34 medium #1: re-entries would restart the quiet period and could keep the phone silent)
+        if (!entry.replaced) promotedOnce.delete(key)
       }
       resolve(decision)
     }
@@ -330,7 +456,12 @@ export function waitForDecision(
     entry.resolve = finish
 
     // ★ remove the card when the connection closes. This is the only way to prevent mismatches
-    registerAbort(() => finish(undefined))
+    //   ⚠️ A lost connection is not a settlement (r13 high #2): the request may come back; its first-seen time and its
+    //      place in a grant's snapshot stay until it is answered, found settled, or its turn ends
+    registerAbort(() => {
+      entry.transportLost = true
+      finish(undefined)
+    })
   })
 }
 
@@ -457,6 +588,14 @@ export function abandon(key: string): boolean {
 /** Discards all of that session's cards (Stop arrived = the turn ended, so all are invalid) */
 export function abandonSession(sessionId: string | undefined): number {
   if (!sessionId) return 0
+  // ★ The turn is over: requests of this session whose connection was lost are over too, unless one came back
+  //   (r14 medium #2: a same-fingerprint command of a later turn must start a fresh lifetime)
+  const lost = lostOrigins.get(sessionId)
+  if (lost) {
+    lostOrigins.delete(sessionId)
+    const waiting = new Set([...pending.values()].filter((p) => !p.settled).map((p) => originOf(p.info)))
+    for (const o of lost) if (!waiting.has(o)) retireOrigin(o)
+  }
   let n = 0
   for (const entry of [...pending.values()]) {
     if (entry.settled || entry.info.sessionId !== sessionId) continue
@@ -478,6 +617,8 @@ export function abandonSession(sessionId: string | undefined): number {
 
 /** For tests. Clears in-process state */
 export function resetPending(): void {
+  firstSeen.clear()
+  lostOrigins.clear()
   // ⚠️ let resolve manage settled (see the comment above)
   for (const entry of [...pending.values()]) {
     if (!entry.settled) entry.resolve(undefined)

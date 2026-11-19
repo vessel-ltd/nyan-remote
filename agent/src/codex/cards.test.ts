@@ -35,10 +35,16 @@ const AT = '2026-11-14T12:00:00.000Z'
 test('the card: a Codex yes/no card for the thread, with the row identity and the command as sent', () => {
   const c = codexCard(approval(), row, 3, AT)
   assert.match(c.key, /^codex:[0-9a-f]{24}#[0-9a-f]{12}$/)
+  // ★ The same request on a later connection: another key, the same origin (teams / codex review r2, high #3)
+  const replay = codexCard(approval(), row, 4, AT)
+  assert.notEqual(replay.key, c.key)
+  assert.equal(replay.origin, c.origin)
+  assert.match(c.origin ?? '', /^codex:[0-9a-f]{24}$/)
   assert.deepEqual(
-    { ...c, key: '' },
+    { ...c, key: '', origin: '' },
     {
       key: '',
+      origin: '',
       machine: 'pc-a',
       account: '.codex',
       project: 'proj',

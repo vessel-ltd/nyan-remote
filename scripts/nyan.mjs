@@ -28,6 +28,8 @@ export const PASSTHROUGH = {
   pending: 'scripts/pending.mjs',
   keys: 'scripts/keys-status.mjs',
   uninstall: 'scripts/uninstall.mjs',
+  // ★ Teams (`/nyan-team` / docs/TEAM.md): a lead session directs other sessions
+  team: 'scripts/team.mjs',
 }
 
 /** ★ Account (2026-09-24 / billing). ⚠️ One script, given the command name (`scripts/account.mjs`) */
@@ -131,6 +133,18 @@ export function helpDetail() {
   Exit code: 0 none / 1 pending / 2 agent is stopped / 3 could not check
 `,
     ),
+    team: t(
+      `nyan team — 管理役のセッションから、ほかのセッションを使う
+
+  Claude Code の管理役のセッションの中で使います（skill の /nyan-team が使い方を教えます）。
+  nyan team help で一覧。人が端末から使えるのは list と disband <team id> だけです。
+`,
+      `nyan team — direct other sessions from a lead session
+
+  Used inside the lead Claude Code session (the /nyan-team skill teaches it).
+  nyan team help lists the commands. From a plain terminal only list and disband <team id> work.
+`,
+    ),
     keys: t(
       `nyan keys — 打鍵の入口の確認
 
@@ -226,6 +240,7 @@ export function helpText() {
   nyan logs        ログを見る（-f で追いかける）
   nyan pending     承認待ちがあるか
   nyan keys        打鍵の入口の確認
+  nyan team        管理役のセッションからほかのセッションを使う（/nyan-team）
   nyan login       Plus のためにログインする（GitHub・マシンを増やす）
   nyan logout      ログアウトする（このマシンをアカウントから外す）
   nyan account     プランと上限
@@ -245,6 +260,7 @@ export function helpText() {
   nyan logs        show logs (-f to follow)
   nyan pending     whether an approval is pending
   nyan keys        check the keystroke path
+  nyan team        direct other sessions from a lead session (/nyan-team)
   nyan login       sign in for Plus (GitHub; more machines)
   nyan logout      sign out (removes this machine from the account)
   nyan account     plan and limits
@@ -333,6 +349,8 @@ export function setupSteps(root) {
     { label: t('notify.sh を置き直す', 'Reinstall notify.sh'), argv: [process.execPath, join(root, 'scripts', 'install-notify.mjs')], cwd: root },
     { label: t('フックの設置', 'Install hooks'), argv: [process.execPath, join(root, 'scripts', 'install-permission-hook.mjs')], cwd: root },
     { label: t('打鍵の経路と nyan の設置', 'Install the keystroke relay and nyan'), argv: [process.execPath, join(root, 'scripts', 'install-relay.mjs')], cwd: root },
+    // ★ The /nyan-team skill in every Claude profile (docs/TEAM.md §5). ⚠️ Only our marked copy is replaced
+    { label: t('/nyan-team の skill を置く', 'Place the /nyan-team skill'), argv: [process.execPath, join(root, 'scripts', 'install-skill.mjs')], cwd: root },
   ]
 }
 

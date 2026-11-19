@@ -311,6 +311,8 @@ else
   node "$HOME_DIR/scripts/install-permission-hook.mjs"
   node "$HOME_DIR/scripts/install-relay.mjs"
 fi
+# ★ The /nyan-team skill (docs/TEAM.md §5): needs no agent; only our marked copy is ever replaced
+node "$HOME_DIR/scripts/install-skill.mjs"
 
 # ── Cleanup: keep **only the most recent** update backup (2026-09-23 / user decision) ─────────
 # ⚠️ Each update used to add another `.old-<timestamp>`, and **the only way to remove them was by hand** (they piled up in the user's home).

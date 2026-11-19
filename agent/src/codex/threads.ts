@@ -402,6 +402,12 @@ export class ThreadBook {
     return entry !== undefined && !entry.unsure && entry.thread.status.type === 'idle'
   }
 
+  /** ★ A listed row whose status could be read (not `unsure`): teams grant only on a known state (r7 high #2) */
+  statusKnown(threadId: string): boolean {
+    const entry = this.#threads.get(threadId)
+    return entry !== undefined && !entry.unsure
+  }
+
   has(threadId: string): boolean {
     return this.#threads.has(threadId) || this.#hidden.has(threadId)
   }

@@ -45,6 +45,8 @@ export const STATE_FILES = [
   'hooks.jsonl', 'sent.jsonl', 'traffic.jsonl', 'inflight.off',
 ]
 export const STATE_DIRS = ['bin', 'panes', 'inflight', 'usage']
+/** ★ The team socket's name (`TEAM_SOCKET_NAME` in `agent/src/teamSocket.ts`) */
+export const TEAM_SOCKET = 'team.sock'
 /**
  * ★ The names written inside those directories (codex round 4: any regular file used to pass).
  *   panes/    `<pid>.json` (relay.py), its temp `<pid>.json.<pid>.tmp`, `<pid>.rejected`
@@ -255,6 +257,9 @@ export function foreignEntries(stateDir, { lstat = lstatSync, list = readdirSync
     } catch {
       continue
     }
+    // ★ The team socket (`agent/src/teamSocket.ts`) left by an agent that did not exit cleanly: ours when it is a socket
+    //   (codex review, low #1: it kept the whole state directory from being purged)
+    if (n === TEAM_SOCKET && st.isSocket()) continue
     if (!isStateEntry(n)) {
       out.push(n)
       continue
@@ -513,6 +518,7 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
   const steps = [
     { label: t('Claude Code のフックを外す', 'Remove the Claude Code hooks'), script: 'install-permission-hook.mjs', args: ['--remove'] },
     { label: t('notify.sh を外す', 'Remove notify.sh'), script: 'install-notify.mjs', args: ['--remove'] },
+    { label: t('/nyan-team の skill を外す', 'Remove the /nyan-team skill'), script: 'install-skill.mjs', args: ['--remove'] },
     { label: t('claude の入口（PATH）と nyan コマンドを外す', 'Remove the claude entry point (PATH) and the nyan command'), script: 'install-relay.mjs', args: ['--uninstall'] },
   ]
   for (const s of steps) {

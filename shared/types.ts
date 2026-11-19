@@ -706,6 +706,12 @@ export interface PermissionRequest {
    *    → The options must be shown on screen and **the chosen one sent back** (§9.11).
    */
   interaction?: Interaction
+  /**
+   * ★ The request's identity **across replays** (agent-internal; screens ignore it / 2026-11-19 / teams). A Codex card's
+   *   `key` changes when the daemon replays the same request after a reconnect (it carries the connection generation);
+   *   this does not. Absent = the key without its generation is the identity (Claude).
+   */
+  origin?: string
 }
 
 /** ★ A question with options (built from `AskUserQuestion` input. Used for both display and validation) */

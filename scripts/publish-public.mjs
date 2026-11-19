@@ -29,7 +29,7 @@ const AUTHOR = { name: 'Vessel Ltd.', email: 'noreply@nyan-remote.app' }
  *   automatically). A file outside these rules **stops** the publish — add it here on purpose, or move it under `docs/`.
  *   ①top-level entries ②file types ③Markdown only as the root README ④binary files only as images/fonts.
  */
-export const PUBLIC_TOP = ['.github', '.gitignore', 'LICENSE', 'README.md', 'SECURITY.md', 'account', 'agent', 'hooks', 'install.sh', 'landing', 'package-lock.json', 'package.json', 'relay', 'scripts', 'shared', 'site', 'web']
+export const PUBLIC_TOP = ['.github', '.gitignore', 'LICENSE', 'README.md', 'SECURITY.md', 'account', 'agent', 'hooks', 'install.sh', 'landing', 'package-lock.json', 'package.json', 'relay', 'scripts', 'shared', 'site', 'skills', 'web']
 /** ★ Kept private on purpose (dropped quietly — everything else not allowed stops the publish) */
 export const PRIVATE = ['CLAUDE.md', 'docs', '.claude', 'marketing']
 const TEXT_EXT = /\.(ts|tsx|mjs|cjs|js|json|jsonc|sql|sh|py|css|html|svg|webmanifest|gitignore|ya?ml)$|(^|\/)(LICENSE|\.gitignore)$/
@@ -41,6 +41,8 @@ export function classify(path) {
   if (PRIVATE.includes(top)) return 'drop'
   if (!PUBLIC_TOP.includes(top)) return `not in the public list (${top})`
   // ★ Public Markdown: the root README and SECURITY, and GitHub's own files under .github/ (everything else is a work note)
+  // ★ Skills we install (`skills/<name>/SKILL.md` / `install-skill.mjs`): shipped, the installers copy them into the profiles
+  if (/^skills\/[a-z0-9-]+\/SKILL\.md$/.test(path)) return 'keep'
   if (/\.md$/i.test(path)) return path === 'README.md' || path === 'SECURITY.md' || path.startsWith('.github/') ? 'keep' : 'drop'
   if (TEXT_EXT.test(path) || BINARY_EXT.test(path)) return 'keep'
   return 'unknown file type'

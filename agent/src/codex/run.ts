@@ -16,6 +16,7 @@ import { autoApproveFor } from '../autoApprove.ts'
 import { askCodexQuestion, offerCodexCard, offerCodexFileChange } from './cards.ts'
 import { codexSessionPrefix, startCodexDaemonLine, type CodexDaemonLine, type CodexSendResult, type CodexInterruptResult, type CodexHome, type DaemonDeps, type DaemonHooks, type SocketLook } from './daemon.ts'
 import { CodexLogs, type CodexLogSource } from './log.ts'
+import { itemEntries } from './history.ts'
 import { ContextCache } from './context.ts'
 import { CodexNotifier } from './notify.ts'
 import { connectWsUds } from './wsUds.ts'
@@ -138,7 +139,7 @@ export interface StartCodexOptions {
    * Send one notification (build the payload from the fields and push it). Returns how many devices got it.
    * ⚠️ Absent = no notifications for Codex threads (the list still works).
    */
-  notify?: (row: SessionSummary, fields: NotifyFields) => Promise<number>
+  notify?: (row: SessionSummary, fields: NotifyFields, turn?: string, current?: () => boolean) => Promise<number>
   /**
    * Called when the set of Codex approval cards changed.
    * ⚠️ Absent = approvals are off: no thread is joined, no request from the daemon is answered (view-only).
@@ -146,6 +147,8 @@ export interface StartCodexOptions {
   cardsChanged?: () => void
   /** ★ Injected in tests */
   deps?: DaemonDeps
+  /** ★ A row's status moved (row id, new status): teams clear a grant-time wait on its first real transition */
+  onRowStatus?: (sessionId: string, to: string) => void
   /** ★ How many closed threads per home are listed as history (the config's `maxSessionsPerAccount`, as for Claude) */
   historyLimit?: number
 }
@@ -199,6 +202,7 @@ export function startCodex(cfg: CodexConfig | undefined, opts: StartCodexOptions
         // ⚠️ `change.thread.id` is the bare thread id (the notifier works per line); rows and auto-approve use the row id
         onStatus: (change) => {
           opts.hooks?.onStatus?.(change)
+          opts.onRowStatus?.(line.sessionIdOf(change.thread.id), change.to)
           void notifier?.onStatus(change)
         },
         ...(opts.cardsChanged
@@ -249,6 +253,17 @@ const contexts = new ContextCache()
  * The Codex rows: live ones, then closed threads as history (`live: false` / `closedThreads.ts`).
  * ★ A live row gets `contextTokens` from its rollout's tail when it can be read (`context.ts`; otherwise no chip).
  */
+/** ★ Whether a Codex row is listed with a status we could read, right now (teams' grant / r7 high #2) */
+export function codexStatusKnown(sessionId: string): boolean {
+  const found = locate(sessionId)
+  return found !== undefined && found.line.statusKnown(found.threadId)
+}
+
+/** ★ The live Codex rows as the lines hold them **now** (synchronous: teams snapshot who is waiting at a grant / r5 high #2) */
+export function codexRowsNow(): SessionSummary[] {
+  return lines.flatMap((l) => l.rows())
+}
+
 export async function codexRows(): Promise<SessionSummary[]> {
   const live = lines.flatMap((l) => l.rows())
   const paths = new Map(lines.flatMap((l) => [...l.rolloutPaths()]))
@@ -368,10 +383,10 @@ export function codexLists(sessionId: string): boolean {
 }
 
 /** Send to a Codex row, or `undefined` if no line lists it right now (= not ours; the caller goes on). */
-export async function codexSend(sessionId: string, text: string, images: readonly string[] = []): Promise<CodexSendResult | undefined> {
+export async function codexSend(sessionId: string, text: string, images: readonly string[] = [], guard?: () => boolean): Promise<CodexSendResult | undefined> {
   const found = locate(sessionId)
   if (!found) return undefined
-  return found.line.send(found.threadId, text, images)
+  return found.line.send(found.threadId, text, images, guard)
 }
 
 /** Compact an idle Codex row, or `undefined` if no line lists it right now (= not ours). */
@@ -396,6 +411,40 @@ export async function codexLog(
   const found = locate(sessionId, true)
   if (!found) return undefined
   return logs.page(logSource(found.line), sessionId, found.line.label, opts)
+}
+
+/**
+ * ★ The last words of **one** ended turn of a Codex row (teams' reports / `teamHooks.ts`), read fresh from the daemon.
+ *   ⚠️ Only that turn is read in full, on a connection of its own (r18 medium #3, r20 medium #2: an unrelated huge turn
+ *      next to it cannot make it unreadable): its position is found from the headers, then one full turn at that cursor.
+ *   ⚠️ Strict (r20 medium #3): the turn must have ended and every item must have been read; otherwise undefined (a
+ *      failure, retried later). `{ text: undefined }` = it ended and said nothing.
+ */
+export async function codexLastWords(sessionId: string, turnId: string): Promise<{ text: string | undefined } | undefined> {
+  const found = locate(sessionId)
+  if (!found) return undefined
+  const heads = await found.line.turns(found.threadId, { limit: 50, headersOnly: true })
+  const idx = heads?.turns.findIndex((x) => x.id === turnId) ?? -1
+  if (!heads || idx < 0) return undefined
+  let cursor: string | undefined
+  if (idx > 0) {
+    const before = await found.line.turns(found.threadId, { limit: idx, headersOnly: true })
+    if (!before?.nextCursor) return undefined
+    cursor = before.nextCursor
+  }
+  const page = await found.line.turnsAside(found.threadId, { limit: 1, ...(cursor === undefined ? {} : { cursor }) })
+  const turn = page?.turns[0]
+  if (!page || !turn || turn.id !== turnId || page.skipped > 0) return undefined
+  if (turn.status !== 'completed' && turn.status !== 'failed' && turn.status !== 'interrupted') return undefined
+  // ⚠️ A message item whose text is not a string would be dropped, and an earlier progress line would pass for the
+  //    answer (r21 medium #2): a retryable failure instead
+  if (turn.items.some((it) => it.type === 'agentMessage' && typeof it.raw.text !== 'string')) return undefined
+  const entries = turn.items.flatMap((item) => itemEntries(item))
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const e = entries[i]!
+    if (e.kind === 'assistant' && e.text.trim()) return { text: e.text }
+  }
+  return { text: undefined }
 }
 
 /**

@@ -36,6 +36,7 @@ import { aliveProcStartSync, readIndexEntriesDetailed, selectLive } from '../cla
 import { isKnownRawStatus, resolveStatus } from '../claude/sessions.ts'
 import { isPermissionHookInstalled } from '../claude/permissionHook.ts'
 import { abandonSession, hasPendingForSession, withPendingPerms } from '../permission.ts'
+import { sessionEnded, teamQuietLabel } from '../teamHooks.ts'
 import { sendToAll } from '../push.ts'
 import { threadUrl } from '../pushUrl.ts'
 import { appendJsonl } from '../state.ts'
@@ -424,6 +425,16 @@ export function classifyNotice(payload: HookPayload): 'permission' | 'idle' {
 const seenNotificationTypes = new Set<string>()
 let loggedNotificationShape = false
 
+/**
+ * ★ Each event's transcript path, beside it and never stored (teams compare it with a member's profile directory /
+ *   `teamHooks.ts`). ⚠️ Not a field of `HookEvent`: events go to `hooks.jsonl`, and the path names the home and project.
+ */
+const eventPaths = new WeakMap<HookEvent, string>()
+function originOfEvent(event: HookEvent): { account: string; transcriptPath?: string } {
+  const p = eventPaths.get(event)
+  return { account: event.account, ...(p ? { transcriptPath: p } : {}) }
+}
+
 export async function hook(ctx: Ctx): Promise<{ ok: true; pushed: number }> {
   const payload = await readJsonBody<HookPayload>(ctx.req)
   const { account, sessionId } = parseTranscriptPath(payload.transcript_path)
@@ -451,6 +462,7 @@ export async function hook(ctx: Ctx): Promise<{ ok: true; pushed: number }> {
     // ★ The turn's id (so dedup does not cross turns / 2026-09-21)
     ...(typeof payload['prompt_id'] === 'string' ? { promptId: payload['prompt_id'] } : {}),
   }
+  if (typeof payload.transcript_path === 'string') eventPaths.set(event, payload.transcript_path)
   // Used as evidence for the list's status display (agents --json cannot tell needs attention / abnormal exit)
   noteHook(event)
 
@@ -478,6 +490,8 @@ export async function hook(ctx: Ctx): Promise<{ ok: true; pushed: number }> {
   //   ⚠️ Queued unconditionally; whether there is an entry is decided inside the chain (an "on" still saving must not be missed / codex).
   const endedId = event.event === 'SessionEnd' ? (sessionId ?? sessionIdOf(payload['session_id'])) : undefined
   if (endedId) {
+    // ★ Teams: a leader that ended takes its team with it; a member leaves its team (`teamHooks.ts`)
+    sessionEnded(endedId, originOfEvent(event))
     const r = await endSessionAutoApprove(endedId)
     if (!r.ok) {
       console.log(t(`[auto] セッション終了で自動承認を切れなかった（${endedId.slice(0, 8)}）: ${r.reason}`, `[auto] Session ended, but auto-approve could not be turned off (${endedId.slice(0, 8)}): ${r.reason}`))
@@ -551,6 +565,10 @@ export async function hook(ctx: Ctx): Promise<{ ok: true; pushed: number }> {
         //    ⚠️ Still **remember the wording** (otherwise the "done" after answering is dropped as a duplicate)
         rememberLabel(event, label, why ?? undefined)
         skipped = t(' 承認の札があるので状態の通知は省略', ' skipped the state notification because an approval card is open')
+      } else if (teamQuietLabel(event.sessionId, label, originOfEvent(event))) {
+        // ★ A team member's turn end: the user talks to the leader (docs/TEAM.md §4.6). ⚠️ Remember it like a sent one
+        rememberLabel(event, label, why ?? undefined)
+        skipped = t(' チームのメンバーなので「完了」は鳴らさない', ' a team member: "done" is not rung')
       } else if (!shouldSendLabel(event, label, why ?? undefined)) {
         // ★ The state has not changed = nothing to announce (the idle 60 seconds after `Stop` is this)
         skipped = t(` （${logLabel(label)} は直前と同じなので送らない）`, ` (not sent: ${logLabel(label)} is the same as last time)`)
@@ -671,6 +689,12 @@ export async function sendSettled(event: HookEvent, probe: StatusProbe): Promise
           `[hook] ${event.account} ${event.project} — ${logLabel(label)} ${basis} skipped because an approval card is open`,
         ),
       )
+      return
+    }
+    if (teamQuietLabel(event.sessionId, label, originOfEvent(event))) {
+      // ★ A team member's turn end is not rung (the user talks to the leader / docs/TEAM.md §4.6)
+      rememberLabel(event, label, why ?? undefined)
+      console.log(`[hook] ${event.account} ${event.project} — ${logLabel(label)} ${basis} team member: not rung`)
       return
     }
     if (!shouldSendLabel(event, label, why ?? undefined)) {

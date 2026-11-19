@@ -51,6 +51,8 @@ test('★★ update: git machines do pull → pending check → build → restar
     'notify.sh を置き直す',
     'フックの設置',
     '打鍵の経路と nyan の設置',
+    // ★ The /nyan-team skill (docs/TEAM.md §5)
+    '/nyan-team の skill を置く',
   ])
   assert.equal(plan[1].onlyIfLockChanged, true, '⚠️ reinstalls dependencies every time (slow) / no condition')
   assert.equal(plan[2].pendingCheck, true, '⚠️⚠️ does not stop on pending approvals (the restart would lose them)')

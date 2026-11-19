@@ -106,6 +106,21 @@ test('★★ --purge looks inside: a personal tool in bin/, a subdirectory in pa
   assert.deepEqual(foreignEntries(s).sort(), ['bin/mytool', 'inflight/personal.csv', 'inflight/x.jsonl', 'panes/notes.txt', 'panes/sub', 'vapid.json'], '⚠️ codex round 4: any regular file used to pass')
 })
 
+test('★ --purge accepts the team socket left by an agent that did not exit cleanly; a regular file of that name is foreign', async () => {
+  const { createServer } = await import('node:net')
+  const s = mkdtempSync(join(tmpdir(), 'nyan-un-'))
+  writeFileSync(join(s, 'config.json'), '{}')
+  const server = createServer()
+  await new Promise((r) => server.listen(join(s, 'team.sock'), r))
+  try {
+    assert.deepEqual(foreignEntries(s), [])
+  } finally {
+    await new Promise((r) => server.close(r))
+  }
+  writeFileSync(join(s, 'team.sock'), 'not a socket')
+  assert.deepEqual(foreignEntries(s), ['team.sock'])
+})
+
 test('★ --purge knows usage/: the relay\'s readings and a write cut short are ours, anything else is not (2026-11-17)', () => {
   const s = mkdtempSync(join(tmpdir(), 'nyan-un-'))
   writeFileSync(join(s, 'config.json'), '{}')
@@ -246,6 +261,11 @@ function installed() {
   const tree = join(home, 'nyan-remote-app')
   for (const d of ['scripts', 'shared', 'hooks']) {
     cpSync(join(REPO, d), join(tree, d), { recursive: true, filter: (p) => !p.includes('__pycache__') && !p.endsWith('.test.mjs') })
+  }
+  // ★ The skill installer shares the private-directory walk with the agent (a real tree always has agent/)
+  {
+    mkdirSync(join(tree, 'agent', 'src'), { recursive: true })
+    cpSync(join(REPO, 'agent', 'src', 'privateDir.ts'), join(tree, 'agent', 'src', 'privateDir.ts'))
   }
   fakeTree(tree)
   const state = join(home, '.nyan-remote')

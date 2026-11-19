@@ -11,6 +11,9 @@ test('★★★ only listed places and file types are public; anything else stop
   assert.equal(classify('web/public/cats/mochi-cat.png'), 'keep')
   assert.equal(classify('README.md'), 'keep')
   assert.equal(classify('SECURITY.md'), 'keep')
+  // ★ The skills we install ship; other Markdown under skills/ does not
+  assert.equal(classify('skills/nyan-team/SKILL.md'), 'keep')
+  assert.equal(classify('skills/nyan-team/NOTES.md'), 'drop')
   assert.equal(classify('.github/ISSUE_TEMPLATE/bug_report.yml'), 'keep')
   assert.equal(classify('docs/HANDOFF.md'), 'drop')
   assert.equal(classify('CLAUDE.md'), 'drop')

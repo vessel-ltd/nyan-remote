@@ -89,6 +89,11 @@ export interface ApprovalsDeps {
   fetchChanges?(threadId: string, turnId: string, itemId: string, live: () => boolean): Promise<FileChange[] | undefined>
   /** The same for a question. Absent ⇒ questions are left to the PC (never answered). */
   ask?(question: CodexQuestion, onWithdraw: (withdraw: () => void) => void): Promise<QuestionReply | undefined>
+  /**
+   * ★ A request of ours was accepted (before any card, before a diff is read): teams record when it was first seen
+   *   (`permission.ts` `noteFirstSeen` / codex review r3, high #3)
+   */
+  seen?(kind: 'command' | 'question' | 'file', req: { threadId: string; turnId: string; itemId: string }): void
   log?: (line: string) => void
 }
 
@@ -254,6 +259,7 @@ export class CodexApprovals {
     if (!approval) return this.#onQuestion(req) || this.#onFileChange(req)
     // ⚠️ Only for a thread we list and that says it is waiting (an id from the wire is not trusted on its own)
     if (!this.#deps.isWaiting(approval.threadId, 'approval')) return false
+    this.#deps.seen?.('command', approval)
     const key = idKey(approval.requestId)
     // ★ The same request replayed (a second join) replaces the card; the old one ends without a decision
     const old = this.#cards.get(key)
@@ -291,6 +297,8 @@ export class CodexApprovals {
     const request = parseFileChangeRequest(req)
     if (!request) return false
     if (!this.#deps.isWaiting(request.threadId, 'approval')) return false
+    // ★ Seen now, before the diff is read (a grant made while it loads must not make it "new" / r3 high #3)
+    this.#deps.seen?.('file', request)
     const key = idKey(request.requestId)
     const old = this.#cards.get(key)
     if (old) this.#withdraw(key, old)
@@ -333,6 +341,7 @@ export class CodexApprovals {
     const question = parseUserInput(req)
     if (!question) return false
     if (!this.#deps.isWaiting(question.threadId, 'answer')) return false
+    this.#deps.seen?.('question', question)
     const key = idKey(question.requestId)
     const old = this.#cards.get(key)
     if (old) this.#withdraw(key, old)

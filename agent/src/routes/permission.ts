@@ -42,6 +42,8 @@ import {
   type Decision,
   withPendingPerms,
   pendingPermTags,
+  wasPromoted,
+  markPromoted,
 } from '../permission.ts'
 import { sendToAll } from '../push.ts'
 import { clearLabelIfSettled, sweepResolved } from '../permissionSweep.ts'
@@ -52,6 +54,9 @@ import { buildUpdatedInput, describeInteraction, requiresInteraction } from '../
 import { buildCodexAnswers } from '../codex/questions.ts'
 import { actorOf } from '../auth.ts'
 import { autoApproveList, shouldAutoApprove } from '../autoApprove.ts'
+import { announceToLeader } from '../teamHooks.ts'
+import { membershipOf } from '../team.ts'
+import { hasHidden } from '../../../shared/reveal.ts'
 import { isCodexSessionId } from '../codex/daemon.ts'
 import { resolveAgentTranscript } from '../claude/subagentTranscript.ts'
 import { parseTranscriptPath } from './hook.ts'
@@ -129,6 +134,7 @@ export function buildPermissionInfo(body: HookPayload): PermissionRequest {
   //      New UIs use the structured fields when present (`web/src/ui/agentText.ts`).
   const items = suggestionItems(body['permission_suggestions'])
   const sub = subagentOf(body)
+  const cwdClipped = cwd !== undefined && cwd.length > CWD_MAX
   return {
     // ★★ Attach a generation so that **only the card that was pressed can be answered** (ABA protection).
     //   Without a generation, when the same command is retried in the same turn,
@@ -158,9 +164,13 @@ export function buildPermissionInfo(body: HookPayload): PermissionRequest {
     ...(sub ? { subagent: sub } : {}),
     summary: summarize(toolName, body['tool_input']),
     // ★ Some approvals cannot be judged without seeing past the "…", so the full text is passed too (tap to open in the UI)
-    ...(detail ? { detail: detail.text, detailClipped: detail.clipped } : {}),
+    ...(detail ? { detail: detail.text, detailClipped: detail.clipped || cwdClipped } : cwdClipped ? { detailClipped: true } : {}),
+    // ★★ Where it runs (2026-11-19 / codex review r8, high #2): `make clean` in a scratch checkout and in a live
+    //    directory looked the same — the card carried only the project's base name. The same rule as a Codex card:
+    //    cut at `CWD_MAX` (and said: `detailClipped`), third-party text drawn through `Revealed`, counted in `hidden`.
+    ...(cwd === undefined ? {} : { cwd: cwd.slice(0, CWD_MAX) }),
     // ★★ Checked on the uncut input (the phone warns even if the character lies past the cut / 2026-11-10)
-    ...(hiddenIn(toolName, body['tool_input']) ? { hidden: true as const } : {}),
+    ...(hiddenIn(toolName, body['tool_input']) || (cwd !== undefined && hasHidden(cwd)) ? { hidden: true as const } : {}),
     suggestions: items.map(legacySuggestionText),
     suggestionItems: items,
     permissionMode: str(body['permission_mode']),
@@ -171,6 +181,9 @@ export function buildPermissionInfo(body: HookPayload): PermissionRequest {
       : {}),
   }
 }
+
+/** A directory longer than this is cut, and the card says it is not all there (the same bound as a Codex card) */
+const CWD_MAX = 1000
 
 /**
  * The hook's entry point. ★ This is where it waits.
@@ -278,7 +291,7 @@ export async function permissionRequest(ctx: Ctx): Promise<unknown> {
   return decisionResponse(decision)
 }
 
-interface AnswerBody {
+export interface AnswerBody {
   key?: string
   behavior?: string
   /**
@@ -296,6 +309,21 @@ interface AnswerBody {
 /** The reply from the phone */
 export async function permissionAnswer(ctx: Ctx): Promise<{ ok: boolean; reason?: string }> {
   const body = await readJsonBody<AnswerBody>(ctx.req)
+  return answerPermission(body, actorOf(ctx.identity))
+}
+
+/**
+ * ★★ Answer one approval: the phone (`permissionAnswer`) and a team's leader (`/team/approve` / `team.ts`) go through
+ *    this one function, so the rules (labels only, no `updatedInput`, the generation check) are written once.
+ * ⚠️ `guard` sees the request **found by this same lookup**, with no await between the check and the answer
+ *    (whoever answers first wins; a check made on an older lookup could pass a newer request).
+ * @param actor who answered, for the journal (`device:…` / `team:<id>/<leader>`)
+ */
+export function answerPermission(
+  body: AnswerBody,
+  actor: string,
+  guard?: (target: PermissionRequest | undefined) => { ok: true } | { ok: false; reason: string },
+): { ok: boolean; reason?: string } {
   const key = str(body.key)
   const behavior = str(body.behavior)
   if (!key) throw new HttpError(400, t('key が必要です', '`key` is required.'))
@@ -307,6 +335,10 @@ export async function permissionAnswer(ctx: Ctx): Promise<{ ok: boolean; reason?
   //    (they actually could not be told apart in the journal). Add the tool name so they can be distinguished
   const found = pendingWithMeta().find((p) => p.info.key === key)
   const target = found?.info
+  if (guard) {
+    const g = guard(target)
+    if (!g.ok) return { ok: false, reason: g.reason }
+  }
 
   // ★★ Tools that cannot be answered with "yes/no" **are ignored by the CLI without updatedInput**
   //    (§9.11 / interaction.ts). Being ignored means "I pressed it but the PC did nothing", so
@@ -349,7 +381,7 @@ export async function permissionAnswer(ctx: Ctx): Promise<{ ok: boolean; reason?
   const ok = answer(key, behavior as Behavior, { updatedInput, message: fb.message })
   if (ok) {
     console.log(
-      `[perm] ${behavior} key=${key.slice(0, 12)}…${key.slice(-4)} by=${actorOf(ctx.identity)}` +
+      `[perm] ${behavior} key=${key.slice(0, 12)}…${key.slice(-4)} by=${actor}` +
         (target ? ` tool=${target.toolName}${target.agentType ? ` sub=${target.agentType}` : ''}` : '') +
         // ⚠️ No contents. Only "was a reason attached" and its length
         (fb.message
@@ -427,9 +459,21 @@ const QUIET_MS = 6000
  *    **unsent notifications being lost at shutdown** is accepted (the approvals themselves die on restart).
  */
 function announce(info: PermissionRequest, meta?: { transcriptPath?: string; agentId?: string }): () => void {
-  if (!info.agentType) {
-    // A request from the main agent. Announce immediately, as before
+  // ★ A subagent request already shown once and now re-entering: the card stays (its new key is broadcast), but it is
+  //   not announced again — no second ring, no second notice to a leader (r37 low #1: re-entries every few seconds
+  //   rang the phone each time)
+  if (info.agentType && wasPromoted(info.key)) {
+    broadcast({ type: 'permissions-changed', machine: info.machine, at: info.at })
+    return () => {}
+  }
+  // ★ A team member's subagent card skips the quiet period (r36 medium #4: a pending hook re-entering every few seconds
+  //   restarted it, and neither the phone nor the leader heard); it counts as shown from now on
+  if (info.agentType && membershipOf(info.sessionId)) markPromoted(info.key)
+  if (!info.agentType || membershipOf(info.sessionId)) {
+    // A request from the main agent — or a subagent request already shown once (its re-entry is not hidden again).
+    // Announce immediately, as before. ★ A team member's: its leader is told too (`teamHooks.ts`)
     void notifyPermission(info, meta?.transcriptPath)
+    announceToLeader(info)
     broadcast({ type: 'permissions-changed', machine: info.machine, at: info.at })
     return () => {}
   }
@@ -475,6 +519,8 @@ function announce(info: PermissionRequest, meta?: { transcriptPath?: string; age
         return
       }
       void notifyPermission(info, meta?.transcriptPath)
+      // ★ A team member's subagent: once surfaced, its leader is told too
+      announceToLeader(info)
       broadcast({ type: 'permissions-changed', machine: info.machine, at: new Date().toISOString() })
     })()
   }, QUIET_MS)

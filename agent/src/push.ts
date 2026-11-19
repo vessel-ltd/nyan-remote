@@ -636,7 +636,15 @@ export type PushSender = (
 ) => Promise<unknown>
 
 /** Sends to every registered device. Cleans up expired subscriptions (404/410). */
-export async function sendToAll(payload: PushPayload, sender?: PushSender): Promise<SendResult> {
+export async function sendToAll(
+  payload: PushPayload,
+  sender?: PushSender,
+  /**
+   * ★ Asked right before each device's send (teams: a held approval push stops the moment the card is answered,
+   *   even while subscriptions or other devices are being read / codex review r7, medium #11). False ⇒ not sent.
+   */
+  guard?: () => boolean,
+): Promise<SendResult> {
   const subs = newestPerDevice(await listSubscriptions())
   // ★ do not mix "no recipients" with "cannot send because unreadable" (2026-08-14 review, low).
   //   mixing them makes a stoppage from the moment of breakage look like a `{sent:0}` success
@@ -665,6 +673,7 @@ export async function sendToAll(payload: PushPayload, sender?: PushSender): Prom
   }
   const send = async (s: StoredSubscription): Promise<void> => {
     {
+      if (guard && !guard()) return
       try {
         if (sender) {
           await sender({ endpoint: s.endpoint, keys: s.keys }, bodies[asLang(s.lang) ?? 'ja'])

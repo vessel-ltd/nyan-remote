@@ -25,6 +25,7 @@ import { createHash } from 'node:crypto'
 import { codexSessionPrefix as prefixOf } from './ids.ts'
 import type { CodexLineHealth, SessionSummary } from '../../../shared/types.ts'
 import { CodexApprovals, type CodexApproval, type PhoneDecision, type QuestionReply } from './approvals.ts'
+import { cardOrigin } from './origin.ts'
 import type { CodexQuestion } from './questions.ts'
 import { findChanges, MAX_ROLLOUT_BYTES, type CodexFileChange, type FileChange } from './fileChanges.ts'
 import { parseTurnsPage, type TurnsPage } from './history.ts'
@@ -149,6 +150,8 @@ export interface DaemonHooks {
   onLoadedSnapshot?: (prefix: string, loaded: ReadonlySet<string>) => void
   /** The line has connected (initialized) to the daemon — each time, reconnects included */
   onConnected?: () => void
+  /** ★ A request of ours was accepted: its replay-stable origin (`origin.ts`), before any card (teams / r3 high #3) */
+  noteSeen?: (origin: string) => void
   log?: (line: string) => void
 }
 
@@ -189,6 +192,8 @@ export interface CodexDaemonLine {
   threadOf(sessionId: string): string | undefined
   /** Whether this thread is a row right now */
   lists(threadId: string): boolean
+  /** ★ Whether this row's status is known right now (not waiting on a fresh read after an unreadable update) */
+  statusKnown(threadId: string): boolean
   /** ★ Whether this thread is a row or a history row right now (its conversation may be read; nothing else) */
   knows(threadId: string): boolean
   /** ★ Closed threads as history rows (`live: false`) */
@@ -206,6 +211,8 @@ export interface CodexDaemonLine {
    *    cap ends the whole line (every approval card with it) just to word a notification.
    */
   turns(threadId: string, opts: { limit: number; cursor?: string; headersOnly?: boolean }): Promise<TurnsPage | undefined>
+  /** ★ The same with items, on a connection of its own (a huge reply cannot end the line / teams' reports) */
+  turnsAside(threadId: string, opts: { limit: number; cursor?: string }): Promise<TurnsPage | undefined>
   /**
    * Record how the turn that just ended really ended (read back from the history). Tells `onChange` if the row changed.
    * `mark`: the status change it was settled for (`StatusChange.mark`); a newer status of the thread refuses it.
@@ -219,7 +226,8 @@ export interface CodexDaemonLine {
    *    override (each of those lasts beyond this turn).
    * ⚠️ Only for a row that is idle right now. The caller validates the text.
    */
-  send(threadId: string, text: string, images?: readonly string[]): Promise<CodexSendResult>
+  /** `guard` (optional): the caller's own condition, asked right before the bytes go out (teams: still a member) */
+  send(threadId: string, text: string, images?: readonly string[], guard?: () => boolean): Promise<CodexSendResult>
   /**
    * ★ Compact the thread's context (`thread/compact/start`; the TUI's own `/compact` / docs/CODEX.md §5.8).
    * ⚠️⚠️ Only for a row that is idle right now: the daemon aborts any running or waiting turn to compact
@@ -284,6 +292,42 @@ export function startCodexDaemonLine(opts: DaemonOptions): CodexDaemonLine {
   const hooks = opts.hooks ?? {}
   const book = new ThreadBook()
   const idPrefix = codexSessionPrefix(home.id)
+  /**
+   * ★ One request on **a connection of its own** (initialize → the request → close): a reply over the message limit
+   *   then drops only this connection, never the line (whose cards would go with it). Used for the full-history join of
+   *   a file change and for a team's full-turn reads (codex review r18, medium #3).
+   * ⚠️ Requests replayed to this connection are never answered (it has no `onServerRequest`).
+   */
+  const withSideRpc = async <T>(work: (rpc: Rpc) => Promise<T | undefined>): Promise<T | undefined> => {
+    let side: Rpc | undefined
+    const early: string[] = []
+    let conn: WsUdsConnection
+    try {
+      conn = await deps.connect(home.socketPath, (text) => (side ? side.receive(text) : early.push(text)))
+    } catch {
+      return undefined
+    }
+    try {
+      const rpcSide = createRpc({
+        ...(opts.rpcTimeoutMs === undefined ? {} : { timeoutMs: opts.rpcTimeoutMs }),
+        send: (t, guard) => conn.send(t, guard),
+        onServerRequest: () => undefined,
+        onNotification: () => undefined,
+      })
+      side = rpcSide
+      for (const t of early) rpcSide.receive(t)
+      void conn.closed.then((why) => rpcSide.fail(why.reason))
+      const init = await rpcSide.call('initialize', {
+        clientInfo: { name: opts.clientName, title: null, version: opts.clientVersion },
+        capabilities: { experimentalApi: false, requestAttestation: false },
+      })
+      if (!init.ok) return undefined
+      await rpcSide.notify('initialized')
+      return await work(rpcSide)
+    } finally {
+      conn.close()
+    }
+  }
   const rowsCtx = { machine, account: home.label, idPrefix }
   // ★ `liveRpc` is declared below; this is only called once a line is up
   const closed = new ClosedThreads({
@@ -354,31 +398,8 @@ export function startCodexDaemonLine(opts: DaemonOptions): CodexDaemonLine {
      * history, unsubscribed and closed; the PC's approval kept waiting and was answered there.
      * ⚠️ The request replayed to this connection is never answered (it has no `onServerRequest`).
      */
-    const sideResume = async (threadId: string, still: () => boolean): Promise<unknown> => {
-      let side: Rpc | undefined
-      const early: string[] = []
-      let conn: WsUdsConnection
-      try {
-        conn = await deps.connect(home.socketPath, (text) => (side ? side.receive(text) : early.push(text)))
-      } catch {
-        return undefined
-      }
-      try {
-        const rpcSide = createRpc({
-          ...(opts.rpcTimeoutMs === undefined ? {} : { timeoutMs: opts.rpcTimeoutMs }),
-          send: (t, guard) => conn.send(t, guard),
-          onServerRequest: () => undefined,
-          onNotification: () => undefined,
-        })
-        side = rpcSide
-        for (const t of early) rpcSide.receive(t)
-        void conn.closed.then((why) => rpcSide.fail(why.reason))
-        const init = await rpcSide.call('initialize', {
-          clientInfo: { name: opts.clientName, title: null, version: opts.clientVersion },
-          capabilities: { experimentalApi: false, requestAttestation: false },
-        })
-        if (!init.ok) return undefined
-        await rpcSide.notify('initialized')
+    const sideResume = (threadId: string, still: () => boolean): Promise<unknown> =>
+      withSideRpc(async (rpcSide) => {
         const res = await rpcSide.call('thread/resume', { threadId, excludeTurns: false }, { guard: still })
         if (!res.ok) {
           hooks.log?.(`[codex] could not read a file change's diff (${failureDetail(res.failure)}; left to the PC)`)
@@ -387,10 +408,7 @@ export function startCodexDaemonLine(opts: DaemonOptions): CodexDaemonLine {
         // ★ Leave before closing, as measured
         await rpcSide.call('thread/unsubscribe', { threadId })
         return res.result
-      } finally {
-        conn.close()
-      }
-    }
+      })
     const fetchChanges = (threadId: string, turnId: string, itemId: string, live: () => boolean): Promise<FileChange[] | undefined> => {
       const k = [threadId, turnId, itemId].join('\0')
       const known = diffs.get(k)
@@ -443,6 +461,7 @@ export function startCodexDaemonLine(opts: DaemonOptions): CodexDaemonLine {
                   ? book.waitsOnPerson(id)
                   : book.waitsOnApproval(id),
           sleep: (ms) => deps.sleep(ms, abort.signal),
+          seen: (kind, req) => hooks.noteSeen?.(cardOrigin(req, idPrefix + req.threadId, kind)),
           offer: (approval, onWithdraw) => {
             const row = rowOf(approval.threadId)
             // ★ For the types only: `isWaiting` was just true, so the row exists
@@ -699,7 +718,7 @@ export function startCodexDaemonLine(opts: DaemonOptions): CodexDaemonLine {
    * ⚠️⚠️ Both share one hold: a send and a compaction pressed at once are one press (the second is `busy`), and the
    *    daemon would let either one replace the other (`thread/compact/start` aborts any running turn / docs/CODEX.md §5.8).
    */
-  async function startOnIdle(threadId: string, method: string, params: Record<string, unknown>): Promise<CodexSendResult> {
+  async function startOnIdle(threadId: string, method: string, params: Record<string, unknown>, callerGuard?: () => boolean): Promise<CodexSendResult> {
     const rpc = liveRpc
     if (!rpc || !book.isRow(threadId)) return { ok: false, reason: 'not-listed' }
     // ⚠️⚠️ Reserved **before the first await** (high #3): two phones sending at once both saw "idle", and the second
@@ -715,7 +734,7 @@ export function startCodexDaemonLine(opts: DaemonOptions): CodexDaemonLine {
     // ⚠️⚠️ And only while this send still owns the thread (second review, high #1): a status move ends the hold
     //    for good, so a queued send that saw active → idle meanwhile is not written next to a newer send.
     const res = await rpc.call(method, params, {
-      guard: () => owns() && liveRpc === rpc && book.isRow(threadId) && book.acceptsInput(threadId),
+      guard: () => owns() && liveRpc === rpc && book.isRow(threadId) && book.acceptsInput(threadId) && (callerGuard?.() ?? true),
     })
     if (res.ok) return { ok: true }
     const f = res.failure
@@ -735,6 +754,7 @@ export function startCodexDaemonLine(opts: DaemonOptions): CodexDaemonLine {
     sessionIdOf: (threadId) => idPrefix + threadId,
     threadOf: (sessionId) => (sessionId.startsWith(idPrefix) && sessionId.length > idPrefix.length ? sessionId.slice(idPrefix.length) : undefined),
     lists: (threadId) => book.isRow(threadId),
+    statusKnown: (threadId) => book.isRow(threadId) && book.statusKnown(threadId),
     knows: (threadId) => book.isRow(threadId) || closed.has(threadId),
     historyRows: () => closed.rows(rowsCtx),
     refreshHistory: (ms) => {
@@ -756,13 +776,21 @@ export function startCodexDaemonLine(opts: DaemonOptions): CodexDaemonLine {
       // ⚠️ A refusal is not remembered: right after a thread is created this method answers -32601 and works later
       return res.ok ? parseTurnsPage(res.result) : undefined
     },
+    turnsAside: async (threadId, o) => {
+      if (!(book.isRow(threadId) || closed.has(threadId))) return undefined
+      const result = await withSideRpc(async (r) => {
+        const res = await r.call('thread/turns/list', { threadId, limit: o.limit, sortDirection: 'desc', itemsView: 'full', ...(o.cursor === undefined ? {} : { cursor: o.cursor }) })
+        return res.ok ? res.result : undefined
+      })
+      return result === undefined ? undefined : parseTurnsPage(result)
+    },
     setOutcome: (threadId, outcome, mark) => {
       if (book.setOutcome(threadId, outcome, mark)) hooks.onChange?.()
     },
     mark: (threadId) => book.mark(threadId),
     // ★ Images from the phone go as `localImage` items (measured: the TUI shows `[Image #1]` and the model sees it).
     //   ⚠️ The paths are the agent's own (`uploads.ts`), never from the phone
-    send: (threadId, text, images = []) => startOnIdle(threadId, 'turn/start', { threadId, input: codexInput(text, images) }),
+    send: (threadId, text, images = [], guard) => startOnIdle(threadId, 'turn/start', { threadId, input: codexInput(text, images) }, guard),
     compact: (threadId) => startOnIdle(threadId, 'thread/compact/start', { threadId }),
     rateLimits: async () => {
       const rpc = liveRpc

@@ -15,13 +15,15 @@ import { discoverConfigDirs } from './claude/configDirs.ts'
 import { seedHookState } from './claude/hookState.ts'
 import { startSessionWatch } from './claude/sessionWatch.ts'
 import { uploads } from './uploads.ts'
-import { CODEX_FOLLOW_TICK_MS, codexFollowTick, startCodex } from './codex/run.ts'
+import { CODEX_FOLLOW_TICK_MS, codexFollowTick, codexLastWords, codexRowsNow, startCodex } from './codex/run.ts'
+import { codexCardsChanged, codexMemberState, codexRowStatus, codexSnapshot, sessionEnded } from './teamHooks.ts'
+import { startTeamSocket } from './teamSocket.ts'
 import { codexPayload } from './codex/notify.ts'
 import { sendToAll } from './push.ts'
 import { withPendingPerms } from './permission.ts'
 import { toPushPayload } from './routes/hook.ts'
 import { broadcast, followedSessions, notifyFollowers } from './events.ts'
-import { pendingCount } from './permission.ts'
+import { noteFirstSeen, pendingCount } from './permission.ts'
 import { config, configProblem, loadConfig } from './config.ts'
 import { loadAgentKey } from './deviceKey.ts'
 import { devicesBroken, listDevices, loadDevices } from './devices.ts'
@@ -138,9 +140,13 @@ async function main(): Promise<void> {
           }, 100)
         },
         log: (line) => console.log(line),
+        // ★ Teams: when a request was first seen, by its replay-stable origin (`permission.ts`)
+        noteSeen: (origin) => noteFirstSeen(origin),
         // ★ A closed thread ends its auto-approve entry, like `SessionEnd` does for Claude (never left on for a
         //   thread nobody is running). ⚠️ Never throws into the daemon line.
         onClosed: (threadId) => {
+          // ★ Teams: a closed member leaves its team (`teamHooks.ts`)
+          sessionEnded(threadId)
           void endSessionAutoApprove(threadId)
             .then((r) => {
               if (r.had) broadcast({ type: 'sessions-changed', at: new Date().toISOString() })
@@ -150,6 +156,8 @@ async function main(): Promise<void> {
         },
         // ★ Threads that closed while nobody listened (line down, agent off): their entries end too
         onLoadedSnapshot: (prefix, loaded) => {
+          // ★ Teams: Codex members that closed while nobody listened leave their team (`teamHooks.ts`)
+          codexSnapshot(prefix, loaded)
           void endCodexAutoApproveOutside(prefix, loaded)
             .then((r) => {
               if (r.ended > 0) broadcast({ type: 'sessions-changed', at: new Date().toISOString() })
@@ -159,10 +167,33 @@ async function main(): Promise<void> {
         },
       },
       // ★ The same text builder and the same sender as the Claude side (`toPushPayload` → `sendToAll`)
-      notify: async (row, fields) =>
-        (await sendToAll(withPendingPerms(codexPayload(row, fields, new Date().toISOString(), toPushPayload)))).sent,
+      notify: async (row, fields, turn, current) => {
+        const send = async (guard?: () => boolean): Promise<number> =>
+          (await sendToAll(withPendingPerms(codexPayload(row, fields, new Date().toISOString(), toPushPayload)), undefined, guard)).sent
+        // ★ A team member (docs/TEAM.md §4.6): its turn end is reported to the leader instead of ringing (the phone
+        //   rings if that report does not get through). ⚠️ 0 = not sent now (not remembered)
+        const held = codexMemberState(
+          row,
+          fields.label,
+          // ★ A late fallback rings only while this change is still the thread's latest (its status mark)
+          //   ⚠️ A row gone with a reconnect is not a newer state: the mark check applies only while the row is listed
+          (guard) =>
+            void send(() => {
+              const listed = codexRowsNow().some((x) => x.sessionId === row.sessionId)
+              return (!listed || (current?.() ?? true)) && (guard?.() ?? true)
+            }).catch(() => undefined),
+          async () => (turn ? codexLastWords(row.sessionId, turn) : undefined),
+        )
+        return held ? 0 : send()
+      },
+      // ★ Teams: a member waiting at the grant is released on its first real transition out of waiting (`teamHooks.ts`)
+      onRowStatus: (sessionId, to) => codexRowStatus(sessionId, to),
       // ★ Approvals: the cards live in the same store as the Claude ones; the phones only need to read it again
-      cardsChanged: () => broadcast({ type: 'permissions-changed', machine: machineName(), at: new Date().toISOString() }),
+      cardsChanged: () => {
+        broadcast({ type: 'permissions-changed', machine: machineName(), at: new Date().toISOString() })
+        // ★ Teams: each new Codex card the leader may answer is announced to it once (`teamHooks.ts`)
+        codexCardsChanged()
+      },
     })
     if (n > 0) {
       console.log(t(`[codex] Codex の daemon を見張ります: ${n} 件`, `[codex] Watching Codex daemons: ${n}`))
@@ -215,6 +246,8 @@ async function main(): Promise<void> {
 
   // ★ Files from the phone: expired uploads and week-old files go on a timer, not only when someone uploads (uploads.ts)
   uploads.startSweeping()
+  // ★ Teams (`/nyan-team`): their routes live only on a Unix socket in the state directory (`teamSocket.ts`). Never fatal
+  void startTeamSocket()
   server.listen(cfg.port, cfg.host, () => {
     console.log(`[agent] nyan-remote ${AGENT_VERSION} on ${machineName()}`)
     const badName = machineNameProblem(config().machineName)

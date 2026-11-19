@@ -19,6 +19,7 @@ import type { PermissionRequest, SessionSummary } from '../../../shared/types.ts
 import { shouldAutoApprove } from '../autoApprove.ts'
 import { hasHidden } from '../../../shared/reveal.ts'
 import { detailOf, hiddenIn, summarize, waitForDecision, withGeneration } from '../permission.ts'
+import { cardOrigin } from './origin.ts'
 import { ASK_USER_QUESTION } from '../claude/interaction.ts'
 import type { CodexApproval, PhoneDecision, QuestionReply } from './approvals.ts'
 import { questionInteraction, type CodexAnswers, type CodexQuestion } from './questions.ts'
@@ -51,6 +52,7 @@ export function codexCard(approval: CodexApproval, row: SessionSummary, generati
   const cwdClipped = cwd !== undefined && cwd.length > CWD_MAX
   return {
     key: withGeneration(`codex:${id}`),
+    origin: cardOrigin(approval, row.sessionId, 'command'),
     machine: row.machine,
     account: row.account,
     // ★ The same project as the list row (not the request's cwd, which moves with `cd`)
@@ -91,7 +93,9 @@ export function offerCodexCard(
       deps.log?.(`[codex] allowed by auto-approve thread=${approval.threadId.slice(0, 8)}`)
       return 'yes'
     }
-    const waiting = waitForDecision(info, onWithdraw)
+    // ★ The exact command (and where it runs) beside the card: a team's leader judges by this, not by the summary
+    //   (whitespace is folded there / codex review r18, medium #2)
+    const waiting = waitForDecision(info, onWithdraw, { toolInput: { command: approval.command, ...(approval.cwd === undefined ? {} : { cwd: approval.cwd }) } })
     deps.changed()
     const decision = await waiting
     deps.changed()
@@ -111,6 +115,7 @@ export function codexQuestionCard(question: CodexQuestion, row: SessionSummary, 
   const detail = detailOf(ASK_USER_QUESTION, input)
   return {
     key: withGeneration(`codex:${cardId(question, row, generation, 'question')}`),
+    origin: cardOrigin(question, row.sessionId, 'question'),
     machine: row.machine,
     account: row.account,
     project: row.project,
@@ -158,6 +163,7 @@ export function codexFileChangeCard(change: CodexFileChange, row: SessionSummary
   const detail = detailOf(FILE_CHANGE_TOOL, input)
   return {
     key: withGeneration(`codex:${cardId(change, row, generation, 'file')}`),
+    origin: cardOrigin(change, row.sessionId, 'file'),
     machine: row.machine,
     account: row.account,
     project: row.project,
@@ -185,7 +191,8 @@ export function offerCodexFileChange(
       deps.log?.(`[codex] file change allowed by auto-approve thread=${change.threadId.slice(0, 8)}`)
       return 'yes'
     }
-    const waiting = waitForDecision(info, onWithdraw)
+    // ★ The exact patch beside the card (a team's leader judges by it / r18 medium #2)
+    const waiting = waitForDecision(info, onWithdraw, { toolInput: { patch: patchText(change) } })
     deps.changed()
     const decision = await waiting
     deps.changed()
