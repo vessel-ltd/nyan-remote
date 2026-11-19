@@ -147,17 +147,59 @@ function pct(n) {
   return n === undefined ? '?' : `${n}%`
 }
 
+function windowName(minutes) {
+  if (minutes === 7 * 24 * 60) return t('週', 'week')
+  if (minutes % 60 === 0) return t(`${minutes / 60}時間`, `${minutes / 60}h`)
+  return t(`${minutes}分`, `${minutes}min`)
+}
+
+/** A span as days / hours / minutes (two units at most) */
+function span(ms) {
+  const m = Math.max(0, Math.round(ms / 60_000))
+  const d = Math.floor(m / 1440)
+  const h = Math.floor((m % 1440) / 60)
+  const min = m % 60
+  if (d > 0) return t(`${d}日${h}時間`, `${d}d ${h}h`)
+  if (h > 0) return t(`${h}時間${min}分`, `${h}h ${min}m`)
+  return t(`${min}分`, `${min}m`)
+}
+
+/** Local `M/D HH:MM` (the machine's own time zone, as the lead's clock) */
+function when(ms) {
+  const d = new Date(ms)
+  const p2 = (n) => String(n).padStart(2, '0')
+  return `${d.getMonth() + 1}/${d.getDate()} ${p2(d.getHours())}:${p2(d.getMinutes())}`
+}
+
+/**
+ * ★ A login's plan limits as one line (2026-11-19): each window's use with its reset time, then how old the reading is.
+ * The lead uses it to spread work by what is left **and when it comes back**; how to spread it is the user's call.
+ * Falls back to the weekly percent alone from an older agent.
+ */
+export function formatLimits(c, nowMs = Date.now()) {
+  if (!c.limits) return `${t('週', 'week')} ${pct(c.weeklyUsedPercent)}`
+  const parts = c.limits.windows.map((w) => {
+    const at = Date.parse(w.resetsAt)
+    return t(`${windowName(w.minutes)} ${w.usedPercent}%（${when(at)} リセット・あと${span(at - nowMs)}）`, `${windowName(w.minutes)} ${w.usedPercent}% (resets ${when(at)}, in ${span(at - nowMs)})`)
+  })
+  const age = nowMs - Date.parse(c.limits.at)
+  const old = Number.isFinite(age) ? t(`${span(age)}前の値`, `read ${span(age)} ago`) : ''
+  // ★ Profiles logged in to the same account share these windows (one quota)
+  const shared = c.limits.sameLoginAs?.length ? t(`（${c.limits.sameLoginAs.join('・')} と同じログイン＝同じ枠）`, ` (same login as ${c.limits.sameLoginAs.join(', ')}: one quota)`) : ''
+  return `${parts.join(' · ')}${old ? ` — ${old}` : ''}${shared}`
+}
+
 export function formatCandidates(list) {
   if (list.length === 0) return t('候補はありません（ほかに生きているセッションがない）', 'No candidates (no other live session).')
   return list
     .map((c) => {
-      const tags = [c.tool === 'codex' ? 'Codex' : 'Claude', c.account, c.model && `${c.model}${c.effort ? `/${c.effort}` : ''}`, `${t('週', 'week')} ${pct(c.weeklyUsedPercent)}`, c.status]
+      const tags = [c.tool === 'codex' ? 'Codex' : 'Claude', c.account, c.model && `${c.model}${c.effort ? `/${c.effort}` : ''}`, c.status]
         .filter(Boolean)
         .join(' · ')
       const team = c.team ? `  [${t('チーム', 'team')} ${c.team.id} ${c.team.role}]` : ''
       // ★ Session-supplied text (title, project) inside a random data fence; refs and addresses (ours) outside it (r23 medium #3)
       const fenced = fence(t('題名とプロジェクト（データ）', 'title and project (data)'), `${c.title}\n${c.project}`).replace(/^/gm, '    ')
-      return `${c.ref}  ${tags}${team}${c.address ? `\n    SendMessage to: ${c.address}` : ''}\n${fenced}`
+      return `${c.ref}  ${tags}${team}\n    ${t('上限', 'limits')}: ${formatLimits(c)}${c.address ? `\n    SendMessage to: ${c.address}` : ''}\n${fenced}`
     })
     .join('\n')
 }
@@ -171,8 +213,10 @@ export function formatStatus(s) {
         : t('承認の任せは切れています', 'The approvals delegation has ended'),
     )
   }
+  if (s.leader?.limits) lines.push(`lead  Claude · ${s.leader.account}\n    ${t('上限', 'limits')}: ${formatLimits(s.leader)}`)
   for (const m of s.members) {
     lines.push(`${m.name}  ${m.tool === 'codex' ? 'Codex' : 'Claude'} · ${m.account} · ${m.status}`)
+    if (m.limits) lines.push(`    ${t('上限', 'limits')}: ${formatLimits(m)}`)
     lines.push(fence(t('題名（データ）', 'title (data)'), m.title).replace(/^/gm, '    '))
     lines.push(
       m.address

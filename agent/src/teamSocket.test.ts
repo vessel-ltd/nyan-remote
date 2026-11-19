@@ -10,7 +10,7 @@ import { aliveProcStartFreshSync } from './claude/sessionIndex.ts'
 import { resetPending, waitForDecision, type Decision } from './permission.ts'
 import { createTeam, resetTeamsForTest } from './team.ts'
 import { requestRef } from './teamHooks.ts'
-import { answersFromChoices } from './routes/team.ts'
+import { answersFromChoices, limitsOf, withoutSharedLabels } from './routes/team.ts'
 import { dirProblem, startTeamSocket, teamSocketPath } from './teamSocket.ts'
 
 const root = mkdtempSync(join(tmpdir(), 'nr-team-'))
@@ -373,3 +373,55 @@ test('★★ a lost hook connection is not a settlement: the request keeps its f
   assert.equal(firstSeenAt(back), t0)
 })
 
+
+test('★ limits carry each window’s reset time and the reading time, longest first, from that tool and profile only (2026-11-19)', () => {
+  const u = {
+    usage: [
+      { tool: 'claude' as const, account: '.claude-r', at: '2026-11-19T11:48:00Z', windows: [
+        { minutes: 300, usedPercent: 10.4, resetsAt: '2026-11-19T14:30:00Z' },
+        { minutes: 10080, usedPercent: 41.6, resetsAt: '2026-11-22T12:00:00Z' },
+      ] },
+      { tool: 'codex' as const, account: '.claude-r', at: '2026-11-19T11:59:00Z', windows: [{ minutes: 10080, usedPercent: 90, resetsAt: '2026-11-20T00:00:00Z' }] },
+      { tool: 'claude' as const, account: '.claude-s', at: '2026-11-19T11:00:00Z', windows: [] },
+    ],
+  }
+  assert.deepEqual(limitsOf(u, 'claude', '.claude-r'), {
+    windows: [
+      { minutes: 10080, usedPercent: 42, resetsAt: '2026-11-22T12:00:00Z' },
+      { minutes: 300, usedPercent: 10, resetsAt: '2026-11-19T14:30:00Z' },
+    ],
+    at: '2026-11-19T11:48:00Z',
+  })
+  // the tool must match too (a Codex home and a Claude profile can share a label)
+  assert.equal(limitsOf(u, 'codex', '.claude-r')?.windows[0]?.usedPercent, 90)
+  // every window reset since the reading, or nothing read: unknown, never "0%"
+  assert.equal(limitsOf(u, 'claude', '.claude-s'), undefined)
+  assert.equal(limitsOf(u, 'claude', '.claude'), undefined)
+  // ★ two Codex homes with one label: unknown, never the first one's numbers (codex review r1)
+  const twin = { usage: [...u.usage, { tool: 'codex' as const, account: '.claude-r', at: '2026-11-19T11:59:00Z', windows: [{ minutes: 10080, usedPercent: 5, resetsAt: '2026-11-20T00:00:00Z' }] }] }
+  assert.equal(limitsOf(twin, 'codex', '.claude-r'), undefined)
+  // ★ one reading of a label two watched homes share: dropped (only one read succeeded / codex review r2–r3)
+  const one = withoutSharedLabels(u, (label) => label === '.claude-r')
+  assert.equal(limitsOf(one, 'codex', '.claude-r'), undefined)
+  assert.ok(limitsOf(one, 'claude', '.claude-r'), 'a Claude profile with the same label is not a Codex home')
+  assert.ok(limitsOf(withoutSharedLabels(u, () => false), 'codex', '.claude-r'))
+  // ★★ two profiles on one account: one quota ⇒ both show the newest reading and name each other (codex review r4)
+  const one2 = {
+    usage: [
+      { tool: 'claude' as const, account: '.claude-r', accountKey: 'k1', at: '2026-11-19T11:00:00Z', windows: [{ minutes: 300, usedPercent: 12, resetsAt: '2026-11-19T14:30:00Z' }] },
+      { tool: 'claude' as const, account: '.claude-rs', accountKey: 'k1', at: '2026-11-19T11:55:00Z', windows: [{ minutes: 300, usedPercent: 96, resetsAt: '2026-11-19T14:30:00Z' }] },
+      { tool: 'claude' as const, account: '.claude-s', accountKey: 'k2', at: '2026-11-19T11:58:00Z', windows: [{ minutes: 300, usedPercent: 1, resetsAt: '2026-11-19T14:30:00Z' }] },
+    ],
+  }
+  for (const [profile, other] of [['.claude-r', '.claude-rs'], ['.claude-rs', '.claude-r']] as const) {
+    const l = limitsOf(one2, 'claude', profile)
+    assert.equal(l?.windows[0]?.usedPercent, 96, profile)
+    assert.equal(l?.at, '2026-11-19T11:55:00Z')
+    assert.deepEqual(l?.sameLoginAs, [other])
+  }
+  assert.equal(limitsOf(one2, 'claude', '.claude-s')?.sameLoginAs, undefined)
+  assert.equal(limitsOf(one2, 'claude', '.claude-s')?.windows[0]?.usedPercent, 1)
+  // the newest reading of the account has no window left: unknown, never an older window (codex review r5)
+  const emptied = { usage: [...one2.usage, { tool: 'claude' as const, account: '.claude-rt', accountKey: 'k1', at: '2026-11-19T11:59:00Z', windows: [] }] }
+  assert.equal(limitsOf(emptied, 'claude', '.claude-r'), undefined)
+})

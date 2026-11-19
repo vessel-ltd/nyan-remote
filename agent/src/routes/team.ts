@@ -6,7 +6,7 @@
 
 import { createHash } from 'node:crypto'
 import { t } from '../../../shared/i18n.ts'
-import { looksLikeCommand, MAX_SEND_BYTES, type LogEntry, type PermissionRequest, type SessionSummary } from '../../../shared/types.ts'
+import { looksLikeCommand, MAX_SEND_BYTES, type LogEntry, type PermissionRequest, type SessionSummary, type ToolUsage } from '../../../shared/types.ts'
 import { config } from '../config.ts'
 import { discoverConfigDirs } from '../claude/configDirs.ts'
 import { findTarget } from '../claude/inbox.ts'
@@ -33,7 +33,7 @@ import {
 import { asMemberData, cardText, endTeam, soleProcessSync, indexStatusNow, leaderMay, leaderSessionNow, liveMember, memberUnique, ownsCard, revealed, requestRef, teamDeps, tellLeader } from '../teamHooks.ts'
 import { answerPermission, type AnswerBody } from './permission.ts'
 import { codexMessage } from './message.ts'
-import { codexLists, codexLog, codexRowsNow, codexSend, codexStatusKnown } from '../codex/run.ts'
+import { codexLabelShared, codexLists, codexLog, codexRowsNow, codexSend, codexStatusKnown } from '../codex/run.ts'
 import { readFileSync } from 'node:fs'
 import { readdir, stat } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
@@ -122,10 +122,56 @@ interface Candidate {
   contextTokens?: number
   /** Claude: where its own SendMessage reaches it (`uds:<socket>`). Codex: absent (use `nyan team send`) */
   address?: string
-  /** Weekly limit used (0–100) of that profile's login, when known */
+  /** Weekly limit used (0–100) of that profile's login, when known. ⚠️ Kept for an older `nyan team` (use `limits`) */
   weeklyUsedPercent?: number
+  /** ★ That login's plan-limit windows with their reset times, and when they were read (2026-11-19) */
+  limits?: Limits
   /** Already in a team (`lead` / `member`) */
   team?: { id: string; role: 'lead' | 'member' }
+}
+
+/**
+ * ★ A login's plan-limit windows as the team commands show them (2026-11-19): each window's use **and reset time**, and
+ * when the numbers were read, so the lead can tell how stale they are. Longest window first.
+ * ⚠️ Only what the tool reported (some plans have no 5-hour window); windows whose reset passed are already dropped.
+ */
+interface Limits {
+  windows: { minutes: number; usedPercent: number; resetsAt: string }[]
+  at: string
+  /** ★ Other profiles logged in to the same account: one quota (codex review r4). Labels only, never the account */
+  sameLoginAs?: string[]
+}
+
+export function limitsOf(u: { usage: ToolUsage[] }, tool: 'claude' | 'codex', account: string): Limits | undefined {
+  // ⚠️ Two homes can share a label (`work/.codex` and `personal/.codex`): then which login a row is cannot be told,
+  //    so nothing is shown rather than another login's numbers (codex review r1)
+  const found = u.usage.filter((x) => x.tool === tool && x.account === account)
+  const own = found.length === 1 ? found[0] : undefined
+  if (!own) return undefined
+  // ★ Two profiles can be one account (measured: `.claude-r` and `.claude-rs`), so one quota: every profile of it shows
+  //   the newest reading and names the others, or the lead would see 96% and 12% for the same 5 hours (codex review r4)
+  const same = own.accountKey ? u.usage.filter((x) => x.tool === tool && x.accountKey === own.accountKey) : [own]
+  // ⚠️ The newest reading wins even when it has no window left: an older one could bring back a window the plan no
+  //    longer has (codex review r5)
+  const got = [...same].sort((a, b) => Date.parse(b.at) - Date.parse(a.at))[0]
+  if (!got || got.windows.length === 0) return undefined
+  const windows = [...got.windows]
+    .sort((a, b) => b.minutes - a.minutes)
+    .map((w) => ({ minutes: w.minutes, usedPercent: Math.round(w.usedPercent), resetsAt: w.resetsAt }))
+  const others = [...new Set(same.map((x) => x.account).filter((a) => a !== account))].sort()
+  return { windows, at: got.at, ...(others.length ? { sameLoginAs: others } : {}) }
+}
+
+/**
+ * The readings the team commands use. ⚠️ A Codex label shared by two watched homes is left out even when only one of
+ * them has a reading (codex review r2): which home a row with that label belongs to cannot be told.
+ */
+async function teamUsage(): Promise<{ usage: ToolUsage[] }> {
+  return withoutSharedLabels(await usage().catch(() => ({ usage: [] as ToolUsage[] })), codexLabelShared)
+}
+
+export function withoutSharedLabels(u: { usage: ToolUsage[] }, shared: (label: string) => boolean): { usage: ToolUsage[] } {
+  return { usage: u.usage.filter((x) => !(x.tool === 'codex' && shared(x.account))) }
 }
 
 async function liveRows(): Promise<SessionSummary[]> {
@@ -135,7 +181,7 @@ async function liveRows(): Promise<SessionSummary[]> {
 
 export async function teamCandidates(ctx: Ctx): Promise<{ candidates: Candidate[] }> {
   const { sessionId: self } = leaderOf(fromQuery(ctx))
-  const [rows, u] = await Promise.all([liveRows(), usage().catch(() => ({ usage: [] }))])
+  const [rows, u] = await Promise.all([liveRows(), teamUsage()])
   const dirs = await discoverConfigDirs(config().configDirs)
   const out: Candidate[] = []
   for (const row of rows) {
@@ -147,9 +193,8 @@ export async function teamCandidates(ctx: Ctx): Promise<{ candidates: Candidate[
       if ('reason' in target) continue // not reachable now (no inbox, unverifiable, ambiguous): not a candidate
       address = `uds:${target.socketPath}`
     }
-    const week = u.usage
-      .find((x) => x.tool === tool && x.account === row.account)
-      ?.windows.find((w) => w.minutes === WEEK_MINUTES)
+    const limits = limitsOf(u, tool, row.account)
+    const week = limits?.windows.find((w) => w.minutes === WEEK_MINUTES)
     const led = allTeams().find((x) => x.leader.sessionId === row.sessionId)
     const inTeam = led ? { id: led.id, role: 'lead' as const } : membershipOf(row.sessionId) ? { id: membershipOf(row.sessionId)!.team.id, role: 'member' as const } : undefined
     out.push({
@@ -163,7 +208,8 @@ export async function teamCandidates(ctx: Ctx): Promise<{ candidates: Candidate[
       ...(row.effort ? { effort: row.effort } : {}),
       ...(row.contextTokens !== undefined ? { contextTokens: row.contextTokens } : {}),
       ...(address ? { address } : {}),
-      ...(week ? { weeklyUsedPercent: Math.round(week.usedPercent) } : {}),
+      ...(week ? { weeklyUsedPercent: week.usedPercent } : {}),
+      ...(limits ? { limits } : {}),
       ...(inTeam ? { team: inTeam } : {}),
     })
   }
@@ -277,7 +323,7 @@ export async function teamCreate(ctx: Ctx): Promise<unknown> {
 }
 
 async function statusOf(team: Team): Promise<unknown> {
-  const rows = await liveRows()
+  const [rows, u] = await Promise.all([liveRows(), teamUsage()])
   const dirs = await discoverConfigDirs(config().configDirs)
   const v = teamView(team)
   const members = []
@@ -292,6 +338,7 @@ async function statusOf(team: Team): Promise<unknown> {
       if (!('reason' in target) && target.pid === m.pid && liveMember(m)) address = `uds:${target.socketPath}`
       else replaced = true
     }
+    const limits = limitsOf(u, m.tool, m.account)
     members.push({
       name: m.name,
       sessionId: m.sessionId,
@@ -300,15 +347,22 @@ async function statusOf(team: Team): Promise<unknown> {
       title: row ? revealed(row.title) : '',
       status: replaced ? 'replaced' : (row?.status ?? 'gone'),
       ...(address ? { address } : {}),
+      ...(limits ? { limits } : {}),
     })
   }
   return {
     id: v.id,
-    leader: { sessionId: v.leader.sessionId, account: v.leader.account },
+    leader: { sessionId: v.leader.sessionId, account: v.leader.account, ...leaderLimits(u, v.leader.account) },
     members,
     ...(v.approvals ? { approvals: { duration: v.approvals.duration, until: new Date(v.approvals.untilMs).toISOString(), active: v.approvals.untilMs > Date.now() } } : {}),
     createdAt: new Date(v.createdAtMs).toISOString(),
   }
+}
+
+/** The lead is a Claude session (Codex cannot lead yet): its own login's limits, since its work counts too */
+function leaderLimits(u: { usage: ToolUsage[] }, account: string): { limits?: Limits } {
+  const limits = limitsOf(u, 'claude', account)
+  return limits ? { limits } : {}
 }
 
 export async function teamStatus(ctx: Ctx): Promise<unknown> {

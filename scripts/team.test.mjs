@@ -3,7 +3,8 @@ import { chmodSync, mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
-import { callerOf, dirProblem, formatCandidates, formatPending, main, oneLine, parentOf, parseArgs } from './team.mjs'
+import { currentLang, setLang } from '../shared/i18n.ts'
+import { callerOf, dirProblem, formatCandidates, formatLimits, formatPending, formatStatus, main, oneLine, parentOf, parseArgs } from './team.mjs'
 
 const tree = (rows) => (pid) => rows[pid]
 
@@ -78,6 +79,50 @@ test('candidates and pending print member text inside a data fence, with the add
   const p = formatPending([{ member: 'm1', ref: 'r0123456789', tool: 'Bash', summary: 'rm x', mayAnswer: true }])
   assert.match(p, /r0123456789/)
   assert.match(p, /<<<DATA-[0-9a-f]{12} m1[^\n]*\nrm x\nDATA-[0-9a-f]{12}>>>/)
+})
+
+for (const lang of ['en', 'ja']) test(`★ limits show each window with its reset time and how old the reading is (${lang} / 2026-11-19)`, (t) => {
+  const was = currentLang()
+  setLang(lang)
+  t.after(() => setLang(was))
+  const now = Date.parse('2026-11-19T12:00:00Z')
+  const limits = {
+    windows: [
+      { minutes: 10080, usedPercent: 42, resetsAt: '2026-11-22T12:00:00Z' },
+      { minutes: 300, usedPercent: 10, resetsAt: '2026-11-19T14:30:00Z' },
+    ],
+    at: '2026-11-19T11:48:00Z',
+  }
+  const line = formatLimits({ limits }, now)
+  // both windows, longest first, each with when it resets and how far away that is
+  assert.match(line, /(week|週) 42%[^·]*(in 3d 0h|あと3日0時間)/)
+  assert.match(line, /(5h|5時間) 10%[^·]*(in 2h 30m|あと2時間30分)/)
+  assert.ok(line.indexOf('42%') < line.indexOf('10%'))
+  // the reset time is printed as the machine's local clock time of each window (codex review r1: shape alone passed)
+  const local = (iso) => {
+    const d = new Date(iso)
+    return `${d.getMonth() + 1}/${d.getDate()} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
+  }
+  // ⚠️ followed by a space (ja) or a comma (en), so 1/1 12:00 never matches inside 11/1 12:00 (codex review r3)
+  const at = (iso) => line.search(new RegExp(`(^|[^\\d])${local(iso).replace('/', '\\/')}(?=[ ,])`))
+  const weekAt = at('2026-11-22T12:00:00Z')
+  const fiveAt = at('2026-11-19T14:30:00Z')
+  assert.ok(weekAt >= 0 && fiveAt >= 0, line)
+  assert.ok(weekAt < line.indexOf('10%') && fiveAt > line.indexOf('10%'), line)
+  // ★ how stale the numbers are
+  assert.match(line, /read 12m ago|12分前の値/)
+  // an older agent sends only the weekly percent
+  assert.match(formatLimits({ weeklyUsedPercent: 40 }, now), /(week|週) 40%/)
+  assert.match(formatLimits({}, now), /(week|週) \?/)
+  // candidates and status carry the line (status: the lead's own login too)
+  const c = formatCandidates([{ ref: 'abcd1234', tool: 'codex', account: '.codex', title: 't', project: 'p', status: 'idle', limits }])
+  assert.match(c, /(limits|上限): .*42%/)
+  // each row prints its own login's numbers (codex review r4: identical fixtures could not tell)
+  const theirs = { windows: [{ minutes: 10080, usedPercent: 77, resetsAt: '2026-11-25T00:00:00Z' }], at: '2026-11-19T11:59:00Z', sameLoginAs: ['.codex-b'] }
+  const st = formatStatus({ id: 'tm1', createdAt: 'x', leader: { sessionId: 's', account: '.claude-r', limits }, members: [{ name: 'm1', tool: 'codex', account: '.codex', status: 'idle', title: 't', limits: theirs }] })
+  assert.match(st, /lead {2}Claude · \.claude-r\n {4}(limits|上限): [^\n]*42%/)
+  assert.match(st, /m1 {2}Codex · \.codex · idle\n {4}(limits|上限): [^\n]*77%[^\n]*(same login as \.codex-b|\.codex-b と同じログイン)/)
+  assert.doesNotMatch(st.split('\nm1 ')[1], /42%/)
 })
 
 test('★★★ member text cannot close the fence or pass for our own lines; it is kept exactly (r4 high #4, r11 high #2)', () => {

@@ -6,7 +6,7 @@ import { join } from 'node:path'
 import { afterEach, test } from 'node:test'
 import { validateCodexConfig } from '../config.ts'
 import type { DaemonDeps } from './daemon.ts'
-import { codexEnabled, codexFollowTick, codexHealth, codexHomes, codexNotice, codexRows, controlSocketOf, lookAtSocket, realSocketPath, startCodex, stopCodex } from './run.ts'
+import { codexEnabled, codexLabelShared, codexFollowTick, codexHealth, codexHomes, codexNotice, codexRows, controlSocketOf, lookAtSocket, realSocketPath, startCodex, stopCodex } from './run.ts'
 import { connectWsUds } from './wsUds.ts'
 
 afterEach(() => stopCodex())
@@ -153,6 +153,9 @@ test('start: turned off starts nothing and reports nothing; no section means on'
 test('start: enabled starts one line per home; stop turns it off again', async () => {
   const n = startCodex({ enabled: true, homes: ['/a/.codex', '/b/.codex'] }, { machine: 'pc-a', version: '1', deps: idleDeps })
   assert.equal(n, 2)
+  // ★ two homes, one label: the team commands cannot tell which login a row is (codex review r2)
+  assert.equal(codexLabelShared('.codex'), true)
+  assert.equal(codexLabelShared('.other'), false)
   assert.equal(codexEnabled(), true)
   await new Promise((r) => setImmediate(r))
   assert.deepEqual(

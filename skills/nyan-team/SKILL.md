@@ -13,8 +13,10 @@ Bash tool; it talks to the local nyan-remote agent). `nyan team help` lists the 
 
 ## 1. Pick the members (the user decides)
 
-1. Run `nyan team candidates`. Each line: a **ref** (left), title, project, Claude/Codex, profile, model, the weekly
-   limit used by that login, state, and for Claude sessions a SendMessage address.
+1. Run `nyan team candidates`. Each line: a **ref** (left), title, project, Claude/Codex, profile, model, state, the
+   plan limits of that login (each window's use and reset time, and how old the reading is), and for Claude sessions a
+   SendMessage address. `nyan team status` shows the same limits for you and each member; run either again for fresh
+   numbers. How to spread the work over them is the user's call.
 2. Ask the user which to use with **AskUserQuestion** (`multiSelect: true`). A question holds at most 4 options and
    you may ask at most 4 questions: split Claude and Codex sessions into separate questions, put the ref in the label
    and "profile · model · week N% · state" in the description. If there are more than fit, say so and let the user

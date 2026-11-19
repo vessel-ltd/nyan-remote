@@ -344,6 +344,12 @@ export async function codexUsage(nowMs: number = Date.now()): Promise<ToolUsage[
   return out
 }
 
+/** ★ Whether more than one watched home shows this label (`work/.codex` and `personal/.codex`): a row's label alone
+ *  then cannot tell which login it is (the team commands show no limits for it / codex review r2) */
+export function codexLabelShared(label: string): boolean {
+  return lines.filter((l) => l.label === label).length > 1
+}
+
 /** ★ How old the history may be when the phone opens it (it is also read again whenever a thread closes) */
 export const HISTORY_REFRESH_MS = 60_000
 
