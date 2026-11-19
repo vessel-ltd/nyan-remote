@@ -520,6 +520,8 @@ export async function readLogSlice(
   file: string,
   limit: number,
   before?: number,
+  /** ★ Record → display entries. Claude's by default; agy's transcript is read the same way (`agy/log.ts`) */
+  map: (rec: Rec) => LogEntry[] = toEntries,
 ): Promise<LogSlice> {
   const fh = await open(file, 'r')
   try {
@@ -579,7 +581,7 @@ export async function readLogSlice(
 
       const chunk = splitRecords(body, bodyStartAbs).map((r) => ({
         start: r.start,
-        entries: toEntries(r.rec),
+        entries: map(r.rec),
       }))
       records.unshift(...chunk)
       for (const r of chunk) total += r.entries.length
@@ -617,7 +619,7 @@ export async function readLogSlice(
 }
 
 /** Live follow: read only what was appended after byte offset `from` */
-export async function readLogSince(file: string, from: number): Promise<LogSlice> {
+export async function readLogSince(file: string, from: number, map: (rec: Rec) => LogEntry[] = toEntries): Promise<LogSlice> {
   const fh = await open(file, 'r')
   try {
     const st = await fh.stat()
@@ -635,7 +637,7 @@ export async function readLogSince(file: string, from: number): Promise<LogSlice
     const nl = buf.lastIndexOf(0x0a)
     // No complete line = nothing to read yet (do not advance tail)
     if (nl < 0) return { entries: [], cursor: null, tail: from, bytes: size }
-    const entries = parseChunk(buf.subarray(0, nl + 1).toString('utf8')).flatMap(toEntries)
+    const entries = parseChunk(buf.subarray(0, nl + 1).toString('utf8')).flatMap((r) => map(r))
     return { entries, cursor: null, tail: from + nl + 1, bytes: size }
   } finally {
     await fh.close()

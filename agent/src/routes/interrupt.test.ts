@@ -115,7 +115,8 @@ test('★★★ the registered endpoint really is `sessionInterrupt` (rejects sw
   //    If it were `sessionMessage`, `POST /interrupt` would turn into **an endpoint that reads the body**.
   const m = buildRouter().match('POST', '/sessions/x/interrupt')
   assert.ok(m)
-  assert.equal(m?.handler, sessionInterrupt, '⚠️⚠️ a different endpoint is wired in')
+  // ★ Behind the agy guard (`notForAgy`, 2026-11-19): the handler it wraps
+  assert.equal((m?.handler as { inner?: unknown } | undefined)?.inner ?? m?.handler, sessionInterrupt, '⚠️⚠️ a different endpoint is wired in')
 })
 
 test('★★★ the clear-input endpoint also never reads the body / does not know the inbox / is POST only', () => {

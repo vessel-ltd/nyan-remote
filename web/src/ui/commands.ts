@@ -299,6 +299,8 @@ export function commandView(
     if (id !== 'compact' || !features?.includes('codex-compact')) return { show: false, disabled: true, label: ui.label }
     return phase === 'sending' ? { show: true, disabled: true, label: `${ui.label}…` } : { show: true, disabled: false, label: ui.label }
   }
+  // ⚠️ agy (and any tool this PWA does not know): no commands (they would reach Claude's routes)
+  if (session.tool !== undefined) return { show: false, disabled: true, label: ui.label }
   // ★★★ **Do not show it to agents lacking that endpoint** (multiple machines update one by one, so they always coexist)
   if (!features?.includes(NEEDS_FEATURE[id])) return { show: false, disabled: true, label: ui.label }
   // ⚠️⚠️ **Show only for `keys`** (codex low #1, 2026-08-25).

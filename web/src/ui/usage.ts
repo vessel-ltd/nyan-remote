@@ -9,7 +9,7 @@ import { t } from '../../../shared/i18n.ts'
 import { hhmm } from '../time.ts'
 
 export interface UsageGroup {
-  tool: 'claude' | 'codex'
+  tool: ToolUsage['tool']
   /** `machine: profile` of every profile that is this account */
   names: string[]
   plan?: string
@@ -49,16 +49,19 @@ export function groupUsage(byMachine: ReadonlyArray<{ machine: string; usage: re
       at: best.at,
     })
   }
-  // Claude first, then the fullest week first (the one to watch)
+  // Claude, Codex, then agy; within a tool the fullest week first (the one to watch)
   const week = (g: UsageGroup): number => g.windows.find((w) => w.minutes >= 7 * 24 * 60)?.usedPercent ?? -1
-  return out.sort((a, b) => (a.tool === b.tool ? week(b) - week(a) : a.tool === 'claude' ? -1 : 1))
+  const order = (tool: UsageGroup['tool']): number => (tool === 'claude' ? 0 : tool === 'codex' ? 1 : 2)
+  return out.sort((a, b) => (a.tool === b.tool ? week(b) - week(a) : order(a.tool) - order(b.tool)))
 }
 
 /**
  * The plan as each tool's `/status` names it. ⚠️ Only names that were seen there (codex-cli 0.169.0 shows `prolite` as
  * "Pro 100"; Claude Code 2.1.326 shows `claude_team` as "Claude Team account"); anything else is shown as the tool sent it.
  */
-export function planLabel(tool: 'claude' | 'codex', plan: string): string {
+export function planLabel(tool: UsageGroup['tool'], plan: string): string {
+  // agy names its plan in words already (`Google AI Pro`)
+  if (tool === 'agy') return plan
   if (tool === 'codex') return plan === 'prolite' ? 'Pro 100' : plan
   const m = /^claude_([a-z0-9]+)$/.exec(plan)
   return m ? m[1]!.charAt(0).toUpperCase() + m[1]!.slice(1) : plan
@@ -69,6 +72,11 @@ export function windowName(minutes: number): string {
   if (minutes % 1440 === 0) return t(`${minutes / 1440}日`, `${minutes / 1440}d`)
   if (minutes % 60 === 0) return t(`${minutes / 60}時間`, `${minutes / 60}h`)
   return t(`${minutes}分`, `${minutes}m`)
+}
+
+/** The tool's name as the usage list shows it */
+export function toolName(tool: UsageGroup['tool']): string {
+  return tool === 'claude' ? 'Claude' : tool === 'codex' ? 'Codex' : 'agy'
 }
 
 /** When it resets, in local time: the time today, else month/day and time */

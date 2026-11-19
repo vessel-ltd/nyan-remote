@@ -15,6 +15,17 @@ export function isCodex(session: Pick<SessionSummary, 'tool'> | undefined): bool
   return session?.tool === 'codex'
 }
 
+/**
+ * ★ An Antigravity CLI (agy) row (2026-11-19 / docs/AGY.md). Like Codex, only what its own marks grant; the first
+ * version is read-only (list, thread, follow), so sending, stopping, commands and auto-approve stay off.
+ */
+export function isAgy(session: Pick<SessionSummary, 'tool'> | undefined): boolean {
+  return session?.tool === 'agy'
+}
+
+/** agy mark → the Claude-side features the thread may use for an agy row */
+const AGY_GRANTS: ReadonlyArray<readonly [AgentFeature, readonly AgentFeature[]]> = [['agy-log-follow', ['log-follow']]]
+
 /** Codex mark → the Claude-side features the thread may use for a Codex row */
 const CODEX_GRANTS: ReadonlyArray<readonly [AgentFeature, readonly AgentFeature[]]> = [
   ['codex-log-follow', ['log-follow']],
@@ -29,10 +40,13 @@ export function actionFeatures(
   session: Pick<SessionSummary, 'tool'> | undefined,
   features: readonly AgentFeature[] | undefined,
 ): AgentFeature[] | undefined {
-  if (isCodex(session)) {
+  if (isCodex(session) || isAgy(session)) {
     if (!features) return []
-    return CODEX_GRANTS.flatMap(([mark, grants]) => (features.includes(mark) ? grants.filter((g) => features.includes(g)) : []))
+    const table = isCodex(session) ? CODEX_GRANTS : AGY_GRANTS
+    return table.flatMap(([mark, grants]) => (features.includes(mark) ? grants.filter((g) => features.includes(g)) : []))
   }
+  // ⚠️ A tool this PWA does not know (a newer agent): nothing, never Claude's actions
+  if (session?.tool !== undefined) return []
   return features ? [...features] : undefined
 }
 
@@ -43,12 +57,15 @@ export function actionFeatures(
  */
 export function canStop(session: Pick<SessionSummary, 'tool' | 'sendRoute'>, features: readonly AgentFeature[] | undefined): boolean {
   if (isCodex(session)) return features?.includes('codex-interrupt') ?? false
+  if (session.tool !== undefined) return false
   return session.sendRoute !== undefined
 }
 
 /** Whether the message box may send to this row. ⚠️ `features` are the **agent's** (not `actionFeatures`). */
 export function canSendTo(session: Pick<SessionSummary, 'tool'> | undefined, features: readonly AgentFeature[] | undefined): boolean {
-  return !isCodex(session) || (features?.includes('codex-send') ?? false)
+  if (isCodex(session)) return features?.includes('codex-send') ?? false
+  // ⚠️ agy (and any tool this PWA does not know): no sending yet
+  return session?.tool === undefined
 }
 
 /** What the message box says instead of sending (only for rows it cannot send to). */
@@ -57,6 +74,12 @@ export function sendBlockedNote(
   features: readonly AgentFeature[] | undefined,
 ): string | undefined {
   if (canSendTo(session, features)) return undefined
+  if (!isCodex(session)) {
+    return t(
+      'このセッションへの送信は、まだスマホからできません（PC で入力してください）',
+      'Sending to this session from the phone is not supported yet (type on the PC)',
+    )
+  }
   return t(
     'このマシンの nyan-remote は、Codex のセッションへの送信にまだ対応していません（PC で入力してください）',
     'nyan-remote on this machine cannot send to Codex sessions yet (type on the PC)',

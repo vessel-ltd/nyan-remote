@@ -46,8 +46,11 @@ export interface SessionSummary {
    *    thread loaded for about a minute after its TUI exits. For such rows `account` is the label of the Codex home
    *    (its base name, e.g. `.codex`), and `sessionId` is the Codex thread id.
    * ⚠️ The UI must not offer what the agent cannot do for that tool (gate on `/health` features, not on this field alone).
+   * ★ `agy` = an Antigravity CLI conversation (2026-11-19 / docs/AGY.md): `account` is `agy`, `sessionId` is
+   *   `agy-<conversation id>`. ⚠️ An older PWA reads an unknown tool as Claude, so the agent refuses Claude-only actions
+   *   for these ids by itself (they are found in no Claude profile).
    */
-  tool?: 'codex'
+  tool?: 'codex' | 'agy'
   /** ★ A synthetic row the UI built from an approval, with unknown account (carries `PermissionRequest.accountUnknown`) */
   accountUnknown?: true
   sessionId: string
@@ -266,6 +269,11 @@ export type AgentFeature =
    * ⚠️ Separate from `log-follow`: an agent can list Codex threads without watching them.
    */
   | 'codex-log-follow'
+  /**
+   * ★ agy (Antigravity CLI) conversations are listed (`tool: 'agy'`) and `GET /sessions/:id/follow` signals for them
+   * (2026-11-19 / docs/AGY.md). Read-only for now: no send, stop, commands or approvals.
+   */
+  | 'agy-log-follow'
   /** ★ `POST /sessions/:id/message` sends to an idle Codex thread (a new turn on the daemon / 2026-11-15) */
   | 'codex-send'
   /** ★ Auto-approve mode also passes Codex command approvals, and Codex rows carry the mark (2026-11-14) */
@@ -325,7 +333,7 @@ export interface UsageWindow {
  * ⚠️ Limits belong to the **account**: two profiles logged in to one account show the same numbers (`accountKey`).
  */
 export interface ToolUsage {
-  tool: 'claude' | 'codex'
+  tool: 'claude' | 'codex' | 'agy'
   /** The profile: `.claude-r` / `.codex` (the same label as the rows) */
   account: string
   /** A short hash of the account id (equal = one account and one set of limits). Never the id itself. Absent = unknown */

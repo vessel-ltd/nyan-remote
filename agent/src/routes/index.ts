@@ -16,6 +16,7 @@ import { permissionAnswer, permissionRequest, permissions } from './permission.t
 import { pushStatus, pushSubscribe, pushTest, pushUnsubscribe } from './push.ts'
 import { sessionFollow, sessionLog, sessions } from './sessions.ts'
 import { uploadRoutes } from './uploads.ts'
+import { notForAgy } from '../agy/sessions.ts'
 
 export function buildRouter(): Router {
   const router = new Router()
@@ -30,19 +31,19 @@ export function buildRouter(): Router {
   // ★★ Follow a thread via notifications (⚠️ only devices viewing that session open it / 2026-09-23)
   router.get('/sessions/:id/follow', sessionFollow)
   // ★ Send an instruction from the phone (M4-2). It is an internal feature, so it is isolated in inbox.ts
-  router.post('/sessions/:id/message', sessionMessage)
+  router.post('/sessions/:id/message', notForAgy(sessionMessage))
   // ★ "Stop" (ESC). ⚠️ **POST only** (with GET, merely getting someone to follow a link could stop it).
   //   ⚠️⚠️ Takes no body (the bytes sent are fixed in an agent-side table / routes/interrupt.ts)
-  router.post('/sessions/:id/interrupt', sessionInterrupt)
+  router.post('/sessions/:id/interrupt', notForAgy(sessionInterrupt))
   // ★ Clear the PC's input box (Ctrl-U). ⚠️ Takes no body (the key sent is fixed in the handler)
   //   ⚠️⚠️ The endpoints are separate so there is no "endpoint that can fire anything in the table"
-  router.post('/sessions/:id/clear', sessionClear)
+  router.post('/sessions/:id/clear', notForAgy(sessionClear))
   // ★ Slash commands from the table (`/compact` / `/exit`). ⚠️ Only the **id** is taken from the body.
   //   ⚠️⚠️ Free text never runs them (text starting with `/` `!` is refused / keys.ts `sanitizeForKeys`)
-  router.post('/sessions/:id/command', sessionCommand)
+  router.post('/sessions/:id/command', notForAgy(sessionCommand))
   // ★ Toggle auto-approve mode (per session, with an expiry / autoApprove.ts).
   //   ⚠️⚠️ **POST only** (with GET, merely getting someone to follow a link could enable auto-approve)
-  router.post('/sessions/:id/auto-approve', sessionAutoApprove)
+  router.post('/sessions/:id/auto-approve', notForAgy(sessionAutoApprove))
   router.post('/hook', hook)
   // ★ Files from the phone (2026-11-17 / `uploads.ts`): start → chunks in order → finish (checked) → attached by id
   //   with the next instruction. ⚠️ POST only; bound to the device that started it

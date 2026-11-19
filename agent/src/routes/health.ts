@@ -51,7 +51,12 @@ export async function health(): Promise<AgentHealth> {
     devMode: devMode(),
     accounts: await describeAccounts(dirs),
     // ★ `codex-sessions` is not in the constant: it is present only while the user has Codex support turned on
-    features: codexEnabled() ? [...AGENT_FEATURES, 'codex-sessions', 'codex-log-follow', 'codex-send', 'codex-auto-approve', 'codex-interrupt', 'codex-compact'] : AGENT_FEATURES,
+    // ★ `agy-log-follow`: agy rows are listed and followed (always on: there is nothing to start; no agy ⇒ no rows)
+    features: [
+      ...AGENT_FEATURES,
+      ...(codexEnabled() ? (['codex-sessions', 'codex-log-follow', 'codex-send', 'codex-auto-approve', 'codex-interrupt', 'codex-compact'] as const) : []),
+      'agy-log-follow',
+    ],
     // ★ The device key for ③. ⚠️ **Omitted** when unusable (the PWA then fails to match and
     //   says "the machine that showed this QR is not among your endpoints" = never send to a false destination)
     ...(agentKeyProblem() ? {} : { agentPublicKey: toBase64Url(agentPublicRaw()) }),

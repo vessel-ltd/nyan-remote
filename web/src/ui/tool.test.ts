@@ -138,3 +138,25 @@ test('★ a row built from a Codex auto-approve mark is a Codex row too', () => 
   const [claude] = applyAutoApprove([], [{ sessionId: 'x', until: '2026-11-14T03:00:00.000Z', machine: 'pc-a' }])
   assert.equal(isCodex(claude), false)
 })
+
+test('★ an agy row (2026-11-19): only follow, with its own mark; no send, stop, command or auto-approve, whatever the marks', () => {
+  for (const agy of [row({ tool: 'agy', account: 'agy' }), row({ tool: 'agy', account: 'agy', sendRoute: 'keys' })]) {
+    const f = actionFeatures(agy, [...EVERYTHING, 'agy-log-follow'])
+    assert.deepEqual(f, ['log-follow'])
+    assert.deepEqual(actionFeatures(agy, EVERYTHING), [], 'no agy mark ⇒ nothing, not Claude’s features')
+    for (const id of Object.keys(COMMAND_UI) as Array<keyof typeof COMMAND_UI>) {
+      if (id === 'auto-approve') continue
+      assert.equal(commandView(agy, id as never, 'ready', f).show, false, `command ${String(id)}`)
+    }
+    assert.equal(autoApproveView(agy, 'ready', f).show, false)
+    assert.equal(stopView(agy, 'ready', EVERYTHING).show, false)
+    assert.equal(canStop(agy, EVERYTHING), false)
+    assert.equal(canSendTo(agy, EVERYTHING), false)
+    assert.ok(sendBlockedNote(agy, EVERYTHING))
+  }
+  // ⚠️ a tool this PWA does not know is never treated as Claude
+  const unknown = row({ tool: 'future' as never, sendRoute: 'keys' })
+  assert.deepEqual(actionFeatures(unknown, ALL), [])
+  assert.equal(canSendTo(unknown, ALL), false)
+  assert.equal(canStop(unknown, ALL), false)
+})

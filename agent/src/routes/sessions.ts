@@ -16,6 +16,8 @@ import { ensureFollowWatch } from '../claude/follow.ts'
 import { attach } from '../events.ts'
 import { t } from '../../../shared/i18n.ts'
 import { codexHistoryWanted, codexLog, codexRows } from '../codex/run.ts'
+import { agyRows, conversationOf, transcriptPathOf } from '../agy/sessions.ts'
+import { agyEntries } from '../agy/log.ts'
 
 const DEFAULT_LIMIT = 60
 const MAX_LIMIT = 300
@@ -181,7 +183,8 @@ export async function sessions(ctx?: Ctx): Promise<SessionsPage> {
   //   ⚠️⚠️ They do get the auto-approve mark: a Codex command approval passes while the entry is in effect
   //      (`codex/cards.ts`), and "passing but not shown" is the worst state of that feature.
   //   ★ Closed Codex threads come as history rows (`live: false`, 2026-11-16 / `codex/closedThreads.ts`).
-  const marked = markAutoApprove([...markSend(sessions, await scanPanes(dirs)), ...(await codexRows())], now)
+  // ★ agy conversations (docs/AGY.md) join after `markSend` too: no send route is claimed for them yet
+  const marked = markAutoApprove([...markSend(sessions, await scanPanes(dirs)), ...(await codexRows()), ...(await agyRows(machine))], now)
   // ⚠️⚠️ **Filtering comes after the cleanup** (`sweepInflight` / `sweepPanes` above decide on **all items**).
   //    Moving it earlier breaks two things:
   //      1) during periods with 0 active sessions (all idle) **the cleanup never runs**
@@ -212,9 +215,23 @@ export async function sessionLog(ctx: Ctx): Promise<LogPage> {
   const sessionId = ctx.params['id']
   if (!sessionId) throw new HttpError(400, t('session id が必要です', 'A session id is required.'))
 
+  const before = intOrNull(ctx.url.searchParams.get('before'))
+  // ★ An agy conversation: its transcript, read like Claude's (docs/AGY.md). ⚠️ Only a well-formed `agy-<uuid>` id
+  const agyId = conversationOf(sessionId)
+  if (agyId) {
+    const path = transcriptPathOf(agyId)
+    const limit = clampInt(ctx.url.searchParams.get('limit'), DEFAULT_LIMIT, 1, MAX_LIMIT)
+    const since = intOrNull(ctx.url.searchParams.get('since'))
+    let slice
+    try {
+      slice = since !== null ? await readLogSince(path, since, agyEntries) : await readLogSlice(path, limit, before ?? undefined, agyEntries)
+    } catch {
+      throw new HttpError(404, t('このセッションの記録はまだありません', 'This session has no transcript yet.'))
+    }
+    return { sessionId, account: 'agy', entries: slice.entries, cursor: slice.cursor, tail: slice.tail, bytes: slice.bytes }
+  }
   const cfg = config()
   const dirs = await discoverConfigDirs(cfg.configDirs)
-  const before = intOrNull(ctx.url.searchParams.get('before'))
   // ★ A Codex thread has no transcript file: its turns are read from the daemon (`codex/log.ts`).
   //   ⚠️ `undefined` = no Codex line lists this id ⇒ fall through to the Claude side as before.
   const codex = await codexLog(sessionId, {

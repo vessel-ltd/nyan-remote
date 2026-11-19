@@ -352,6 +352,8 @@ export function setupSteps(root) {
     { label: t('打鍵の経路と nyan の設置', 'Install the keystroke relay and nyan'), argv: [process.execPath, join(root, 'scripts', 'install-relay.mjs')], cwd: root },
     // ★ The /nyan-team skill in every Claude profile (docs/TEAM.md §5). ⚠️ Only our marked copy is replaced
     { label: t('/nyan-team の skill を置く', 'Place the /nyan-team skill'), argv: [process.execPath, join(root, 'scripts', 'install-skill.mjs')], cwd: root },
+    // ★ agy's status line relay (docs/AGY.md). ⚠️ Does nothing when agy is not installed
+    { label: t('agy の設定', 'Set up agy'), argv: [process.execPath, join(root, 'scripts', 'install-agy.mjs')], cwd: root },
   ]
 }
 

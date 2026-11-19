@@ -128,7 +128,9 @@ test('★★★ pin the endpoint ↔ handler mapping (detect swapped wiring)', (
   ] as const) {
     const m = r.match('POST', path)
     assert.ok(m, `${path} is missing`)
-    assert.equal(m?.handler, handler, `${path} is not wired to ${name} (swapped wiring)`)
+    // ★ Behind the agy guard (`notForAgy`, 2026-11-19): the handler it wraps
+    const wired = (m?.handler as { inner?: unknown } | undefined)?.inner ?? m?.handler
+    assert.equal(wired, handler, `${path} is not wired to ${name} (swapped wiring)`)
   }
   // ★ The four are **different handlers** (wiring them to the same one would be meaningless)
   assert.equal(new Set([sessionInterrupt, sessionClear, sessionCommand, sessionAutoApprove]).size, 4)
@@ -193,7 +195,8 @@ test('★★★ /health actually returns the feature flags (checking only the co
     await rm(account, { recursive: true, force: true })
   })
   const h = await health()
-  assert.deepEqual(h.features, AGENT_FEATURES, '/health does not return the flags (no buttons appear)')
+  // ★ plus the agy mark, always on (2026-11-19 / docs/AGY.md); Codex's only while Codex support is on (off here)
+  assert.deepEqual(h.features, [...AGENT_FEATURES, 'agy-log-follow'], '/health does not return the flags (no buttons appear)')
   assert.ok((h.features?.length ?? 0) > 0, 'flags are empty (the trap where 0 items is still green)')
 })
 
@@ -232,5 +235,20 @@ test('★ the pattern is identical to the registered one (not rebuilt from segme
     const m = r.match(method, path)
     assert.ok(m, `${method} ${path} does not match`)
     assert.equal(m.pattern, want, `${method} ${path}`)
+  }
+})
+
+test('★★ agy ids are refused by every session action they do not have yet (an old PWA shows Claude buttons for them)', async () => {
+  const r = buildRouter()
+  const id = 'agy-062a8f25-9451-42f3-ae93-34a208e99365'
+  for (const action of ['message', 'interrupt', 'clear', 'command', 'auto-approve']) {
+    const m = r.match('POST', `/sessions/${id}/${action}`)
+    assert.ok(m, action)
+    // ⚠️ refused before the handler reads anything (no body, no request object needed)
+    await assert.rejects(
+      async () => m.handler({ params: m.params } as never),
+      (err: unknown) => (err as { status?: number }).status === 400,
+      action,
+    )
   }
 })

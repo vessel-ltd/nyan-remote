@@ -44,7 +44,7 @@ export const STATE_FILES = [
   'account.json', 'account.lock', 'license.json', 'auto-approve.json',
   'hooks.jsonl', 'sent.jsonl', 'traffic.jsonl', 'inflight.off',
 ]
-export const STATE_DIRS = ['bin', 'panes', 'inflight', 'usage']
+export const STATE_DIRS = ['bin', 'panes', 'inflight', 'usage', 'agy']
 /** ★ The team socket's name (`TEAM_SOCKET_NAME` in `agent/src/teamSocket.ts`) */
 export const TEAM_SOCKET = 'team.sock'
 /**
@@ -54,6 +54,8 @@ export const TEAM_SOCKET = 'team.sock'
  *   usage/    `claude-<profile>.json` and its temp `.claude-<profile>.<pid>.<random>.tmp` (hooks/statusline.sh only accepts
  *             a `.claude*` profile name / 2026-11-17), and each session's `session-<session UUID>.json` with its temp
  *             `.session-<session UUID>.<pid>.<random>.tmp`
+ *   agy/      `session-<conversation UUID>.json` and its temp `.session-<UUID>.<pid>.<random>.tmp`
+ *             (hooks/agy-statusline.sh / docs/AGY.md)
  *   bin/      nothing: the removers take ours out before a purge
  */
 export const STATE_CHILD = {
@@ -61,6 +63,7 @@ export const STATE_CHILD = {
   panes: /^\d+\.(json|rejected|json\.\d+\.tmp)$/,
   inflight: /^[0-9a-fA-F-]{36}\.jsonl$/,
   // ★ And a relay write cut short before its rename (`.claude-<profile>.<pid>.<random>.tmp` / codex review)
+  agy: /^(session-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\.json|\.session-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\.\d+\.\d+\.tmp)$/,
   usage: /^(claude-\.claude(-[A-Za-z0-9._-]+)?\.json|\.claude-\.claude(-[A-Za-z0-9._-]+)?\.\d+\.\d+\.tmp|session-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\.json|\.session-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\.\d+\.\d+\.tmp)$/,
 }
 /** ★ At least one of these must be there before anything is called "our state directory" */
@@ -519,6 +522,8 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
     { label: t('Claude Code のフックを外す', 'Remove the Claude Code hooks'), script: 'install-permission-hook.mjs', args: ['--remove'] },
     { label: t('notify.sh を外す', 'Remove notify.sh'), script: 'install-notify.mjs', args: ['--remove'] },
     { label: t('/nyan-team の skill を外す', 'Remove the /nyan-team skill'), script: 'install-skill.mjs', args: ['--remove'] },
+    // ★ agy's status line goes back to the user's own (or none) before the tree that holds the relay goes
+    { label: t('agy の設定を戻す', 'Restore the agy settings'), script: 'install-agy.mjs', args: ['--uninstall'] },
     { label: t('claude の入口（PATH）と nyan コマンドを外す', 'Remove the claude entry point (PATH) and the nyan command'), script: 'install-relay.mjs', args: ['--uninstall'] },
   ]
   for (const s of steps) {

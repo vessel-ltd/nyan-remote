@@ -1,4 +1,4 @@
-import { actionFeatures, canSendTo, isCodex, sendBlockedNote } from './tool.ts'
+import { actionFeatures, canSendTo, isAgy, isCodex, sendBlockedNote } from './tool.ts'
 import type { VNode } from 'preact'
 import { subscribeWhileVisible, whileVisible } from '../visibility.ts'
 import { coalesce, followPlan, shouldPull } from './followPlan.ts'
@@ -1063,7 +1063,14 @@ export function Thread({
               ⚠️ Say only what we see — no card here — and name what the phone never shows (`approvals.ts` rule 2 /
               `questions.ts` rule 4) without claiming this one is of that kind (a join can still be retrying / codex
               review, low). The reason comes from the daemon's flags (`waitingForOf`) */}
-          {isCodex(session) && wait.kind !== 'unknown' ? (
+          {isAgy(session) ? (
+            /* ★ agy (2026-11-19): its approvals are not on the phone yet (docs/AGY.md §4) */
+            <>
+              {t('PCの画面で承認を待っています。', 'The PC screen is waiting for an approval. ')}
+              <strong>{t('agy の承認は、まだスマホからは答えられません', 'agy approvals can’t be answered from the phone yet')}</strong>
+              {t('。PCで答えてください。', '. Please answer on the PC.')}
+            </>
+          ) : isCodex(session) && wait.kind !== 'unknown' ? (
             session?.waitingFor === 'input needed' ? (
               <>
                 {t('PCの画面で質問の答えを待っています。', 'The PC screen is waiting for an answer to a question. ')}

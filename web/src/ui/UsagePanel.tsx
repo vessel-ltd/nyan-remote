@@ -3,7 +3,7 @@ import type { ToolUsage } from '../../../shared/types.ts'
 import { t } from '../../../shared/i18n.ts'
 import type { Transport } from '../transport/index.ts'
 import { relativeTime } from './SessionList.tsx'
-import { groupUsage, planLabel, windowText } from './usage.ts'
+import { groupUsage, planLabel, toolName, windowText } from './usage.ts'
 
 /** How often the open settings screen reads the limits again (the agent asks Codex at most once a minute) */
 const USAGE_REFRESH_MS = 60_000
@@ -66,7 +66,7 @@ export function UsagePanel({ transports }: { transports: Transport[] }) {
         {groups.map((g) => (
           <div key={`${g.tool}:${g.names.join(',')}`} class="pushrow usagerow">
             <span class="grow">
-              <strong>{g.tool === 'claude' ? 'Claude' : 'Codex'}</strong>
+              <strong>{toolName(g.tool)}</strong>
               {/* ★ Who, as `/status` shows it: plan · organization, then the e-mail (text only: Preact escapes it) */}
               {[g.plan ? planLabel(g.tool, g.plan) : undefined, g.org].filter(Boolean).map((x) => ` · ${x}`).join('')}
               <br />

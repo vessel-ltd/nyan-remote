@@ -4,6 +4,8 @@
 //    Measured: other tailnet devices cannot reach WSL's ports (the Hyper-V firewall blocks them).
 //    Do not open the port. Opening it creates an unauthenticated entry point (§4.2.1).
 
+import { startAgyWatch } from './agy/watch.ts'
+import { agyDir } from './agy/sessions.ts'
 import { langFromEnv, setLang, t } from '../../shared/i18n.ts'
 import { reasonText } from './reasons.ts'
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
@@ -120,6 +122,14 @@ async function main(): Promise<void> {
     // ⚠️ Do not crash here. Only immediacy is lost; the feature still works through 15s polling
     const msg = err instanceof Error ? err.message : String(err)
     console.warn(t(`[agent] セッション状態の監視を開始できません: ${msg}`, `[agent] Cannot start watching session state: ${msg}`))
+  }
+
+  // ★ agy conversations (docs/AGY.md): say "sessions changed" when one changes state. ⚠️ Never fatal (polling remains)
+  let agyWatcher: { close(): void } | undefined
+  try {
+    agyWatcher = await startAgyWatch(agyDir(), () => broadcast({ type: 'sessions-changed', at: new Date().toISOString() }))
+  } catch {
+    // no immediacy for agy rows; the list still polls
   }
 
   // ★ Codex sessions (docs/CODEX.md). ⚠️ On unless `codex.enabled` is false: connects to the user's Codex daemon under
@@ -321,6 +331,7 @@ async function main(): Promise<void> {
       )
     }
     watcher?.close()
+    agyWatcher?.close()
     // ★ Close the relay line too (⚠️ leave no pending subscriptions; keep exiting even if it fails)
     void stopRelay().catch(() => undefined)
     server.close(() => process.exit(0))

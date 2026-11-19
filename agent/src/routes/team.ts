@@ -186,6 +186,8 @@ export async function teamCandidates(ctx: Ctx): Promise<{ candidates: Candidate[
   const out: Candidate[] = []
   for (const row of rows) {
     if (row.sessionId === self) continue
+    // ⚠️ agy conversations cannot be members yet (docs/AGY.md: nothing can be sent to them)
+    if (row.tool === 'agy') continue
     const tool = toolOf(row)
     let address: string | undefined
     if (tool === 'claude') {

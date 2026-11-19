@@ -22,6 +22,7 @@ import { followedSessions, notifyFollowers } from '../events.ts'
 import { discoverConfigDirs } from './configDirs.ts'
 import { inflightDir } from './inflight.ts'
 import { findTranscript } from './sessions.ts'
+import { conversationOf, transcriptPathOf } from '../agy/sessions.ts'
 
 export interface FileSig {
   size: number
@@ -92,6 +93,9 @@ let timer: NodeJS.Timeout | null = null
 const live = createFollowWatch({
   sessions: followedSessions,
   locateTranscript: async (id) => {
+    // ★ An agy conversation's transcript (docs/AGY.md): known from the id alone
+    const agy = conversationOf(id)
+    if (agy) return transcriptPathOf(agy)
     const dirs = await discoverConfigDirs(config().configDirs)
     return (await findTranscript(dirs, id))?.path
   },
