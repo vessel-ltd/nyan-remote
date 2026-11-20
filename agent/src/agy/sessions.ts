@@ -395,6 +395,11 @@ export async function agyRows(machine: string, deps: AgyDeps = defaultAgyDeps())
   for (const f of live) {
     const path = transcriptPathOf(f.state.conversationId, deps.home)
     const bytes = await sizeOf(path)
+    // ★ Not listed before its first message, like Claude (whose list is built from transcripts): a send there is
+    //   refused anyway (the gate needs the transcript) / user decision 2026-11-20. ⚠️ A turn that runs or waits on a
+    //   card stays listed even then (never hide something that needs an answer)
+    const status = agyStatus(f.state)
+    if (bytes === 0 && status !== 'working' && status !== 'waiting') continue
     let title = titles.get(f.state.conversationId)
     if (title === undefined && !f.state.title && bytes > 0) {
       const head = await headOf(path)

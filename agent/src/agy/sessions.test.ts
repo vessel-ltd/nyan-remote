@@ -149,6 +149,32 @@ test('rows: built from the live files with the transcript’s size and first req
   assert.equal(rows[0]!.status, 'done')
 })
 
+test('rows: an agy with no transcript yet is not listed (like Claude) unless a turn runs or a card waits', async (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'nyan-agy-rows-'))
+  t.after(() => rmSync(root, { recursive: true, force: true }))
+  const dir = join(root, 'state')
+  mkdirSync(dir)
+  const deps = { dir, home: root, isAgy: () => true, now: Date.now() }
+  const put = (over: Record<string, unknown>): void =>
+    writeFileSync(join(dir, `session-${A}.json`), JSON.stringify({ nyanPid: 100, nyanBusyAt: 0, input: { ...input(A), ...over } }))
+  for (const s of ['idle', 'initializing', 'error']) {
+    put({ agent_state: s })
+    assert.deepEqual(await agyRows('pc-a', deps), [], s)
+  }
+  put({ agent_state: 'working' })
+  assert.equal((await agyRows('pc-a', deps))[0]?.status, 'working')
+  put({ agent_state: 'tool_use', tool_confirmation_pending: true })
+  assert.equal((await agyRows('pc-a', deps))[0]?.status, 'waiting')
+  // an empty transcript is still "none yet"
+  const tp = transcriptPathOf(A, root)
+  mkdirSync(join(tp, '..'), { recursive: true })
+  writeFileSync(tp, '')
+  put({ agent_state: 'idle' })
+  assert.deepEqual(await agyRows('pc-a', deps), [])
+  writeFileSync(tp, JSON.stringify({ type: 'USER_INPUT', source: 'USER_EXPLICIT', content: '<USER_REQUEST>\nhi\n</USER_REQUEST>' }) + '\n')
+  assert.equal((await agyRows('pc-a', deps)).length, 1)
+})
+
 test('usage: the Gemini windows only (other buckets share their lengths and could not be told apart)', () => {
   assert.equal(bucketMinutes('gemini-weekly'), 10080)
   assert.equal(bucketMinutes('3p-5h'), 300)
