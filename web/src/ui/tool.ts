@@ -18,14 +18,19 @@ export function isCodex(session: Pick<SessionSummary, 'tool'> | undefined): bool
 /**
  * ★ An Antigravity CLI (agy) row (2026-11-19 / docs/AGY.md). Like Codex, only what its own marks grant: list, thread
  * and follow (`agy-log-follow`), and — for an agy started through the relay (`sendRoute: 'keys'`) — sending
- * (`agy-send`) and stopping (`agy-interrupt`). Commands, clearing the input box and auto-approve stay off.
+ * (`agy-send`), stopping (`agy-interrupt`) and auto-approve (`agy-auto-approve` / `autoApprove.ts` checks the relay).
+ * Commands and clearing the input box stay off.
  */
 export function isAgy(session: Pick<SessionSummary, 'tool'> | undefined): boolean {
   return session?.tool === 'agy'
 }
 
 /** agy mark → the Claude-side features the thread may use for an agy row */
-const AGY_GRANTS: ReadonlyArray<readonly [AgentFeature, readonly AgentFeature[]]> = [['agy-log-follow', ['log-follow']]]
+const AGY_GRANTS: ReadonlyArray<readonly [AgentFeature, readonly AgentFeature[]]> = [
+  ['agy-log-follow', ['log-follow']],
+  // ★ 2026-11-20: the agent answers its cards with keys (the 24 h choice still needs the agent's own mark)
+  ['agy-auto-approve', ['auto-approve', 'auto-approve-24h']],
+]
 
 /** Codex mark → the Claude-side features the thread may use for a Codex row */
 const CODEX_GRANTS: ReadonlyArray<readonly [AgentFeature, readonly AgentFeature[]]> = [

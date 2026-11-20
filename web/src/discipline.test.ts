@@ -827,10 +827,12 @@ test('★★ pin auto-approve wiring (shown in the banner, off without confirmat
   // ① Passed to the banner (`ThreadBar`)
   assert.match(src, /auto=\{/, '⚠️ the auto-approve warning is not passed to the banner (hidden in the menu)')
   assert.match(src, /autoApproveBanner\(session, Date\.now\(\)\)/, 'the banner text is not taken from one place')
+  // ★ Every toggle reads the list again at once (the event saying so may not come / 2026-11-20)
+  assert.match(src, /res = await transport\.setAutoApprove\(target, on, duration\)\s*\}\s*finally\s*\{\s*onToggled\?\.\(\)/, 'a toggle must refresh the list (a lost answer too)')
   // ③④ Visibility is `autoApproveView` (⚠️ not `commandView`)
   assert.match(
     src,
-    /autoApproveView\(\s*session,\s*running\?\.id === 'auto-approve' \? 'sending' : 'ready',\s*features,\s*\)/,
+    /autoApproveView\(\s*session,[^)]*running\?\.id === 'auto-approve' && !session\?\.autoApprove \? 'sending' : 'ready',\s*features,\s*\)/,
     'the running marker or feature markers are not passed to auto-approve',
   )
   // ② On needs confirmation, off is immediate (branching on `autoView.on`)

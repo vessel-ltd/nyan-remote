@@ -97,7 +97,7 @@ interface EndpointState {
    */
   permissionsKnown: boolean
   /** ★ Sessions in auto-approve mode (from `/permissions`; used to mark synthetic rows) */
-  autoApprove?: { id: string; until: string; tool?: 'codex' }[]
+  autoApprove?: { id: string; until: string; tool?: 'codex' | 'agy' }[]
   error?: string
   /** ★ The last failure could not reach the machine at all (shown as a quiet "offline" line, not an error / `ui/offline.ts`) */
   offline?: boolean
@@ -838,6 +838,7 @@ function App() {
         features={ownerState?.features}
         onAnswer={answerPermission}
         onBack={goList}
+        onToggled={() => void refresh(new Set([transport.endpoint.id]))}
       />
     )
   }

@@ -174,6 +174,7 @@ export async function loadAutoApprove(now = Date.now()): Promise<void> {
   for (const raw of entries) {
     // ⚠️ It passed the check above, so it always becomes an entry (checked by the same function as `structureProblem`)
     const found = validEntry(raw)!
+    if (memoryOnly(found.entry.id)) continue
     if (found.untilMs <= now) {
       expired.push(found.entry)
       continue
@@ -266,6 +267,8 @@ export function shouldAutoApprove(
   if (requiresInteraction(req.toolName)) return false
   // ★ Stop questions with choices and plan approvals (= not "yes/no")
   if (req.interaction) return false
+  // ⚠️ An "off" on its way (still queued behind another save) already stops it
+  if (pendingOff.has(req.sessionId)) return false
   const found = state.active.get(req.sessionId)
   if (!found) return false
   return found.untilMs > now
@@ -312,23 +315,51 @@ export async function setAutoApprove(
   duration: AutoApproveDuration = AUTO_APPROVE_DEFAULT,
   /** ★ Who asked (`actorOf` in auth.ts). Only for the journal: a toggle must be traceable to a phone */
   by?: string,
+  /**
+   * ★ Run synchronously at the moment an "on" takes effect in memory (never when it fails or is cancelled). agy binds
+   * the grant to its process there (`agy/grants.ts` / codex review: bound before the save, a failed save left the old
+   * grant usable by the new process).
+   */
+  installed?: () => void,
 ): Promise<SetResult> {
   const who = by ? ` by=${by}` : ''
   if (!sessionId) return { ok: false, reason: t('セッションが指定されていません', 'No session was specified.'), saved: false }
+  changes.set(sessionId, (changes.get(sessionId) ?? 0) + 1)
+  // ★ An "off" stops passing at once, not when its turn in the save queue comes (codex review: another session's slow
+  //   save held it while an agy key went out after the phone had pressed off)
+  if (!on) pendingOff.set(sessionId, (pendingOff.get(sessionId) ?? 0) + 1)
   // ★ When this toggle was asked (a session end after it cancels an "on" that is still waiting — see `endSessionAutoApprove`)
   const askedAt = ++seq
   // ★ An "on" on its way is known at once (a Codex snapshot must be able to cancel it / `endCodexAutoApproveOutside`)
   if (on) pendingOn.set(sessionId, (pendingOn.get(sessionId) ?? 0) + 1)
   try {
-    return await toggle(sessionId, on, now, duration, who, askedAt)
+    return await toggle(sessionId, on, now, duration, who, askedAt, installed)
   } finally {
     if (on) {
       const n = (pendingOn.get(sessionId) ?? 1) - 1
       if (n > 0) pendingOn.set(sessionId, n)
       else pendingOn.delete(sessionId)
+    } else {
+      const n = (pendingOff.get(sessionId) ?? 1) - 1
+      if (n > 0) pendingOff.set(sessionId, n)
+      else pendingOff.delete(sessionId)
     }
   }
 }
+
+/**
+ * ★ How many toggles and ends were asked for each session (a caller that looks something up before toggling can tell
+ * whether another toggle came meanwhile / `autoApproveChanges`)
+ */
+const changes = new Map<string, number>()
+
+/** ★ The session's toggle count now: compare before and after a slow check (an older "on" must not undo a newer "off") */
+export function autoApproveChanges(sessionId: string): number {
+  return changes.get(sessionId) ?? 0
+}
+
+/** "Off" toggles asked and not finished yet, per session: nothing passes meanwhile (`shouldAutoApprove`) */
+const pendingOff = new Map<string, number>()
 
 /** "On" toggles asked and not finished yet, per session (how many) */
 const pendingOn = new Map<string, number>()
@@ -340,6 +371,7 @@ async function toggle(
   duration: AutoApproveDuration,
   who: string,
   askedAt: number,
+  installed?: () => void,
 ): Promise<SetResult> {
   // ★★ **Serialize the whole toggle** (2026-09-07 codex, high #1).
   //
@@ -352,6 +384,9 @@ async function toggle(
   // ⇒ **Close check, memory update and save into one section** (`await` inside `enqueue` is fine).
   //   ★ This promotes "something the caller must be careful about" to an invariant (ARCHITECTURE §14.1.2.11).
   return await enqueue(async () => {
+    // ★ An "off" of a memory-only grant (agy) with a broken file: there is nothing on or on disk for it (a broken file
+    //   loads no grant, and an "on" is refused while broken) ⇒ done, without the "a restart revives it" warning (codex)
+    if (state.kind !== 'ok' && !on && memoryOnly(sessionId)) return { ok: true }
     // ⚠️ Do not write when broken (keep the evidence). Cannot turn it on either
     if (state.kind !== 'ok') {
       return { ok: false, reason: t(`状態ファイルが壊れています（${state.reason}）`, `The state file is broken (${reasonText(state.reason)}).`), saved: false }
@@ -362,7 +397,8 @@ async function toggle(
       const had = active.delete(sessionId)
       clearTimer(sessionId)
       // ★ We are inside the serial section, so writing **the current memory as is** is fine
-      const saved = await writeState([...active.values()].map((a) => a.entry))
+      // ⚠️ A memory-only grant (agy) is not in the file: nothing to write, and no "a restart revives it" (codex review)
+      const saved = memoryOnly(sessionId) ? ({ ok: true } as const) : await writeState([...active.values()].map((a) => a.entry))
       if (!saved.ok) {
         // ⚠️ Memory already dropped it (it stops passing now), but the file keeps it until expiry ⇒ restarting revives it.
         //   Still say who asked (codex: the actor was missing exactly on this partial outcome)
@@ -383,7 +419,8 @@ async function toggle(
     // ★★ Save first (do not start passing if saving failed).
     //   ⚠️ The set is **current memory + this entry** (do not drop other sessions)
     const next = [...active.values()].map((a) => a.entry).filter((e) => e.id !== sessionId)
-    const saved = await writeState([...next, entry])
+    // ⚠️ A memory-only grant (agy) does not touch the file
+    const saved = memoryOnly(sessionId) ? ({ ok: true } as const) : await writeState([...next, entry])
     if (!saved.ok) {
       console.warn(t(`[auto] 自動承認オンを断った（保存に失敗） session=${shortSessionId(sessionId)}${who}`, `[auto] Auto-approve on refused (not saved) session=${shortSessionId(sessionId)}${who}`))
       return { ok: false, reason: saved.reason, saved: false }
@@ -396,6 +433,7 @@ async function toggle(
     if (cancelledBy(sessionId, askedAt)) return { ok: true }
     const found: Active = { entry, untilMs }
     active.set(sessionId, found)
+    installed?.()
     schedule(found, now)
     console.log(t(`[auto] 自動承認オン session=${shortSessionId(sessionId)} 期限=${entry.until}${who}`, `[auto] Auto-approve on session=${shortSessionId(sessionId)} until=${entry.until}${who}`))
     return { ok: true, entry }
@@ -416,6 +454,7 @@ export async function endSessionAutoApprove(sessionId: string): Promise<{ had: b
   //    ② by an "on" asked earlier that was still saving and then installed itself ⇒ the mark below cancels it.
   const mark = { at: ++seq, cancelled: false }
   ended.set(sessionId, mark)
+  changes.set(sessionId, (changes.get(sessionId) ?? 0) + 1)
   const hadNow = state.kind === 'ok' && state.active.delete(sessionId)
   if (hadNow) clearTimer(sessionId)
   return await enqueue(async () => {
@@ -423,7 +462,7 @@ export async function endSessionAutoApprove(sessionId: string): Promise<{ had: b
     if (ended.get(sessionId) === mark) ended.delete(sessionId)
     // ★ `had`: it was on, or an "on" was on its way (the caller tells the phone either way)
     const had = hadNow || mark.cancelled
-    if (state.kind !== 'ok' || !had) return { ok: true, had }
+    if (state.kind !== 'ok' || !had || memoryOnly(sessionId)) return { ok: true, had }
     // ⚠️ Written again, either way the file can still hold this session: a toggle of another session that was saving
     //    when this one was dropped took its set from memory before, and a cancelled "on" wrote it itself
     const saved = await writeState([...state.active.values()].map((a) => a.entry))
@@ -490,10 +529,19 @@ function enqueue<T>(op: () => Promise<T>): Promise<T> {
 /**
  * Write the state file. ⚠️ **Call only inside `enqueue`** (calling it from outside breaks the order).
  */
+/**
+ * ★ agy grants live in memory only (2026-11-20 / docs/AGY.md §10): they belong to one agy process (`agy/grants.ts`),
+ * which an agent restart forgets anyway. ⚠️ Never written, and ignored when read (codex review: an older agent read
+ * back a persisted agy grant it could neither use nor turn off, and the phone showed it on).
+ */
+function memoryOnly(id: string): boolean {
+  return id.startsWith('agy-')
+}
+
 async function writeState(
   entries: AutoApproveEntry[],
 ): Promise<{ ok: true } | { ok: false; reason: string }> {
-  const stored: Stored = { v: 1, entries }
+  const stored: Stored = { v: 1, entries: entries.filter((e) => !memoryOnly(e.id)) }
   try {
     await writeJson(AUTO_APPROVE_FILE, stored)
     return { ok: true }
@@ -524,7 +572,8 @@ function schedule(found: Active, now: number): void {
       // ⚠️ Generation check (an old timer right after a toggle must not drop the new entry)
       if (state.kind !== 'ok' || state.active.get(entry.id) !== found) return
       state.active.delete(entry.id)
-      await writeState([...state.active.values()].map((a) => a.entry))
+      // ⚠️ A memory-only grant (agy) does not touch the file
+      if (!memoryOnly(entry.id)) await writeState([...state.active.values()].map((a) => a.entry))
       console.log(t(`[auto] 自動承認が期限切れ session=${shortSessionId(entry.id)}`, `[auto] Auto-approve expired session=${shortSessionId(entry.id)}`))
       onExpire?.(entry)
     })
@@ -552,4 +601,5 @@ export function resetAutoApprove(): void {
   onExpire = undefined
   chain = Promise.resolve()
   ended.clear()
+  pendingOff.clear()
 }

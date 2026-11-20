@@ -9,7 +9,7 @@
 //   passes even arbitrary `Bash` commands, so the wording lives in one place: `web/src/ui/commands.ts`.
 
 import { notificationText, type AutoApproveResult, type PushPayload } from '../../../shared/types.ts'
-import { AUTO_APPROVE_DEFAULT, type AutoApproveEntry, setAutoApprove, toAutoApproveDuration } from '../autoApprove.ts'
+import { AUTO_APPROVE_DEFAULT, type AutoApproveEntry, autoApproveChanges, setAutoApprove, toAutoApproveDuration } from '../autoApprove.ts'
 import { broadcast } from '../events.ts'
 import { withPendingPerms } from '../permission.ts'
 import { sendToAll } from '../push.ts'
@@ -19,14 +19,36 @@ import { HttpError, readJsonBody, type Ctx } from '../router.ts'
 import { t } from '../../../shared/i18n.ts'
 import { machineName } from '../machine.ts'
 import { shortSessionId } from '../codex/ids.ts'
+import { AGY_PREFIX, conversationOf } from '../agy/sessions.ts'
+import { defaultAgyKeysDeps, findAgyTarget, type AgyKeysDeps, type AgyTargetFailure } from '../agy/keys.ts'
+import { setAgyGrantOwner } from '../agy/grants.ts'
+
+/**
+ * ★ Why "on" is refused for an agy conversation (2026-11-20 / docs/AGY.md §10): auto-approve types `1` into the agy, so
+ * it needs the same way in as a phone answer (the relay, the lock, one agy on the conversation). "Off" is never refused.
+ */
+const AGY_AUTO_REFUSAL: Record<AgyTargetFailure, () => string> = {
+  'not-open': () => t('この agy の会話は、いま開かれていません。', 'This agy conversation is not open right now.'),
+  shared: () =>
+    t('この会話は2つの agy で開かれています。スマホからは自動承認をオンにできません。', 'This conversation is open in two agys. Auto-approve cannot be turned on from the phone.'),
+  'no-relay': () =>
+    t(
+      'この agy は nyan-remote を通さずに起動しています。新しいターミナルで agy を起こし直すと、自動承認を使えます。',
+      'This agy was not started through nyan-remote. Start agy again in a new terminal to use auto-approve.',
+    ),
+  broken: () => t('この agy への入口が壊れています。agy を起こし直してください。', 'The way into this agy is broken. Start agy again.'),
+  unverified: () => t('この agy を確かめられませんでした。少し待ってからもう一度押してください。', 'Could not verify this agy. Wait a moment and press it again.'),
+}
 
 interface Body {
   on?: unknown
   /** ★ The duration's name (`'3h'` / `'24h'`). ⚠️ No length is accepted (the agent's table owns it) */
   duration?: unknown
+  /** ★ agy: the phone showed agy's own confirmation (an older PWA showed Claude's for an agy row) */
+  agy?: unknown
 }
 
-export async function sessionAutoApprove(ctx: Ctx): Promise<AutoApproveResult> {
+export async function sessionAutoApprove(ctx: Ctx, agyDeps: () => AgyKeysDeps = defaultAgyKeysDeps): Promise<AutoApproveResult> {
   const sessionId = ctx.params['id']
   if (!sessionId) throw new HttpError(400, t('session id が必要です', 'A session id is required.'))
   const body = await readJsonBody<Body>(ctx.req)
@@ -43,8 +65,26 @@ export async function sessionAutoApprove(ctx: Ctx): Promise<AutoApproveResult> {
     if (!d) throw new HttpError(400, t('期限は 3h か 24h です', '`duration` must be 3h or 24h.'))
     duration = d
   }
+  // ★ agy: "on" only for a conversation the phone could answer (`AGY_AUTO_REFUSAL`)
+  let installed: (() => void) | undefined
+  if (body.on && sessionId.startsWith(AGY_PREFIX)) {
+    // ⚠️ A PWA from before agy support takes an agy row for Claude's and confirms with Claude's words (codex review)
+    if (body.agy !== true) {
+      throw new HttpError(409, t('アプリを更新してから、もう一度オンにしてください（agy の自動承認には新しい版が要ります）。', 'Update the app, then turn it on again (agy auto-approve needs the new version).'))
+    }
+    const ticket = autoApproveChanges(sessionId)
+    const conv = conversationOf(sessionId)
+    const target = conv === undefined ? 'not-open' : await findAgyTarget(conv, agyDeps())
+    if (typeof target === 'string') throw new HttpError(409, AGY_AUTO_REFUSAL[target]())
+    // ⚠️ Another toggle came while the agy was looked up (an "off" from another phone): this older "on" must not undo it
+    if (autoApproveChanges(sessionId) !== ticket) {
+      throw new HttpError(409, t('自動承認の状態が変わりました。画面を確かめてから、もう一度押してください。', 'Auto-approve changed meanwhile. Check the screen and press it again.'))
+    }
+    // ★ The consent is for this agy process (`grants.ts`), bound the moment the grant takes effect
+    installed = () => setAgyGrantOwner(target.conversationId, { pid: target.pid, startedAt: target.pane.startedAt })
+  }
   // ★ Who asked goes to the journal (a toggle that lets any command run must be traceable to a phone)
-  const res = await setAutoApprove(sessionId, body.on, Date.now(), duration, actorOf(ctx.identity))
+  const res = await setAutoApprove(sessionId, body.on, Date.now(), duration, actorOf(ctx.identity), installed)
   // ★ The list's marker (`SessionSummary.autoApprove`) changes, so announce it
   broadcast({ type: 'sessions-changed', at: new Date().toISOString() })
   if (!res.ok) return { ok: false, reason: res.reason, saved: res.saved }

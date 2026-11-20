@@ -179,13 +179,27 @@ const autoApprove = Array.isArray(body.autoApprove) ? body.autoApprove : []
 //   ⚠️⚠️ **This is no reason to block a restart** (no card is raised, so there is no approval to kill).
 //      But **it is persisted, so it stays in effect after a restart until it expires**. It is a
 //      "keeps running if you don't notice" feature, so it must always be readable on this screen.
-if (autoApprove.length > 0) {
+// ★ agy grants are memory only (docs/AGY.md §10): a restart ends them (told apart, so nobody expects them to carry on)
+const isAgyGrant = (a) => String(a?.id ?? '').startsWith('agy-')
+const lasting = autoApprove.filter((a) => !isAgyGrant(a))
+const agyGrants = autoApprove.filter(isAgyGrant)
+if (lasting.length > 0) {
   console.log(
     t(
-      `⚠️ 自動承認モード ${autoApprove.length} 件（再起動後も期限まで有効）`,
-      `⚠️ Auto-approve mode: ${autoApprove.length} (stays on until it expires, even after a restart)`,
+      `⚠️ 自動承認モード ${lasting.length} 件（再起動後も期限まで有効）`,
+      `⚠️ Auto-approve mode: ${lasting.length} (stays on until it expires, even after a restart)`,
     ),
   )
+}
+if (agyGrants.length > 0) {
+  console.log(
+    t(
+      `⚠️ agy の自動承認 ${agyGrants.length} 件（再起動で切れます。続けるならスマホでもう一度オンにしてください）`,
+      `⚠️ agy auto-approve: ${agyGrants.length} (a restart ends it; turn it on again from the phone to keep it)`,
+    ),
+  )
+}
+if (autoApprove.length > 0) {
   for (const a of autoApprove) {
     // ⚠️ **Never crash** on a malformed shape (do not change the exit code for display's sake)
     const left = Math.round((Date.parse(a?.until) - Date.now()) / 60000)

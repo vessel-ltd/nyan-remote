@@ -724,6 +724,34 @@ export async function agyConversations(deps: AgyDeps): Promise<Map<string, AgyCo
   return out
 }
 
+/**
+ * ★ Whether the agy process an auto-approve grant was given to (`grants.ts`) still shows that conversation
+ * (docs/AGY.md §10): running, the same relay registration (a reused pid has another), holding the conversation's lock
+ * (a `/new` moves the lock at once while the status file still names the old conversation / codex review).
+ * undefined = cannot tell now (a lock probe that failed): kept, ended once it can be told.
+ */
+export async function agyOwnerShows(owner: { pid: number; startedAt: number }, conversationId: string, deps: AgyDeps): Promise<boolean | undefined> {
+  // ⚠️ Gone only when the process is known gone or known to be another (a probe that failed, e.g. out of file
+  //    descriptors, is not proof / codex review)
+  if (!deps.isAgy(owner.pid)) {
+    const alive = (deps.aliveProcStart ?? aliveProcStartSync)(owner.pid)
+    if (alive === null) return false
+    if (alive === undefined) return undefined
+    // the very process its relay registered (same start) ⇒ the name probe failed, not another process
+    const same = await agyPaneOf(owner.pid, () => alive)
+    // (a relay record that cannot be read either: cannot tell; another registration: gone)
+    if (typeof same === 'string') return same === 'unverified' ? false : undefined
+    return same.startedAt === owner.startedAt ? undefined : false
+  }
+  const pane = await agyPaneOf(owner.pid, deps.aliveProcStart ?? aliveProcStartSync)
+  // ⚠️ A relay record that cannot be read while the agy runs is a read that failed (e.g. out of file descriptors), not
+  //    a move: cannot tell (codex review: one failed read ended a live grant). Another registration = another run
+  if (typeof pane === 'string') return undefined
+  if (pane.startedAt !== owner.startedAt) return false
+  const locks = (deps.locksOf ?? ((p: number) => agyLocksOf(p, deps.home)))(owner.pid)
+  return locks === undefined ? undefined : locks.includes(conversationId.toLowerCase())
+}
+
 /** ★ The live agy rows for `/sessions` */
 export async function agyRows(machine: string, given: AgyDeps = defaultAgyDeps()): Promise<SessionSummary[]> {
   const deps = await withLocksProbed(given)

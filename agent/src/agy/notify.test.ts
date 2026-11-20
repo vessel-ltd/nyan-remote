@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import type { NotifyFields, SessionSummary, SessionStatus } from '../../../shared/types.ts'
-import { AgyNotifier } from './notify.ts'
+import { AgyNotifier, QUIET_UNSURE_MAX } from './notify.ts'
 
 const A = '062a8f25-9451-42f3-ae93-34a208e99365'
 
-function rig() {
+function rig(opts: { quiet?: (sessionId: string, card: string) => boolean | undefined | Promise<boolean | undefined> } = {}) {
   let status: SessionStatus | undefined = 'idle'
   let wrote = '2026-11-20T00:00:10Z'
   let records: Record<string, unknown>[] = []
@@ -27,6 +27,7 @@ function rig() {
     },
     tail: () => records,
     now: () => clock,
+    ...(opts.quiet ? { quiet: opts.quiet } : {}),
   })
   return {
     n,
@@ -54,9 +55,9 @@ const asking = (step: number) => [user(step), { step_index: step + 1, type: 'PLA
 
 test('★★ a card rings "needs you", a finished turn rings "done", in the list’s words; the first look is the baseline', async () => {
   const r = rig()
-  r.set('waiting', asking(0))
+  r.set('working', asking(0))
   await r.n.look()
-  assert.equal(r.sent.length, 0, 'the state at start is not news')
+  assert.equal(r.sent.length, 0, 'the state at start is not news (a waiting card is: below)')
   r.set('working')
   await r.n.look()
   r.set('waiting')
@@ -346,10 +347,11 @@ test('★ the guard also reads the state right now (a look can be up to 300 ms b
   now = { status: 'done', turn: 0 }
   clock += 1500 // (the direct read is reused for a second within one send)
   assert.equal(guard?.(), false)
-  // ★ the same state, but a newer turn (a look missed it): not this push's news
+  // ★ for "needs you" the card alone decides: the same card read with another turn (a transcript read that failed) is
+  //   still this push's news (a new card would be another state write)
   now = { status: 'waiting', turn: 2, card: '' }
   clock += 1500 // (the direct read is reused for a second within one send)
-  assert.equal(guard?.(), false)
+  assert.equal(guard?.(), true)
   // ★ the same turn, but another card
   now = { status: 'waiting', turn: 0, card: '1/1' }
   clock += 1500 // (the direct read is reused for a second within one send)
@@ -805,4 +807,131 @@ test('★ a push whose newest look lacks the row (a failed probe) is owed, not d
   r.tick(31_000)
   await r.n.look()
   assert.deepEqual(r.sent.map((f) => f.label), ['完了'])
+})
+
+test('★★ a card auto-approve is answering does not ring; the turn still rings "done"; a card handed to the phone rings', async () => {
+  const quietFor = new Set<string>()
+  const r = rig({ quiet: (id, card) => id === `agy-${A}` && quietFor.has(card) })
+  await r.n.look()
+  quietFor.add('2026-11-20T00:00:20Z')
+  r.set('working', asking(0))
+  await r.n.look()
+  r.set('waiting', undefined, '2026-11-20T00:00:20Z')
+  await r.n.look()
+  assert.equal(r.sent.length, 0, 'answered by auto-approve: quiet')
+  // ★ its key did not land: the card goes to the phone (`owe`) and rings
+  quietFor.delete('2026-11-20T00:00:20Z')
+  r.n.owe(`agy-${A}`, '2026-11-20T00:00:20Z')
+  await r.n.look()
+  assert.deepEqual(r.sent.map((f) => f.label), ['要対応'])
+  r.set('working')
+  await r.n.look()
+  r.set('done', answered(0), '2026-11-20T00:00:30Z')
+  await r.n.look()
+  assert.deepEqual(r.sent.map((f) => f.label), ['要対応', '完了'])
+  // a card not answered by auto-approve (another write) rings as usual
+  r.set('waiting', asking(4), '2026-11-20T00:01:00Z')
+  await r.n.look()
+  assert.deepEqual(r.sent.map((f) => f.label), ['要対応', '完了', '要対応'])
+})
+
+test('★ an auto-answer that fails while "quiet" is asked rings that card once, not twice', async () => {
+  let r!: ReturnType<typeof rig>
+  let quietCalls = 0
+  r = rig({
+    quiet: async (id, card) => {
+      // the auto-answer fails during this question: the card is handed to the phone (owe) and is not quiet any more
+      if (quietCalls++ === 0) {
+        r.n.owe(id, card, true)
+        void r.n.look()
+      }
+      return false
+    },
+  })
+  await r.n.look()
+  r.set('working', asking(0))
+  await r.n.look()
+  r.set('waiting', undefined, '2026-11-20T00:00:20Z')
+  await r.n.look()
+  await r.n.look()
+  await r.n.look()
+  assert.ok(quietCalls >= 1)
+  assert.deepEqual(r.sent.map((f) => f.label), ['要対応'])
+})
+
+test('★ "cannot tell" whether auto-approve answers a card holds its "needs you" back a few looks: quiet if it then answers, rung if it never can tell', async () => {
+  const answers: (boolean | undefined)[] = [undefined, true]
+  const r = rig({ quiet: async () => (answers.length > 0 ? answers.shift() : true) })
+  await r.n.look()
+  r.set('working', asking(0))
+  await r.n.look()
+  r.set('waiting', undefined, '2026-11-20T00:00:20Z')
+  await r.n.look()
+  await r.n.look()
+  await r.n.look()
+  assert.equal(r.sent.length, 0, 'held back, then answered by auto-approve')
+  // never able to tell ⇒ rung after QUIET_UNSURE_MAX looks
+  const r2 = rig({ quiet: async () => undefined })
+  await r2.n.look()
+  r2.set('working', asking(0))
+  await r2.n.look()
+  r2.set('waiting', undefined, '2026-11-20T00:00:20Z')
+  for (let i = 0; i < QUIET_UNSURE_MAX; i++) {
+    await r2.n.look()
+    assert.equal(r2.sent.length, 0, `look ${i + 1}`)
+  }
+  await r2.n.look()
+  assert.deepEqual(r2.sent.map((f) => f.label), ['要対応'])
+})
+
+test('★ a card waiting when the agent starts rings (it may have appeared while the agent was down); other states do not', async () => {
+  const r = rig()
+  r.set('waiting', asking(0), '2026-11-20T00:00:20Z')
+  await r.n.look()
+  assert.deepEqual(r.sent.map((f) => f.label), ['要対応'])
+  await r.n.look()
+  assert.equal(r.sent.length, 1, 'once')
+  for (const s of ['done', 'error', 'working'] as const) {
+    const r2 = rig()
+    r2.set(s, answered(0))
+    await r2.n.look()
+    assert.equal(r2.sent.length, 0, s)
+  }
+})
+
+test('★ a card auto-approve was answering is asked about again while it waits: rung once it is not answered any more', async () => {
+  let answering = true
+  const r = rig({ quiet: async () => answering })
+  await r.n.look()
+  r.set('working', asking(0))
+  await r.n.look()
+  r.set('waiting', undefined, '2026-11-20T00:00:20Z')
+  await r.n.look()
+  await r.n.look()
+  assert.equal(r.sent.length, 0)
+  // the auto-answer failed without a fallback (its record dropped): still waiting ⇒ rung
+  answering = false
+  await r.n.look()
+  assert.deepEqual(r.sent.map((f) => f.label), ['要対応'])
+  await r.n.look()
+  assert.equal(r.sent.length, 1)
+})
+
+test('★ a "needs you" is judged by its card, not the turn: a newer look reading another turn for the same card still lets it go', async () => {
+  const sent: string[] = []
+  const reads = [[{ step_index: 1, type: 'PLANNER_RESPONSE', tool_calls: [{ name: 'run_command', args: { CommandLine: 'ls' } }] }], asking(0)]
+  const n = new AgyNotifier({
+    rows: async () => [{ machine: 'pc-a', account: 'agy', tool: 'agy', sessionId: `agy-${A}`, cwd: '/home/user/p', project: 'p', title: 'x', titleSource: 'ai', status: 'waiting', live: true, lastActivity: '2026-11-20T00:00:20Z' } as SessionSummary],
+    home: '/home/user',
+    // the first look could not read the prompt (no turn); the newer one did
+    tail: () => (reads.length > 1 ? reads.shift()! : reads[0]!),
+    now: () => 0,
+    send: async (_r, f) => {
+      sent.push(f.label)
+      return 1
+    },
+  })
+  // two looks at once: the first is judged against the newer one
+  await Promise.all([n.look(), n.look()])
+  assert.deepEqual(sent, ['要対応'])
 })

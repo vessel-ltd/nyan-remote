@@ -59,6 +59,7 @@ export async function health(): Promise<AgentHealth> {
       'agy-send',
       'agy-interrupt',
       'agy-approve',
+      'agy-auto-approve',
     ],
     // ★ The device key for ③. ⚠️ **Omitted** when unusable (the PWA then fails to match and
     //   says "the machine that showed this QR is not among your endpoints" = never send to a false destination)

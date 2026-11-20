@@ -15,8 +15,17 @@
 //  4. An answered card is not raised again while the same card is still up (the status file needs a moment); if the key
 //     could not go out, it is raised again on the next look; if it went out but the same card is still up after
 //     `UNCONFIRMED_MS` (4c), it is raised again too.
-//  5. ⚠️ No auto-approve (the phone offers none for agy rows) and no notification from here: the row turning
-//     "waiting" sends "needs you" (`notify.ts`), and a second push would only stack on iOS.
+//  5. No notification from here: the row turning "waiting" sends "needs you" (`notify.ts`), and a second push would
+//     only stack on iOS.
+//  5b. ★★ Auto-approve (2026-11-20 / docs/AGY.md §10): a card the phone could answer, of a conversation whose
+//     auto-approve is on (`shouldAutoApprove`, the one place that decides), shown by the very agy process it was given
+//     to (`grants.ts`: pid + relay start), is answered `1` here without going to the phone, and its "needs you" is not
+//     rung (`autoAnswering`, read by the notifier). ⚠️ A card the phone cannot answer (an unmeasured kind) is never
+//     typed at: it stays on the PC and rings as before.
+//     ⚠️⚠️ A call that has ever been on the phone is never auto-answered (a person may have denied it there and the
+//     key failed). Remembered by the call, not the status write (a resize rewrites that / codex review).
+//     ⚠️ A key that did not go out, or a card still up after `UNCONFIRMED_MS`, falls back to the phone: the card is
+//     raised there and "needs you" rings once if it has not rung yet (`reraised`).
 //  6. ⚠️ The phone sends a behavior and nothing else (never a text to type).
 //  7. ⚠️ No card while another running agy shows the same conversation (`agyShared`): they share its transcript, so
 //     the card could be the other agy's (checked again right before the key / `keys.ts`).
@@ -31,6 +40,8 @@ import type { PermissionRequest, SessionSummary } from '../../../shared/types.ts
 import { hasHidden } from '../../../shared/reveal.ts'
 import { t } from '../../../shared/i18n.ts'
 import { detailOf, hiddenIn, summarize, waitForDecision, withGeneration } from '../permission.ts'
+import { shouldAutoApprove } from '../autoApprove.ts'
+import { agyGrantOwner, type AgyGrantOwner } from './grants.ts'
 import { aliveProcStartSync } from '../claude/sessionIndex.ts'
 import { agyLocksOf, agyPaneOf, withLocksProbed, agyPidFiles, agyRow, agyShared, readAgyPidFile, sweepAgyPidFiles, transcriptPathOf, type AgyDeps, type AgyState } from './sessions.ts'
 import { callBeforeState, readTailRecords, turnEnd, type PendingCall } from './pending.ts'
@@ -94,7 +105,13 @@ export interface AgyCardDeps {
   agy(): AgyDeps
   /** This machine's name (the card's row) */
   machine: string
-  answer(conversationId: string, mark: AgyCardMark, behavior: 'allow' | 'deny'): Promise<{ ok: true } | { ok: false; reason: AgyCardFailure }>
+  /** @param stillWanted asked right before the byte goes out (auto-approve: still on) */
+  answer(
+    conversationId: string,
+    mark: AgyCardMark,
+    behavior: 'allow' | 'deny',
+    stillWanted?: () => boolean,
+  ): Promise<{ ok: true } | { ok: false; reason: AgyCardFailure }>
   /** The set of cards changed (tell the phones to read `/permissions` again) */
   changed(): void
   now(): Date
@@ -106,7 +123,7 @@ export interface AgyCardDeps {
    * Rule 4c: a card shown again after its key did not land (the notifier owes a fresh "needs you").
    * @param card the card's state write (ISO time of the agy's own state file, as the notifier's `cardOf`)
    */
-  reraised?: (conversationId: string, card: string) => void
+  reraised?: (conversationId: string, card: string, once?: boolean) => void
 }
 
 /** Rule 4c: how long the same card may stay up after its key was written before it is shown again */
@@ -141,6 +158,10 @@ export function agyDeliveryMessage(reason: AgyCardFailure): string {
 }
 
 const markId = (m: AgyCardMark): string => `${m.pid}:${m.stateMtimeMs}:${m.step}:${m.index}:${m.callAt}`
+/** How many calls "on the phone" / "auto-tried" remember */
+const CALL_MEMORY_MAX = 1024
+/** The call itself (the same through a status rewrite such as a resize) */
+const callId = (m: AgyCardMark): string => `${m.pid}:${m.step}:${m.index}:${m.callAt}`
 
 export class AgyCards {
   readonly #deps: AgyCardDeps
@@ -153,35 +174,92 @@ export class AgyCards {
    * key, so the phone keeps the failure reason it showed on it (codex review: a fresh key hid it).
    */
   #lastInfo = new Map<string, { id: string; info: PermissionRequest }>()
-  #running = false
+  /** conversation → the card being answered by auto-approve (rule 5b): its mark id and its state write (ISO) */
+  #auto = new Map<string, { id: string; card: string }>()
+  /** The calls (`conversation:callId`) that have been on the phone (rule 5b: never auto-answered). Bounded, oldest out */
+  #onPhone = new Set<string>()
+  /** The conversations the last look could not tell about */
+  #lastUnsure = new Set<string>()
+  /** The calls auto-approve has tried once (rule 5b: never a second time; the phone's after that). Bounded */
+  #autoTried = new Set<string>()
+  #run: Promise<void> | undefined
   #again = false
+  /** How many looks have started (`fresh`) */
+  #begun = 0
+  /** Callers of `fresh` waiting for a look numbered above `after` */
+  #waiters: { after: number; resolve: () => void }[] = []
 
   constructor(deps: AgyCardDeps) {
     this.#deps = deps
   }
 
-  /** Look at every agy once and bring the phone's cards in line. Overlapping calls fold into one more look. */
-  async sync(): Promise<void> {
-    if (this.#running) {
+  /**
+   * Look at every agy once and bring the phone's cards in line. Overlapping calls fold into one more look.
+   * ★ Settles only after a look that started after this call (the notifier asks `autoAnswering` right after it).
+   */
+  sync(): Promise<void> {
+    if (this.#run) {
       this.#again = true
-      return
+      return this.#run
     }
-    this.#running = true
-    try {
-      do {
-        this.#again = false
-        await this.#look()
-      } while (this.#again)
-    } finally {
-      this.#running = false
+    const run = (async () => {
+      try {
+        do {
+          this.#again = false
+          const n = ++this.#begun
+          try {
+            await this.#look()
+          } finally {
+            this.#settle(n)
+          }
+        } while (this.#again)
+      } finally {
+        this.#run = undefined
+        this.#settle(Infinity)
+      }
+    })()
+    this.#run = run
+    return run
+  }
+
+  /**
+   * ★ Settles once one whole look that started after this call is done (not when the looks go idle: under a stream of
+   * status updates they never do / codex review). Never rejects.
+   */
+  fresh(): Promise<void> {
+    const after = this.#begun
+    const done = new Promise<void>((resolve) => this.#waiters.push({ after, resolve }))
+    void this.sync().catch(() => undefined)
+    return done
+  }
+
+  #settle(n: number): void {
+    const keep: { after: number; resolve: () => void }[] = []
+    for (const w of this.#waiters) {
+      if (n > w.after) w.resolve()
+      else keep.push(w)
     }
+    this.#waiters = keep
+  }
+
+  /**
+   * ★ Rule 5b: whether this card (its state write, ISO, as the notifier's `cardOf`) is being answered by auto-approve,
+   * so its "needs you" is not rung.
+   */
+  autoAnswering(conversationId: string, card: string): boolean {
+    return this.#auto.get(conversationId)?.card === card
+  }
+
+  /** Whether the last look could not tell about this conversation's card (a lock probe that failed) */
+  unsureAbout(conversationId: string): boolean {
+    return this.#lastUnsure.has(conversationId)
   }
 
   async #look(): Promise<void> {
     // ⚠️ Locks probed all at once without blocking (a Mac's `lsof` / `withLocksProbed`)
     const deps = await withLocksProbed(this.#deps.agy())
     void sweepAgyPidFiles(deps)
-    const want = new Map<string, { state: AgyState; mark: AgyCardMark; call: PendingCall }>()
+    const want = new Map<string, { state: AgyState; mark: AgyCardMark; call: PendingCall; relayAt: number }>()
     const shared = new Set<string>()
     const unsure = new Set<string>()
     // ★ Each agy's own state file (a second agy on the conversation can neither take the card over nor hide it)
@@ -192,6 +270,12 @@ export class AgyCards {
       const conv = f.state.conversationId
       // Rule 1: only an agy whose relay checks out (the pane's process is this agy)
       const pane = await agyPaneOf(pid, deps.aliveProcStart ?? aliveProcStartSync)
+      // ⚠️ A relay record that could not be read (or checked) now is "cannot tell", not "no relay" (codex review: one
+      //    failed read rang for a card the next look auto-answered, and withdrew a phone card)
+      if (pane === 'broken' || pane === 'unverified') {
+        unsure.add(f.state.conversationId)
+        continue
+      }
       if (typeof pane === 'string' || f.mtimeMs < pane.startedAt) continue
       // ★★ agy's own word that this process shows this conversation (rule 8)
       const locksOf = deps.locksOf ?? ((p: number) => agyLocksOf(p, deps.home))
@@ -216,9 +300,15 @@ export class AgyCards {
         shared.add(conv)
         continue
       }
-      want.set(conv, { state: f.state, mark: { pid, stateMtimeMs: f.mtimeMs, step: end.pending.step, index: end.pending.index, callAt: end.pending.at! }, call: end.pending })
+      want.set(conv, {
+        state: f.state,
+        mark: { pid, stateMtimeMs: f.mtimeMs, step: end.pending.step, index: end.pending.index, callAt: end.pending.at! },
+        call: end.pending,
+        relayAt: pane.startedAt,
+      })
     }
     for (const conv of shared) want.delete(conv)
+    this.#lastUnsure = unsure
     let changed = false
     // Rule 3: cards no longer up
     for (const [conv, r] of this.#raised) {
@@ -231,7 +321,20 @@ export class AgyCards {
     }
     for (const conv of this.#answered.keys()) {
       const w = want.get(conv)
+      // ⚠️ Cannot tell now ⇒ kept (dropping it let an auto-answer whose key was lost be typed again / codex review)
+      if (!w && unsure.has(conv)) continue
       if (!w || markId(w.mark) !== this.#answered.get(conv)) this.#answered.delete(conv)
+    }
+    for (const [conv, a] of this.#auto) {
+      const w = want.get(conv)
+      if (!w && unsure.has(conv)) continue
+      if (!w || markId(w.mark) !== a.id) this.#auto.delete(conv)
+    }
+    // ⚠️ Remembered per call, never per conversation (a late failure of an older call overwrote the newer call's record
+    //    / codex review), and never forgotten because a card is not seen now (a status file missing for a moment).
+    //    A call never comes back, so only the oldest go when the bound is reached.
+    for (const memory of [this.#onPhone, this.#autoTried]) {
+      while (memory.size > CALL_MEMORY_MAX) memory.delete(memory.values().next().value as string)
     }
     for (const conv of this.#lastInfo.keys()) {
       const w = want.get(conv)
@@ -251,6 +354,27 @@ export class AgyCards {
         this.#answered.set(conv, id)
         continue
       }
+      // ★ Rule 5b: auto-approve answers it here: never a call that has been on the phone, only for its owner process
+      const owner = agyGrantOwner(conv)
+      const mine = (o: AgyGrantOwner | undefined): boolean => o !== undefined && o.pid === w.mark.pid && o.startedAt === w.relayAt
+      // ⚠️ Once per call: a call still up after its try (a status rewrite such as a resize gives it a new mark) is the
+      //    phone's, never typed at again (codex review: a byte the relay dropped, then a resize, typed `1` twice)
+      const call = `${conv}:${callId(w.mark)}`
+      if (!this.#onPhone.has(call) && !this.#autoTried.has(call) && mine(owner) && shouldAutoApprove(info, this.#deps.now().getTime())) {
+        this.#autoTried.add(call)
+        this.#answered.set(conv, id)
+        this.#auto.set(conv, { id, card: new Date(w.mark.stateMtimeMs).toISOString() })
+        // ⚠️ Asked again right before the byte (an "off", the expiry or a new grant during the settle wait / codex review);
+        //    and never once the call has gone to the phone meanwhile (a person may be denying it there / codex review)
+        void this.#autoAnswer(
+          conv,
+          id,
+          w.mark,
+          () => !this.#onPhone.has(call) && agyGrantOwner(conv) === owner && shouldAutoApprove(info, this.#deps.now().getTime()),
+        )
+        continue
+      }
+      this.#onPhone.add(call)
       this.#lastInfo.set(conv, { id, info })
       const raised: Raised = { id }
       this.#raised.set(conv, raised)
@@ -258,6 +382,36 @@ export class AgyCards {
       void this.#wait(conv, raised, info, w.mark)
     }
     if (changed) this.#deps.changed()
+  }
+
+  /** Rule 5b: type `1` for a card auto-approve passes; a key that does not land sends the card to the phone */
+  async #autoAnswer(conv: string, id: string, mark: AgyCardMark, stillOn: () => boolean): Promise<void> {
+    const res: AgyDelivery = await this.#deps.answer(conv, mark, 'allow', stillOn).catch(() => ({ ok: false as const, reason: 'unreachable' as const }))
+    // ⚠️ One line, no command text
+    this.#deps.log?.(`[agy] card allow (auto-approve) conversation=${conv.slice(0, 8)} ${res.ok ? 'typed' : `not typed (${res.reason})`}`)
+    // ⚠️ Not tied to `#auto` still holding this try: a look that could not read the transcript for a moment drops it, and
+    //    the card then stayed quiet with no fallback (codex review). Once per call.
+    const toPhone = (): void => {
+      if (this.#auto.get(conv)?.id === id) this.#auto.delete(conv)
+      if (this.#onPhone.has(`${conv}:${callId(mark)}`)) return
+      this.#onPhone.add(`${conv}:${callId(mark)}`)
+      if (this.#answered.get(conv) === id) this.#answered.delete(conv)
+      // `once`: it has not been on the phone; a "needs you" already sent for this card is enough (codex review: two)
+      this.#deps.reraised?.(conv, new Date(mark.stateMtimeMs).toISOString(), true)
+      void this.sync()
+    }
+    if (!res.ok) {
+      // ⚠️ Every failure goes to the phone, `changed` too: it also covers "turned off meanwhile" and a final check that
+      //    could not tell (a slow lock probe), where the card is still up (codex review: it stayed quiet and was typed
+      //    later). A card that really went away is not raised (the look no longer sees it) and its ring is dropped.
+      toPhone()
+      return
+    }
+    setTimeout(() => {
+      if (this.#answered.get(conv) !== id || this.#auto.get(conv)?.id !== id) return
+      this.#deps.log?.(`[agy] card allow (auto-approve) conversation=${conv.slice(0, 8)} still up after the key; sent to the phone`)
+      toPhone()
+    }, this.#deps.unconfirmedMs ?? UNCONFIRMED_MS).unref?.()
   }
 
   async #wait(conv: string, raised: Raised, info: PermissionRequest, mark: AgyCardMark): Promise<void> {

@@ -83,7 +83,7 @@ export class AgentTransport implements Transport {
     quiet: number
     pendingTags?: string[]
     at?: string
-    autoApprove?: { id: string; until: string; tool?: 'codex' }[]
+    autoApprove?: { id: string; until: string; tool?: 'codex' | 'agy' }[]
   }> {
     const body = await this.get<{
       permissions: PermissionRequest[]
@@ -110,7 +110,14 @@ export class AgentTransport implements Transport {
         ? body.autoApprove.flatMap((a) => {
             const r = a as { id?: unknown; until?: unknown; tool?: unknown }
             return typeof r.id === 'string' && typeof r.until === 'string'
-              ? [{ id: r.id, until: r.until, ...(r.tool === 'codex' ? { tool: 'codex' as const } : {}) }]
+              ? [
+                  {
+                    id: r.id,
+                    until: r.until,
+                    // ★ agy: also by its id (an agent that names no tool for it would make a Claude row of it)
+                    ...(r.tool === 'codex' ? { tool: 'codex' as const } : r.tool === 'agy' || r.id.startsWith('agy-') ? { tool: 'agy' as const } : {}),
+                  },
+                ]
               : []
           })
         : undefined,
@@ -220,7 +227,9 @@ export class AgentTransport implements Transport {
     return this.post<AutoApproveResult>(
       `/sessions/${encodeURIComponent(sessionId)}/auto-approve`,
       // ★ The duration is **only a name** (lengths are in the agent's table). ⚠️ Not attached when turning off
-      on && duration ? { on, duration } : { on },
+      // ★ `agy: true`: this PWA shows agy's own confirmation for an agy row (an older one showed Claude's, and the agent
+      //   refuses an agy "on" without it / codex review)
+      { on, ...(on && duration ? { duration } : {}), ...(on && sessionId.startsWith('agy-') ? { agy: true } : {}) },
     )
   }
 

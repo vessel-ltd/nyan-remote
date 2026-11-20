@@ -550,3 +550,68 @@ test('★ notes are refused on a card that does not take them (a Codex command c
   assert.equal(listPending().length, 1)
   void waiting
 })
+
+test('★★ agy (2026-11-20): "on" only for a conversation its agy could be answered in; "off" always; the marks say agy', async (t) => {
+  const dir = await withState(t)
+  const AGY = 'agy-062a8f25-9451-42f3-ae93-34a208e99365'
+  const ctx = (on: boolean) => bodyCtx(`http://agent/sessions/${AGY}/auto-approve`, { id: AGY }, on ? { on, agy: true } : { on }, PHONE_A)
+  // ⚠️ an older PWA (no `agy: true`) is refused before anything is looked up
+  await assert.rejects(
+    sessionAutoApprove(bodyCtx(`http://agent/sessions/${AGY}/auto-approve`, { id: AGY }, { on: true }, PHONE_A), (() => assert.fail('looked up')) as never),
+    (e: unknown) => e instanceof HttpError && e.status === 409 && /更新|Update/.test(e.message),
+  )
+  // no agy shows it (an empty status directory) ⇒ refused, nothing turned on
+  const none = () => ({ dir: join(dir, 'agy'), home: join(dir, 'home'), isAgy: () => false, now: Date.now(), aliveProcStart: () => null, locksOf: () => [] })
+  await assert.rejects(sessionAutoApprove(ctx(true), none as never), (e: unknown) => e instanceof HttpError && e.status === 409)
+  assert.equal(autoApproveFor(AGY), undefined)
+  // a malformed agy id ⇒ refused the same way (never handed on as a Claude id)
+  await assert.rejects(
+    sessionAutoApprove(bodyCtx('http://agent/sessions/agy-nope/auto-approve', { id: 'agy-nope' }, { on: true, agy: true }, PHONE_A), none as never),
+    (e: unknown) => e instanceof HttpError && e.status === 409,
+  )
+  // "off" is never refused (whatever the agy)
+  await setAutoApprove(AGY, true)
+  const off = await sessionAutoApprove(ctx(false), none as never)
+  assert.equal(off.ok, true)
+  assert.equal(autoApproveFor(AGY), undefined)
+  // the list's mark names the tool (a row built from it must not pass for Claude)
+  await setAutoApprove(AGY, true)
+  const page = await permissions()
+  assert.deepEqual(page.autoApprove.find((m) => m.id === AGY)?.tool, 'agy')
+})
+
+test('★★ agy "on": bound to the agy process when it takes effect; an older "on" whose lookup outlived another toggle is refused', async (t) => {
+  const dir = await withState(t)
+  const { mkdirSync, writeFileSync } = await import('node:fs')
+  const { agyGrantOwner, resetAgyGrantOwners } = await import('../agy/grants.ts')
+  resetAgyGrantOwners()
+  t.after(() => resetAgyGrantOwners())
+  const CONV = '062a8f25-9451-42f3-ae93-34a208e99365'
+  const AGY = `agy-${CONV}`
+  mkdirSync(join(dir, 'agy'), { recursive: true })
+  mkdirSync(join(dir, 'panes'), { recursive: true })
+  writeFileSync(join(dir, 'agy', 'pid-100.json'), JSON.stringify({ nyanPid: 100, nyanBusyAt: 1, input: { conversation_id: CONV, cwd: '/home/user/p', agent_state: 'idle' } }))
+  writeFileSync(join(dir, 'panes', '100.json'), JSON.stringify({ pid: 100, procStart: '1', socket: join(dir, 's'), startedAt: 5000, paste: true }))
+  let during: (() => void) | undefined
+  const deps = () => ({
+    dir: join(dir, 'agy'),
+    home: join(dir, 'home'),
+    isAgy: (p: number) => p === 100,
+    now: Date.now(),
+    aliveProcStart: () => '1',
+    locksOf: () => {
+      during?.()
+      during = undefined
+      return [CONV]
+    },
+  })
+  const ctx = (on: boolean) => bodyCtx(`http://agent/sessions/${AGY}/auto-approve`, { id: AGY }, on ? { on, agy: true } : { on }, PHONE_A)
+  const ok = await sessionAutoApprove(ctx(true), deps as never)
+  assert.equal(ok.ok, true)
+  assert.deepEqual(agyGrantOwner(CONV), { pid: 100, startedAt: 5000 })
+  // ⚠️ another phone turns it off while this "on" is looking the agy up
+  await sessionAutoApprove(ctx(false), deps as never)
+  during = () => void setAutoApprove(AGY, false)
+  await assert.rejects(sessionAutoApprove(ctx(true), deps as never), (e: unknown) => e instanceof HttpError && e.status === 409)
+  assert.equal(autoApproveFor(AGY), undefined, 'the newer "off" stands')
+})

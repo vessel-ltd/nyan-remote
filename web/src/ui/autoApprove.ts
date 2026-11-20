@@ -13,6 +13,7 @@
 import type { AgentFeature, SessionSummary } from '../../../shared/types.ts'
 import { t } from '../../../shared/i18n.ts'
 import { mdhhmm } from '../time.ts'
+import { isAgy } from './tool.ts'
 
 /** `sending` right after a tap (⚠️ a double tap must not fire twice) */
 export type AutoApprovePhase = 'ready' | 'sending'
@@ -85,6 +86,9 @@ export function autoApproveView(
   if (!session) return { show: false, disabled: true, label, on }
   if (!features?.includes('auto-approve')) return { show: false, disabled: true, label, on }
   if (!session.live && !on) return { show: false, disabled: true, label, on }
+  // ★ agy: answered with keys, so turning it on needs a relayed agy that is the only one on the conversation (the agent
+  //   refuses the rest too). ⚠️ Turning it off is always offered (never hide what is in effect)
+  if (isAgy(session) && !on && (session.sendRoute !== 'keys' || session.agyShared)) return { show: false, disabled: true, label, on }
   if (phase === 'sending') return { show: true, disabled: true, label: `${label}…`, on }
   return { show: true, disabled: false, label, on }
 }
@@ -107,3 +111,4 @@ export function autoApproveError(on: boolean, reason: string | undefined): strin
         `Auto-approve was stopped but could not be saved (${why}). If the agent restarts, it comes back until it expires`,
       )
 }
+

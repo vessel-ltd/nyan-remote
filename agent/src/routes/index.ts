@@ -43,7 +43,8 @@ export function buildRouter(): Router {
   router.post('/sessions/:id/command', notForAgy(sessionCommand))
   // ★ Toggle auto-approve mode (per session, with an expiry / autoApprove.ts).
   //   ⚠️⚠️ **POST only** (with GET, merely getting someone to follow a link could enable auto-approve)
-  router.post('/sessions/:id/auto-approve', notForAgy(sessionAutoApprove))
+  //   ★ agy too since 2026-11-20 (its cards are answered with keys / `agy/cards.ts` rule 5b; "on" needs a relayed agy)
+  router.post('/sessions/:id/auto-approve', sessionAutoApprove)
   router.post('/hook', hook)
   // ★ Files from the phone (2026-11-17 / `uploads.ts`): start → chunks in order → finish (checked) → attached by id
   //   with the next instruction. ⚠️ POST only; bound to the device that started it

@@ -107,7 +107,7 @@ export interface AutoApproveMark {
   until: string
   machine?: string
   /** Which tool's session (absent = Claude). ⚠️ Carried onto a row built from the mark: its gates depend on it */
-  tool?: 'codex'
+  tool?: 'codex' | 'agy'
 }
 
 /**

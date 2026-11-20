@@ -5,6 +5,8 @@ import { join } from 'node:path'
 import { test } from 'node:test'
 import type { SessionSummary } from '../../../shared/types.ts'
 import { answer, listPending, resetPending } from '../permission.ts'
+import { resetAutoApprove, setAutoApprove } from '../autoApprove.ts'
+import { resetAgyGrantOwners, setAgyGrantOwner } from './grants.ts'
 import { answerPermission } from '../routes/permission.ts'
 import { AgyCards, agyCard, agyCardTool, agyDelivery, agyDeliveryMessage, type AgyCardDeps } from './cards.ts'
 import type { AgyCardMark } from './keys.ts'
@@ -370,5 +372,307 @@ test('★ a second agy whose lock cannot be told keeps the card as it is (neithe
   probe.fail = false
   await c.sync()
   assert.equal(agyCards().length, 1)
+  assert.equal(agyCards()[0]!.key, key)
+})
+
+// ── auto-approve (2026-11-20 / docs/AGY.md §10, rule 5b) ──────────────────────────────────────────────────────────
+
+/** On, given to the lab's agy (its pid and relay registration, as the route sets it) */
+async function autoOn(t: { after(fn: () => void): void }, owner = { pid: PID, startedAt: (BASE - 1000) * 1000 }): Promise<void> {
+  resetAutoApprove()
+  resetAgyGrantOwners()
+  t.after(() => {
+    resetAutoApprove()
+    resetAgyGrantOwners()
+  })
+  setAgyGrantOwner(A, owner)
+  const r = await setAutoApprove(`agy-${A}`, true)
+  assert.equal(r.ok, true)
+}
+
+test('★★ auto-approve: a card the phone could answer is answered `1` here, never shown on the phone, and is quiet', async (t) => {
+  const l = lab(t)
+  await autoOn(t)
+  const cards = new AgyCards({ ...l.deps, unconfirmedMs: 10_000 })
+  await cards.sync()
+  await settle()
+  assert.equal(agyCards().length, 0, 'not on the phone')
+  assert.equal(l.answers.length, 1)
+  assert.equal(l.answers[0]!.behavior, 'allow')
+  assert.equal(l.answers[0]!.mark.step, 1)
+  assert.equal(cards.autoAnswering(A, new Date(BASE * 1000).toISOString()), true, 'the notifier does not ring it')
+  assert.equal(cards.autoAnswering(A, new Date((BASE + 1) * 1000).toISOString()), false, 'another card is not quiet')
+  assert.ok(l.logs.some((x) => /auto-approve/.test(x) && !/ls/.test(x)), 'logged, without the command')
+  // the same card is typed once
+  await cards.sync()
+  await settle()
+  assert.equal(l.answers.length, 1)
+  // ★ the next card (the next call, a new state write) is answered too
+  appendFileSync(l.transcript, JSON.stringify({ step_index: 2, type: 'GENERIC', content: `Created At: ${new Date((BASE - 50) * 1000).toISOString()}\nok` }) + '\n')
+  appendFileSync(l.transcript, JSON.stringify({ step_index: 3, type: 'PLANNER_RESPONSE', created_at: new Date((BASE - 40) * 1000).toISOString(), tool_calls: [{ name: 'run_command', args: { CommandLine: 'pwd' } }] }) + '\n')
+  l.setState({}, BASE + 5)
+  await cards.sync()
+  await settle()
+  assert.equal(l.answers.length, 2)
+  assert.equal(l.answers[1]!.mark.step, 3)
+  // ⚠️ the same call again under a new state write (a resize after a byte the relay dropped): never typed twice — the phone's
+  l.setState({}, BASE + 6)
+  await cards.sync()
+  await settle()
+  assert.equal(l.answers.length, 2)
+  assert.equal(agyCards().length, 1)
+})
+
+test('★★ auto-approve: a key that does not land sends that card to the phone (and rings it); it is not typed again', async (t) => {
+  const l = lab(t)
+  await autoOn(t)
+  l.result.value = { ok: false, reason: 'unreachable' } as never
+  const reraised: string[] = []
+  const cards = new AgyCards({ ...l.deps, unconfirmedMs: 10_000, reraised: (c, card) => reraised.push(`${c}@${card}`) })
+  await cards.sync()
+  await settle()
+  await cards.sync()
+  await settle()
+  assert.equal(l.answers.length, 1, 'typed once')
+  assert.equal(agyCards().length, 1, 'now on the phone')
+  assert.deepEqual(reraised, [`${A}@${new Date(BASE * 1000).toISOString()}`])
+  assert.equal(cards.autoAnswering(A, new Date(BASE * 1000).toISOString()), false, 'it rings')
+})
+
+test('★★ auto-approve: a card still up after the key goes to the phone', async (t) => {
+  const l = lab(t)
+  await autoOn(t)
+  const reraised: string[] = []
+  const cards = new AgyCards({ ...l.deps, unconfirmedMs: 40, reraised: (c, card) => reraised.push(`${c}@${card}`) })
+  await cards.sync()
+  await new Promise((r) => setTimeout(r, 120))
+  await cards.sync()
+  assert.equal(l.answers.length, 1)
+  assert.equal(agyCards().length, 1)
+  assert.equal(reraised.length, 1)
+})
+
+test('★ auto-approve: a card the phone cannot answer is never typed at (it stays on the PC and is not quiet)', async (t) => {
+  const l = lab(t)
+  await autoOn(t)
+  writeFileSync(
+    l.transcript,
+    JSON.stringify({ step_index: 0, type: 'USER_INPUT', content: '<USER_REQUEST>\nhi\n</USER_REQUEST>' }) +
+      '\n' +
+      JSON.stringify({ step_index: 1, type: 'PLANNER_RESPONSE', created_at: new Date((BASE - 60) * 1000).toISOString(), tool_calls: [{ name: 'browser_open', args: { Url: 'x' } }] }) +
+      '\n',
+  )
+  const cards = new AgyCards(l.deps)
+  await cards.sync()
+  await settle()
+  assert.equal(l.answers.length, 0)
+  assert.equal(cards.autoAnswering(A, new Date(BASE * 1000).toISOString()), false)
+})
+
+test('auto-approve off (or another conversation’s): the card goes to the phone as before', async (t) => {
+  const l = lab(t)
+  resetAutoApprove()
+  t.after(() => resetAutoApprove())
+  await setAutoApprove('agy-ffffffff-ffff-4fff-8fff-ffffffffffff', true)
+  const cards = new AgyCards(l.deps)
+  await cards.sync()
+  await settle()
+  assert.equal(l.answers.length, 0)
+  assert.equal(agyCards().length, 1)
+})
+
+test('★★ auto-approve: turned off (or expired) during the wait ⇒ nothing typed, the card goes to the phone and rings', async (t) => {
+  const l = await (async () => lab(t))()
+  await autoOn(t)
+  const reraised: string[] = []
+  let wanted: boolean | undefined
+  const cards = new AgyCards({
+    ...l.deps,
+    unconfirmedMs: 10_000,
+    reraised: (c, card) => reraised.push(`${c}@${card}`),
+    answer: async (_c, _m, _b, stillWanted) => {
+      await setAutoApprove(`agy-${A}`, false)
+      wanted = stillWanted?.()
+      return wanted ? { ok: true } : { ok: false, reason: 'changed' }
+    },
+  })
+  await cards.sync()
+  await settle()
+  await cards.sync()
+  assert.equal(wanted, false, 'asked right before the key')
+  assert.equal(agyCards().length, 1, 'on the phone')
+  assert.equal(reraised.length, 1)
+})
+
+test('★★ auto-approve never types at a card already shown on the phone (a denial whose key failed stays a denial)', async (t) => {
+  const l = lab(t)
+  const cards = new AgyCards({ ...l.deps, unconfirmedMs: 10_000 })
+  await cards.sync()
+  assert.equal(agyCards().length, 1)
+  await autoOn(t)
+  l.result.value = { ok: false, reason: 'unreachable' } as never
+  answer(agyCards()[0]!.key, 'deny')
+  await settle()
+  await cards.sync()
+  await settle()
+  assert.deepEqual(l.answers.map((a) => a.behavior), ['deny'], 'never an allow')
+  assert.equal(agyCards().length, 1, 'back on the phone')
+})
+
+test('★ auto-approve: a look that cannot tell keeps the typed card (it is not typed again, and still goes to the phone if it stays up)', async (t) => {
+  const l = lab(t)
+  await autoOn(t)
+  const probe = { fail: false }
+  const reraised: string[] = []
+  const cards = new AgyCards({
+    ...l.deps,
+    unconfirmedMs: 60,
+    reraised: (c) => reraised.push(c),
+    agy: () => ({ ...l.deps.agy(), locksOf: (p: number) => (probe.fail ? undefined : p === PID ? [A] : []) }),
+  })
+  await cards.sync()
+  await settle()
+  probe.fail = true
+  await cards.sync()
+  probe.fail = false
+  await cards.sync()
+  await settle()
+  assert.equal(l.answers.length, 1, 'typed once')
+  await new Promise((r) => setTimeout(r, 120))
+  await cards.sync()
+  assert.equal(l.answers.length, 1)
+  assert.equal(reraised.length, 1, 'handed to the phone')
+  assert.equal(agyCards().length, 1)
+})
+
+test('★★ auto-approve types only into the agy process it was given to (same pid, same relay registration)', async (t) => {
+  for (const owner of [{ pid: PID + 1, startedAt: (BASE - 1000) * 1000 }, { pid: PID, startedAt: (BASE - 999) * 1000 }]) {
+    const l = lab(t)
+    await autoOn(t, owner)
+    const cards = new AgyCards(l.deps)
+    await cards.sync()
+    await settle()
+    assert.equal(l.answers.length, 0, JSON.stringify(owner))
+    assert.equal(agyCards().length, 1, 'on the phone instead')
+    resetPending()
+  }
+})
+
+test('★★ a denial whose key failed stays a denial through a status rewrite (a resize): the call is remembered, not the write', { timeout: 5000 }, async (t) => {
+  const l = lab(t)
+  const cards = new AgyCards({ ...l.deps, unconfirmedMs: 10_000 })
+  await cards.sync()
+  await autoOn(t)
+  l.result.value = { ok: false, reason: 'unreachable' } as never
+  answer(agyCards()[0]!.key, 'deny')
+  await settle()
+  // the terminal is resized: the same call, a new status write
+  l.setState({}, BASE + 7)
+  await cards.sync()
+  await settle()
+  assert.deepEqual(l.answers.map((a) => a.behavior), ['deny'])
+  assert.equal(agyCards().length, 1)
+})
+
+test('★★ a denial whose key failed stays a denial while the status file is missing for a while (a full disk)', { timeout: 5000 }, async (t) => {
+  const l = lab(t)
+  const cards = new AgyCards({ ...l.deps, unconfirmedMs: 10_000 })
+  await cards.sync()
+  await autoOn(t)
+  l.result.value = { ok: false, reason: 'unreachable' } as never
+  answer(agyCards()[0]!.key, 'deny')
+  await settle()
+  const { rmSync: rm } = await import('node:fs')
+  rm(join(l.deps.agy().dir, `pid-${PID}.json`))
+  await cards.sync()
+  l.setState({}, BASE + 9)
+  await cards.sync()
+  await settle()
+  assert.deepEqual(l.answers.map((a) => a.behavior), ['deny'])
+})
+
+test('★★ a late failure of an older auto-answer never erases a newer call’s "was on the phone"', { timeout: 5000 }, async (t) => {
+  const l = lab(t)
+  await autoOn(t)
+  let release!: (v: { ok: false; reason: 'changed' }) => void
+  const first = new Promise<{ ok: false; reason: 'changed' }>((r) => (release = r))
+  let calls = 0
+  const cards = new AgyCards({
+    ...l.deps,
+    unconfirmedMs: 10_000,
+    answer: async (conv, mark, behavior) => {
+      l.answers.push({ conv, mark, behavior })
+      return calls++ === 0 ? first : { ok: false, reason: 'unreachable' }
+    },
+  })
+  await cards.sync()
+  // auto-approve turned off; the PC answers call A; call B reaches the phone
+  await setAutoApprove(`agy-${A}`, false)
+  appendFileSync(l.transcript, JSON.stringify({ step_index: 2, type: 'GENERIC', content: `Created At: ${new Date((BASE - 50) * 1000).toISOString()}\nok` }) + '\n')
+  appendFileSync(l.transcript, JSON.stringify({ step_index: 3, type: 'PLANNER_RESPONSE', created_at: new Date((BASE - 40) * 1000).toISOString(), tool_calls: [{ name: 'run_command', args: { CommandLine: 'pwd' } }] }) + '\n')
+  l.setState({}, BASE + 5)
+  await cards.sync()
+  assert.equal(agyCards().length, 1, 'B on the phone')
+  // A's attempt fails late
+  release({ ok: false, reason: 'changed' })
+  await settle()
+  // on again; the phone's denial of B does not land
+  await autoOn(t)
+  answer(agyCards()[0]!.key, 'deny')
+  await settle()
+  await cards.sync()
+  await settle()
+  assert.ok(!l.answers.some((a) => a.mark.step === 3 && a.behavior === 'allow'), 'B is never auto-allowed')
+})
+
+test('★★ an auto-answer still waiting to type gives way once its call reaches the phone', { timeout: 5000 }, async (t) => {
+  const l = lab(t)
+  await autoOn(t)
+  let wantedAtKey: boolean | undefined
+  let go!: () => void
+  const gate = new Promise<void>((r) => (go = r))
+  const cards = new AgyCards({
+    ...l.deps,
+    unconfirmedMs: 10_000,
+    answer: async (_c, _m, _b, stillWanted) => {
+      await gate
+      wantedAtKey = stillWanted?.()
+      return wantedAtKey ? { ok: true } : { ok: false, reason: 'changed' }
+    },
+  })
+  await cards.sync()
+  // a look that cannot read the transcript drops the try; the next shows the call on the phone
+  writeFileSync(l.transcript, '')
+  await cards.sync()
+  writeFileSync(
+    l.transcript,
+    JSON.stringify({ step_index: 0, type: 'USER_INPUT', content: '<USER_REQUEST>\nhi\n</USER_REQUEST>' }) +
+      '\n' +
+      JSON.stringify({ step_index: 1, type: 'PLANNER_RESPONSE', created_at: new Date((BASE - 60) * 1000).toISOString(), tool_calls: [{ name: 'run_command', args: { CommandLine: 'ls' } }] }) +
+      '\n',
+  )
+  await cards.sync()
+  assert.equal(agyCards().length, 1, 'on the phone')
+  go()
+  await settle()
+  assert.equal(wantedAtKey, false, 'the waiting auto-answer does not type')
+})
+
+test('★ a relay record that cannot be read now is "cannot tell": the phone card stays, nothing new is decided', async (t) => {
+  const l = lab(t)
+  const cards = new AgyCards(l.deps)
+  await cards.sync()
+  const key = agyCards()[0]!.key
+  const paneFile = join(process.env.NYAN_REMOTE_STATE_DIR!, 'panes', `${PID}.json`)
+  const { readFileSync: read } = await import('node:fs')
+  const good = read(paneFile, 'utf8')
+  writeFileSync(paneFile, '{ broken')
+  await cards.sync()
+  assert.equal(agyCards().length, 1)
+  assert.equal(agyCards()[0]!.key, key)
+  assert.equal(cards.unsureAbout(A), true)
+  writeFileSync(paneFile, good)
+  await cards.sync()
+  assert.equal(cards.unsureAbout(A), false)
   assert.equal(agyCards()[0]!.key, key)
 })

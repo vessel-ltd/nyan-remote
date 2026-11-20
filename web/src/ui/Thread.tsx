@@ -77,6 +77,7 @@ export function Thread({
   waitConfirmed,
   onAnswer,
   onBack,
+  onToggled,
 }: {
   transport: Transport
   sessionId: string
@@ -140,6 +141,8 @@ export function Thread({
    */
   waitConfirmed: boolean
   onBack: () => void
+  /** ★ An auto-approve toggle was answered: read this machine's list again now (its mark shows the banner and its off) */
+  onToggled?: () => void
 }) {
   // ★★ What this row may be acted on with (2026-11-14 / `ui/tool.ts`). ⚠️ Everything below uses `features`, never
   //   `agentFeatures`: a Codex row gets only what its own marks grant (no button that 404s). The one exception is
@@ -876,7 +879,15 @@ export function Thread({
    *    **Never make it look like success**. The text is in one place, `ui/autoApprove.ts` (on/off mean opposite things).
    */
   const sendAuto = async (target: string, on: boolean, duration?: AutoApproveDuration): Promise<AutoApproveResult> => {
-    const res = await transport.setAutoApprove(target, on, duration)
+    // ★ The list (the row's mark, which shows the banner and its off) is read again at once, whatever came of it — a lost
+    //   answer too (it may have taken effect): the event that says so may not arrive (codex review: the thread still
+    //   offered "turn on" while it was passing). A newer read makes any older one in flight stale (`main.tsx` `refresh`)
+    let res: AutoApproveResult
+    try {
+      res = await transport.setAutoApprove(target, on, duration)
+    } finally {
+      onToggled?.()
+    }
     if (!res.ok) throw new Error(autoApproveError(on, res.reason))
     return res
   }
@@ -894,9 +905,10 @@ export function Thread({
     setNote(undefined)
     try {
       await sendAuto(target.sessionId, false)
-      setNote({ bad: false, text: t('自動承認をオフにしました', 'Auto-approve turned off') })
+      // ⚠️ Not over a later toggle's note (a late answer contradicted a newer one / codex review)
+      if (runToken.current === token) setNote({ bad: false, text: t('自動承認をオフにしました', 'Auto-approve turned off') })
     } catch (err) {
-      setNote({ bad: true, text: err instanceof Error ? err.message : String(err) })
+      if (runToken.current === token) setNote({ bad: true, text: err instanceof Error ? err.message : String(err) })
     } finally {
       setRunning((prev) => releaseRunning(prev, token))
     }
@@ -918,7 +930,8 @@ export function Thread({
       else if (target.id === 'auto-approve') {
         // ★ The duration is passed by name (the length comes from the agent's table). ⚠️ The notice is built from **the expiry the agent returned**
         const res = await sendAuto(target.sessionId, true, target.duration)
-        setNote({ bad: false, text: autoApproveOnText(res.until) })
+        // ⚠️ Not over a later toggle's note (a late "on" answer wrote "on" over "turned off" / codex review)
+        if (runToken.current === token) setNote({ bad: false, text: autoApproveOnText(res.until) })
         return
       } else await transport.runCommand(target.sessionId, target.id)
       // ⚠️⚠️ Checking "does it match the current `sessionId`" here **means nothing**
@@ -949,7 +962,9 @@ export function Thread({
    */
   const autoView = autoApproveView(
     session,
-    running?.id === 'auto-approve' ? 'sending' : 'ready',
+    // ★ While the list shows it on, "off" is never held back by a request in flight (an "on" whose answer stalls had
+    //   disabled it while it was already passing / codex review). A second "off" is harmless.
+    running?.id === 'auto-approve' && !session?.autoApprove ? 'sending' : 'ready',
     features,
   )
   const actions: ThreadBarAction[] = [

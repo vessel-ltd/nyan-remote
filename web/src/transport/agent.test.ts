@@ -295,7 +295,11 @@ test('★★ auto-approve duration is sent as a name only and not attached when 
     rec.calls.map((c) => c.body),
     [{ on: true, duration: '24h' }, { on: true }, { on: false }],
     '⚠️⚠️ duration name not delivered (choosing 24h gives 3h) / duration attached to off',
-  )
+  )  // ★ an agy "on" says this PWA showed agy's own confirmation (an off never needs it)
+  const agy = recording(() => ({ status: 200, body: { ok: true } }))
+  await agy.transport.setAutoApprove('agy-1', true, '3h')
+  await agy.transport.setAutoApprove('agy-1', false)
+  assert.deepEqual(agy.calls.map((c) => c.body), [{ on: true, duration: '3h', agy: true }, { on: false }])
 })
 
 test('★ the session list keeps the agent’s `at` (the "needs you" cleanup reads it); a non-string is dropped', async () => {
@@ -306,4 +310,24 @@ test('★ the session list keeps the agent’s `at` (the "needs you" cleanup rea
   assert.equal((await odd.transport.listSessions({ history: false })).at, undefined)
   const old = recording(() => ({ status: 200, body: { machine: 'm', sessions: [] } }))
   assert.equal('at' in (await old.transport.listSessions({ history: false })), false)
+})
+
+test('★ auto-approve marks keep their tool; an agy id is agy even when the agent names none', async () => {
+  const rec = recording(() => ({
+    status: 200,
+    body: {
+      permissions: [],
+      autoApprove: [
+        { id: 'agy-062a8f25-9451-42f3-ae93-34a208e99365', until: 'x' },
+        { id: 'agy-062a8f25-9451-42f3-ae93-34a208e99366', until: 'x', tool: 'agy' },
+        { id: 'codex-1', until: 'x', tool: 'codex' },
+        { id: 'claude', until: 'x', tool: 'something' },
+      ],
+    },
+  }))
+  const page = await rec.transport.listPermissions()
+  assert.deepEqual(
+    page.autoApprove?.map((m) => m.tool),
+    ['agy', 'agy', 'codex', undefined],
+  )
 })

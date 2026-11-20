@@ -655,3 +655,62 @@ test('★★ an "on" still saving when a Codex snapshot leaves its thread out is
   const stored = JSON.parse(await readFile(join(process.env['NYAN_REMOTE_STATE_DIR']!, AUTO_APPROVE_FILE), 'utf8')) as { entries: Array<{ id: string }> }
   assert.deepEqual(stored.entries.map((e) => e.id), [later])
 })
+
+test('★★ an "off" stops passing the moment it is asked, even while it waits behind another session\'s save', async (t) => {
+  await withStateDir(t)
+  const X = '0d6d4d8c-1111-2222-3333-444455556666'
+  const Y = '0d6d4d8c-7777-2222-3333-444455556666'
+  await setAutoApprove(X, true)
+  assert.equal(shouldAutoApprove({ sessionId: X, toolName: 'Bash' }), true)
+  const y = setAutoApprove(Y, true)
+  const off = setAutoApprove(X, false)
+  // still queued behind Y's save: already not passing
+  assert.equal(shouldAutoApprove({ sessionId: X, toolName: 'Bash' }), false)
+  await Promise.all([y, off])
+  assert.equal(shouldAutoApprove({ sessionId: X, toolName: 'Bash' }), false)
+  assert.equal(shouldAutoApprove({ sessionId: Y, toolName: 'Bash' }), true)
+  // a later "on" passes again
+  await setAutoApprove(X, true)
+  assert.equal(shouldAutoApprove({ sessionId: X, toolName: 'Bash' }), true)
+})
+
+test('★★ agy grants are memory only: never written, ignored when read back (an older agent could neither use nor end one)', async (t) => {
+  const dir = await withStateDir(t)
+  const AGY = 'agy-062a8f25-9451-42f3-ae93-34a208e99365'
+  await setAutoApprove(AGY, true)
+  await setAutoApprove(SESSION, true)
+  assert.ok(autoApproveFor(AGY))
+  const stored = JSON.parse(await readFile(join(dir, AUTO_APPROVE_FILE), 'utf8')) as { entries: { id: string }[] }
+  assert.deepEqual(stored.entries.map((e) => e.id), [SESSION])
+  // one written by hand is ignored on load
+  const until = new Date(Date.now() + 60_000).toISOString()
+  await writeFile(join(dir, AUTO_APPROVE_FILE), JSON.stringify({ v: 1, entries: [{ scope: 'session', id: AGY, until, at: new Date().toISOString() }] }))
+  resetAutoApprove()
+  await loadAutoApprove()
+  assert.equal(autoApproveFor(AGY), undefined)
+})
+
+test('★ a memory-only (agy) grant turns on and off without touching the file (a full disk says nothing false)', async (t) => {
+  const dir = await withStateDir(t)
+  const AGY = 'agy-062a8f25-9451-42f3-ae93-34a208e99365'
+  await setAutoApprove(SESSION, true)
+  const before = await readFile(join(dir, AUTO_APPROVE_FILE), 'utf8')
+  await chmod(dir, 0o500)
+  t.after(() => chmod(dir, 0o700).catch(() => undefined))
+  assert.equal((await setAutoApprove(AGY, true)).ok, true)
+  assert.deepEqual(await setAutoApprove(AGY, false), { ok: true })
+  assert.equal(autoApproveFor(AGY), undefined)
+  await setAutoApprove(AGY, true)
+  assert.deepEqual(await endSessionAutoApprove(AGY), { ok: true, had: true })
+  await chmod(dir, 0o700)
+  assert.equal(await readFile(join(dir, AUTO_APPROVE_FILE), 'utf8'), before)
+})
+
+test('★ an agy "off" with a broken state file is done (no "a restart revives it" warning)', async (t) => {
+  const dir = await withStateDir(t)
+  await writeFile(join(dir, AUTO_APPROVE_FILE), '{ broken')
+  await loadAutoApprove()
+  assert.ok(autoApproveBroken())
+  assert.deepEqual(await setAutoApprove('agy-062a8f25-9451-42f3-ae93-34a208e99365', false), { ok: true })
+  assert.equal((await setAutoApprove(SESSION, false)).ok, false, 'a Claude grant still says it could not save')
+})

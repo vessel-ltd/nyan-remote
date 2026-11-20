@@ -295,8 +295,13 @@ test('★★ a card is answered with `1` (allow) or ESC (deny), only while the s
   const mark = { pid: PID, stateMtimeMs: BASE * 1000, step: 1, index: 0, callAt: (BASE - 60) * 1000 }
   assert.deepEqual(await answerAgyCard(A, mark, 'allow', l.deps), { ok: true })
   assert.deepEqual(await answerAgyCard(A, mark, 'deny', l.deps), { ok: true })
+  // ★ no longer wanted right before the byte (auto-approve turned off during the wait) ⇒ nothing typed
+  let asked = 0
+  assert.deepEqual(await answerAgyCard(A, mark, 'allow', l.deps, undefined, () => (asked++, false)), { ok: false, reason: 'changed' })
+  assert.ok(asked > 0)
   await settle()
-  assert.deepEqual(l.got, ['1', '\x1b'])
+  // (the refused one connected and wrote nothing)
+  assert.equal(l.got.join(''), '1\x1b')
   assert.deepEqual(AGY_CARD_KEYS, { allow: '1', deny: '\x1b' })
   // ⚠️ the status file was written again (answered on the PC, a new card): nothing is typed
   l.setState(up, BASE + 1)

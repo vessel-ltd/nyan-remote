@@ -59,6 +59,7 @@ import { membershipOf } from '../team.ts'
 import { hasHidden } from '../../../shared/reveal.ts'
 import { isCodexSessionId } from '../codex/daemon.ts'
 import { agyDelivery, agyDeliveryMessage } from '../agy/cards.ts'
+import { AGY_PREFIX } from '../agy/sessions.ts'
 import { resolveAgentTranscript } from '../claude/subagentTranscript.ts'
 import { parseTranscriptPath } from './hook.ts'
 import { t } from '../../../shared/i18n.ts'
@@ -94,7 +95,7 @@ export async function permissions(): Promise<{
    *    **"auto-approve continues until its expiry even after a restart"** must be readable there
    *    (no marker is raised, so not a single one appears in `permissions`).
    */
-  autoApprove: { id: string; until: string }[]
+  autoApprove: { id: string; until: string; tool?: 'codex' | 'agy' }[]
 }> {
   await sweepResolved()
   // ★ `quiet` = the number of subagent requests "waiting quietly".
@@ -112,7 +113,11 @@ export async function permissions(): Promise<{
     // ⚠️ Only `sessionId` and expiry (nothing derived from the conversation / §6.2)
     // ★ `tool` for a Codex row's entry: the phone builds a row from a mark that landed on no row, and that row must
     //   not pass for a Claude session (its gates differ / codex review, medium #7)
-    autoApprove: autoApproveList().map((e) => ({ id: e.id, until: e.until, ...(isCodexSessionId(e.id) ? { tool: 'codex' as const } : {}) })),
+    autoApprove: autoApproveList().map((e) => ({
+      id: e.id,
+      until: e.until,
+      ...(isCodexSessionId(e.id) ? { tool: 'codex' as const } : e.id.startsWith(AGY_PREFIX) ? { tool: 'agy' as const } : {}),
+    })),
   }
 }
 

@@ -188,7 +188,7 @@ export interface Transport {
      * ⚠️ Old agents don't return it (`undefined`). Then nothing shows, as before.
      */
     /** `tool`: which tool's session (absent = Claude) — a row built from the mark must keep it */
-    autoApprove?: { id: string; until: string; tool?: 'codex' }[]
+    autoApprove?: { id: string; until: string; tool?: 'codex' | 'agy' }[]
   }>
   /**
    * Approve / deny. ok:false means it timed out or was handled on the PC.

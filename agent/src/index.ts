@@ -5,7 +5,8 @@
 //    Do not open the port. Opening it creates an unauthenticated entry point (§4.2.1).
 
 import { startAgyWatch } from './agy/watch.ts'
-import { agyDir, agyOthersWrote, agyOwnRowOf, agyOwnRows, conversationOf, defaultAgyDeps, transcriptPathOf, withLocksProbed } from './agy/sessions.ts'
+import { endAgyGrantsOver } from './agy/grants.ts'
+import { AGY_PREFIX, agyDir, agyOthersWrote, agyOwnRowOf, agyOwnRows, conversationOf, defaultAgyDeps, transcriptPathOf, withLocksProbed } from './agy/sessions.ts'
 import { lastTurnStartCached, readTailRecords, turnEnd } from './agy/pending.ts'
 import { AgyCards } from './agy/cards.ts'
 import { homedir } from 'node:os'
@@ -21,7 +22,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import { hostAllowed } from './hostCheck.ts'
 import { watchServe } from './tailscale.ts'
 import { devMode } from './auth.ts'
-import { autoApproveList, endCodexAutoApproveOutside, endSessionAutoApprove, loadAutoApprove, setAutoApproveExpiryHandler } from './autoApprove.ts'
+import { autoApproveFor, autoApproveList, endCodexAutoApproveOutside, endSessionAutoApprove, loadAutoApprove, setAutoApproveExpiryHandler } from './autoApprove.ts'
 import { discoverConfigDirs } from './claude/configDirs.ts'
 import { seedHookState } from './claude/hookState.ts'
 import { startSessionWatch } from './claude/sessionWatch.ts'
@@ -140,13 +141,13 @@ async function main(): Promise<void> {
   const agyCards = new AgyCards({
     agy: () => ({ ...defaultAgyDeps(), aliveProcStart: aliveProcStartSync }),
     machine: machineName(),
-    answer: (conv, mark, behavior) => answerAgyCard(conv, mark, behavior),
+    answer: (conv, mark, behavior, stillWanted) => answerAgyCard(conv, mark, behavior, undefined, undefined, stillWanted),
     changed: () => broadcast({ type: 'permissions-changed', machine: machineName(), at: new Date().toISOString() }),
     now: () => new Date(),
     log: (line) => console.log(line),
     // ★ The card came back after a key that did not land: ring "needs you" again (`notify.ts` rule 11)
-    reraised: (conv, card) => {
-      agyNotifier.owe(`agy-${conv}`, card)
+    reraised: (conv, card, once) => {
+      agyNotifier.owe(`agy-${conv}`, card, once)
       void agyNotifier.look()
     },
   })
@@ -176,14 +177,39 @@ async function main(): Promise<void> {
       return agyOthersWrote(d.dir, conv, since, d.isAgy, d.locksOf!)
     },
     home: homedir(),
+    // ★ A card auto-approve answers does not ring (`cards.ts` rule 5b)
+    //   ⚠️ The cards look again first when it is on (a card written after their last look and before this snapshot was
+    //      not decided yet, and rang / codex review). `sync` settles after a look that started after the call.
+    quiet: async (sessionId, card) => {
+      const conv = conversationOf(sessionId)
+      if (conv === undefined || autoApproveFor(sessionId) === undefined) return false
+      await agyCards.fresh()
+      if (agyCards.autoAnswering(conv, card)) return true
+      // cannot tell now ⇒ the notifier holds it back for a few looks
+      return agyCards.unsureAbout(conv) ? undefined : false
+    },
     // ★ The same text builder and sender as Claude and Codex
     send: async (row, fields, current) =>
       (await sendToAll(withPendingPerms(codexPayload(row, fields, new Date().toISOString(), toPushPayload)), undefined, current)).sent,
     log: (line) => console.log(line),
   })
+  // ★ Cards first: the notifier asks which card auto-approve is answering (`quiet`), decided by the cards' look
   const agyLook = (): void => {
-    void agyCards.sync().catch(() => undefined)
-    void agyNotifier.look()
+    void agyCards.fresh().then(() => agyNotifier.look())
+    void endAgyAutoApproveGone().catch(() => undefined)
+  }
+  // ★ An agy grant whose agy no longer shows the conversation (it exited, moved on, or this agent restarted and forgot
+  //   which agy it was for) is ended, like Claude's `SessionEnd` (docs/AGY.md §10 / `grants.ts`). Only while one is on.
+  const endAgyAutoApproveGone = async (): Promise<void> => {
+    // ⚠️ The grants first, then the probe (one turned on during the probe is not judged by a lock seen before it)
+    const entries = autoApproveList().filter((e) => e.id.startsWith(AGY_PREFIX))
+    if (entries.length === 0) return
+    const ended = await endAgyGrantsOver(entries, await withLocksProbed({ ...defaultAgyDeps(), aliveProcStart: aliveProcStartSync }), (l) => console.warn(l))
+    if (ended.length === 0) return
+    broadcast({ type: 'sessions-changed', at: new Date().toISOString() })
+    // ★ A card the grant would have answered is now the person's: the cards raise it on the phone and the notifier
+    //   rings it (a waiting card rings even on the agent's first look / `notify.ts` rule 3)
+    agyLook()
   }
   agyLook()
   setInterval(agyLook, AGY_LOOK_MS).unref()
@@ -381,7 +407,14 @@ async function main(): Promise<void> {
       )
     }
     // ★ Auto-approve **stays in effect after a restart until it expires** (it is persisted). Make it readable in the exit log
-    const auto = autoApproveList()
+    // ⚠️ agy grants are memory only: they end here (docs/AGY.md §10)
+    const agyAuto = autoApproveList().filter((e) => e.id.startsWith(AGY_PREFIX))
+    if (agyAuto.length > 0) {
+      console.warn(
+        t(`[auto] ⚠️ agy の自動承認 ${agyAuto.length} 件はこの終了で切れます`, `[auto] ⚠️ ${agyAuto.length} agy auto-approve grants end with this exit`),
+      )
+    }
+    const auto = autoApproveList().filter((e) => !e.id.startsWith(AGY_PREFIX))
     if (auto.length > 0) {
       console.warn(
         t(

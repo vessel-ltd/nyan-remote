@@ -484,6 +484,11 @@ export async function answerAgyCard(
   behavior: 'allow' | 'deny',
   deps: AgyKeysDeps = defaultAgyKeysDeps(),
   tail: (path: string) => Record<string, unknown>[] = readTailRecords,
+  /**
+   * ★ Asked right before the byte (with the card checks): false = no longer wanted, nothing typed (`changed`).
+   * Auto-approve passes "still on for this card" (codex review: an "off" or the expiry during the settle wait typed `1`).
+   */
+  stillWanted?: () => boolean,
 ): Promise<{ ok: true } | { ok: false; reason: AgyCardFailure }> {
   const conv = conversationId.toLowerCase()
   return serializeBySession(keyOf(conv), async () => {
@@ -501,7 +506,8 @@ export async function answerAgyCard(
     if (!sameCardNow(target, mark, checks)) return { ok: false, reason: 'changed' }
     await new Promise((r) => setTimeout(r, deps.answerSettleMs ?? AGY_ANSWER_SETTLE_MS))
     const res = await writeControl(pane.socketPath, AGY_CARD_KEYS[behavior], {
-      beforeWrite: () => !sameCardNow(target, mark, checks),
+      // ⚠️ `stillWanted` last: the card checks can take a while (a Mac's `lsof`), and an expiry during them counts
+      beforeWrite: () => !sameCardNow(target, mark, checks) || (stillWanted !== undefined && !stillWanted()),
     })
     if (res.ok) return { ok: true }
     return { ok: false, reason: res.reason === 'pending-approval' ? 'changed' : 'unreachable' }

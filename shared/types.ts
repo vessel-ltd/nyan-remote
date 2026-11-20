@@ -296,6 +296,11 @@ export type AgentFeature =
    *   docs/AGY.md §9). Only the thread's note uses it (the cards themselves need nothing new on the phone).
    */
   | 'agy-approve'
+  /**
+   * ★ `POST /sessions/:id/auto-approve` takes agy conversations (2026-11-20 / docs/AGY.md §10): a card the phone could
+   *   answer is answered `1` by the agent while it is on. ⚠️ Without it an older agent refuses agy ids (400).
+   */
+  | 'agy-auto-approve'
   /** ★ `POST /sessions/:id/message` sends to an idle Codex thread (a new turn on the daemon / 2026-11-15) */
   | 'codex-send'
   /** ★ Auto-approve mode also passes Codex command approvals, and Codex rows carry the mark (2026-11-14) */

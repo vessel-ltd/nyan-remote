@@ -8,7 +8,9 @@
 //  2. ⚠️⚠️ "Done" only when the turn ended with the model's answer (`pending.ts` `turnEnd(...).answered`). A turn
 //     stopped with ESC, or ended by declining a card, also ends idle (agy sends nothing that tells them apart), and
 //     its transcript ends without an answer ⇒ nothing is sent (someone stopped it by hand).
-//  3. Only changes are told: the first look after the agent starts is the baseline (nothing is sent for it).
+//  3. Only changes are told: the first look after the agent starts is the baseline — except a card waiting then, which
+//     rings ("needs you" is always something to do; codex review: a card that appeared while the agent was down, or
+//     whose auto-approve grant the restart ended, stayed silent). Accepted: a restart rings a still-waiting card again.
 //  4. Same turn and same words ⇒ not sent again; for "needs you", same card (each card rings once, like a Claude
 //     approval). ⚠️ Remembered only when a send succeeded. The turn is the last USER_INPUT's step.
 //  4b. ★ A send that reached no device is tried again while the row stays in that state (at most every
@@ -26,6 +28,8 @@
 //     cached by the file's size) when the rows are read, so every look knows the turn (codex review).
 // 11. ★ A card the phone answered but whose key did not land comes back (`cards.ts` rule 4c) ⇒ `owe` rings "needs you"
 //     again on a look that sees it waiting (the phone had closed the old one when it denied).
+// 12. ★ A card auto-approve is answering (`cards.ts` rule 5b / `quiet`) does not ring "needs you". If its key does not
+//     land, the card goes to the phone and `owe` rings it (rule 11).
 //  8. ★ The rows come from each agy's own state (`agyOwnRows`: the agys holding their conversation's lock), not
 //     from the per-conversation file a second agy on the same conversation can overwrite.
 
@@ -55,6 +59,11 @@ export interface AgyNotifyDeps {
   othersWrote?: (sessionId: string, since: number) => Promise<boolean | undefined> | boolean | undefined
   /** ★ The turn's prompt looked for further back, when the tail did not hold it (rule 10). Absent = not looked for */
   turnStart?: (sessionId: string) => { turn: number; at: number } | undefined
+  /**
+   * ★ Rule 12: whether this card (`cardOf`) is being answered by auto-approve. undefined = cannot tell now (held back
+   * for the next looks, at most `QUIET_UNSURE_MAX`, then rung). Absent = never
+   */
+  quiet?: (sessionId: string, card: string) => boolean | undefined | Promise<boolean | undefined>
 }
 
 interface Sent {
@@ -83,7 +92,12 @@ interface Owed {
   card?: string
   label: string
   nextAt: number
+  /** Rule 12: how many looks in a row could not tell whether auto-approve is answering this card */
+  unsure?: number
 }
+
+/** Rule 12: looks that may hold back a "needs you" while it cannot be told whether auto-approve answers it */
+export const QUIET_UNSURE_MAX = 3
 
 /**
  * ★ Whether the row's state belongs to the transcript's newest prompt. The prompt's time is whole seconds, so a state
@@ -120,7 +134,7 @@ export class AgyNotifier {
   /** When the previous applied look was taken (rule 7) */
   #lastAt: number | undefined
   /** Rule 11: session → the request to ring again (its number) */
-  #ringAgain = new Map<string, { seq: number; nextAt: number; card: string | undefined }>()
+  #ringAgain = new Map<string, { seq: number; nextAt: number; card: string | undefined; once?: true }>()
   #ringSeq = 0
   /** The newest snapshot's states, as soon as it is read (rule 6, the sender's guard) */
   #seen = new Map<string, { status: string; turn: number | undefined; card?: string }>()
@@ -134,9 +148,11 @@ export class AgyNotifier {
    * Rule 11: ring "needs you" again for this conversation (its card came back after a key that did not land). Sent on a
    * look that sees it waiting, past the "same turn, same words" rule; dropped once it is not waiting.
    */
-  owe(sessionId: string, card: string): void {
+  owe(sessionId: string, card: string, once = false): void {
     // ★ For that card (its own state write, as `cardOf`): another card is told in its own right (codex review)
-    this.#ringAgain.set(sessionId, { seq: ++this.#ringSeq, nextAt: 0, card })
+    // ★ `once`: only if that card has not rung yet (an auto-answer that failed: a "needs you" already sent or on its
+    //   way for it is enough / codex review: it rang twice)
+    this.#ringAgain.set(sessionId, { seq: ++this.#ringSeq, nextAt: 0, card, ...(once ? { once: true } : {}) })
   }
 
   /**
@@ -205,8 +221,9 @@ export class AgyNotifier {
     this.#last = kept
     const prevAt = this.#lastAt
     this.#lastAt = snap.at
-    // Rule 3
-    if (!before) return
+    // Rule 3: the baseline tells only the cards waiting now
+    const baseline = before === undefined
+    const prior = before ?? new Map<string, { status: string; turn: number | undefined; card?: string }>()
     const nowMs = (this.#deps.now ?? Date.now)()
     // a push owed for a state or turn that is over is dropped (codex review: an old turn's "done" was retried after the
     // next turn had been stopped)
@@ -230,8 +247,12 @@ export class AgyNotifier {
     }
     // ★ For "needs you", the same card too (a queued alert for a card already answered is not sent for the next one)
     const sameCard = (a: string | undefined, b: string | undefined, to: string): boolean => to !== 'waiting' || a === b
+    // ★ For "needs you" the card alone decides, not the turn (a look that could not read the transcript had another turn
+    //   for the same card, and its push was dropped for good / codex review)
+    const sameTurn = (a: number | undefined, b: number | undefined, to: string): boolean => to === 'waiting' || a === b
     for (const row of rows) {
-      const from = before.get(row.sessionId)
+      if (baseline && row.status !== 'waiting') continue
+      const from = prior.get(row.sessionId)
       const to = row.status
       const end = ends.get(row.sessionId)
       if (!end || !conversationOf(row.sessionId)) continue
@@ -250,7 +271,11 @@ export class AgyNotifier {
       //   codex review); other states go by turn
       const fresh = from === undefined || from.status !== to || (to === 'waiting' ? newCard : newTurn)
       // Rule 11
-      const ring = to === 'waiting' ? this.#ringAgain.get(row.sessionId) : undefined
+      let ring = to === 'waiting' ? this.#ringAgain.get(row.sessionId) : undefined
+      if (ring?.once && ring.card !== undefined && this.#sent.get(row.sessionId)?.card === ring.card) {
+        this.#ringAgain.delete(row.sessionId)
+        ring = undefined
+      }
       // ⚠️ A failed ring waits like any owed push (`RETRY_MS`), not every look; meanwhile the usual rules apply
       const again = ring && ring.nextAt <= nowMs && ring.card === now.get(row.sessionId)?.card ? ring : undefined
       if (again !== undefined) {
@@ -267,6 +292,27 @@ export class AgyNotifier {
         // Rule 7
       } else {
         continue
+      }
+      // Rule 12 (asked only for a "needs you" about to go out)
+      if (to === 'waiting' && cardKey !== undefined && again === undefined && this.#deps.quiet) {
+        const q = await this.#deps.quiet(row.sessionId, cardKey)
+        const l = statusLabel(row.status)
+        if (q === true) {
+          // ★ Asked again on every look while the card waits: an auto-answer that fails without telling (its record
+          //   dropped by a look that could not read the transcript) is then rung (codex review: it stayed silent)
+          if (l) this.#owed.set(row.sessionId, { status: to, turn: now.get(row.sessionId)?.turn, card: cardKey, label: l, nextAt: nowMs })
+          continue
+        }
+        // ⚠️ Cannot tell (the cards' lock probe failed): held back for the next looks, then rung (codex review: it rang
+        //    for a card the next look auto-answered)
+        if (q === undefined) {
+          const was = this.#owed.get(row.sessionId)
+          const n = (was?.card === cardKey ? (was.unsure ?? 0) : 0) + 1
+          if (n <= QUIET_UNSURE_MAX && l) {
+            this.#owed.set(row.sessionId, { status: to, turn: now.get(row.sessionId)?.turn, card: cardKey, label: l, nextAt: nowMs, unsure: n })
+            continue
+          }
+        }
       }
       // Rule 9: a "done" read from a transcript another agy wrote into during this turn may be the other one's answer
       if (to === 'done') {
@@ -289,7 +335,7 @@ export class AgyNotifier {
         this.#owed.set(row.sessionId, { status: to, turn: now.get(row.sessionId)?.turn, ...(cardKey !== undefined ? { card: cardKey } : {}), label, nextAt: nowMs + RETRY_MS })
         continue
       }
-      if (l.status !== to || l.turn !== end.turn || !sameCard(l.card, cardKey, to)) continue
+      if (l.status !== to || !sameTurn(l.turn, end.turn, to) || !sameCard(l.card, cardKey, to)) continue
       // ★ The turn this state belongs to (not merely the newest prompt: a state written before it is the previous
       //   turn's, and is remembered under that turn / codex review)
       const turn = now.get(row.sessionId)?.turn
@@ -304,6 +350,7 @@ export class AgyNotifier {
       }
       // ⚠️ What was owed when this send started: only that is settled by it (a newer `owe` made meanwhile stays)
       const owedAtStart = this.#owed.get(row.sessionId)
+
       let direct: { at: number; cur: ReturnType<NonNullable<AgyNotifyDeps['statusNow']>> } | undefined
       // ⚠️ A send that throws (a key file unreadable for a moment) counts as reaching nobody: it is owed (rule 4b)
       //    and the other rows of this look still go (codex review)
@@ -318,14 +365,14 @@ export class AgyNotifier {
           label,
         }, () => {
           const n = this.#seen.get(row.sessionId)
-          if (n?.status !== to || n.turn !== end.turn || !sameCard(n.card, cardKey, to)) return false
+          if (n?.status !== to || !sameTurn(n.turn, end.turn, to) || !sameCard(n.card, cardKey, to)) return false
           if (!this.#deps.statusNow) return true
           // ⚠️ The direct read once per send, reused for its devices for a second (a Mac's `lsof` per device stalled
           //    the agent / codex review)
           const t0 = (this.#deps.now ?? Date.now)()
           if (!direct || t0 - direct.at > 1000) direct = { at: t0, cur: this.#deps.statusNow(row.sessionId) }
           const cur = direct.cur
-          return cur?.status === to && cur.turn === end.turn && sameCard(cur.card, cardKey, to)
+          return cur?.status === to && sameTurn(cur.turn, end.turn, to) && sameCard(cur.card, cardKey, to)
         })
         .catch((err: unknown) => {
           this.#deps.log?.(`[agy] notify failed: ${err instanceof Error ? err.message : String(err)}`)

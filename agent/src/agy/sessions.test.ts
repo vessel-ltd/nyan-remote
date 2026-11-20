@@ -17,6 +17,7 @@ import {
   transcriptPathOf,
   AGY_FILE_MAX_AGE_MS,
   agyConversations,
+  agyOwnerShows,
   agyOthersWrote,
   agyOwnRowOf,
   agyOwnRows,
@@ -415,4 +416,91 @@ test('★ "done": only another agy’s writes during the turn count — one mere
   utimesSync(visit, (turnAt + 2000) / 1000, (turnAt + 2000) / 1000)
   assert.equal(agyOthersWrote(dir, A, turnAt, live, locks), true, 'wrote during the turn')
   assert.equal(agyOthersWrote(dir, A, turnAt, live, (p) => (p === 200 ? undefined : locks(p))), undefined, 'cannot tell')
+})
+
+test('★★ an auto-approve owner shows its conversation only while running, with the same relay, holding the lock', async (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'nyan-agy-owner-'))
+  const prev = process.env.NYAN_REMOTE_STATE_DIR
+  process.env.NYAN_REMOTE_STATE_DIR = root
+  t.after(() => {
+    if (prev === undefined) delete process.env.NYAN_REMOTE_STATE_DIR
+    else process.env.NYAN_REMOTE_STATE_DIR = prev
+    rmSync(root, { recursive: true, force: true })
+  })
+  mkdirSync(join(root, 'panes'))
+  writeFileSync(join(root, 'panes', '100.json'), JSON.stringify({ pid: 100, procStart: '1', socket: join(root, 's'), startedAt: 5000, paste: true }))
+  const deps = { dir: join(root, 'agy'), home: root, isAgy: (p: number) => p === 100, now: Date.now(), locksOf: () => [A] as string[] | undefined, aliveProcStart: () => '1' }
+  const owner = { pid: 100, startedAt: 5000 }
+  assert.equal(await agyOwnerShows(owner, A, deps), true)
+  // ⚠️ `/new` (the lock moved) / another conversation
+  assert.equal(await agyOwnerShows(owner, A, { ...deps, locksOf: () => [B] }), false)
+  assert.equal(await agyOwnerShows(owner, B, deps), false)
+  // cannot tell
+  assert.equal(await agyOwnerShows(owner, A, { ...deps, locksOf: () => undefined }), undefined)
+  // ⚠️ another run (a relay registered later, e.g. a reused pid) / exited
+  assert.equal(await agyOwnerShows({ pid: 100, startedAt: 4000 }, A, deps), false)
+  assert.equal(await agyOwnerShows(owner, A, { ...deps, isAgy: () => false, aliveProcStart: () => null }), false, 'gone')
+  assert.equal(await agyOwnerShows(owner, A, { ...deps, isAgy: () => false, aliveProcStart: () => '2' }), false, 'another process now')
+  // ⚠️ the name probe failing for the very process its relay registered: cannot tell
+  assert.equal(await agyOwnerShows(owner, A, { ...deps, isAgy: () => false }), undefined)
+  // ⚠️ …and the relay record unreadable as well: still cannot tell
+  writeFileSync(join(root, 'panes', '100.json'), '{ broken')
+  assert.equal(await agyOwnerShows(owner, A, { ...deps, isAgy: () => false }), undefined)
+  writeFileSync(join(root, 'panes', '100.json'), JSON.stringify({ pid: 100, procStart: '1', socket: join(root, 's'), startedAt: 5000, paste: true }))
+  // ⚠️ the process probes failing: cannot tell
+  assert.equal(await agyOwnerShows(owner, A, { ...deps, isAgy: () => false, aliveProcStart: () => undefined }), undefined)
+  // ⚠️ the relay record unreadable while the agy runs: cannot tell (never ends a live grant on one failed read)
+  assert.equal(await agyOwnerShows(owner, A, { ...deps, aliveProcStart: () => null }), undefined)
+})
+
+test('★★ agy grants end when their owner no longer shows the conversation, or has no owner (an agent restart); never one given again', async (t) => {
+  const { resetAutoApprove, setAutoApprove, autoApproveFor, autoApproveList } = await import('../autoApprove.ts')
+  const { endAgyGrantsOver, resetAgyGrantOwners, setAgyGrantOwner, agyGrantOwner } = await import('./grants.ts')
+  const root = mkdtempSync(join(tmpdir(), 'nyan-agy-grants-'))
+  const prev = process.env.NYAN_REMOTE_STATE_DIR
+  process.env.NYAN_REMOTE_STATE_DIR = root
+  resetAutoApprove()
+  resetAgyGrantOwners()
+  t.after(() => {
+    resetAutoApprove()
+    resetAgyGrantOwners()
+    if (prev === undefined) delete process.env.NYAN_REMOTE_STATE_DIR
+    else process.env.NYAN_REMOTE_STATE_DIR = prev
+    rmSync(root, { recursive: true, force: true })
+  })
+  mkdirSync(join(root, 'panes'))
+  writeFileSync(join(root, 'panes', '100.json'), JSON.stringify({ pid: 100, procStart: '1', socket: join(root, 's'), startedAt: 5000, paste: true }))
+  const locks = { now: [A] as string[] | undefined }
+  const deps = { dir: join(root, 'agy'), home: root, isAgy: (p: number) => p === 100, now: Date.now(), locksOf: () => locks.now, aliveProcStart: () => '1' }
+  setAgyGrantOwner(A, { pid: 100, startedAt: 5000 })
+  await setAutoApprove(`agy-${A}`, true)
+  // no owner (as after a restart) ⇒ ended
+  await setAutoApprove(`agy-${B}`, true)
+  assert.equal((await endAgyGrantsOver(autoApproveList().filter((e) => e.id.startsWith('agy-')), deps)).length, 1)
+  assert.equal(autoApproveFor(`agy-${B}`), undefined)
+  assert.ok(autoApproveFor(`agy-${A}`))
+  // cannot tell ⇒ kept
+  locks.now = undefined
+  assert.equal((await endAgyGrantsOver(autoApproveList().filter((e) => e.id.startsWith('agy-')), deps)).length, 0)
+  // the lock moved (`/new`) ⇒ ended, and its owner forgotten
+  locks.now = [B]
+  assert.equal((await endAgyGrantsOver(autoApproveList().filter((e) => e.id.startsWith('agy-')), deps)).length, 1)
+  assert.equal(autoApproveFor(`agy-${A}`), undefined)
+  assert.equal(agyGrantOwner(A), undefined)
+  // ⚠️ given again while the sweep looks: the new grant stands
+  setAgyGrantOwner(A, { pid: 100, startedAt: 5000 })
+  await setAutoApprove(`agy-${A}`, true)
+  const slow = {
+    ...deps,
+    locksOf: () => {
+      setAgyGrantOwner(A, { pid: 100, startedAt: 5000 })
+      return [B]
+    },
+  }
+  assert.equal((await endAgyGrantsOver(autoApproveList().filter((e) => e.id.startsWith('agy-')), slow)).length, 0)
+  // ⚠️ a grant not in the sweep's list (turned on after it listed, before its probe) is not judged by it
+  resetAgyGrantOwners()
+  assert.equal((await endAgyGrantsOver([], deps)).length, 0)
+  assert.ok(autoApproveFor(`agy-${A}`))
+  assert.ok(autoApproveFor(`agy-${A}`))
 })

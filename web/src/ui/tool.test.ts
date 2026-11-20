@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import type { AgentFeature, PermissionRequest, SessionSummary } from '../../../shared/types.ts'
 import { autoApproveView } from './autoApprove.ts'
-import { COMMAND_UI, commandView } from './commands.ts'
+import { COMMAND_UI, commandUi, commandView } from './commands.ts'
 import { applyAutoApprove, synthesizeRows } from './order.ts'
 import { stopView } from './stop.ts'
 import { actionFeatures, canAttachTo, canSendTo, canStop, isCodex, sendBlockedNote } from './tool.ts'
@@ -191,4 +191,38 @@ test('★ agy: a conversation open in two agys says so (not "restart agy")', () 
   assert.match(note ?? '', /2つの agy|two agys/)
   assert.doesNotMatch(note ?? '', /起こし直す|Start agy again/)
   assert.match(sendBlockedNote({ tool: 'agy' }, features) ?? '', /起こし直す|Start agy again/)
+})
+
+test('★★ agy auto-approve (2026-11-20): only with its own mark; "on" needs a relayed agy alone on the conversation; "off" always shows', () => {
+  const marks: AgentFeature[] = [...EVERYTHING, 'agy-log-follow', 'agy-send', 'agy-interrupt', 'agy-auto-approve']
+  const relayed = row({ tool: 'agy', account: 'agy', sendRoute: 'keys', status: 'idle' })
+  const f = actionFeatures(relayed, marks)
+  assert.deepEqual(f, ['log-follow', 'auto-approve', 'auto-approve-24h'])
+  assert.equal(autoApproveView(relayed, 'ready', f).show, true)
+  // ⚠️ the 24 h choice still needs the agent's own mark; the Claude-side mark alone grants nothing to agy
+  assert.deepEqual(actionFeatures(relayed, marks.filter((m) => m !== 'auto-approve-24h')), ['log-follow', 'auto-approve'])
+  assert.deepEqual(actionFeatures(relayed, marks.filter((m) => m !== 'agy-auto-approve')), ['log-follow'])
+  // not through the relay / open in two agys ⇒ no "on"
+  for (const r of [row({ tool: 'agy', account: 'agy', status: 'idle' }), row({ tool: 'agy', account: 'agy', sendRoute: 'keys', agyShared: true, status: 'idle' })]) {
+    assert.equal(autoApproveView(r, 'ready', actionFeatures(r, marks)).show, false)
+    // ★ but when it is on, the way to turn it off stays
+    const on = { ...r, autoApprove: { until: '2026-11-20T03:00:00.000Z' } }
+    assert.equal(autoApproveView(on, 'ready', actionFeatures(on, marks)).show, true)
+    assert.equal(autoApproveView(on, 'ready', actionFeatures(on, marks)).on, true)
+  }
+  // a row built from an agy mark is an agy row (never Claude's buttons)
+  const [made] = applyAutoApprove([], [{ sessionId: 'agy-062a8f25-9451-42f3-ae93-34a208e99365', until: '2026-11-14T03:00:00.000Z', machine: 'pc-a', tool: 'agy' }])
+  assert.equal(made!.tool, 'agy')
+  assert.equal(canSendTo(made, ALL), false)
+})
+
+
+test('★ the agy auto-approve confirmation says what it really passes (commands and outside reads; others still stop; ends on restart)', () => {
+  const body = commandUi('auto-approve', { tool: 'agy' }).body
+  assert.match(body, /コマンド|commands/)
+  assert.match(body, /再起動|restarts/)
+  assert.doesNotMatch(body, /Web 取得|web fetches/)
+  // ⚠️ no "needs you" promised for agy questions (they do not ring yet)
+  assert.doesNotMatch(body, /質問は今までどおり止まり、「要対応」|questions still stop as before, and you get/)
+  assert.match(commandUi('auto-approve', undefined).body, /Web 取得|web fetches/, 'Claude keeps its wording')
 })
