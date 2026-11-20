@@ -83,10 +83,17 @@ export function canAttachTo(session: Pick<SessionSummary, 'tool' | 'sendRoute'> 
 
 /** What the message box says instead of sending (only for rows it cannot send to). */
 export function sendBlockedNote(
-  session: Pick<SessionSummary, 'tool' | 'sendRoute'> | undefined,
+  session: Pick<SessionSummary, 'tool' | 'sendRoute' | 'agyShared'> | undefined,
   features: readonly AgentFeature[] | undefined,
 ): string | undefined {
   if (canSendTo(session, features)) return undefined
+  // ★ Two agys show this conversation: which one would get it cannot be told (restarting would not help)
+  if (isAgy(session) && session?.agyShared) {
+    return t(
+      'この会話は2つの agy で開かれています。どちらに届くか決められないので、スマホからは送れません（PC で操作してください）',
+      'This conversation is open in two agys. Which one would get it cannot be told, so it cannot be sent from the phone (use the PC)',
+    )
+  }
   if (isAgy(session) && features?.includes('agy-send')) {
     return t(
       'この agy は nyan-remote を通さずに起動しています。新しいターミナルで agy を起こし直すと、スマホから送れます',

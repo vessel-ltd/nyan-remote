@@ -8,7 +8,7 @@
 //   We actually reproduced "tapping the notification shows sw.js source" with an old notification after the fix.
 //   → The right thing is to **remove notifications once they have served their purpose**.
 
-import { permissionTag } from '../../shared/types.ts'
+import { permissionTag, sessionTag } from '../../shared/types.ts'
 
 /**
  * ★★ **Look at every registration** (2026-09-21 / codex round 12, medium #5).
@@ -28,12 +28,39 @@ async function registrations(): Promise<readonly ServiceWorkerRegistration[]> {
 }
 
 /** Remove the notification for that approval (call right after answering) */
+/**
+ * ★ Close a session's notification (`sessionTag`). Used after denying an agy card from the phone: that stops agy's
+ *   turn, and no later notification replaces the "needs you" one (codex review 2026-11-20).
+ */
+export async function closeSessionNotification(machine: string, account: string, sessionId: string, shownBefore: number): Promise<void> {
+  // ⚠️ Only one shown before the deny took effect (a newer turn's "needs you" may have arrived meanwhile / codex review)
+  await closeTag(sessionTag(machine, account, sessionId), (n) => shownBeforeAnswer(n, shownBefore))
+}
+
+/**
+ * ★ Whether a notification was shown before an answer took effect at `tookEffect` (both the agent's clock).
+ * The sender's time is `data.at` (our service worker puts it there; WebKit has no `timestamp`), else `timestamp`
+ * (in the spec but not in TS's DOM types). Neither ⇒ false (not closed).
+ * ★ 0.5 s of margin: a push that started right after the key went out, before agy rewrote its state (measured 13–48
+ *   ms), is older news too. A newer turn's alert cannot come that soon (a new prompt, then the model).
+ */
+export function shownBeforeAnswer(n: { data?: unknown; timestamp?: number }, tookEffect: number): boolean {
+  // ⚠️ Only a "needs you" (an earlier error or "done" under the same tag stays / codex review)
+  if ((n.data as { waiting?: unknown } | null | undefined)?.waiting !== true) return false
+  const fromData = (n.data as { at?: unknown } | null | undefined)?.at
+  const at = typeof fromData === 'number' ? fromData : n.timestamp
+  return typeof at === 'number' && Number.isFinite(at) && at <= tookEffect + 500
+}
+
 export async function closePermissionNotification(machine: string, key: string): Promise<void> {
-  const tag = permissionTag(machine, key)
+  await closeTag(permissionTag(machine, key))
+}
+
+async function closeTag(tag: string, which: (n: Notification) => boolean = () => true): Promise<void> {
   for (const reg of await registrations()) {
     if (!reg.getNotifications) continue
     try {
-      for (const n of await reg.getNotifications({ tag })) n.close()
+      for (const n of await reg.getNotifications({ tag })) if (which(n)) n.close()
     } catch {
       // Not fatal if it can't be closed (the next cleanup picks it up)
     }
@@ -130,6 +157,82 @@ export async function closeStalePermissionNotifications(
       for (const n of list) if (stale.has(n.tag)) n.close()
     } catch {
       // Same as above (skip just that registration)
+    }
+  }
+}
+
+/** Just the parts of a shown notification the "needs you" cleanup needs */
+export interface WaitingFacts {
+  tag: string
+  machine?: string
+  session?: string
+  waiting?: boolean
+  /** The sender's time (`data.at`, else `timestamp`) */
+  at?: number
+}
+
+/**
+ * ★ Which "needs you" notifications are over (2026-11-20 / agy rows): the session's row, in a list its machine took
+ * at least 2 s after the notification, is not waiting. Covers a card answered on the PC, a phone deny, and a push
+ * delivered late. ⚠️ Only what is known: the machine's list was read, the row is in it, both times are the agent's.
+ * @param rows machine → session id → its status, only for machines whose list was read
+ * @param snapshotAt machine → when that list was taken (agent clock)
+ */
+export function staleWaitingTags(
+  shown: WaitingFacts[],
+  rows: Map<string, Map<string, string>>,
+  snapshotAt: Map<string, number>,
+  goneWhenMissing: (session: string) => boolean = () => false,
+): string[] {
+  return shown.filter((n) => isStaleWaiting(n, rows, snapshotAt, goneWhenMissing)).map((n) => n.tag)
+}
+
+/**
+ * ★ Whether this one notification is over. ⚠️ Judged per notification and closed one by one: a tray can hold an older
+ * "done" and a live "needs you" under the same tag, and closing by tag took the live one too (codex review).
+ * @param goneWhenMissing sessions whose absence from a read list means they are over (agy: a running agy's waiting
+ *   conversation is always listed, so a missing one has exited / moved on). Others: absent = unknown, left.
+ */
+export function isStaleWaiting(
+  n: WaitingFacts,
+  rows: Map<string, Map<string, string>>,
+  snapshotAt: Map<string, number>,
+  goneWhenMissing: (session: string) => boolean = () => false,
+): boolean {
+  if (!n.machine || !n.session || typeof n.at !== 'number' || !Number.isFinite(n.at)) return false
+  const taken = snapshotAt.get(n.machine)
+  const list = rows.get(n.machine)
+  if (taken === undefined || !list || n.at > taken - 2000) return false
+  const status = list.get(n.session) ?? (goneWhenMissing(n.session) ? 'gone' : undefined)
+  // ⚠️ Open in two agys (`main.tsx` marks it): which state is that conversation's cannot be told ⇒ nothing closed
+  if (status === undefined || status === 'contested') return false
+  // a "needs you" that no longer waits; ★ or an older "done"/"error" while it waits again (a late delivery of an
+  // earlier turn's alert after a newer card's was opened — on Android the newer one replaces it anyway)
+  return n.waiting ? status !== 'waiting' : status === 'waiting'
+}
+
+export async function closeStaleWaitingNotifications(rows: Map<string, Map<string, string>>, snapshotAt: Map<string, number>): Promise<void> {
+  if (snapshotAt.size === 0) return
+  for (const reg of await registrations()) {
+    if (!reg.getNotifications) continue
+    try {
+      const list = await reg.getNotifications()
+      const facts = list.map((n): WaitingFacts => {
+        const d = (n.data ?? {}) as { machine?: unknown; session?: unknown; waiting?: unknown; at?: unknown }
+        const ts = (n as Notification & { timestamp?: number }).timestamp
+        return {
+          tag: n.tag,
+          ...(typeof d.machine === 'string' ? { machine: d.machine } : {}),
+          ...(typeof d.session === 'string' ? { session: d.session } : {}),
+          ...(d.waiting === true ? { waiting: true } : {}),
+          ...(typeof d.at === 'number' ? { at: d.at } : typeof ts === 'number' ? { at: ts } : {}),
+        }
+      })
+      list.forEach((n, i) => {
+        if (isStaleWaiting(facts[i]!, rows, snapshotAt, (session) => session.startsWith('agy-'))) n.close()
+      })
+    } catch {
+      // skip just that registration
     }
   }
 }

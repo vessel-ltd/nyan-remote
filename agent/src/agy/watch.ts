@@ -27,7 +27,12 @@ function same(a: Map<string, string>, b: Map<string, string>): boolean {
   return true
 }
 
-export async function startAgyWatch(dir: string, onChange: () => void): Promise<{ close(): void }> {
+/**
+ * @param onChange some conversation's list status changed (re-fetch the list)
+ * @param onTick after every look, changed or not (approval cards and notifications look themselves: a card's
+ *   identity includes the status file's time, which can move without a status change / `cards.ts`)
+ */
+export async function startAgyWatch(dir: string, onChange: () => void, onTick?: () => void): Promise<{ close(): void }> {
   // ⚠️ The directory is the installer's (0700); made here too so a later `nyan update` finds it watched
   await mkdir(dir, { recursive: true, mode: 0o700 }).catch(() => undefined)
   let last = await agyStatuses(dir)
@@ -48,6 +53,7 @@ export async function startAgyWatch(dir: string, onChange: () => void): Promise<
           last = now
           onChange()
         }
+        onTick?.()
       } while (again)
     } finally {
       running = false

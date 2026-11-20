@@ -1,0 +1,808 @@
+import assert from 'node:assert/strict'
+import { test } from 'node:test'
+import type { NotifyFields, SessionSummary, SessionStatus } from '../../../shared/types.ts'
+import { AgyNotifier } from './notify.ts'
+
+const A = '062a8f25-9451-42f3-ae93-34a208e99365'
+
+function rig() {
+  let status: SessionStatus | undefined = 'idle'
+  let wrote = '2026-11-20T00:00:10Z'
+  let records: Record<string, unknown>[] = []
+  let ok = 1
+  let gate: Promise<void> | undefined
+  let clock = 0
+  const sent: NotifyFields[] = []
+  const n = new AgyNotifier({
+    rows: async () =>
+      status
+        ? [{ machine: 'pc-a', account: 'agy', tool: 'agy', sessionId: `agy-${A}`, cwd: '/home/user/p', project: 'p', title: 'Fix it', titleSource: 'ai', status, live: true, lastActivity: wrote } as SessionSummary]
+        : [],
+    home: '/home/user',
+    send: async (_row, fields) => {
+      if (ok < 0) throw new Error('vapid.json unreadable')
+      if (ok > 0) sent.push(fields)
+      if (gate) await gate
+      return ok
+    },
+    tail: () => records,
+    now: () => clock,
+  })
+  return {
+    n,
+    sent,
+    set(s: SessionStatus | undefined, r?: Record<string, unknown>[], at?: string) {
+      status = s
+      if (r) records = r
+      if (at) wrote = at
+    },
+    fail(v: boolean | 'throw') {
+      ok = v === 'throw' ? -1 : v ? 0 : 1
+    },
+    hold(p: Promise<void> | undefined) {
+      gate = p
+    },
+    tick(ms: number) {
+      clock += ms
+    },
+  }
+}
+
+const user = (step: number) => ({ step_index: step, type: 'USER_INPUT', created_at: '2026-11-20T00:00:00Z' })
+const answered = (step: number) => [user(step), { step_index: step + 1, type: 'PLANNER_RESPONSE', content: 'Done.' }]
+const asking = (step: number) => [user(step), { step_index: step + 1, type: 'PLANNER_RESPONSE', tool_calls: [{ name: 'run_command', args: { CommandLine: 'ls' } }] }]
+
+test('★★ a card rings "needs you", a finished turn rings "done", in the list’s words; the first look is the baseline', async () => {
+  const r = rig()
+  r.set('waiting', asking(0))
+  await r.n.look()
+  assert.equal(r.sent.length, 0, 'the state at start is not news')
+  r.set('working')
+  await r.n.look()
+  r.set('waiting')
+  await r.n.look()
+  assert.deepEqual(r.sent.map((f) => f.label), ['要対応'])
+  assert.equal(r.sent[0]!.sessionId, `agy-${A}`)
+  r.set('working')
+  await r.n.look()
+  r.set('done', answered(0))
+  await r.n.look()
+  assert.deepEqual(r.sent.map((f) => f.label), ['要対応', '完了'])
+  r.set('error')
+  await r.n.look()
+  assert.deepEqual(r.sent.map((f) => f.label), ['要対応', '完了', '⚠ 異常終了'])
+})
+
+test('★★ a stopped turn or a declined card sends nothing (the transcript ends without an answer)', async () => {
+  const r = rig()
+  await r.n.look()
+  r.set('working', [user(0)])
+  await r.n.look()
+  r.set('done')
+  await r.n.look()
+  assert.equal(r.sent.length, 0, 'stopped while thinking')
+  r.set('waiting', asking(2))
+  await r.n.look()
+  r.set('done')
+  await r.n.look()
+  assert.deepEqual(r.sent.map((f) => f.label), ['要対応'], 'declined at the card')
+})
+
+test('one ring per card: the same card seen again is quiet, the next turn rings again', async () => {
+  const r = rig()
+  await r.n.look()
+  for (const s of ['waiting', 'working', 'waiting'] as const) {
+    r.set(s, asking(0))
+    await r.n.look()
+  }
+  assert.equal(r.sent.length, 1)
+  r.set('working', asking(4))
+  await r.n.look()
+  // (each card is its own state write)
+  r.set('waiting', undefined, '2026-11-20T00:01:00Z')
+  await r.n.look()
+  assert.equal(r.sent.length, 2)
+})
+
+test('a send that reached no device is not remembered (the same state rings next time)', async () => {
+  const r = rig()
+  await r.n.look()
+  r.fail(true)
+  r.set('waiting', asking(0))
+  await r.n.look()
+  r.fail(false)
+  r.set('working')
+  await r.n.look()
+  r.set('waiting')
+  await r.n.look()
+  assert.deepEqual(r.sent.map((f) => f.label), ['要対応'])
+})
+
+test('a conversation that appears already working, or goes from idle to done, is not "done" news', async () => {
+  const r = rig()
+  r.set(undefined)
+  await r.n.look()
+  r.set('done', answered(0))
+  await r.n.look()
+  r.set('idle')
+  await r.n.look()
+  r.set('done')
+  await r.n.look()
+  assert.equal(r.sent.length, 0)
+})
+
+test('a slow push does not swallow a turn that ends meanwhile (each look reads the rows when it is asked for)', async () => {
+  const r = rig()
+  r.set('done', answered(0))
+  await r.n.look()
+  let release!: () => void
+  r.hold(new Promise<void>((res) => (release = res)))
+  r.set('error')
+  const first = r.n.look()
+  // its push is on its way (blocked) before the next looks are asked for
+  await new Promise((res) => setTimeout(res, 0))
+  // while that push is still on its way: a whole turn (working → done)
+  r.set('working', [user(2)])
+  const second = r.n.look()
+  r.set('done', answered(2))
+  const third = r.n.look()
+  r.hold(undefined)
+  release()
+  await Promise.all([first, second, third])
+  assert.deepEqual(r.sent.map((f) => f.label), ['⚠ 異常終了', '完了'])
+})
+
+test('★ a push that reached nobody is tried again while the card is still up (every 30 s), then stops', async () => {
+  const r = rig()
+  await r.n.look()
+  r.fail(true)
+  r.set('waiting', asking(0))
+  await r.n.look()
+  r.fail(false)
+  r.tick(10_000)
+  await r.n.look()
+  assert.equal(r.sent.length, 0, 'not before 30 s')
+  r.tick(20_000)
+  await r.n.look()
+  assert.deepEqual(r.sent.map((f) => f.label), ['要対応'])
+  r.tick(60_000)
+  await r.n.look()
+  assert.equal(r.sent.length, 1, 'once delivered, not again')
+  // a state left before the retry: nothing owed any more
+  r.fail(true)
+  r.set('working', asking(2))
+  await r.n.look()
+  r.set('waiting')
+  await r.n.look()
+  r.set('working')
+  await r.n.look()
+  r.fail(false)
+  r.tick(60_000)
+  await r.n.look()
+  assert.equal(r.sent.length, 1)
+})
+
+test('★ a turn that started and ended between two looks still rings "done" (the turn moved on)', async () => {
+  const r = rig()
+  r.set('done', answered(0))
+  await r.n.look()
+  r.set('done', answered(4))
+  await r.n.look()
+  assert.deepEqual(r.sent.map((f) => f.label), ['完了'])
+  // a new turn stopped by hand: nothing
+  r.set('done', [user(8)])
+  await r.n.look()
+  // a card of a new turn seen without its "working" (each card is its own state write)
+  r.set('waiting', asking(10), '2026-11-20T00:01:00Z')
+  await r.n.look()
+  r.set('waiting', asking(12), '2026-11-20T00:02:00Z')
+  await r.n.look()
+  assert.deepEqual(r.sent.map((f) => f.label), ['完了', '要対応', '要対応'])
+})
+
+test('★ a send that throws is owed like one that reached nobody (and does not stop the look)', async () => {
+  const r = rig()
+  await r.n.look()
+  r.fail('throw')
+  r.set('waiting', asking(0))
+  await r.n.look()
+  r.fail(false)
+  r.tick(31_000)
+  await r.n.look()
+  assert.deepEqual(r.sent.map((f) => f.label), ['要対応'])
+})
+
+test('★ a look held behind a slow push does not ring for a card already handled (the newer look wins)', async () => {
+  const r = rig()
+  r.set('done', answered(0))
+  await r.n.look()
+  let release!: () => void
+  r.hold(new Promise<void>((res) => (release = res)))
+  r.set('error')
+  const first = r.n.look()
+  // its push is on its way (blocked) before the next looks are asked for
+  await new Promise((res) => setTimeout(res, 0))
+  r.set('waiting', asking(2))
+  const second = r.n.look()
+  // declined on the PC before the push queue moved
+  r.set('done', asking(2))
+  const third = r.n.look()
+  r.hold(undefined)
+  release()
+  await Promise.all([first, second, third])
+  assert.deepEqual(r.sent.map((f) => f.label), ['⚠ 異常終了'])
+})
+
+test('★ a "done" still owed is dropped when the next turn starts (it would speak for the wrong turn)', async () => {
+  const r = rig()
+  r.set('working', [user(0)])
+  await r.n.look()
+  r.fail(true)
+  r.set('done', answered(0))
+  await r.n.look()
+  r.fail(false)
+  // the next turn started and was stopped between two looks
+  r.set('done', [user(4)])
+  await r.n.look()
+  r.tick(60_000)
+  await r.n.look()
+  assert.equal(r.sent.length, 0)
+})
+
+test('★ a first turn that started and ended between two looks rings "done"; an old answer of a resumed one does not', async () => {
+  const r = rig()
+  r.set(undefined)
+  await r.n.look()
+  r.tick(5_000)
+  // an answer older than the previous look (a conversation resumed with its old answer)
+  r.set('done', [user(0), { step_index: 1, type: 'PLANNER_RESPONSE', content: 'Old.', created_at: new Date(-60_000).toISOString() }])
+  await r.n.look()
+  assert.equal(r.sent.length, 0)
+  // the conversation goes away (and is forgotten after the grace for missing ones)
+  r.set(undefined)
+  await r.n.look()
+  r.tick(61_000)
+  await r.n.look()
+  r.tick(5_000)
+  // a new conversation whose first turn started and ended between two looks
+  r.set('done', [user(0), { step_index: 1, type: 'PLANNER_RESPONSE', content: 'New.', created_at: new Date(70_000).toISOString() }])
+  await r.n.look()
+  assert.deepEqual(r.sent.map((f) => f.label), ['完了'])
+})
+
+test('★ within one look, a second row’s push checks the newest look again (its card was declined meanwhile)', async () => {
+  const B = 'ffffffff-ffff-4fff-8fff-ffffffffffff'
+  let rows: SessionSummary[] = []
+  const mk = (id: string, status: SessionStatus) => ({ machine: 'pc-a', account: 'agy', tool: 'agy', sessionId: `agy-${id}`, cwd: '/home/user/p', project: 'p', title: 'x', titleSource: 'ai', status, live: true, lastActivity: '' }) as SessionSummary
+  let release!: () => void
+  let gate: Promise<void> | undefined = new Promise<void>((res) => (release = res))
+  const sent: string[] = []
+  const n = new AgyNotifier({
+    rows: async () => rows,
+    home: '/home/user',
+    send: async (row) => {
+      sent.push(row.sessionId)
+      if (gate) await gate
+      return 1
+    },
+    tail: () => asking(0),
+  })
+  rows = [mk(A, 'working'), mk(B, 'working')]
+  await n.look()
+  rows = [mk(A, 'waiting'), mk(B, 'waiting')]
+  const first = n.look()
+  await new Promise((res) => setTimeout(res, 0))
+  // A's push is on its way; B's card is declined on the PC
+  rows = [mk(A, 'waiting'), mk(B, 'done')]
+  const second = n.look()
+  gate = undefined
+  release()
+  await Promise.all([first, second])
+  assert.deepEqual(sent, [`agy-${A}`])
+})
+
+test('★ the sender is handed a guard that turns false when a newer look shows the state moved on', async () => {
+  let rows: SessionSummary[] = []
+  const mk = (status: SessionStatus) => ({ machine: 'pc-a', account: 'agy', tool: 'agy', sessionId: `agy-${A}`, cwd: '/home/user/p', project: 'p', title: 'x', titleSource: 'ai', status, live: true, lastActivity: '' }) as SessionSummary
+  let guard: (() => boolean) | undefined
+  let release!: () => void
+  const gate = new Promise<void>((res) => (release = res))
+  let clock = 0
+  const n = new AgyNotifier({ rows: async () => rows, home: '/home/user', tail: () => asking(0), now: () => ++clock, send: async (_r, _f, current) => {
+    guard = current
+    await gate
+    return current?.() ? 1 : 0
+  } })
+  rows = [mk('working')]
+  await n.look()
+  rows = [mk('waiting')]
+  const first = n.look()
+  await new Promise((res) => setTimeout(res, 0))
+  assert.equal(guard?.(), true)
+  // declined on the PC: the watcher's look reads it while the push is still being prepared
+  rows = [mk('done')]
+  const second = n.look()
+  await new Promise((res) => setTimeout(res, 0))
+  assert.equal(guard?.(), false)
+  release()
+  await Promise.all([first, second])
+})
+
+test('★ the guard also reads the state right now (a look can be up to 300 ms behind the files)', async () => {
+  // (the card is the row's own state write: '' in this fixture)
+  let now: { status: string; turn: number | undefined; card?: string } | undefined = { status: 'waiting', turn: 0, card: '' }
+  let guard: (() => boolean) | undefined
+  const row = (status: SessionStatus) => ({ machine: 'pc-a', account: 'agy', tool: 'agy', sessionId: `agy-${A}`, cwd: '/home/user/p', project: 'p', title: 'x', titleSource: 'ai', status, live: true, lastActivity: '' }) as SessionSummary
+  let rows = [row('working')]
+  let clock = 0
+  const n = new AgyNotifier({ rows: async () => rows, home: '/home/user', now: () => clock, tail: () => asking(0), statusNow: () => now, send: async (_r, _f, current) => {
+    guard = current
+    return 1
+  } })
+  await n.look()
+  rows = [row('waiting')]
+  await n.look()
+  assert.equal(guard?.(), true)
+  now = { status: 'done', turn: 0 }
+  clock += 1500 // (the direct read is reused for a second within one send)
+  assert.equal(guard?.(), false)
+  // ★ the same state, but a newer turn (a look missed it): not this push's news
+  now = { status: 'waiting', turn: 2, card: '' }
+  clock += 1500 // (the direct read is reused for a second within one send)
+  assert.equal(guard?.(), false)
+  // ★ the same turn, but another card
+  now = { status: 'waiting', turn: 0, card: '1/1' }
+  clock += 1500 // (the direct read is reused for a second within one send)
+  assert.equal(guard?.(), false)
+})
+
+test('★ no "done" when another agy wrote into the conversation during the turn (the answer may be the other one’s)', async () => {
+  let others = true
+  const row = (status: SessionStatus) => ({ machine: 'pc-a', account: 'agy', tool: 'agy', sessionId: `agy-${A}`, cwd: '/home/user/p', project: 'p', title: 'x', titleSource: 'ai', status, live: true, lastActivity: '' }) as SessionSummary
+  let rows = [row('working')]
+  let records: Record<string, unknown>[] = [user(0)]
+  const sent: string[] = []
+  const n = new AgyNotifier({ rows: async () => rows, home: '/home/user', tail: () => records, othersWrote: () => others, send: async (_r, f) => {
+    sent.push(f.label)
+    return 1
+  } })
+  await n.look()
+  rows = [row('done')]
+  records = answered(0)
+  await n.look()
+  assert.deepEqual(sent, [])
+  others = false
+  rows = [row('working')]
+  records = [user(2)]
+  await n.look()
+  rows = [row('done')]
+  records = answered(2)
+  await n.look()
+  assert.deepEqual(sent, ['完了'])
+  // a turn whose start time is unknown is not trusted for "done" either
+  rows = [row('working')]
+  records = [{ step_index: 4, type: 'USER_INPUT' }]
+  await n.look()
+  rows = [row('done')]
+  records = [{ step_index: 4, type: 'USER_INPUT' }, { step_index: 5, type: 'PLANNER_RESPONSE', content: 'ok' }]
+  await n.look()
+  assert.deepEqual(sent, ['完了'])
+})
+
+test('★ a long turn whose prompt is out of the tail still rings "done" (looked for further back)', async () => {
+  const row = (status: SessionStatus) => ({ machine: 'pc-a', account: 'agy', tool: 'agy', sessionId: `agy-${A}`, cwd: '/home/user/p', project: 'p', title: 'x', titleSource: 'ai', status, live: true, lastActivity: '' }) as SessionSummary
+  const tailOnly = [{ step_index: 900, type: 'GENERIC' }, { step_index: 901, type: 'PLANNER_RESPONSE', content: 'Done.' }]
+  for (const deep of [true, false]) {
+    let rows = [row('working')]
+    const sent: string[] = []
+    const n = new AgyNotifier({
+      rows: async () => rows,
+      home: '/home/user',
+      tail: () => tailOnly,
+      ...(deep ? { turnStart: () => ({ turn: 4, at: 1000 }) } : {}),
+      othersWrote: () => false,
+      send: async (_r, f) => {
+        sent.push(f.label)
+        return 1
+      },
+    })
+    await n.look()
+    rows = [row('done')]
+    await n.look()
+    assert.deepEqual(sent, deep ? ['完了'] : [], String(deep))
+  }
+})
+
+test('★ owe: a card shown again after a key that did not land rings "needs you" again', async () => {
+  const r = rig()
+  r.set('working', asking(0))
+  await r.n.look()
+  r.set('waiting')
+  await r.n.look()
+  assert.equal(r.sent.length, 1)
+  await r.n.look()
+  assert.equal(r.sent.length, 1)
+  r.n.owe(`agy-${A}`, '2026-11-20T00:00:10Z')
+  await r.n.look()
+  assert.deepEqual(r.sent.map((f) => f.label), ['要対応', '要対応'])
+  // not owed when it is not waiting any more
+  r.set('working')
+  await r.n.look()
+  r.n.owe(`agy-${A}`, '2026-11-20T00:00:10Z')
+  await r.n.look()
+  assert.equal(r.sent.length, 2)
+})
+
+test('★ a long turn’s failed push is retried (its turn is known only from further back)', async () => {
+  const row = (status: SessionStatus) => ({ machine: 'pc-a', account: 'agy', tool: 'agy', sessionId: `agy-${A}`, cwd: '/home/user/p', project: 'p', title: 'x', titleSource: 'ai', status, live: true, lastActivity: '' }) as SessionSummary
+  let rows = [row('working')]
+  let ok = 0
+  let clock = 0
+  const sent: string[] = []
+  const n = new AgyNotifier({
+    rows: async () => rows,
+    home: '/home/user',
+    now: () => clock,
+    tail: () => [{ step_index: 900, type: 'PLANNER_RESPONSE', content: 'Done.' }],
+    turnStart: () => ({ turn: 4, at: 1000 }),
+    othersWrote: () => false,
+    send: async (_r, f) => {
+      if (ok) sent.push(f.label)
+      return ok
+    },
+  })
+  await n.look()
+  rows = [row('done')]
+  await n.look()
+  ok = 1
+  clock += 31_000
+  await n.look()
+  assert.deepEqual(sent, ['完了'])
+})
+
+test('★ an `owe` made while the earlier push is still going out is not settled by that push', async () => {
+  const r = rig()
+  r.set('working', asking(0))
+  await r.n.look()
+  let release!: () => void
+  r.hold(new Promise<void>((res) => (release = res)))
+  r.set('waiting')
+  const first = r.n.look()
+  await new Promise((res) => setTimeout(res, 0))
+  // phone A denied, the key did not land, the card came back: a fresh "needs you" is owed
+  r.n.owe(`agy-${A}`, '2026-11-20T00:00:10Z')
+  r.hold(undefined)
+  release()
+  await first
+  await r.n.look()
+  assert.deepEqual(r.sent.map((f) => f.label), ['要対応', '要対応'])
+})
+
+test('★ owe made before the waiting look is applied still rings; a failed ring is kept and tried again after 30 s', async () => {
+  const r = rig()
+  r.set('waiting', asking(0))
+  r.set('working')
+  await r.n.look()
+  r.set('waiting')
+  await r.n.look()
+  assert.equal(r.sent.length, 1)
+  // the second card of the same turn, while the previous applied look still says working
+  r.set('working')
+  await r.n.look()
+  r.n.owe(`agy-${A}`, '2026-11-20T00:00:10Z')
+  r.set('waiting')
+  r.fail(true)
+  await r.n.look()
+  r.fail(false)
+  await r.n.look()
+  assert.equal(r.sent.length, 1, 'not on every look')
+  r.tick(31_000)
+  await r.n.look()
+  assert.deepEqual(r.sent.map((f) => f.label), ['要対応', '要対応'])
+  await r.n.look()
+  assert.equal(r.sent.length, 2, 'once')
+})
+
+test('★ a look between a new prompt and agy rewriting its state does not tell the old state as the new turn’s', async () => {
+  const row = (status: SessionStatus, lastActivity: string) => ({ machine: 'pc-a', account: 'agy', tool: 'agy', sessionId: `agy-${A}`, cwd: '/home/user/p', project: 'p', title: 'x', titleSource: 'ai', status, live: true, lastActivity }) as SessionSummary
+  let rows = [row('error', '2026-11-20T00:00:05Z')]
+  let records: Record<string, unknown>[] = [{ step_index: 0, type: 'USER_INPUT', created_at: '2026-11-20T00:00:00Z' }]
+  const sent: string[] = []
+  const n = new AgyNotifier({ rows: async () => rows, home: '/home/user', tail: () => records, send: async (_r, f) => {
+    sent.push(f.label)
+    return 1
+  } })
+  await n.look()
+  // the new prompt is written; the state file still holds the old error
+  records = [{ step_index: 4, type: 'USER_INPUT', created_at: '2026-11-20T00:01:00Z' }]
+  await n.look()
+  assert.deepEqual(sent, [])
+  // the new turn fails for real (its state written after the prompt)
+  rows = [row('error', '2026-11-20T00:01:03Z')]
+  await n.look()
+  assert.deepEqual(sent, ['⚠ 異常終了'])
+})
+
+test('★ a queued older look does not drop a ring asked for since (the newest look decides)', async () => {
+  const B = 'ffffffff-ffff-4fff-8fff-ffffffffffff'
+  const mk = (id: string, status: SessionStatus) => ({ machine: 'pc-a', account: 'agy', tool: 'agy', sessionId: `agy-${id}`, cwd: '/home/user/p', project: 'p', title: 'x', titleSource: 'ai', status, live: true, lastActivity: '' }) as SessionSummary
+  let rows = [mk(A, 'working'), mk(B, 'working')]
+  let gate: Promise<void> | undefined
+  const sent: string[] = []
+  const n = new AgyNotifier({ rows: async () => rows, home: '/home/user', tail: () => asking(0), send: async (row, f) => {
+    sent.push(`${row.sessionId.slice(4, 5)}:${f.label}`)
+    if (gate && row.sessionId === `agy-${B}`) await gate
+    return 1
+  } })
+  await n.look()
+  // A's first card rings
+  rows = [mk(A, 'waiting'), mk(B, 'working')]
+  await n.look()
+  // B's push is slow and holds the queue; A goes working, then its second card of the same turn comes
+  let release!: () => void
+  gate = new Promise<void>((res) => (release = res))
+  rows = [mk(A, 'waiting'), mk(B, 'error')]
+  const a = n.look()
+  await new Promise((res) => setTimeout(res, 0))
+  rows = [mk(A, 'working'), mk(B, 'error')]
+  const b = n.look()
+  rows = [mk(A, 'waiting'), mk(B, 'error')]
+  const c = n.look()
+  await new Promise((res) => setTimeout(res, 0))
+  // the phone denied A's second card, the key did not land, the card came back: ring A again
+  n.owe(`agy-${A}`, '')
+  gate = undefined
+  release()
+  await Promise.all([a, b, c])
+  assert.deepEqual(sent, ['0:要対応', 'f:⚠ 異常終了', '0:要対応'])
+})
+
+test('★ a late retry of an old error is remembered under its own turn (the next turn’s real error still rings)', async () => {
+  const row = (status: SessionStatus, lastActivity: string) => ({ machine: 'pc-a', account: 'agy', tool: 'agy', sessionId: `agy-${A}`, cwd: '/home/user/p', project: 'p', title: 'x', titleSource: 'ai', status, live: true, lastActivity }) as SessionSummary
+  let rows = [row('working', '2026-11-20T00:00:01Z')]
+  let records: Record<string, unknown>[] = [{ step_index: 0, type: 'USER_INPUT', created_at: '2026-11-20T00:00:00Z' }]
+  let ok = 0
+  let clock = 0
+  const sent: string[] = []
+  const n = new AgyNotifier({ rows: async () => rows, home: '/home/user', now: () => clock, tail: () => records, send: async (_r, f) => {
+    if (ok) sent.push(f.label)
+    return ok
+  } })
+  await n.look()
+  rows = [row('error', '2026-11-20T00:00:05Z')]
+  await n.look()
+  // the retry comes due after the next prompt was written but before agy rewrote its state
+  ok = 1
+  clock += 31_000
+  records = [{ step_index: 4, type: 'USER_INPUT', created_at: '2026-11-20T00:01:00Z' }]
+  await n.look()
+  assert.deepEqual(sent, ['⚠ 異常終了'])
+  // the next turn fails for real
+  rows = [row('working', '2026-11-20T00:01:01Z')]
+  await n.look()
+  rows = [row('error', '2026-11-20T00:01:05Z')]
+  await n.look()
+  assert.deepEqual(sent, ['⚠ 異常終了', '⚠ 異常終了'])
+})
+
+test('★ a ring for an old card does not hold back the next turn’s card', async () => {
+  const r = rig()
+  r.set('working', asking(0))
+  await r.n.look()
+  r.set('waiting')
+  await r.n.look()
+  r.n.owe(`agy-${A}`, '2026-11-20T00:00:10Z')
+  r.fail(true)
+  await r.n.look()
+  r.fail(false)
+  // the old card was answered on the PC; a new turn reaches its own card (its own state write)
+  r.set('working', asking(4))
+  await r.n.look()
+  r.set('waiting', undefined, '2026-11-20T00:01:00Z')
+  await r.n.look()
+  assert.deepEqual(r.sent.map((f) => f.label), ['要対応', '要対応'])
+})
+
+test('★ a state in the same second as a new prompt is the previous turn’s until the model writes after the prompt', async () => {
+  const row = (status: SessionStatus, lastActivity: string) => ({ machine: 'pc-a', account: 'agy', tool: 'agy', sessionId: `agy-${A}`, cwd: '/home/user/p', project: 'p', title: 'x', titleSource: 'ai', status, live: true, lastActivity }) as SessionSummary
+  let rows = [row('working', '2026-11-20T00:00:01Z')]
+  let records: Record<string, unknown>[] = [{ step_index: 0, type: 'USER_INPUT', created_at: '2026-11-20T00:00:00Z' }]
+  const sent: string[] = []
+  const n = new AgyNotifier({ rows: async () => rows, home: '/home/user', tail: () => records, send: async (_r, f) => {
+    sent.push(f.label)
+    return 1
+  } })
+  await n.look()
+  rows = [row('error', '2026-11-20T00:00:05.100Z')]
+  await n.look()
+  assert.deepEqual(sent, ['⚠ 異常終了'])
+  // a queued prompt went in at .800 of the same second; the state file still holds turn 0's error
+  records = [...records, { step_index: 1, type: 'ERROR_MESSAGE' }, { step_index: 2, type: 'USER_INPUT', created_at: '2026-11-20T00:00:05Z' }]
+  await n.look()
+  assert.deepEqual(sent, ['⚠ 異常終了'], 'not told again as the new turn’s')
+  // the new turn errs for real (the model wrote after the prompt)
+  records = [...records, { step_index: 3, type: 'ERROR_MESSAGE' }]
+  rows = [row('working', '2026-11-20T00:00:05.300Z')]
+  await n.look()
+  rows = [row('error', '2026-11-20T00:00:05.900Z')]
+  await n.look()
+  assert.deepEqual(sent, ['⚠ 異常終了', '⚠ 異常終了'])
+})
+
+test('★ a second card in the same turn rings too (each card is told once)', async () => {
+  const r = rig()
+  const two = [user(0), { step_index: 1, type: 'PLANNER_RESPONSE', created_at: '2026-11-20T00:00:01Z', tool_calls: [{ name: 'read_file', args: { Path: '/etc/hostname' } }, { name: 'run_command', args: { CommandLine: 'make' } }] }]
+  r.set('working', two)
+  await r.n.look()
+  r.set('waiting')
+  await r.n.look()
+  r.set('working', [...two, { step_index: 2, type: 'GENERIC', content: 'Created At: 2026-11-20T00:00:01Z\nok' }], '2026-11-20T00:00:20Z')
+  await r.n.look()
+  r.set('waiting', undefined, '2026-11-20T00:00:21Z')
+  await r.n.look()
+  assert.deepEqual(r.sent.map((f) => f.label), ['要対応', '要対応'])
+})
+
+test('★ a second card seen without the `working` between them still rings (two waiting looks, different cards)', async () => {
+  const r = rig()
+  const two = [user(0), { step_index: 1, type: 'PLANNER_RESPONSE', created_at: '2026-11-20T00:00:01Z', tool_calls: [{ name: 'read_file', args: { Path: '/etc/hostname' } }, { name: 'run_command', args: { CommandLine: 'make' } }] }]
+  r.set('working', two)
+  await r.n.look()
+  r.set('waiting')
+  await r.n.look()
+  r.set('waiting', [...two, { step_index: 2, type: 'GENERIC', content: 'Created At: 2026-11-20T00:00:01Z\nok' }], '2026-11-20T00:00:21Z')
+  await r.n.look()
+  assert.deepEqual(r.sent.map((f) => f.label), ['要対応', '要対応'])
+  await r.n.look()
+  assert.equal(r.sent.length, 2, 'the same card is not told again')
+})
+
+test('★ a queued alert for a card answered meanwhile is not sent for the next card (only the next card’s own)', async () => {
+  const B = 'ffffffff-ffff-4fff-8fff-ffffffffffff'
+  const mk = (id: string, status: SessionStatus) => ({ machine: 'pc-a', account: 'agy', tool: 'agy', sessionId: `agy-${id}`, cwd: '/home/user/p', project: 'p', title: 'x', titleSource: 'ai', status, live: true, lastActivity: '2026-11-20T00:00:10Z' }) as SessionSummary
+  const two = [user(0), { step_index: 1, type: 'PLANNER_RESPONSE', created_at: '2026-11-20T00:00:01Z', tool_calls: [{ name: 'read_file', args: { Path: '/x' } }, { name: 'run_command', args: { CommandLine: 'make' } }] }]
+  let rows = [mk(A, 'working'), mk(B, 'working')]
+  let records: Record<string, unknown>[] = two
+  let gate: Promise<void> | undefined
+  const sent: string[] = []
+  const n = new AgyNotifier({ rows: async () => rows, home: '/home/user', tail: () => records, send: async (row, f) => {
+    sent.push(`${row.sessionId.slice(4, 5)}:${f.label}`)
+    if (gate && row.sessionId === `agy-${B}`) await gate
+    return 1
+  } })
+  await n.look()
+  let release!: () => void
+  gate = new Promise<void>((res) => (release = res))
+  rows = [mk(A, 'working'), mk(B, 'error')]
+  const a = n.look()
+  await new Promise((res) => setTimeout(res, 0))
+  // card 1 comes up (its alert queues behind B's), then is allowed on the PC and card 2 comes up
+  rows = [mk(A, 'waiting'), mk(B, 'error')]
+  const b = n.look()
+  records = [...two, { step_index: 2, type: 'GENERIC', content: 'Created At: 2026-11-20T00:00:01Z\nok' }]
+  rows = [mk(A, 'waiting'), mk(B, 'error')]
+  const c = n.look()
+  gate = undefined
+  release()
+  await Promise.all([a, b, c])
+  assert.deepEqual(sent.filter((x) => x.startsWith('0')), ['0:要対応'])
+})
+
+test('★ another agy’s later call in the shared transcript is not a new card of this agy (no extra "needs you")', async () => {
+  const r = rig()
+  const mine = [user(0), { step_index: 1, type: 'PLANNER_RESPONSE', created_at: '2026-11-20T00:00:01Z', tool_calls: [{ name: 'run_command', args: { CommandLine: 'make' } }] }]
+  r.set('working', mine)
+  await r.n.look()
+  r.set('waiting')
+  await r.n.look()
+  // a second agy wrote its own call after this agy's state (the rig's state time is 00:00:10)
+  r.set('waiting', [...mine, { step_index: 2, type: 'USER_INPUT', created_at: '2026-11-20T00:00:20Z' }, { step_index: 3, type: 'PLANNER_RESPONSE', created_at: '2026-11-20T00:00:30Z', tool_calls: [{ name: 'read_file', args: { Path: '/x' } }] }])
+  await r.n.look()
+  assert.deepEqual(r.sent.map((f) => f.label), ['要対応'])
+})
+
+test('★ cards are not told apart while another agy writes into the conversation (one "needs you" per turn then)', async () => {
+  const row = (status: SessionStatus) => ({ machine: 'pc-a', account: 'agy', tool: 'agy', sessionId: `agy-${A}`, cwd: '/home/user/p', project: 'p', title: 'x', titleSource: 'ai', status, live: true, lastActivity: '2026-11-20T00:00:10Z' }) as SessionSummary
+  const two = [user(0), { step_index: 1, type: 'PLANNER_RESPONSE', created_at: '2026-11-20T00:00:01Z', tool_calls: [{ name: 'read_file', args: { Path: '/x' } }, { name: 'run_command', args: { CommandLine: 'make' } }] }]
+  let rows = [row('working')]
+  let records: Record<string, unknown>[] = two
+  const sent: string[] = []
+  const n = new AgyNotifier({ rows: async () => rows, home: '/home/user', tail: () => records, othersWrote: () => true, send: async (_r, f) => {
+    sent.push(f.label)
+    return 1
+  } })
+  await n.look()
+  rows = [row('waiting')]
+  await n.look()
+  // what looks like the next card (it may be the other agy's call)
+  records = [...two, { step_index: 2, type: 'GENERIC', content: 'Created At: 2026-11-20T00:00:01Z\nok' }]
+  await n.look()
+  assert.deepEqual(sent, ['要対応'])
+})
+
+test('★ the same card is not told again when a second agy’s prompt makes it look like a new turn', async () => {
+  const r = rig()
+  r.set('working', asking(0))
+  await r.n.look()
+  r.set('waiting')
+  await r.n.look()
+  // another agy's prompt (and its model's write) after this agy's state: the turn changes, the card (own write) does not
+  r.set('waiting', [...asking(0), { step_index: 5, type: 'USER_INPUT', created_at: '2026-11-20T00:00:05Z' }, { step_index: 6, type: 'PLANNER_RESPONSE', content: 'x' }])
+  await r.n.look()
+  assert.deepEqual(r.sent.map((f) => f.label), ['要対応'])
+})
+
+test('★ a "needs you" that reached nobody is retried while the same card stays up, even if a second agy changed the turn', async () => {
+  const r = rig()
+  r.set('working', asking(0))
+  await r.n.look()
+  r.fail(true)
+  r.set('waiting')
+  await r.n.look()
+  r.fail(false)
+  // another agy's prompt and response after this agy's state (the turn changes; the card does not)
+  r.set('waiting', [...asking(0), { step_index: 5, type: 'USER_INPUT', created_at: '2026-11-20T00:00:05Z' }, { step_index: 6, type: 'PLANNER_RESPONSE', content: 'x' }])
+  r.tick(31_000)
+  await r.n.look()
+  assert.deepEqual(r.sent.map((f) => f.label), ['要対応'])
+})
+
+test('★ a "done" whose other-writer check cannot be told now is tried again later, not dropped', async () => {
+  const row = (status: SessionStatus) => ({ machine: 'pc-a', account: 'agy', tool: 'agy', sessionId: `agy-${A}`, cwd: '/home/user/p', project: 'p', title: 'x', titleSource: 'ai', status, live: true, lastActivity: '2026-11-20T00:00:10Z' }) as SessionSummary
+  let rows = [row('working')]
+  let tell: boolean | undefined = undefined
+  let clock = 0
+  const sent: string[] = []
+  const n = new AgyNotifier({ rows: async () => rows, home: '/home/user', now: () => clock, tail: () => answered(0), othersWrote: async () => tell, send: async (_r, f) => {
+    sent.push(f.label)
+    return 1
+  } })
+  await n.look()
+  rows = [row('done')]
+  await n.look()
+  assert.deepEqual(sent, [])
+  tell = false
+  clock += 31_000
+  await n.look()
+  assert.deepEqual(sent, ['完了'])
+})
+
+test('★ a conversation missing from one look (a failed probe) is remembered: its completion afterwards still rings', async () => {
+  const r = rig()
+  r.set('working', [user(0)])
+  await r.n.look()
+  r.set(undefined)
+  r.tick(5_000)
+  await r.n.look()
+  r.set('done', answered(0))
+  r.tick(5_000)
+  await r.n.look()
+  assert.deepEqual(r.sent.map((f) => f.label), ['完了'])
+  // gone for longer than the grace: forgotten (then it is a new conversation)
+  r.set('working', [user(2)])
+  await r.n.look()
+  r.set(undefined)
+  await r.n.look()
+  r.tick(61_000)
+  await r.n.look()
+  r.set('done', answered(2))
+  await r.n.look()
+  assert.equal(r.sent.length, 1)
+})
+
+test('★ a push whose newest look lacks the row (a failed probe) is owed, not dropped', async () => {
+  const r = rig()
+  r.set('working', [user(0)])
+  await r.n.look()
+  // the "done" look is applied while a newer look (asked for meanwhile) misses the row
+  r.set('done', answered(0))
+  const first = r.n.look()
+  r.set(undefined)
+  const second = r.n.look()
+  await Promise.all([first, second])
+  assert.equal(r.sent.length, 0)
+  r.set('done', answered(0))
+  r.tick(31_000)
+  await r.n.look()
+  assert.deepEqual(r.sent.map((f) => f.label), ['完了'])
+})

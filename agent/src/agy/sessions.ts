@@ -10,8 +10,8 @@
 // ⚠️ The e-mail address agy includes is removed by the relay before writing; nothing here reads or returns it.
 // ⚠️ Row ids are `agy-<conversation id>` so they never meet a Claude session id or a Codex thread id.
 
-import { execFileSync } from 'node:child_process'
-import { readFileSync } from 'node:fs'
+import { execFile, execFileSync } from 'node:child_process'
+import { lstatSync, readdirSync, readFileSync, readlinkSync, realpathSync, statSync } from 'node:fs'
 import { open, readdir, stat, unlink } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, join } from 'node:path'
@@ -299,6 +299,8 @@ export interface AgyDeps {
   now: number
   /** ★ For the pane check (the list: cached; typing: uncached / `agy/keys.ts`). Absent ⇒ the cached one */
   aliveProcStart?: (pid: number) => string | null | undefined
+  /** ★ The conversations whose lock the agy holds (`agyLocksOf`; replaced in tests) */
+  locksOf?: (pid: number) => string[] | undefined
 }
 
 async function readSmallJson(path: string): Promise<unknown> {
@@ -381,6 +383,280 @@ async function headOf(path: string, bytes = 64 * 1024): Promise<string | undefin
   }
 }
 
+/** The pids that have their own state file (`pid-<pid>.json`, written by the status line relay) */
+export function agyPidFiles(dir: string): number[] {
+  try {
+    return readdirSync(dir).flatMap((name) => {
+      const m = /^pid-(\d+)\.json$/.exec(name)
+      return m ? [Number(m[1])] : []
+    })
+  } catch {
+    return []
+  }
+}
+
+/**
+ * ★ One agy's own state (`pid-<pid>.json`: the same content as the conversation's file, but only this agy writes it).
+ * ⚠️ Synchronous (read right before an answer's key). Not a plain file, too big, unreadable, not ours ⇒ undefined.
+ */
+export function readAgyPidFile(dir: string, pid: number): AgyFile | undefined {
+  const path = join(dir, `pid-${pid}.json`)
+  try {
+    const st = lstatSync(path)
+    if (!st.isFile() || st.size > MAX_FILE_BYTES) return undefined
+    const raw = JSON.parse(readFileSync(path, 'utf8')) as unknown
+    const cid = isObj(raw) && isObj(raw.input) ? str(raw.input.conversation_id) : undefined
+    const state = cid ? parseAgyFile(raw, cid) : undefined
+    return state && state.pid === pid ? { state, mtimeMs: st.mtimeMs } : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * ★ Whether another agy shows this conversation, or wrote into it since `since`. Two agys on one conversation share its
+ * transcript, so a call or a result after `since` could be the other one's (codex review).
+ * - ★ another agy's visit mark (`visit-<id>-<pid>`, touched by its status line on every write while it shows this
+ *   conversation, and kept when it moves elsewhere or exits) written at or after `since` ⇒ yes
+ * - a running agy whose own file names this conversation and that holds no other conversation's lock (a second agy
+ *   on this conversation), or that cannot be told ⇒ yes. Holding another conversation's lock = it moved there.
+ * ⚠️ Synchronous. An unreadable directory counts as shared (fail-closed). undefined = cannot tell (a lock probe of
+ * another claimant failed): acting on it is refused like shared; what is already shown is kept.
+ */
+export function agyShared(
+  dir: string,
+  conversationId: string,
+  pid: number,
+  isAgy: (pid: number) => boolean,
+  locksOf: (pid: number) => string[] | undefined,
+  since: number,
+): boolean | undefined {
+  try {
+    readdirSync(dir)
+  } catch {
+    return true
+  }
+  const want = conversationId.toLowerCase()
+  if (agyVisitedSince(dir, want, pid, since)) return true
+  let unknown = false
+  const withOwn = new Set(agyPidFiles(dir))
+  for (const other of withOwn) {
+    if (other === pid || !isAgy(other)) continue
+    if (readAgyPidFile(dir, other)?.state.conversationId !== want) continue
+    const locks = locksOf(other)
+    // ⚠️ Cannot tell whether it moved on (a probe that failed): said so (the cards keep what they show / codex review)
+    if (locks === undefined) {
+      unknown = true
+      continue
+    }
+    if (locks.some((c) => c !== want)) continue
+    return true
+  }
+  // ★ An agy with an older relay (no own file) whose conversation file names this one (`agyConversations` counts it too).
+  //   ⚠️ Whether that file is still its newest is not looked at here: counted as shared (fail-closed)
+  try {
+    const raw = JSON.parse(readFileSync(join(dir, `session-${want}.json`), 'utf8')) as unknown
+    const other = parseAgyFile(raw, want)?.pid
+    if (other !== undefined && other !== pid && !withOwn.has(other) && isAgy(other)) return true
+  } catch {
+    // no such file: nobody else
+  }
+  return unknown ? undefined : false
+}
+
+/**
+ * ★ Whether an agy other than the one holding this conversation's lock wrote into it since `since` (a visit mark at or
+ * after it). For "done": a shared transcript's last answer may be the other agy's (codex review). No holder (or it
+ * cannot be told) ⇒ true (fail-closed).
+ */
+export function agyOthersWrote(
+  dir: string,
+  conversationId: string,
+  since: number,
+  isAgy: (pid: number) => boolean,
+  locksOf: (pid: number) => string[] | undefined,
+): boolean | undefined {
+  const want = conversationId.toLowerCase()
+  const claimants = agyPidFiles(dir).filter((p) => isAgy(p) && readAgyPidFile(dir, p)?.state.conversationId === want)
+  // ⚠️ A claimant whose lock cannot be told ⇒ cannot tell (the caller tries again later instead of deciding / codex review)
+  if (claimants.some((p) => locksOf(p) === undefined)) return undefined
+  const holder = claimants.find((p) => locksOf(p)?.includes(want))
+  if (holder === undefined) return true
+  // ★ Only what another agy wrote counts here (its visit mark since then): one merely open and idle on it does not
+  //   (codex review: a parked second terminal silenced every "done")
+  return agyVisitedSince(dir, want, holder, since)
+}
+
+/** ★ Whether an agy other than `pid` wrote into this conversation since `since` (its visit mark). Unreadable ⇒ yes */
+export function agyVisitedSince(dir: string, conversationId: string, pid: number, since: number): boolean {
+  let names: string[]
+  try {
+    names = readdirSync(dir)
+  } catch {
+    return true
+  }
+  const want = conversationId.toLowerCase()
+  for (const name of names) {
+    const m = /^visit-([0-9a-fA-F-]{36})-(\d+)$/.exec(name)
+    if (!m || m[1]!.toLowerCase() !== want || Number(m[2]) === pid) continue
+    try {
+      if (statSync(join(dir, name)).mtimeMs >= since) return true
+    } catch {
+      // gone meanwhile
+    }
+  }
+  return false
+}
+
+/**
+ * ★★ agy's own word for which conversation a process shows: it keeps `presence/<id>.lock` open for it (measured on
+ * 1.5.13: the lock moves at `/new` — before the first prompt — and at `/resume`; a second agy on the same
+ * conversation says "already open" and holds none). Linux reads `/proc/<pid>/fd`; elsewhere `lsof`.
+ * @returns the conversation ids whose lock the process holds; undefined = cannot tell
+ */
+export function agyLocksOf(pid: number, home: string = homedir()): string[] | undefined {
+  if (process.platform === 'linux') {
+    let fds: string[]
+    try {
+      fds = readdirSync(`/proc/${pid}/fd`)
+    } catch {
+      return undefined
+    }
+    const paths: string[] = []
+    for (const fd of fds) {
+      try {
+        paths.push(readlinkSync(`/proc/${pid}/fd/${fd}`))
+      } catch {
+        // closed meanwhile
+      }
+    }
+    return lockIds(paths, home)
+  }
+  try {
+    return lockIds(lsofNames(execFileSync('lsof', lsofArgs(pid), { ...LSOF_OPTS, stdio: ['ignore', 'pipe', 'ignore'] })), home)
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * ★ `agyLocksOf` without blocking: the background looks and the list use this (a Mac's `lsof` takes a while, and
+ * several agys probed one after another blocked every other request / codex review). Linux's `/proc` is read as is.
+ */
+export function agyLocksOfAsync(pid: number, home: string = homedir()): Promise<string[] | undefined> {
+  if (process.platform === 'linux') return Promise.resolve(agyLocksOf(pid, home))
+  return new Promise((resolve) => {
+    execFile('lsof', lsofArgs(pid), LSOF_OPTS, (err, out) => resolve(err ? undefined : lockIds(lsofNames(String(out)), home)))
+  })
+}
+
+/**
+ * ★ Deps whose `locksOf` answers from probes made beforehand, all at once and without blocking (`agyLocksOfAsync`), for
+ * every running agy that has a state file. Deps that bring their own `locksOf` (tests) are returned as they are.
+ */
+export async function withLocksProbed(deps: AgyDeps): Promise<AgyDeps> {
+  if (deps.locksOf) return deps
+  const pids = new Set<number>(agyPidFiles(deps.dir).filter((p) => deps.isAgy(p)))
+  for (const f of await readAgyFiles(deps.dir)) if (deps.isAgy(f.state.pid)) pids.add(f.state.pid)
+  const probed = new Map(await Promise.all([...pids].map(async (p) => [p, await agyLocksOfAsync(p, deps.home)] as const)))
+  return { ...deps, locksOf: (p) => (probed.has(p) ? probed.get(p) : agyLocksOf(p, deps.home)) }
+}
+
+const LSOF_OPTS = {
+  encoding: 'utf8' as const,
+  timeout: 3000,
+  maxBuffer: 4 * 1024 * 1024,
+  env: { ...process.env, PATH: `${process.env.PATH ?? ''}:/usr/sbin:/usr/bin` },
+}
+const lsofArgs = (pid: number): string[] => ['-a', '-p', String(pid), '-Fn']
+const lsofNames = (out: string): string[] => out.split('\n').flatMap((l) => (l.startsWith('n') ? [l.slice(1)] : []))
+
+/** The conversation ids of the presence locks among these open paths (also through a linked `~/.gemini`) */
+function lockIds(paths: string[], home: string): string[] {
+  const plain = join(agyHome(home), 'presence')
+  let real = plain
+  try {
+    real = realpathSync(plain)
+  } catch {
+    // not there (yet): no lock can be held in it either
+  }
+  const dirs = [...new Set([plain, real])].map((d) => d + '/')
+  return paths.flatMap((p) => {
+    const dir = dirs.find((d) => p.startsWith(d))
+    if (!dir) return []
+    const m = /^([0-9a-fA-F-]{36})\.lock$/.exec(p.slice(dir.length))
+    return m ? [m[1]!.toLowerCase()] : []
+  })
+}
+
+/** ★ Whether the process holds this conversation's lock. ⚠️ Cannot tell ⇒ false (no card / no answer) */
+export function agyHoldsLock(pid: number, conversationId: string, home: string = homedir()): boolean {
+  return agyLocksOf(pid, home)?.includes(conversationId.toLowerCase()) ?? false
+}
+
+/**
+ * ★ The rows as each agy's own state says, for the agys that hold their conversation's lock (notifications / codex
+ * review: the per-conversation file can be overwritten by a second agy on the same conversation). One row per
+ * conversation; a conversation two agys claim is left out.
+ */
+export function agyOwnRows(machine: string, deps: AgyDeps): SessionSummary[] {
+  const locksOf = deps.locksOf ?? ((p: number) => agyLocksOf(p, deps.home))
+  const byConv = new Map<string, SessionSummary | null>()
+  // ⚠️ Every slow part (`lsof` on a Mac) first, then every file read: the states used are the ones read last, not one
+  //    read before another agy's slow lock scan (codex review)
+  const locks = new Map(agyPidFiles(deps.dir).filter((p) => deps.isAgy(p)).map((p) => [p, locksOf(p)] as const))
+  for (const [pid, held] of locks) {
+    const f = readAgyPidFile(deps.dir, pid)
+    if (!f || !held?.includes(f.state.conversationId)) continue
+    const id = f.state.conversationId
+    byConv.set(id, byConv.has(id) ? null : agyRow(f.state, { machine, transcriptBytes: 0, lastActivity: new Date(f.mtimeMs).toISOString() }))
+  }
+  return [...byConv.values()].filter((r): r is SessionSummary => r !== null)
+}
+
+/**
+ * ★ The own row of one conversation (the sender guard's direct read): only the agys whose own file names it are probed
+ * (usually one), the lock first and the file after. Two holding it ⇒ none.
+ */
+export function agyOwnRowOf(machine: string, deps: AgyDeps, conversationId: string): SessionSummary | undefined {
+  const want = conversationId.toLowerCase()
+  const locksOf = deps.locksOf ?? ((p: number) => agyLocksOf(p, deps.home))
+  const candidates = agyPidFiles(deps.dir).filter((p) => deps.isAgy(p) && readAgyPidFile(deps.dir, p)?.state.conversationId === want)
+  const holders = candidates.filter((p) => locksOf(p)?.includes(want))
+  if (holders.length !== 1) return undefined
+  const f = readAgyPidFile(deps.dir, holders[0]!)
+  return f && f.state.conversationId === want ? agyRow(f.state, { machine, transcriptBytes: 0, lastActivity: new Date(f.mtimeMs).toISOString() }) : undefined
+}
+
+/** `pid-<n>.json` files of agys gone for a day, and visit marks a day old, are removed (only ours) */
+export async function sweepAgyPidFiles(deps: AgyDeps): Promise<void> {
+  let names: string[]
+  try {
+    names = await readdir(deps.dir)
+  } catch {
+    return
+  }
+  // ⚠️ A visit mark of a conversation a running agy shows is kept however old (it may still guard a card left up for
+  //    days / codex review)
+  const shown = new Set(
+    agyPidFiles(deps.dir)
+      .filter((p) => deps.isAgy(p))
+      .flatMap((p) => readAgyPidFile(deps.dir, p)?.state.conversationId ?? []),
+  )
+  for (const name of names) {
+    const own = /^pid-(\d+)\.json$/.exec(name)
+    const visit = /^visit-([0-9a-fA-F-]{36})-\d+$/.exec(name)
+    if (own ? deps.isAgy(Number(own[1])) : !visit || shown.has(visit[1]!.toLowerCase())) continue
+    const path = join(deps.dir, name)
+    try {
+      const st = await stat(path)
+      if (deps.now - st.mtimeMs > AGY_FILE_MAX_AGE_MS) await unlink(path)
+    } catch {
+      // gone meanwhile
+    }
+  }
+}
+
 /** Titles from transcript heads, kept while the conversation lives (the first request never changes) */
 const titles = new Map<string, string>()
 
@@ -388,11 +664,75 @@ export function defaultAgyDeps(): AgyDeps {
   return { dir: agyDir(), home: homedir(), isAgy: isAgyProcess, now: Date.now() }
 }
 
+export interface AgyConversation {
+  /** The state to go by: the showing agy's own file, else the per-conversation file (an agy with an older relay) */
+  file: AgyFile
+  /** ★ Which file it came from (read again from that same file: a move then shows as a mismatch) */
+  source: 'own' | 'conversation'
+  /** ★ Two running agys show it (agy allows that, with a warning): no send, stop or card for it (fail-closed) */
+  contested: boolean
+}
+
+/**
+ * ★★ The conversations the running agys show, each with the state to go by (codex review: the per-conversation file is
+ * written by every agy on the conversation, so a second agy could overwrite it, take the Stop key, or — by exiting —
+ * make the conversation vanish from the list).
+ * - an agy's own file (`pid-<pid>.json`) names the conversation it shows; one that holds another conversation's lock
+ *   has moved there (a `/new` at an empty prompt writes no file yet) and does not count
+ * - one agy ⇒ its state; two or more ⇒ `contested`, the state of the one holding the lock (else the newest)
+ * - an agy without an own file (an older relay) claims by its newest per-conversation file (`liveAgy`), and counts
+ *   like any other (a mix of relay versions is contested too)
+ */
+export async function agyConversations(deps: AgyDeps): Promise<Map<string, AgyConversation>> {
+  // ★ One claimant per running agy: its own file when it has one (only that: its per-conversation files may be stale,
+  //   it may have moved on / codex review), else its newest per-conversation file (an agy with an older relay)
+  const claims = new Map<string, (AgyFile & { source: AgyConversation['source'] })[]>()
+  const add = (f: AgyFile, source: AgyConversation['source']): void => {
+    const list = claims.get(f.state.conversationId) ?? []
+    list.push({ ...f, source })
+    claims.set(f.state.conversationId, list)
+  }
+  const withOwn = new Set<number>()
+  for (const pid of agyPidFiles(deps.dir)) {
+    if (!deps.isAgy(pid)) continue
+    const own = readAgyPidFile(deps.dir, pid)
+    if (!own) continue
+    withOwn.add(pid)
+    add(own, 'own')
+  }
+  for (const f of await liveAgy(deps)) if (!withOwn.has(f.state.pid)) add(f, 'conversation')
+  const out = new Map<string, AgyConversation>()
+  const locksOf = deps.locksOf ?? ((p: number) => agyLocksOf(p, deps.home))
+  for (const [conv, list] of claims) {
+    // ⚠️ Locks are read only when two claim it (a Mac's `lsof` is slow)
+    const present = list.length < 2 ? list : list.filter((c) => !(locksOf(c.state.pid)?.some((l) => l !== conv) ?? false))
+    if (present.length === 0) continue
+    const pick = (c: (typeof present)[number]): Omit<AgyConversation, 'contested'> => ({ file: { state: c.state, mtimeMs: c.mtimeMs }, source: c.source })
+    if (present.length === 1) {
+      // ⚠️ A "card is up" state is believed only from the lock holder (a status line that stopped writing, then a move
+      //    elsewhere, would keep an old card listed / codex review). Locks are read for waiting states only.
+      //    ⚠️ Only a probe that shows it is NOT held hides it: "cannot tell" (a slow `lsof`) keeps it listed (hiding it
+      //    made the phone close a live "needs you" / codex review). Acting on it still needs the lock (`findAgyTarget`).
+      const locks = present[0]!.state.confirmationPending ? locksOf(present[0]!.state.pid) : undefined
+      if (locks !== undefined && !locks.includes(conv)) continue
+      out.set(conv, { ...pick(present[0]!), contested: false })
+      continue
+    }
+    const holder = present.find((c) => locksOf(c.state.pid)?.includes(conv))
+    out.set(conv, { ...pick(holder ?? present.reduce((a, b) => (b.mtimeMs > a.mtimeMs ? b : a))), contested: true })
+  }
+  return out
+}
+
 /** ★ The live agy rows for `/sessions` */
-export async function agyRows(machine: string, deps: AgyDeps = defaultAgyDeps()): Promise<SessionSummary[]> {
-  const live = await liveAgy(deps)
+export async function agyRows(machine: string, given: AgyDeps = defaultAgyDeps()): Promise<SessionSummary[]> {
+  const deps = await withLocksProbed(given)
+  const conversations = [...(await agyConversations(deps)).values()]
+  const locksOf = deps.locksOf ?? ((p: number) => agyLocksOf(p, deps.home))
+  const holdsLock = (pid: number, conv: string): boolean => locksOf(pid)?.includes(conv) ?? false
+  const live = conversations.map((c) => c.file)
   const rows: SessionSummary[] = []
-  for (const f of live) {
+  for (const { file: f, contested } of conversations) {
     const path = transcriptPathOf(f.state.conversationId, deps.home)
     const bytes = await sizeOf(path)
     // ★ Not listed before its first message, like Claude (whose list is built from transcripts): a send there is
@@ -415,9 +755,12 @@ export async function agyRows(machine: string, deps: AgyDeps = defaultAgyDeps())
         transcriptBytes: bytes,
         lastActivity: new Date(f.mtimeMs).toISOString(),
         ...(title ? { promptTitle: title } : {}),
-        ...(typeof pane === 'string' ? {} : { sendRoute: 'keys' as const }),
+        // ⚠️ A conversation two agys show takes nothing from the phone (`agyConversations`), nor does one whose agy does
+        //    not hold its lock (`findAgyTarget` refuses the same)
+        ...(typeof pane === 'string' || contested || !holdsLock(f.state.pid, f.state.conversationId) ? {} : { sendRoute: 'keys' as const }),
       }),
     )
+    if (contested) rows[rows.length - 1] = { ...rows[rows.length - 1]!, agyShared: true }
   }
   // forget titles of conversations no longer live (bounded)
   const keep = new Set(live.map((f) => f.state.conversationId))

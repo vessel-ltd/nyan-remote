@@ -1,7 +1,8 @@
 import { useMemo, useState } from 'preact/hooks'
 import type { VNode } from 'preact'
 import type { PermissionRequest } from '../../../shared/types.ts'
-import { closePermissionNotification } from '../notifications.ts'
+import { closePermissionNotification, closeSessionNotification } from '../notifications.ts'
+import { clearLost, nextAttempt, rememberLost } from './lostAnswers.ts'
 import { hhmm } from '../time.ts'
 import { answerComplete, byQuestion, needsSubmit, notesToSend, previewText, tapAnswers } from './interaction.ts'
 import { cells } from './previewCells.ts'
@@ -94,7 +95,7 @@ export function Permissions({
     feedback?: string,
     /** ★ Question text → a note (Codex questions) */
     notes?: Record<string, string>,
-  ) => Promise<{ ok: boolean; reason?: string }>
+  ) => Promise<{ ok: boolean; reason?: string; at?: string }>
   /** Whether it is shown at the bottom of the thread (the same placement as Claude's Android app) */
   inThread?: boolean
 }) {
@@ -129,7 +130,11 @@ export function Permissions({
    * ⚠️ Not a block: long heredocs are normal, and blocking would stall work while away.
    */
   const [clippedAsk, setClippedAsk] = useState<PermissionRequest & { endpointId: string }>()
-
+  /**
+   * ★ An answer that did not go through, for a card that is gone by now (2026-11-20 / codex review: an agy deny refused
+   *   because the PC had just allowed it — the reason rendered only inside the card, which had already disappeared, so
+   *   the phone showed nothing while the command ran). Shown above the cards until dismissed.
+   */
   if (items.length === 0) return null
 
   const pick = (key: string, question: string, label: string, multi: boolean): void => {
@@ -156,10 +161,12 @@ export function Permissions({
     notes?: Record<string, string>,
   ) => {
     setBusy(item.key)
+    const attempt = nextAttempt()
     try {
       const res = await onAnswer(item.endpointId, item.key, behavior, answers, feedback, notes)
       if (!res.ok) {
         setMsg((m) => ({ ...m, [item.key]: res.reason ?? t('もう有効ではありません', 'No longer valid') }))
+        rememberLost(item, res.reason ?? t('もう有効ではありません', 'No longer valid'), attempt)
         // ⚠️⚠️ **Do not dismiss the notification when it did not go through** (2026-08-20 codex high #1).
         //    `permissionTag` strips the generation (`#…`), so it has **the same tag as a different generation
         //    of the approval currently waiting**. Closing it when refused (= it was a stale mark)
@@ -170,8 +177,25 @@ export function Permissions({
       //   Moreover an old notification holds **the URL from when it was created**, so leaving it invites accidents
       //   (2026-08-13: after a fix, tapping an old notification showed sw.js's source)
       void closePermissionNotification(item.machine, item.key)
+      // ★ An answer of this conversation went through: an earlier failure is no news any more (codex review)
+      clearLost(item, attempt)
+      // ★ Denying an agy card stops its turn: nothing later replaces its "needs you" (`closeSessionNotification`)
+      //   ⚠️ Only notifications shown before the answer took effect, by the agent's clock (`res.at`; the phone's clock is
+      //      not the agent's). No `at` (an older agent) ⇒ nothing is closed
+      const tookEffect = res.at ? Date.parse(res.at) : NaN
+      if (item.tool === 'agy' && behavior === 'deny' && item.sessionId && Number.isFinite(tookEffect)) {
+        // ★ Again a few times: a push already on its way can be shown after this (codex review)
+        const sessionId = item.sessionId
+        for (const ms of [0, 3000, 10_000, 30_000]) {
+          setTimeout(() => void closeSessionNotification(item.machine, item.account, sessionId, tookEffect), ms)
+        }
+      }
     } catch (err) {
-      setMsg((m) => ({ ...m, [item.key]: err instanceof Error ? err.message : String(err) }))
+      const reason = err instanceof Error ? err.message : String(err)
+      setMsg((m) => ({ ...m, [item.key]: reason }))
+      // ★ Kept beyond the card too (a dropped reply: the card may be gone by now). ⚠️ Whether it took effect is unknown
+      //   (the agent may have typed it before the reply was lost / codex review) ⇒ said so, not "did not go through"
+      rememberLost(item, reason, attempt, true)
     } finally {
       setBusy(undefined)
     }
@@ -179,6 +203,7 @@ export function Permissions({
 
   return (
     <section class={inThread ? 'group perms inthread' : 'group perms'}>
+
       <h2>{inThread ? t('承認が必要です', 'Approval needed') : t(`承認待ち ${items.length}`, `Approval needed ${items.length}`)}</h2>
       <ul class="sessions">
         {items.map((p) => (
@@ -397,7 +422,12 @@ export function Permissions({
                 onClick={() => void answer(p, 'deny')}
               >
                 {/* ★ A Codex question has no "deny": the phone stops the turn that asks (ESC on the PC) */}
-                {p.tool === 'codex' && p.interaction?.kind === 'question' ? t('止める', 'Stop') : t('拒否', 'Deny')}
+                {p.tool === 'codex' && p.interaction?.kind === 'question'
+                  ? t('止める', 'Stop')
+                  : /* ★ agy: declining a card stops its turn (ESC / docs/AGY.md §9) */
+                    p.tool === 'agy'
+                    ? t('拒否して止める', 'Deny and stop')
+                    : t('拒否', 'Deny')}
               </button>
             </div>
           </li>

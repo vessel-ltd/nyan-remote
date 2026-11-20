@@ -112,7 +112,12 @@ test('★ sw: leaves the notification just shown alone', () => {
 })
 
 test('★★ sw: notifications carry machine (forgetting it silently disables cleanup)', () => {
-  assert.match(PUSH, /data: \{ url: data\.url \|\| '\/', machine: data\.machine \}/)
+  assert.match(PUSH, /data: \{\n\s+url: data\.url \|\| '\/',\n\s+machine: data\.machine,/)
+  // ★ and the sender's time (WebKit has no `Notification.timestamp`; the agy deny cleanup reads this), never the device's
+  assert.match(PUSH, /\.\.\.\(Number\.isNaN\(pruneAt\) \? \{\} : \{ at: pruneAt \}\)/)
+  // ★ the session and "needs you" for the open app's cleanup
+  assert.match(PUSH, /\.\.\.\(typeof data\.session === 'string' \? \{ session: data\.session \} : \{\}\)/)
+  assert.match(PUSH, /\.\.\.\(data\.waiting === true \? \{ waiting: true \} : \{\}\)/)
 })
 
 test('★ sw: cleans up after showing the notification (rule: a push must always show a notification)', () => {
@@ -554,4 +559,19 @@ test('★★ sw: notification images are refetched on every update; the old imag
   h.caches_.get('tmux-agent-shell-v2')!.set(`${ORIGIN}/icons/notify-256.png`, res('手元の絵', { type: 'image/png' }))
   await h.install()
   assert.equal(h.body('/icons/notify-256.png', 'tmux-agent-shell-v2'), '手元の絵')
+})
+
+test('★ sw: an older push does not replace a newer notification with the same tag (delivery order is not guaranteed)', () => {
+  const m = PUSH.match(/function newerShown\([\s\S]*?\n\}/)
+  assert.ok(m, 'push-core.js has no newerShown')
+  const newerShown = new Function(`${m[0]}; return newerShown`)() as (shown: unknown[], pushAt: number) => unknown
+  const done = { tag: 't', title: 'x', body: '完了', data: { at: AT + 5000 } }
+  assert.equal(newerShown([done], AT), done)
+  assert.equal(newerShown([done], AT + 6000), undefined, 'a newer push replaces as before')
+  assert.equal(newerShown([{ tag: 't', data: { url: '/' } }], AT), undefined, 'no time on the shown one: as before')
+  assert.equal(newerShown([done], Number.NaN), undefined, 'no time on this push: as before')
+  // the handler asks it before showing, and a kept newer one means nothing else is shown
+  assert.match(PUSH, /const run = pushChain\.then\(\(\) => keepNewer\(data\.tag \|\| 'tmux-agent', pruneAt\)\.then\(\(kept\) => \(kept \? undefined : show\(\)\)\)\)/)
+  // ★ one push at a time (two arriving together both read the tray before either wrote)
+  assert.match(PUSH, /pushChain = run\.catch\(\(\) => undefined\)\n  event\.waitUntil\(run\)/)
 })

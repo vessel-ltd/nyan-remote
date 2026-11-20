@@ -7,8 +7,8 @@
 //
 // ## What is different from Claude (measured on agy 1.5.12, 2026-11-20)
 //
-//   1. ⚠️⚠️ **Text is typed only while agy is idle.** On an approval card `y` approves, `n` declines, digits pick an
-//      option and Enter takes option 1. agy says a card is up only through its status line (written at most every
+//   1. ⚠️⚠️ **Text is typed only while agy is idle.** On an approval card a digit picks an option at once, Enter takes
+//      the option under the cursor and ESC cancels (agy 1.5.13; on 1.5.12 `y` / `n` answered too). agy says a card is up only through its status line (written at most every
 //      300 ms after the change), so a card that appears while a turn runs can be up before we know. From idle no
 //      card can appear before the model has answered (seconds), and the body + Enter take ~150 ms.
 //      ⇒ working / waiting ⇒ refused (agy itself would queue it, but we could not keep it off a card).
@@ -46,9 +46,14 @@ import {
   writeControl,
   writeKeys,
 } from '../claude/keys.ts'
+import { callBeforeState, readTailRecords, turnEnd } from './pending.ts'
 import {
   AGY_PREFIX,
+  agyConversations,
+  agyLocksOf,
   agyPaneOf,
+  agyShared,
+  readAgyPidFile,
   defaultAgyDeps,
   liveAgy,
   parseAgyFile,
@@ -108,13 +113,15 @@ export interface AgyTarget {
   transcript: string
 }
 
-export type AgyTargetFailure = 'not-open' | AgyPaneFailure
+export type AgyTargetFailure = 'not-open' | 'shared' | AgyPaneFailure
 
 export interface AgyKeysDeps extends AgyDeps {
   /** ⚠️ Right before typing: the uncached liveness (codex round 13 / same as Claude's `findPane`) */
   aliveProcStart: (pid: number) => string | null | undefined
   /** ★ Reads the state as of now (each gate). Replaced in tests to change it between the checks */
   readNow?: typeof readNow
+  /** How long a card answer waits before its last check (`AGY_ANSWER_SETTLE_MS`; tests shorten it) */
+  answerSettleMs?: number
 }
 
 export function defaultAgyKeysDeps(): AgyKeysDeps {
@@ -123,9 +130,14 @@ export function defaultAgyKeysDeps(): AgyKeysDeps {
 
 /** ★ The agy showing this conversation now, and its way in. ⚠️ Only the conversation its pid wrote last (`liveAgy`) */
 export async function findAgyTarget(conversationId: string, deps: AgyKeysDeps): Promise<AgyTarget | AgyTargetFailure> {
-  const live = await liveAgy(deps)
-  const f = live.find((x) => x.state.conversationId === conversationId)
-  if (!f) return 'not-open'
+  // ★ The same view as the list (`agyConversations`): the showing agy's own state; two agys on it ⇒ refused
+  const c = (await agyConversations(deps)).get(conversationId)
+  if (!c) return 'not-open'
+  if (c.contested) return 'shared'
+  const f = c.file
+  // ★★ Only the agy that holds the conversation's lock (agy's own word that it shows it): a sole claimant can still be a
+  //    second agy, the lock holder not having written its own file yet (idle since an update / codex review)
+  if (!(deps.locksOf ?? ((p: number) => agyLocksOf(p, deps.home)))(f.state.pid)?.includes(conversationId)) return 'shared'
   const pane = await agyPaneOf(f.state.pid, deps.aliveProcStart)
   if (typeof pane === 'string') return pane
   // ⚠️ Written before this agy's relay registered ⇒ an earlier process with the same pid (codex review)
@@ -135,7 +147,9 @@ export async function findAgyTarget(conversationId: string, deps: AgyKeysDeps): 
     pid: f.state.pid,
     pane,
     dir: deps.dir,
-    stateFile: join(deps.dir, `session-${conversationId}.json`),
+    // ★ Read again from the file it was found in (codex review: choosing again after the fact fell back to a stale
+    //   conversation file when the agy had just moved; its own file then names the new conversation ⇒ refused)
+    stateFile: c.source === 'own' ? join(deps.dir, `pid-${f.state.pid}.json`) : join(deps.dir, `session-${conversationId}.json`),
     transcript: transcriptPathOf(conversationId, deps.home),
   }
 }
@@ -178,14 +192,25 @@ export function readNow(target: Pick<AgyTarget, 'conversationId' | 'pid' | 'pane
   }
 }
 
-const sendNow = (target: AgyTarget, read: typeof readNow): Exclude<AgyGate, 'idle'> => {
+/** ★ The lock check of each gate (`findAgyTarget`): a `/resume` picked on the PC moves the lock before the status line
+ *   writes (codex review). First, so the files are read last. */
+type LockCheck = (pid: number, conversationId: string) => boolean
+
+const sendNow = (target: AgyTarget, read: typeof readNow, holds: LockCheck): Exclude<AgyGate, 'idle'> => {
+  if (!holds(target.pid, target.conversationId)) return 'unsure'
   const now = read(target)
   return now ? sendGate(now.state, now.stateMtimeMs, now.transcriptMtimeMs) : 'unsure'
 }
 
-const stopNow = (target: AgyTarget, read: typeof readNow): Exclude<AgyGate, 'busy'> => {
+const stopNow = (target: AgyTarget, read: typeof readNow, holds: LockCheck): Exclude<AgyGate, 'busy'> => {
+  if (!holds(target.pid, target.conversationId)) return 'unsure'
   const now = read(target)
   return now ? stopGate(now.state, now.stateMtimeMs, now.transcriptMtimeMs) : 'unsure'
+}
+
+const lockCheck = (deps: AgyKeysDeps): LockCheck => {
+  const locksOf = deps.locksOf ?? ((p: number) => agyLocksOf(p, deps.home))
+  return (pid, conv) => locksOf(pid)?.includes(conv) ?? false
 }
 
 /** ★ One key per conversation however the id is spelled (codex review: case variants made separate chains) */
@@ -232,6 +257,13 @@ export interface AgyResult<F> {
 /** ★ What the phone is told (and the HTTP status), by reason. Records so a new reason fails the type check */
 export const AGY_SEND_REFUSAL: Record<AgySendFailure, () => [number, string]> = {
   'not-open': () => [409, t('この agy の会話は、いま開かれていません。', 'This agy conversation is not open right now.')],
+  shared: () => [
+    409,
+    t(
+      'この会話は2つの agy で開かれています。どちらに届くか決められないので、スマホからは送れません（PC で操作してください）。',
+      'This conversation is open in two agys. Which one would get it cannot be told, so it cannot be sent from the phone (use the PC).',
+    ),
+  ],
   'no-relay': () => [
     409,
     t(
@@ -273,6 +305,10 @@ export const AGY_SEND_REFUSAL: Record<AgySendFailure, () => [number, string]> = 
 
 export const AGY_STOP_REFUSAL: Record<AgyStopFailure, () => [number, string]> = {
   'not-open': AGY_SEND_REFUSAL['not-open'],
+  shared: () => [
+    409,
+    t('この会話は2つの agy で開かれています。スマホからは止められません（PC で操作してください）。', 'This conversation is open in two agys. It cannot be stopped from the phone (use the PC).'),
+  ],
   'no-relay': () => [
     409,
     t(
@@ -303,6 +339,7 @@ export async function sendToAgy(
 ): Promise<AgyResult<AgySendFailure>> {
   const key = keyOf(conversationId)
   const read = deps.readNow ?? readNow
+  const holds = lockCheck(deps)
   return serializeBySession(key, async () => {
     const clean = sanitizeForKeys(text)
     if (!clean.ok) {
@@ -313,7 +350,7 @@ export async function sendToAgy(
     const target = await findAgyTarget(conversationId, deps)
     if (typeof target === 'string') return fail(target)
     if (typedTooLong(clean.value.text)) return fail('too-long')
-    const gate = sendNow(target, read)
+    const gate = sendNow(target, read, holds)
     if (gate !== 'ok') return fail(gate)
     const typed = agyTyped(clean.value.text)
     const long = needsPaste(typed)
@@ -321,7 +358,7 @@ export async function sendToAgy(
     // ★ Looked at again right before the body and right before Enter (a card, a turn the PC started)
     let refusedBy: Exclude<AgyGate, 'idle' | 'ok'> | undefined
     const stopHere = (): boolean => {
-      const g = sendNow(target, read)
+      const g = sendNow(target, read, holds)
       if (g === 'ok') return false
       refusedBy = g
       return true
@@ -352,17 +389,18 @@ export async function stopAgy(
 ): Promise<AgyResult<AgyStopFailure>> {
   const key = keyOf(conversationId)
   const read = deps.readNow ?? readNow
+  const holds = lockCheck(deps)
   return serializeBySession(key, async () => {
     const prev = lastStopAt.get(key)
     if (prev !== undefined && now() - prev < AGY_STOP_COOLDOWN_MS) return failStop('too-soon')
     const target = await findAgyTarget(conversationId, deps)
     if (typeof target === 'string') return failStop(target)
-    const gate = stopNow(target, read)
+    const gate = stopNow(target, read, holds)
     if (gate !== 'ok') return failStop(gate)
     let refusedBy: Exclude<AgyGate, 'busy' | 'ok'> | undefined
     const res = await writeControl(target.pane.socketPath, CONTROL_KEYS.escape, {
       beforeWrite: () => {
-        const g = stopNow(target, read)
+        const g = stopNow(target, read, holds)
         if (g === 'ok') return false
         refusedBy = g
         return true
@@ -376,3 +414,96 @@ export async function stopAgy(
   })
 }
 
+
+/**
+ * ★★ The keys that answer an agy approval card (measured on agy 1.5.13, 2026-11-20 / docs/AGY.md §9).
+ * - `1` takes option 1 at once ("Yes, run command" / "Yes, allow access"); ⚠️ `y` did nothing on 1.5.13 (it did on
+ *   1.5.12), and Enter takes whichever option the cursor is on (someone may have moved it on the PC).
+ * - ESC cancels the card ("esc to cancel"): agy declines and stops the turn ("Interrupted"). The option numbers of
+ *   "No" differ per card (4 for a command, 3 for a file), so no digit is used for it.
+ * ⚠️⚠️ Fixed bytes only: nothing from the phone is typed (same as `CONTROL_KEYS`).
+ */
+export const AGY_CARD_KEYS: Record<'allow' | 'deny', string> = { allow: '1', deny: CONTROL_KEYS.escape }
+
+/** Which card the phone answered: the agy, the status file's time and the call (`agy/pending.ts`) */
+export interface AgyCardMark {
+  pid: number
+  stateMtimeMs: number
+  step: number
+  index: number
+  /** When the call's response was written (`PendingCall.at`) */
+  callAt: number
+}
+
+export type AgyCardFailure = AgyTargetFailure | 'changed' | 'unreachable'
+
+/**
+ * ★ A card answer waits this long after its first check, then checks again right before the key (codex review).
+ * agy writes a state change to the status line file within a few hundred ms (at most one call per 300 ms). If the
+ * card was answered on the PC just before the phone's answer, that write lands in this wait and the phone's key is
+ * not sent (ESC would otherwise stop a command the PC had just allowed; `1` would sit in the input box).
+ */
+export const AGY_ANSWER_SETTLE_MS = 500
+
+/** ★ Whether this card is still the one up now (this agy's own file, its lock, the transcript). ⚠️ Synchronous */
+export function sameCardNow(
+  target: Pick<AgyTarget, 'conversationId' | 'pid' | 'pane' | 'dir' | 'transcript'>,
+  mark: AgyCardMark,
+  checks: {
+    holdsLock: (pid: number, conversationId: string) => boolean
+    shared: (conversationId: string, pid: number, since: number) => boolean | undefined
+    tail?: (path: string) => Record<string, unknown>[]
+  },
+): boolean {
+  // ⚠️ The slow checks first (`lsof` on a Mac can take a while), the file reads last: the state the key acts on is the
+  //    one read right before it (codex review)
+  // ★★ agy's own word that this process shows this conversation (`cards.ts` rule 8)
+  if (!checks.holdsLock(mark.pid, target.conversationId)) return false
+  // ⚠️ Another agy on the same conversation (now, or during this card): the last call could be its (`cards.ts` rule 7)
+  // (cannot tell counts as shared here: nothing is typed on a guess)
+  if (checks.shared(target.conversationId, mark.pid, mark.callAt) !== false) return false
+  const p = turnEnd((checks.tail ?? readTailRecords)(target.transcript)).pending
+  if (p === undefined || p.step !== mark.step || p.index !== mark.index || p.at !== mark.callAt) return false
+  // ★ The state file last of all (the transcript read can take a moment / codex review)
+  const f = readAgyPidFile(target.dir, mark.pid)
+  if (!f || f.state.conversationId !== target.conversationId || !f.state.confirmationPending) return false
+  if (f.mtimeMs !== mark.stateMtimeMs || f.mtimeMs < target.pane.startedAt) return false
+  // ★ `cards.ts` rule 9: the call is not newer than this agy's "card is up" state
+  return callBeforeState(p, f.mtimeMs)
+}
+
+/**
+ * ★★ Answer the card the phone saw: `1` (allow) or ESC (deny), only while that same card is up.
+ * ⚠️ Checked after the agy is found, and again right before the byte goes out after `AGY_ANSWER_SETTLE_MS`: a card
+ *    answered on the PC meanwhile (the status file was rewritten) or a later card (another call) is never answered. ⚠️ Serialized with sends and
+ *    stops (the same chain), so a stop cannot slip between the check and the key.
+ */
+export async function answerAgyCard(
+  conversationId: string,
+  mark: AgyCardMark,
+  behavior: 'allow' | 'deny',
+  deps: AgyKeysDeps = defaultAgyKeysDeps(),
+  tail: (path: string) => Record<string, unknown>[] = readTailRecords,
+): Promise<{ ok: true } | { ok: false; reason: AgyCardFailure }> {
+  const conv = conversationId.toLowerCase()
+  return serializeBySession(keyOf(conv), async () => {
+    if (!deps.isAgy(mark.pid)) return { ok: false, reason: 'not-open' }
+    // ⚠️ The uncached liveness (a reused pid is the worst place to type)
+    const pane = await agyPaneOf(mark.pid, deps.aliveProcStart)
+    if (typeof pane === 'string') return { ok: false, reason: pane }
+    const target = { conversationId: conv, pid: mark.pid, pane, dir: deps.dir, transcript: transcriptPathOf(conv, deps.home) }
+    const locksOf = deps.locksOf ?? ((pid: number) => agyLocksOf(pid, deps.home))
+    const checks = {
+      holdsLock: (pid: number, c: string) => locksOf(pid)?.includes(c) ?? false,
+      shared: (c: string, pid: number, since: number) => agyShared(deps.dir, c, pid, deps.isAgy, locksOf, since),
+      tail,
+    }
+    if (!sameCardNow(target, mark, checks)) return { ok: false, reason: 'changed' }
+    await new Promise((r) => setTimeout(r, deps.answerSettleMs ?? AGY_ANSWER_SETTLE_MS))
+    const res = await writeControl(pane.socketPath, AGY_CARD_KEYS[behavior], {
+      beforeWrite: () => !sameCardNow(target, mark, checks),
+    })
+    if (res.ok) return { ok: true }
+    return { ok: false, reason: res.reason === 'pending-approval' ? 'changed' : 'unreachable' }
+  })
+}

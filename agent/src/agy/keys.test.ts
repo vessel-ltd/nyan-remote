@@ -1,10 +1,10 @@
 import assert from 'node:assert/strict'
-import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
+import { appendFileSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
 import { createServer, type Server } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
-import { agyTyped, findAgyTarget, looksLikeAgyShortcut, readNow, sendGate, sendToAgy, stopAgy, stopGate, type AgyKeysDeps } from './keys.ts'
+import { AGY_CARD_KEYS, agyTyped, answerAgyCard, findAgyTarget, looksLikeAgyShortcut, readNow, sendGate, sendToAgy, stopAgy, stopGate, type AgyKeysDeps } from './keys.ts'
 import { agyRows } from './sessions.ts'
 
 const A = '062a8f25-9451-42f3-ae93-34a208e99365'
@@ -68,8 +68,12 @@ async function lab(t: { after(fn: () => void): void }, opts: { pane?: boolean; p
   utimesSync(transcript, BASE - 100, BASE - 100)
   const stateFile = join(dir, `session-${A}.json`)
   const setState = (over: Record<string, unknown>, mtimeSec = BASE): void => {
-    writeFileSync(stateFile, JSON.stringify({ nyanPid: PID, nyanBusyAt: 0, input: { conversation_id: A, cwd: '/home/user/p', agent_state: 'idle', ...over } }))
-    utimesSync(stateFile, mtimeSec, mtimeSec)
+    const body = JSON.stringify({ nyanPid: PID, nyanBusyAt: 0, input: { conversation_id: A, cwd: '/home/user/p', agent_state: 'idle', ...over } })
+    // ★ the relay hook writes both: the conversation's file and this agy's own (`pid-<pid>.json`)
+    for (const f of [stateFile, join(dir, `pid-${PID}.json`)]) {
+      writeFileSync(f, body)
+      utimesSync(f, mtimeSec, mtimeSec)
+    }
   }
   setState({})
   const sock = join(root, 'k.sock')
@@ -96,7 +100,7 @@ async function lab(t: { after(fn: () => void): void }, opts: { pane?: boolean; p
     else process.env.NYAN_REMOTE_STATE_DIR = prev
     rmSync(root, { recursive: true, force: true })
   })
-  const deps: AgyKeysDeps = { dir, home, isAgy: (p) => p === PID, now: Date.now(), aliveProcStart: (p) => (p === PID ? START : null) }
+  const deps: AgyKeysDeps = { dir, home, isAgy: (p) => p === PID, now: Date.now(), aliveProcStart: (p) => (p === PID ? START : null), locksOf: (p) => (p === PID ? [A] : []) }
   return { root, deps, stateFile, transcript, sock, got, server, setState }
 }
 
@@ -195,12 +199,18 @@ test('★★ stop: one ESC while working; refused when idle, on a card, and righ
 test('target: only the conversation its agy wrote last', async (t) => {
   const l = await lab(t)
   const B = '6c0298e8-77c4-406c-aa97-cbecdfd19c88'
-  // the same agy moved on to another conversation (newer file)
-  writeFileSync(join(l.deps.dir, `session-${B}.json`), JSON.stringify({ nyanPid: PID, nyanBusyAt: 0, input: { conversation_id: B, cwd: '/home/user/p', agent_state: 'idle' } }))
-  utimesSync(join(l.deps.dir, `session-${B}.json`), BASE + 10, BASE + 10)
-  assert.equal(await findAgyTarget(A, l.deps), 'not-open')
-  const b = await findAgyTarget(B, l.deps)
+  // the same agy moved on to another conversation (newer file; its own file says so too)
+  for (const f of [`session-${B}.json`, `pid-${PID}.json`]) {
+    writeFileSync(join(l.deps.dir, f), JSON.stringify({ nyanPid: PID, nyanBusyAt: 0, input: { conversation_id: B, cwd: '/home/user/p', agent_state: 'idle' } }))
+    utimesSync(join(l.deps.dir, f), BASE + 10, BASE + 10)
+  }
+  // (its lock moved with it)
+  const moved = { ...l.deps, locksOf: (p: number) => (p === PID ? [B] : []) }
+  assert.equal(await findAgyTarget(A, moved), 'not-open')
+  const b = await findAgyTarget(B, moved)
   assert.equal(typeof b === 'object' ? b.pid : b, PID)
+  // ★ an agy that does not hold the conversation's lock (a second agy; the holder has not written its own file yet)
+  assert.equal(await findAgyTarget(B, l.deps), 'shared')
 })
 
 test('★★★ the state changing between the first look and the socket write: not a byte is sent (send and stop)', async (t) => {
@@ -261,14 +271,136 @@ test('★★ the last look before writing: a file now naming another pid, or wri
   assert.equal(typeof target, 'object')
   if (typeof target !== 'object') return
   assert.ok(readNow(target))
-  // the file now names another process
-  writeFileSync(l.stateFile, JSON.stringify({ nyanPid: PID + 1, nyanBusyAt: 0, input: { conversation_id: A, cwd: '/home/user/p', agent_state: 'idle' } }))
-  utimesSync(l.stateFile, BASE, BASE)
+  // the file it reads (this agy's own) now names another process
+  assert.equal(target.stateFile, join(l.deps.dir, `pid-${PID}.json`))
+  writeFileSync(target.stateFile, JSON.stringify({ nyanPid: PID + 1, nyanBusyAt: 0, input: { conversation_id: A, cwd: '/home/user/p', agent_state: 'idle' } }))
+  utimesSync(target.stateFile, BASE, BASE)
   assert.equal(readNow(target), undefined)
   // the pane registered after the file was written
   l.setState({})
   assert.equal(readNow({ ...target, pane: { ...target.pane, startedAt: (BASE + 60) * 1000 } }), undefined)
   assert.ok(readNow(target))
+  await settle()
+  assert.equal(l.got.join(''), '')
+})
+
+test('★★ a card is answered with `1` (allow) or ESC (deny), only while the same card is still up', async (t) => {
+  const l = await lab(t)
+  const call = { name: 'run_command', args: { CommandLine: 'ls -la' } }
+  appendFileSync(l.transcript, JSON.stringify({ step_index: 1, type: 'PLANNER_RESPONSE', created_at: new Date((BASE - 60) * 1000).toISOString(), tool_calls: [call, { ...call }] }) + '\n')
+  utimesSync(l.transcript, BASE - 50, BASE - 50)
+  const up = { agent_state: 'tool_use', tool_confirmation_pending: true }
+  l.setState(up)
+  l.deps.answerSettleMs = 0
+  const mark = { pid: PID, stateMtimeMs: BASE * 1000, step: 1, index: 0, callAt: (BASE - 60) * 1000 }
+  assert.deepEqual(await answerAgyCard(A, mark, 'allow', l.deps), { ok: true })
+  assert.deepEqual(await answerAgyCard(A, mark, 'deny', l.deps), { ok: true })
+  await settle()
+  assert.deepEqual(l.got, ['1', '\x1b'])
+  assert.deepEqual(AGY_CARD_KEYS, { allow: '1', deny: '\x1b' })
+  // ⚠️ the status file was written again (answered on the PC, a new card): nothing is typed
+  l.setState(up, BASE + 1)
+  assert.deepEqual(await answerAgyCard(A, mark, 'allow', l.deps), { ok: false, reason: 'changed' })
+  // the same file time, but the transcript moved on to the next call
+  const later = { ...mark, stateMtimeMs: (BASE + 1) * 1000 }
+  appendFileSync(l.transcript, JSON.stringify({ step_index: 2, type: 'GENERIC', content: `Created At: ${new Date((BASE - 60) * 1000).toISOString()}\ndone` }) + '\n')
+  assert.deepEqual(await answerAgyCard(A, later, 'allow', l.deps), { ok: false, reason: 'changed' })
+  assert.deepEqual(await answerAgyCard(A, { ...later, index: 1 }, 'allow', l.deps), { ok: true })
+  // no card up any more / another agy / a pid that is not the card's
+  l.setState({ agent_state: 'working' }, BASE + 2)
+  assert.deepEqual(await answerAgyCard(A, { ...later, stateMtimeMs: (BASE + 2) * 1000, index: 1 }, 'allow', l.deps), { ok: false, reason: 'changed' })
+  l.setState(up, BASE + 3)
+  assert.deepEqual(await answerAgyCard(A, { ...later, stateMtimeMs: (BASE + 3) * 1000, index: 1, pid: PID + 1 }, 'allow', l.deps), { ok: false, reason: 'not-open' })
+  // this agy's own file names another conversation
+  assert.deepEqual(await answerAgyCard('6c0298e8-77c4-406c-aa97-cbecdfd19c88', { ...later, stateMtimeMs: (BASE + 3) * 1000, index: 1 }, 'allow', l.deps), { ok: false, reason: 'changed' })
+  // ⚠️ the agy moved to another conversation between the check and the write (`/resume` on the PC; its lock moved):
+  //    the byte never goes out
+  let looks = 0
+  const moves = { ...l.deps, locksOf: () => (++looks < 2 ? [A] : ['ffffffff-ffff-4fff-8fff-ffffffffffff']) }
+  assert.deepEqual(await answerAgyCard(A, { ...later, stateMtimeMs: (BASE + 3) * 1000, index: 1 }, 'allow', moves), { ok: false, reason: 'changed' })
+  assert.equal(looks, 2)
+  // ⚠️ agy does not hold this conversation's lock at all (a status line that stopped, then a `/resume` elsewhere)
+  assert.deepEqual(await answerAgyCard(A, { ...later, stateMtimeMs: (BASE + 3) * 1000, index: 1 }, 'allow', { ...l.deps, locksOf: () => undefined }), { ok: false, reason: 'changed' })
+  await settle()
+  // (the refused one connected and wrote nothing)
+  assert.equal(l.got.join(''), '1\x1b1')
+})
+
+test('★★ a card answer waits before its last check: a PC answer just before it wins (nothing typed)', async (t) => {
+  const l = await lab(t)
+  appendFileSync(l.transcript, JSON.stringify({ step_index: 1, type: 'PLANNER_RESPONSE', created_at: new Date((BASE - 60) * 1000).toISOString(), tool_calls: [{ name: 'run_command', args: { CommandLine: 'make' } }] }) + '\n')
+  utimesSync(l.transcript, BASE - 50, BASE - 50)
+  l.setState({ agent_state: 'tool_use', tool_confirmation_pending: true })
+  const mark = { pid: PID, stateMtimeMs: BASE * 1000, step: 1, index: 0, callAt: (BASE - 60) * 1000 }
+  // the PC allowed it a moment ago; agy's status line writes "working" during the wait
+  setTimeout(() => l.setState({ agent_state: 'working' }, BASE + 1), 30)
+  const t0 = Date.now()
+  assert.deepEqual(await answerAgyCard(A, mark, 'deny', { ...l.deps, answerSettleMs: 200 }), { ok: false, reason: 'changed' })
+  assert.ok(Date.now() - t0 >= 190)
+  await settle()
+  assert.equal(l.got.join(''), '')
+})
+
+test('★ an answer is refused while another running agy shows the same conversation', async (t) => {
+  const l = await lab(t)
+  appendFileSync(l.transcript, JSON.stringify({ step_index: 1, type: 'PLANNER_RESPONSE', created_at: new Date((BASE - 60) * 1000).toISOString(), tool_calls: [{ name: 'run_command', args: { CommandLine: 'ls' } }] }) + '\n')
+  utimesSync(l.transcript, BASE - 50, BASE - 50)
+  l.setState({ agent_state: 'tool_use', tool_confirmation_pending: true })
+  writeFileSync(join(l.deps.dir, 'pid-777.json'), JSON.stringify({ nyanPid: 777, nyanBusyAt: 0, input: { conversation_id: A, cwd: '/home/user/q', agent_state: 'idle' } }))
+  const mark = { pid: PID, stateMtimeMs: BASE * 1000, step: 1, index: 0, callAt: (BASE - 60) * 1000 }
+  const res = await answerAgyCard(A, mark, 'allow', { ...l.deps, answerSettleMs: 0, isAgy: (p) => p === PID || p === 777, locksOf: (p) => (p === PID ? [A] : []) })
+  assert.deepEqual(res, { ok: false, reason: 'changed' })
+  await settle()
+  assert.equal(l.got.join(''), '')
+})
+
+test('★★ an answer is refused when the last call is newer than this agy’s card state (another agy’s call)', async (t) => {
+  const l = await lab(t)
+  appendFileSync(l.transcript, JSON.stringify({ step_index: 1, type: 'PLANNER_RESPONSE', created_at: new Date((BASE + 30) * 1000).toISOString(), tool_calls: [{ name: 'run_command', args: { CommandLine: 'ls' } }] }) + '\n')
+  l.setState({ agent_state: 'tool_use', tool_confirmation_pending: true })
+  const res = await answerAgyCard(A, { pid: PID, stateMtimeMs: BASE * 1000, step: 1, index: 0, callAt: (BASE - 60) * 1000 }, 'allow', { ...l.deps, answerSettleMs: 0 })
+  assert.deepEqual(res, { ok: false, reason: 'changed' })
+})
+
+test('★ send and stop are refused while two running agys show the conversation (which one would get the key is unknown)', async (t) => {
+  const l = await lab(t)
+  writeFileSync(join(l.deps.dir, 'pid-777.json'), JSON.stringify({ nyanPid: 777, nyanBusyAt: 0, input: { conversation_id: A, cwd: '/home/user/q', agent_state: 'idle' } }))
+  const two = { ...l.deps, isAgy: (p: number) => p === PID || p === 777, locksOf: (p: number) => (p === PID ? [A] : []) }
+  assert.equal(await findAgyTarget(A, two), 'shared')
+  assert.equal((await sendToAgy(A, 'hi', two)).reason, 'shared')
+  assert.equal((await stopAgy(A, two)).reason, 'shared')
+  await settle()
+  assert.deepEqual(l.got, [])
+  // the other agy moved to another conversation: back to normal
+  const moved = { ...two, locksOf: (p: number) => (p === PID ? [A] : ['ffffffff-ffff-4fff-8fff-ffffffffffff']) }
+  assert.notEqual(typeof (await findAgyTarget(A, moved)), 'string')
+})
+
+test('★ an agy that moved while its send was being looked up: the re-read of its own file refuses (no fallback)', async (t) => {
+  const l = await lab(t)
+  const target = await findAgyTarget(A, l.deps)
+  assert.equal(typeof target, 'object')
+  if (typeof target !== 'object') return
+  assert.equal(target.stateFile, join(l.deps.dir, `pid-${PID}.json`))
+  // it resumed another conversation: its own file names that one now; A's conversation file is still the old one
+  writeFileSync(target.stateFile, JSON.stringify({ nyanPid: PID, nyanBusyAt: 0, input: { conversation_id: '6c0298e8-77c4-406c-aa97-cbecdfd19c88', cwd: '/home/user/p', agent_state: 'idle' } }))
+  assert.equal(readNow(target), undefined)
+  assert.equal(await findAgyTarget(A, l.deps), 'not-open')
+})
+
+test('★★ a `/resume` picked on the PC after the lookup (the lock moved, the files not yet): not a byte is sent', async (t) => {
+  const l = await lab(t)
+  let looks = 0
+  // the lookup sees the lock on A; from the gate on, it is on another conversation
+  const moving = { ...l.deps, locksOf: (p: number) => (p === PID && ++looks <= 1 ? [A] : ['6c0298e8-77c4-406c-aa97-cbecdfd19c88']) }
+  const sent = await sendToAgy(A, 'hello', moving)
+  assert.equal(sent.ok, false)
+  looks = 0
+  const stopped = await stopAgy(A, { ...moving, readNow: (tg: Parameters<typeof readNow>[0]) => {
+    const r = readNow(tg)
+    return r && { ...r, state: { ...r.state, agentState: 'working' } }
+  } })
+  assert.equal(stopped.ok, false)
   await settle()
   assert.equal(l.got.join(''), '')
 })

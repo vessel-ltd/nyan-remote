@@ -51,6 +51,11 @@ export interface SessionSummary {
    *   for these ids by itself (they are found in no Claude profile).
    */
   tool?: 'codex' | 'agy'
+  /**
+   * ★ agy: two running agys show this conversation (agy allows it, with a warning). Nothing goes to it from the phone
+   *   (no send, stop or approval cards / docs/AGY.md §9); the phone says why instead of "restart agy".
+   */
+  agyShared?: true
   /** ★ A synthetic row the UI built from an approval, with unknown account (carries `PermissionRequest.accountUnknown`) */
   accountUnknown?: true
   sessionId: string
@@ -167,6 +172,11 @@ export function isHistorySession(s: { live: boolean }): boolean {
  */
 export interface SessionsPage {
   machine: string
+  /**
+   * ★ When the rows started being read (this agent's clock / 2026-11-20). The phone closes a "needs you" notification
+   * only when a list read after it says the row no longer waits. Absent (an older agent) ⇒ nothing is closed.
+   */
+  at?: string
   /** ★ Everything by default. Only `live` ones with `?live=1` */
   sessions: SessionSummary[]
   /**
@@ -281,6 +291,11 @@ export type AgentFeature =
   | 'agy-send'
   /** ★ `POST /sessions/:id/interrupt` sends ESC to a working agy started through the relay (2026-11-20) */
   | 'agy-interrupt'
+  /**
+   * ★ agy approval cards come to `/permissions` and are answered with a key through the relay (2026-11-20 /
+   *   docs/AGY.md §9). Only the thread's note uses it (the cards themselves need nothing new on the phone).
+   */
+  | 'agy-approve'
   /** ★ `POST /sessions/:id/message` sends to an idle Codex thread (a new turn on the daemon / 2026-11-15) */
   | 'codex-send'
   /** ★ Auto-approve mode also passes Codex command approvals, and Codex rows carry the mark (2026-11-14) */
@@ -657,8 +672,9 @@ export interface PermissionRequest {
   /**
    * ★ Which coding tool asks (2026-11-14). Absent = Claude Code.
    * ⚠️ A Codex approval is yes/no only: it cannot carry a reason with a denial, and has no choices.
+   * ★ An agy card (2026-11-20 / docs/AGY.md §9) is yes/no too, answered with a key: a denial stops agy's turn.
    */
-  tool?: 'codex'
+  tool?: 'codex' | 'agy'
   /**
    * ★ If the request comes from a subagent (the side started by `Task`), its kind.
    *
@@ -1047,6 +1063,18 @@ export function waitingReason(waitingFor: string | undefined): string | null {
   }
 }
 
+/** Upper bound for one part of a session notification's tag (four joined stay well below the 4KB push limit) */
+export const SESSION_TAG_PART_MAX = 64
+
+/**
+ * ★ The `tag` of a session's notifications (`machine/account/sessionId`, each part cut at `SESSION_TAG_PART_MAX`).
+ * Both the agent (sender, `routes/hook.ts`) and the PWA (which closes one after denying an agy card) use it, so it
+ * lives here (built twice, they drift and the notification stops closing).
+ */
+export function sessionTag(machine: string, account: string, sessionId: string): string {
+  return [machine, account, sessionId].map((part) => String(part ?? '').slice(0, SESSION_TAG_PART_MAX)).join('/')
+}
+
 /**
  * The `tag` of approval notifications. **Both the agent (sender) and the PWA (which clears them) use it, so it lives here.**
  *
@@ -1104,6 +1132,12 @@ export interface PushPayload {
   event?: string
   /** ISO8601. The Service Worker uses it as the notification timestamp (shown in the device TZ) */
   at?: string
+  /**
+   * ★ The session it is about, and whether it says "needs you" (2026-11-20). Kept in the notification's data, so the
+   * open app can close a "needs you" whose session a later list shows no longer waiting (`notifications.ts`).
+   */
+  session?: string
+  waiting?: true
 }
 
 /**

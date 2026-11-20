@@ -23,7 +23,8 @@ import {
   shouldOfferSelf,
   type AgentEndpoint,
 } from './endpoints.ts'
-import { closeStalePermissionNotifications } from './notifications.ts'
+import { closeStalePermissionNotifications, closeStaleWaitingNotifications } from './notifications.ts'
+import { LostAnswers } from './ui/LostAnswers.tsx'
 import { goList, goSession, parseRoute, syncHistory, type Route, type RouteKind } from './route.ts'
 import { t } from '../../shared/i18n.ts'
 import { createTransports, probeUrl, type Transport } from './transport/index.ts'
@@ -118,6 +119,8 @@ interface EndpointState {
    * ⚠️ Never compare with the device clock (skew would misjudge "new notifications" as old).
    */
   permissionsAt?: string
+  /** ★ When this agent started reading the rows (`SessionsPage.at`; the "needs you" cleanup) */
+  sessionsAt?: string
   /** Whether SSE is alive */
   connected: boolean
   /** Count of heartbeats received. Used to check SSE isn't being buffered (docs/VERIFY.md #4) */
@@ -456,6 +459,7 @@ function App() {
             quietPermissions: perms.quiet,
             pendingTags: perms.pendingTags,
             permissionsAt: perms.at,
+            sessionsAt: page.at,
             permissionsKnown: perms.known,
             autoApprove: perms.autoApprove,
             error: undefined,
@@ -627,11 +631,27 @@ function App() {
       if (s.machine && !Number.isNaN(at)) snapshotAt.set(s.machine, at)
     }
     void closeStalePermissionNotifications(active, snapshotAt)
+    // ★ A "needs you" for an agy conversation that no longer waits (answered on the PC, denied, delivered late).
+    //   ⚠️ By the time the rows themselves were read (`sessionsAt`), not the approval list's (fetched in parallel, it
+    //      can be seconds later than the rows / codex review). No time (an older agent) ⇒ nothing closed
+    const rows = new Map<string, Map<string, string>>()
+    const rowsAt = new Map<string, number>()
+    for (const s of known) {
+      const at = s.sessionsAt ? Date.parse(s.sessionsAt) : Number.NaN
+      if (!s.machine || Number.isNaN(at)) continue
+      rowsAt.set(s.machine, at)
+      // ⚠️ A conversation open in two agys: its row's state cannot be trusted to close anything (`isStaleWaiting`)
+      rows.set(s.machine, new Map(s.sessions.filter((r) => r.tool === 'agy').map((r) => [r.sessionId, r.agyShared ? 'contested' : r.status])))
+    }
+    void closeStaleWaitingNotifications(rows, rowsAt)
   }, [
     all
       .map(
         (s) =>
-          `${s.permissionsKnown ? 1 : 0}:${s.machine ?? ''}:${(s.pendingTags ?? s.permissions.map((p) => p.key)).join(',')}`,
+          `${s.permissionsKnown ? 1 : 0}:${s.machine ?? ''}:${(s.pendingTags ?? s.permissions.map((p) => p.key)).join(',')}:` +
+          s.sessions.filter((r) => r.tool === 'agy').map((r) => `${r.sessionId}=${r.status}`).join(',') +
+          // ★ Each refresh (a "needs you" still within its 2 s grace, or delivered since, is looked at again / codex review)
+          `:${s.permissionsAt ?? ''}:${s.sessionsAt ?? ''}`,
       )
       .join('|'),
   ])
@@ -643,7 +663,7 @@ function App() {
     answers?: Record<string, string[]>,
     feedback?: string,
     notes?: Record<string, string>,
-  ): Promise<{ ok: boolean; reason?: string }> => {
+  ): Promise<{ ok: boolean; reason?: string; at?: string }> => {
     const tr = transports.find((x) => x.endpoint.id === endpointId)
     if (!tr) return { ok: false, reason: t('接続先が見つかりません', 'Connection not found') }
     const res = await tr.answerPermission(key, behavior, answers, feedback, notes)
@@ -973,6 +993,12 @@ function App() {
 
 const root = document.getElementById('app')
 if (root) render(<App />, root)
+// ★ Answers that did not go through: one fixed bar over every view (`ui/lostAnswers.ts`)
+if (root) {
+  const bar = document.createElement('div')
+  document.body.appendChild(bar)
+  render(<LostAnswers />, bar)
+}
 
 // The Service Worker is registered for add-to-home-screen and (from M1) Push reception
 if ('serviceWorker' in navigator) {

@@ -56,6 +56,10 @@ test('relay: keeps the state per conversation without the e-mail, names agy (the
   assert.equal(r.stdout.replace(/sh=\d+\n?/, ''), '')
   const j = saved(h)
   assert.equal(j.input.conversation_id, CID)
+  // ★ the same state as this agy's own file (approval cards read it: two agys on one conversation share the file above)
+  assert.deepEqual(JSON.parse(readFileSync(join(h, '.nyan-remote', 'agy', `pid-${j.nyanPid}.json`), 'utf8')), j)
+  // ★ and its visit mark for this conversation (it stays when the agy moves on)
+  assert.equal(existsSync(join(h, '.nyan-remote', 'agy', `visit-${CID}-${j.nyanPid}`)), true)
   assert.equal(j.input.agent_state, 'idle')
   // ⚠️⚠️ the e-mail is never kept
   assert.equal('email' in j.input, false)
@@ -123,6 +127,39 @@ test('relay: the user status line gets the same bytes and prints exactly what it
   const cmd = "cat >/dev/null; echo 'a\\tb'"
   const direct = spawnSync('sh', ['-c', cmd], { input: raw, encoding: 'utf8' }).stdout
   assert.equal(relay(h, `${q(RELAY)} --nyan-remote-relay ${q(cmd)}`, raw).stdout, direct)
+})
+
+test('★★ relay: the user status line never fails on its behalf (agy would turn the whole line off after 30 failures)', (t) => {
+  const h = home()
+  t.after(() => rmSync(h, { recursive: true, force: true }))
+  const failing = relay(h, `${q(RELAY)} --nyan-remote-relay ${q('cat >/dev/null; echo partial; echo oops >&2; exit 3')}`, input())
+  assert.equal(failing.status, 0)
+  assert.equal(failing.stdout, 'partial\n')
+  assert.equal(failing.stderr, 'oops\n', 'its errors still pass')
+  // a hanging one is ended at 4 s with everything it started (before agy's own 5 s limit)
+  const t0 = Date.now()
+  const slow = relay(h, `${q(RELAY)} --nyan-remote-relay ${q('cat >/dev/null; echo early; sleep 30; echo late')}`, input())
+  const took = Date.now() - t0
+  assert.equal(slow.status, 0)
+  assert.equal(slow.stdout, 'early\n')
+  assert.ok(took >= 3900 && took < 4900, `took ${took} ms`)
+  // our own file is still written
+  assert.equal(saved(h).input.conversation_id, CID)
+  // ⚠️ a background child left running does not hold the output open (codex review)
+  const t2 = Date.now()
+  const leaves = relay(h, `${q(RELAY)} --nyan-remote-relay ${q('cat >/dev/null; (sleep 30; echo late) & echo now')}`, input())
+  assert.equal(leaves.status, 0)
+  assert.equal(leaves.stdout, 'now\n')
+  assert.ok(Date.now() - t2 < 2000, `took ${Date.now() - t2} ms`)
+  // ⚠️ no temporary file possible: the user's line is skipped this once (never handed agy's own pipes)
+  const noTmp = spawnSync('sh', ['-c', `${q(RELAY)} --nyan-remote-relay ${q('cat >/dev/null; (sleep 30) & echo shown')}`], { input: input(), encoding: 'utf8', env: { PATH: process.env.PATH, HOME: h, TMPDIR: join(h, 'missing-dir') } })
+  assert.equal(noTmp.status, 0)
+  assert.equal(noTmp.stdout, '')
+  // ⚠️ a command that ignores SIGTERM is ended too (codex review)
+  const t1 = Date.now()
+  const stubborn = relay(h, `${q(RELAY)} --nyan-remote-relay ${q("cat >/dev/null; trap '' TERM; sleep 30")}`, input())
+  assert.equal(stubborn.status, 0)
+  assert.ok(Date.now() - t1 < 4900, `took ${Date.now() - t1} ms`)
 })
 
 test('relay: names agy whether the sh -c stays (dash) or replaces itself with the relay (bash as sh)', (t) => {

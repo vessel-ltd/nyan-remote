@@ -153,6 +153,8 @@ export function historyRev(rows: readonly SessionSummary[]): string {
  * ⚠️ The history **count and revision are always returned** (whether filtered or not).
  */
 export async function sessions(ctx?: Ctx): Promise<SessionsPage> {
+  // ★ Before anything is read (`SessionsPage.at`)
+  const at = new Date().toISOString()
   const cfg = config()
   const dirs = await discoverConfigDirs(cfg.configDirs)
   const { machine, sessions, liveIds, liveComplete } = await collectSessions(dirs, cfg.maxSessionsPerAccount)
@@ -200,6 +202,7 @@ export async function sessions(ctx?: Ctx): Promise<SessionsPage> {
   codexHistoryWanted()
   return {
     machine,
+    at,
     sessions: liveOnly ? marked.filter((s) => !isHistorySession(s)) : marked,
     history: { count: historyRows.length, rev: historyRev(historyRows) },
   }

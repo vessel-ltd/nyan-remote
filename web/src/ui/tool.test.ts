@@ -184,3 +184,11 @@ test('★★ agy send and stop (2026-11-20): only with the agent\'s marks AND a 
   // a Claude row still attaches
   assert.equal(canAttachTo(row(), ALL), true)
 })
+
+test('★ agy: a conversation open in two agys says so (not "restart agy")', () => {
+  const features: AgentFeature[] = ['agy-send']
+  const note = sendBlockedNote({ tool: 'agy', agyShared: true }, features)
+  assert.match(note ?? '', /2つの agy|two agys/)
+  assert.doesNotMatch(note ?? '', /起こし直す|Start agy again/)
+  assert.match(sendBlockedNote({ tool: 'agy' }, features) ?? '', /起こし直す|Start agy again/)
+})

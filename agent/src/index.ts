@@ -5,7 +5,16 @@
 //    Do not open the port. Opening it creates an unauthenticated entry point (§4.2.1).
 
 import { startAgyWatch } from './agy/watch.ts'
-import { agyDir } from './agy/sessions.ts'
+import { agyDir, agyOthersWrote, agyOwnRowOf, agyOwnRows, conversationOf, defaultAgyDeps, transcriptPathOf, withLocksProbed } from './agy/sessions.ts'
+import { lastTurnStartCached, readTailRecords, turnEnd } from './agy/pending.ts'
+import { AgyCards } from './agy/cards.ts'
+import { homedir } from 'node:os'
+import { aliveProcStartSync } from './claude/sessionIndex.ts'
+import { AgyNotifier } from './agy/notify.ts'
+import { answerAgyCard } from './agy/keys.ts'
+
+/** ★ How often agy cards and notifications are looked at besides the watcher (a missed file event) */
+const AGY_LOOK_MS = 5000
 import { langFromEnv, setLang, t } from '../../shared/i18n.ts'
 import { reasonText } from './reasons.ts'
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
@@ -126,8 +135,60 @@ async function main(): Promise<void> {
 
   // ★ agy conversations (docs/AGY.md): say "sessions changed" when one changes state. ⚠️ Never fatal (polling remains)
   let agyWatcher: { close(): void } | undefined
+  // ★ agy approval cards and notifications (docs/AGY.md §9): looked at on every status file change, and every few
+  //   seconds in case watching fails. ⚠️ Never throws into the watcher or the timer.
+  const agyCards = new AgyCards({
+    agy: () => ({ ...defaultAgyDeps(), aliveProcStart: aliveProcStartSync }),
+    machine: machineName(),
+    answer: (conv, mark, behavior) => answerAgyCard(conv, mark, behavior),
+    changed: () => broadcast({ type: 'permissions-changed', machine: machineName(), at: new Date().toISOString() }),
+    now: () => new Date(),
+    log: (line) => console.log(line),
+    // ★ The card came back after a key that did not land: ring "needs you" again (`notify.ts` rule 11)
+    reraised: (conv, card) => {
+      agyNotifier.owe(`agy-${conv}`, card)
+      void agyNotifier.look()
+    },
+  })
+  const agyNotifier: AgyNotifier = new AgyNotifier({
+    // ★ Each lock-holding agy's own state (`notify.ts` rule 8)
+    // ⚠️ Locks probed all at once without blocking (a Mac's `lsof` / `withLocksProbed`)
+    rows: async () => agyOwnRows(machineName(), await withLocksProbed({ ...defaultAgyDeps(), aliveProcStart: aliveProcStartSync })),
+    statusNow: (sessionId) => {
+      const conv = conversationOf(sessionId)
+      // ★ Only that conversation's agy is probed (the guard runs before each device's send)
+      const row = conv === undefined ? undefined : agyOwnRowOf(machineName(), { ...defaultAgyDeps(), aliveProcStart: aliveProcStartSync }, conv)
+      if (row === undefined || conv === undefined) return undefined
+      const path = transcriptPathOf(conv)
+      const end = turnEnd(readTailRecords(path))
+      // ★ The card is this agy's own state write (as `notify.ts` `cardOf`)
+      return { status: row.status, turn: end.turn ?? lastTurnStartCached(path)?.turn, ...(row.status === 'waiting' ? { card: row.lastActivity } : {}) }
+    },
+    turnStart: (sessionId) => {
+      const conv = conversationOf(sessionId)
+      return conv === undefined ? undefined : lastTurnStartCached(transcriptPathOf(conv))
+    },
+    // ⚠️ Locks probed without blocking (a Mac's `lsof`); a probe that fails ⇒ undefined (the push waits, `notify.ts`)
+    othersWrote: async (sessionId, since) => {
+      const conv = conversationOf(sessionId)
+      if (conv === undefined) return true
+      const d = await withLocksProbed(defaultAgyDeps())
+      return agyOthersWrote(d.dir, conv, since, d.isAgy, d.locksOf!)
+    },
+    home: homedir(),
+    // ★ The same text builder and sender as Claude and Codex
+    send: async (row, fields, current) =>
+      (await sendToAll(withPendingPerms(codexPayload(row, fields, new Date().toISOString(), toPushPayload)), undefined, current)).sent,
+    log: (line) => console.log(line),
+  })
+  const agyLook = (): void => {
+    void agyCards.sync().catch(() => undefined)
+    void agyNotifier.look()
+  }
+  agyLook()
+  setInterval(agyLook, AGY_LOOK_MS).unref()
   try {
-    agyWatcher = await startAgyWatch(agyDir(), () => broadcast({ type: 'sessions-changed', at: new Date().toISOString() }))
+    agyWatcher = await startAgyWatch(agyDir(), () => broadcast({ type: 'sessions-changed', at: new Date().toISOString() }), agyLook)
   } catch {
     // no immediacy for agy rows; the list still polls
   }

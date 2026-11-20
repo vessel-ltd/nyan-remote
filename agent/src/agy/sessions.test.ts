@@ -16,6 +16,12 @@ import {
   readAgyFiles,
   transcriptPathOf,
   AGY_FILE_MAX_AGE_MS,
+  agyConversations,
+  agyOthersWrote,
+  agyOwnRowOf,
+  agyOwnRows,
+  agyShared,
+  sweepAgyPidFiles,
 } from './sessions.ts'
 
 const A = '062a8f25-9451-42f3-ae93-34a208e99365'
@@ -154,7 +160,8 @@ test('rows: an agy with no transcript yet is not listed (like Claude) unless a t
   t.after(() => rmSync(root, { recursive: true, force: true }))
   const dir = join(root, 'state')
   mkdirSync(dir)
-  const deps = { dir, home: root, isAgy: () => true, now: Date.now() }
+  // (it holds its conversation's lock, as a running agy does)
+  const deps = { dir, home: root, isAgy: () => true, now: Date.now(), locksOf: () => [A] }
   const put = (over: Record<string, unknown>): void =>
     writeFileSync(join(dir, `session-${A}.json`), JSON.stringify({ nyanPid: 100, nyanBusyAt: 0, input: { ...input(A), ...over } }))
   for (const s of ['idle', 'initializing', 'error']) {
@@ -192,4 +199,220 @@ test('usage: the Gemini windows only (other buckets share their lengths and coul
   // a window whose reset passed is dropped
   assert.equal(agyUsage([{ state: s, mtimeMs: now }], Date.parse('2026-11-30T00:00:00Z')), undefined)
   assert.equal(agyUsage([], now), undefined)
+})
+
+test('★ another running agy on the same conversation is told apart (its pid file); unreadable counts as shared', (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'nyan-agy-shared-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const own = (pid: number, cid: string) =>
+    writeFileSync(join(dir, `pid-${pid}.json`), JSON.stringify({ nyanPid: pid, nyanBusyAt: 0, input: input(cid) }))
+  own(100, A)
+  own(200, A.toUpperCase())
+  own(300, 'ffffffff-ffff-4fff-8fff-ffffffffffff')
+  // a file whose pid does not match its name is not that agy's
+  writeFileSync(join(dir, 'pid-400.json'), JSON.stringify({ nyanPid: 100, nyanBusyAt: 0, input: input(A) }))
+  // `since` in the future: only the running agys count here
+  const LATER = Date.now() + 60_000
+  const live = (p: number) => p === 100 || p === 200 || p === 300
+  // 200 holds no lock: a second agy on A
+  const locks = (p: number) => (p === 100 ? [A] : p === 300 ? ['ffffffff-ffff-4fff-8fff-ffffffffffff'] : [])
+  assert.equal(agyShared(dir, A, 100, live, locks, LATER), true)
+  // the other agy is gone (or its pid is not an agy now)
+  assert.equal(agyShared(dir, A, 100, (p) => p !== 200, locks, LATER), false)
+  assert.equal(agyShared(dir, A, 100, (p) => p === 400, locks, LATER), false)
+  assert.equal(agyShared(dir, 'ffffffff-ffff-4fff-8fff-ffffffffffff', 300, live, locks, LATER), false)
+  // ★ 200 holds another conversation's lock: it moved there (a `/new` at an empty prompt) ⇒ not shared
+  assert.equal(agyShared(dir, A, 100, live, (p) => (p === 200 ? ['ffffffff-ffff-4fff-8fff-ffffffffffff'] : locks(p)), LATER), false)
+  // cannot tell ⇒ said so (undefined: acting on it is refused, what is shown is kept)
+  assert.equal(agyShared(dir, A, 100, live, (p) => (p === 200 ? undefined : locks(p)), LATER), undefined)
+  assert.equal(agyShared(join(dir, 'missing'), A, 100, live, locks, LATER), true)
+  // ★ an agy gone (or moved on) that wrote during the card still counts by its visit mark; an older one does not
+  const gone = (p: number) => p === 100
+  writeFileSync(join(dir, `visit-${A}-200`), '')
+  assert.equal(agyShared(dir, A, 100, gone, locks, Date.now() - 60_000), true)
+  assert.equal(agyShared(dir, A, 100, gone, locks, LATER), false)
+  // its own visit mark does not count
+  assert.equal(agyShared(dir, A, 200, () => false, locks, Date.now() - 60_000), false)
+  // ★ rows from each agy's own file, only for the lock holder; a conversation two agys hold is left out
+  const deps = { dir, home: '/home/user', isAgy: live, now: Date.now() }
+  const rows = agyOwnRows('pc-a', { ...deps, locksOf: (p) => (p === 100 ? [A] : p === 300 ? ['ffffffff-ffff-4fff-8fff-ffffffffffff'] : []) })
+  assert.deepEqual(rows.map((r) => r.sessionId).sort(), [`agy-${A}`, 'agy-ffffffff-ffff-4fff-8fff-ffffffffffff'])
+  assert.equal(agyOwnRows('pc-a', { ...deps, locksOf: () => [A] }).length, 0, 'two holders of one conversation')
+})
+
+test('★ the sweep keeps visit marks of a conversation a running agy shows, however old (they guard its card)', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'nyan-agy-sweep-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const B = 'ffffffff-ffff-4fff-8fff-ffffffffffff'
+  writeFileSync(join(dir, 'pid-100.json'), JSON.stringify({ nyanPid: 100, nyanBusyAt: 0, input: input(A) }))
+  const old = (Date.now() - 3 * AGY_FILE_MAX_AGE_MS) / 1000
+  for (const f of [`visit-${A}-200`, `visit-${B}-200`, 'pid-200.json']) {
+    writeFileSync(join(dir, f), f.endsWith('.json') ? JSON.stringify({ nyanPid: 200, nyanBusyAt: 0, input: input(B) }) : '')
+    utimesSync(join(dir, f), old, old)
+  }
+  await sweepAgyPidFiles({ dir, home: '/home/user', isAgy: (p) => p === 100, now: Date.now() })
+  assert.equal(existsSync(join(dir, `visit-${A}-200`)), true, 'A is shown by a running agy')
+  assert.equal(existsSync(join(dir, `visit-${B}-200`)), false)
+  assert.equal(existsSync(join(dir, 'pid-200.json')), false, 'a gone agy’s own file')
+  assert.equal(existsSync(join(dir, 'pid-100.json')), true)
+})
+
+test('★ the list shows the agy’s own state: a second agy overwriting the conversation file does not change the row', async (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'nyan-agy-own-'))
+  t.after(() => rmSync(root, { recursive: true, force: true }))
+  const dir = join(root, 'state')
+  mkdirSync(dir)
+  const tp = transcriptPathOf(A, root)
+  mkdirSync(join(tp, '..'), { recursive: true })
+  writeFileSync(tp, JSON.stringify({ type: 'USER_INPUT', content: '<USER_REQUEST>\nhi\n</USER_REQUEST>' }) + '\n')
+  const own = (pid: number, over: Record<string, unknown>) =>
+    writeFileSync(join(dir, `pid-${pid}.json`), JSON.stringify({ nyanPid: pid, nyanBusyAt: 7, input: input(A, over) }))
+  // agy 100 waits on a card; agy 200 opened the same conversation and its idle state is the conversation file's now
+  own(100, { agent_state: 'tool_use', tool_confirmation_pending: true })
+  own(200, { agent_state: 'idle' })
+  writeFileSync(join(dir, `session-${A}.json`), JSON.stringify({ nyanPid: 200, nyanBusyAt: 7, input: input(A, { agent_state: 'idle' }) }))
+  const deps = { dir, home: root, isAgy: (p: number) => p === 100 || p === 200, now: Date.now(), locksOf: (p: number) => (p === 100 ? [A] : []) }
+  assert.equal((await agyRows('pc-a', deps))[0]?.status, 'waiting')
+  // only one agy says anything about it: its own file
+  const one = { ...deps, isAgy: (p: number) => p === 100 }
+  writeFileSync(join(dir, `session-${A}.json`), JSON.stringify({ nyanPid: 100, nyanBusyAt: 7, input: input(A, { agent_state: 'idle' }) }))
+  assert.equal((await agyRows('pc-a', one))[0]?.status, 'waiting')
+})
+
+test('★★ two running agys on one conversation: listed once (the lock holder’s state), nothing from the phone; one that left does not hide it', async (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'nyan-agy-contested-'))
+  t.after(() => rmSync(root, { recursive: true, force: true }))
+  const dir = join(root, 'state')
+  mkdirSync(dir)
+  const tp = transcriptPathOf(A, root)
+  mkdirSync(join(tp, '..'), { recursive: true })
+  writeFileSync(tp, JSON.stringify({ type: 'USER_INPUT', content: '<USER_REQUEST>\nhi\n</USER_REQUEST>' }) + '\n')
+  const own = (pid: number, over: Record<string, unknown>) =>
+    writeFileSync(join(dir, `pid-${pid}.json`), JSON.stringify({ nyanPid: pid, nyanBusyAt: 7, input: input(A, over) }))
+  own(100, { agent_state: 'tool_use', tool_confirmation_pending: true })
+  own(200, { agent_state: 'working' })
+  // the conversation file was written last by 200
+  writeFileSync(join(dir, `session-${A}.json`), JSON.stringify({ nyanPid: 200, nyanBusyAt: 7, input: input(A, { agent_state: 'working' }) }))
+  const both = { dir, home: root, isAgy: (p: number) => p === 100 || p === 200, now: Date.now(), locksOf: (p: number) => (p === 100 ? [A] : []) }
+  const c = (await agyConversations(both)).get(A)!
+  assert.equal(c.contested, true)
+  assert.equal(c.file.state.pid, 100, 'the lock holder')
+  const rows = await agyRows('pc-a', both)
+  assert.equal(rows.length, 1)
+  assert.equal(rows[0]!.status, 'waiting')
+  assert.equal(rows[0]!.sendRoute, undefined, 'nothing from the phone while two agys show it')
+  assert.equal(rows[0]!.agyShared, true, 'and the phone is told why (not "restart agy")')
+  // the second agy exits: the conversation file names a gone pid, but 100's own file still shows it
+  const after = { ...both, isAgy: (p: number) => p === 100 }
+  const left = (await agyConversations(after)).get(A)!
+  assert.equal(left.contested, false)
+  assert.equal(left.file.state.pid, 100)
+  assert.equal((await agyRows('pc-a', after))[0]?.status, 'waiting')
+  // a second agy that moved on (holds another conversation's lock) does not contest it
+  const moved = { ...both, locksOf: (p: number) => (p === 100 ? [A] : ['ffffffff-ffff-4fff-8fff-ffffffffffff']) }
+  assert.equal((await agyConversations(moved)).get(A)!.contested, false)
+})
+
+test('★★ an agy is judged by its own file only (a stale conversation file of it is ignored); an older relay’s agy still counts', async (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'nyan-agy-claims-'))
+  t.after(() => rmSync(root, { recursive: true, force: true }))
+  const dir = join(root, 'state')
+  mkdirSync(dir)
+  const B = 'ffffffff-ffff-4fff-8fff-ffffffffffff'
+  const write = (name: string, pid: number, conv: string, over: Record<string, unknown> = {}) =>
+    writeFileSync(join(dir, name), JSON.stringify({ nyanPid: pid, nyanBusyAt: 7, input: input(conv, over) }))
+  // agy 100 moved from A to B (its own file says B); its old A file is still there; agy 200 overwrote B's file
+  write(`pid-100.json`, 100, B, { agent_state: 'tool_use', tool_confirmation_pending: true })
+  write(`session-${A}.json`, 100, A, { agent_state: 'idle' })
+  write(`session-${B}.json`, 200, B, { agent_state: 'idle' })
+  const deps = { dir, home: root, isAgy: (p: number) => p === 100, now: Date.now(), locksOf: (p: number) => (p === 100 ? [B] : []) }
+  const all = await agyConversations(deps)
+  assert.equal(all.has(A), false, 'not shown by 100 any more')
+  assert.equal(all.get(B)!.file.state.pid, 100)
+  // an older relay's agy 300 (no own file) holds C; a current one, 400, opened C too ⇒ contested, the holder's state
+  const C = '11111111-1111-4111-8111-111111111111'
+  write(`session-${C}.json`, 300, C, { agent_state: 'working' })
+  write(`pid-400.json`, 400, C, { agent_state: 'working' })
+  const mixed = { ...deps, isAgy: (p: number) => p === 100 || p === 300 || p === 400, locksOf: (p: number) => (p === 100 ? [B] : p === 300 ? [C] : []) }
+  const c = (await agyConversations(mixed)).get(C)!
+  assert.equal(c.contested, true)
+  assert.equal(c.file.state.pid, 300)
+})
+
+test('★ the cards’ sharing check counts an older relay’s agy too (its conversation file names it)', (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'nyan-agy-legacy-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  writeFileSync(join(dir, 'pid-100.json'), JSON.stringify({ nyanPid: 100, nyanBusyAt: 0, input: input(A) }))
+  writeFileSync(join(dir, `session-${A}.json`), JSON.stringify({ nyanPid: 300, nyanBusyAt: 0, input: input(A) }))
+  const live = (p: number) => p === 100 || p === 300
+  const locks = (p: number) => (p === 100 ? [A] : [])
+  assert.equal(agyShared(dir, A, 100, live, locks, Date.now() + 60_000), true)
+  assert.equal(agyShared(dir, A, 100, (p) => p === 100, locks, Date.now() + 60_000), false, 'that agy is gone')
+  // the conversation file naming this agy itself
+  writeFileSync(join(dir, `session-${A}.json`), JSON.stringify({ nyanPid: 100, nyanBusyAt: 0, input: input(A) }))
+  assert.equal(agyShared(dir, A, 100, live, locks, Date.now() + 60_000), false)
+})
+
+test('★ a row offers send and stop only when its agy holds the conversation’s lock', async (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'nyan-agy-holder-'))
+  t.after(() => rmSync(root, { recursive: true, force: true }))
+  const prev = process.env.NYAN_REMOTE_STATE_DIR
+  process.env.NYAN_REMOTE_STATE_DIR = root
+  t.after(() => {
+    if (prev === undefined) delete process.env.NYAN_REMOTE_STATE_DIR
+    else process.env.NYAN_REMOTE_STATE_DIR = prev
+  })
+  const dir = join(root, 'agy')
+  mkdirSync(dir)
+  mkdirSync(join(root, 'panes'))
+  writeFileSync(join(root, 'panes', '100.json'), JSON.stringify({ pid: 100, procStart: 'S', socket: join(root, 'k.sock'), startedAt: 0, paste: true }))
+  const tp = transcriptPathOf(A, root)
+  mkdirSync(join(tp, '..'), { recursive: true })
+  writeFileSync(tp, JSON.stringify({ type: 'USER_INPUT', content: '<USER_REQUEST>\nhi\n</USER_REQUEST>' }) + '\n')
+  writeFileSync(join(dir, 'pid-100.json'), JSON.stringify({ nyanPid: 100, nyanBusyAt: 7, input: input(A, { agent_state: 'idle' }) }))
+  const deps = { dir, home: root, isAgy: (p: number) => p === 100, now: Date.now(), aliveProcStart: (p: number) => (p === 100 ? 'S' : null) }
+  assert.equal((await agyRows('pc-a', { ...deps, locksOf: () => [A] }))[0]?.sendRoute, 'keys')
+  assert.equal((await agyRows('pc-a', { ...deps, locksOf: () => [] }))[0]?.sendRoute, undefined)
+  assert.equal((await agyRows('pc-a', { ...deps, locksOf: () => undefined }))[0]?.sendRoute, undefined)
+})
+
+test('★ a "card is up" state is hidden only when its agy is shown not to hold the conversation’s lock (it moved on)', async (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'nyan-agy-movedcard-'))
+  t.after(() => rmSync(root, { recursive: true, force: true }))
+  const dir = join(root, 'state')
+  mkdirSync(dir)
+  writeFileSync(join(dir, 'pid-100.json'), JSON.stringify({ nyanPid: 100, nyanBusyAt: 7, input: input(A, { agent_state: 'tool_use', tool_confirmation_pending: true }) }))
+  const deps = { dir, home: root, isAgy: (p: number) => p === 100, now: Date.now() }
+  assert.equal((await agyConversations({ ...deps, locksOf: () => [A] })).has(A), true)
+  assert.equal((await agyConversations({ ...deps, locksOf: () => ['ffffffff-ffff-4fff-8fff-ffffffffffff'] })).has(A), false)
+  // ★ cannot tell (a slow probe): still listed (hiding it made the phone close a live "needs you")
+  assert.equal((await agyConversations({ ...deps, locksOf: () => undefined })).has(A), true)
+})
+
+test('the guard’s single read: only the agy holding that conversation’s lock; two holders or none ⇒ nothing', (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'nyan-agy-ownrowof-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  writeFileSync(join(dir, 'pid-100.json'), JSON.stringify({ nyanPid: 100, nyanBusyAt: 7, input: input(A, { agent_state: 'tool_use', tool_confirmation_pending: true }) }))
+  writeFileSync(join(dir, 'pid-200.json'), JSON.stringify({ nyanPid: 200, nyanBusyAt: 7, input: input(A, { agent_state: 'idle' }) }))
+  const deps = { dir, home: '/home/user', isAgy: (p: number) => p === 100 || p === 200, now: Date.now() }
+  assert.equal(agyOwnRowOf('pc-a', { ...deps, locksOf: (p: number) => (p === 100 ? [A] : []) }, A)?.status, 'waiting')
+  assert.equal(agyOwnRowOf('pc-a', { ...deps, locksOf: () => [A] }, A), undefined)
+  assert.equal(agyOwnRowOf('pc-a', { ...deps, locksOf: () => [] }, A), undefined)
+})
+
+test('★ "done": only another agy’s writes during the turn count — one merely open and idle on it does not', (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'nyan-agy-otherswrote-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  writeFileSync(join(dir, 'pid-100.json'), JSON.stringify({ nyanPid: 100, nyanBusyAt: 0, input: input(A) }))
+  writeFileSync(join(dir, 'pid-200.json'), JSON.stringify({ nyanPid: 200, nyanBusyAt: 0, input: input(A) }))
+  const visit = join(dir, `visit-${A}-200`)
+  writeFileSync(visit, '')
+  const turnAt = Date.now() - 10_000
+  utimesSync(visit, (turnAt - 60_000) / 1000, (turnAt - 60_000) / 1000)
+  const live = (p: number) => p === 100 || p === 200
+  const locks = (p: number) => (p === 100 ? [A] : [])
+  assert.equal(agyOthersWrote(dir, A, turnAt, live, locks), false, 'parked before the turn')
+  utimesSync(visit, (turnAt + 2000) / 1000, (turnAt + 2000) / 1000)
+  assert.equal(agyOthersWrote(dir, A, turnAt, live, locks), true, 'wrote during the turn')
+  assert.equal(agyOthersWrote(dir, A, turnAt, live, (p) => (p === 200 ? undefined : locks(p))), undefined, 'cannot tell')
 })

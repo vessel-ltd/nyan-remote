@@ -17,8 +17,10 @@ import { endSessionAutoApprove } from '../autoApprove.ts'
 const logLabel = (label: string): string => localizeNotificationBody(label, currentLang())
 import { basename } from 'node:path'
 import {
+  SESSION_TAG_PART_MAX,
   UNKNOWN_LABEL,
   notificationText,
+  sessionTag,
   shouldRing,
   statusLabel,
   waitingReason,
@@ -321,7 +323,7 @@ export function resetLabelsForTest(): void {
  * Upper bound for one tag part. ⚠️ Even joining four, keep it well below the push limit (4KB).
  * ⚠️ Even when cut, **the same session always gives the same string** (only cut from the start).
  */
-const TAG_PART_MAX = 64
+const TAG_PART_MAX = SESSION_TAG_PART_MAX
 
 function clipTagPart(part: string): string {
   const t = String(part ?? '')
@@ -384,11 +386,14 @@ export function toPushPayload(
     //    (measured: one session reported `nyan-remote` / `account` / `relay` / `web` / `icon-concepts`) ⇒ the tag changed
     //    and the notification stopped replacing. The session id alone identifies the session; the project stays only as the
     //    fallback when there is no id.
-    tag: (event.sessionId ? [event.machine, event.account, event.sessionId] : [event.machine, event.account, event.project, '-'])
-      .map((part) => clipTagPart(part))
-      .join('/'),
+    tag: event.sessionId
+      ? sessionTag(event.machine, event.account, event.sessionId)
+      : [event.machine, event.account, event.project, '-'].map((part) => clipTagPart(part)).join('/'),
     // ⚠️ Do not write it by hand. Dropping the `/` makes the notification open the source of sw.js (see pushUrl.ts)
     url: threadUrl(event.sessionId),
+    // ★ For the open app's cleanup of a "needs you" that is over (`PushPayload.session` / `waiting`)
+    ...(event.sessionId ? { session: event.sessionId } : {}),
+    ...(event.sessionId && label === statusLabel('waiting') ? { waiting: true as const } : {}),
     event: event.event,
     at: event.at,
   }

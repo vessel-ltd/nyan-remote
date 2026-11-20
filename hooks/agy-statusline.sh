@@ -75,14 +75,53 @@ if [[ $input == *'"conversation_id"'* ]]; then
     else
       rm -f -- "$tmp"
     fi
+    # ★ The same state again as this agy's own file, `pid-<agy pid>.json`. The file above is per conversation, so two agys
+    #   on one conversation (agy allows it) write the same file; the approval cards read each agy's own file instead
+    #   (a second agy can neither take over nor hide the first one's card / codex review 2026-11-20)
+    #   ⚠️ A write that fails removes the old one (a full disk must not leave a card "up" after it was answered: no
+    #      file = no card on the phone)
+    tmp=$dir/.pid-$pid.$$.$RANDOM.tmp
+    if printf '{"nyanPid":%s,"nyanBusyAt":%s,"input":%s}' "$pid" "$busy" "$input" >"$tmp" && mv -f -- "$tmp" "$dir/pid-$pid.json"; then
+      :
+    else
+      rm -f -- "$tmp" "$dir/pid-$pid.json"
+    fi
+    # ★ A visit mark per conversation and agy, touched on every write: it stays when this agy moves to another
+    #   conversation (its own file above does not), so the agent can tell that it wrote into this conversation's
+    #   transcript during another agy's card (codex review). `>|`: noclobber is on here.
+    : >|"$dir/visit-$cid-$pid"
   ) 2>/dev/null
 fi
 
 [[ ${1:-} == --nyan-remote-relay ]] && shift
 
-# The user's own status line, exactly as before: through `sh -c`, as agy runs it (bash would print `echo '\033…'`
-# differently / codex review)
+# The user's own status line, as before: through `sh -c`, as agy runs it (bash would print `echo '\033…'`
+# differently / codex review), with the same bytes on stdin; what it prints is passed on.
+# ★★ But it never fails on its behalf (2026-11-20 / codex review of the approval cards): agy turns the whole status
+#    line off after 30 failures (a non-zero exit, or its 5 s limit), and our relay with it. A state file that stops
+#    changing keeps an old approval card "up", so an answer to it could land on another conversation's card.
+#    ⇒ the user's command gets 4 s (then its whole process group is killed: SIGKILL, which a command cannot ignore),
+#      and this always exits 0.
+#    ⚠️ Its output goes to a temporary file and is printed when `sh` ends: a background child it leaves running would
+#       otherwise hold agy's pipe open past the limit (codex review). The child keeps running; its later output is lost.
 if [[ -n ${1:-} ]]; then
-  exec sh -c "$1" < <(printf '%s' "$input" 2>/dev/null)
+  exec 3>&2 2>/dev/null
+  out=$(mktemp "${TMPDIR:-/tmp}/nyan-agy-status.XXXXXX") || out=
+  err=
+  [[ -n $out ]] && { err=$(mktemp "${TMPDIR:-/tmp}/nyan-agy-status.XXXXXX") || { rm -f -- "$out"; out=; }; }
+  # ⚠️ No temporary file (a full or unwritable temp directory) ⇒ the user's line is skipped this once: handing it agy's
+  #    own pipes would let a child it leaves running hold them past the limit (codex review)
+  if [[ -n $out ]]; then
+    set -m
+    sh -c "$1" < <(printf '%s' "$input") >"$out" 2>"$err" 3>&- &
+    child=$!
+    { sleep 4 && kill -KILL -- "-$child"; } </dev/null >/dev/null 3>&- &
+    timer=$!
+    wait "$child"
+    kill -KILL -- "-$timer"
+    cat -- "$out"
+    cat -- "$err" >&3
+    rm -f -- "$out" "$err"
+  fi
 fi
 exit 0

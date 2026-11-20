@@ -1116,12 +1116,42 @@ export function Thread({
               `questions.ts` rule 4) without claiming this one is of that kind (a join can still be retrying / codex
               review, low). The reason comes from the daemon's flags (`waitingForOf`) */}
           {isAgy(session) ? (
-            /* ★ agy (2026-11-19): its approvals are not on the phone yet (docs/AGY.md §4) */
-            <>
-              {t('PCの画面で承認を待っています。', 'The PC screen is waiting for an approval. ')}
-              <strong>{t('agy の承認は、まだスマホからは答えられません', 'agy approvals can’t be answered from the phone yet')}</strong>
-              {t('。PCで答えてください。', '. Please answer on the PC.')}
-            </>
+            /* ★ agy (2026-11-20 / docs/AGY.md §9): cards come for an agy started through the relay, for a command or a
+               file read. ⚠️ The agent's own mark decides the words (an older agent has no agy cards at all) */
+            session?.agyShared ? (
+              <>
+                {t('PCの画面で承認を待っています。', 'The PC screen is waiting for an approval. ')}
+                <strong>{t('この会話は2つの agy で開かれています', 'This conversation is open in two agys')}</strong>
+                {t(
+                  '（どちらのカードか決められないので、スマホからは答えられません）。PCで答えてください。',
+                  ' (which one’s card it is cannot be told, so it can’t be answered from the phone). Please answer on the PC.',
+                )}
+              </>
+            ) : agentFeatures?.includes('agy-approve') && session?.sendRoute === 'keys' ? (
+              <>
+                {t('PCの画面で承認を待っています。', 'The PC screen is waiting for an approval. ')}
+                <strong>{t('この種類の承認は、スマホからは答えられません', 'This kind of approval can’t be answered from the phone')}</strong>
+                {t(
+                  '（答えられるのはコマンドの実行とファイルの読み取りだけです）。PCで答えてください。',
+                  ' (only running a command and reading a file can be). Please answer on the PC.',
+                )}
+              </>
+            ) : agentFeatures?.includes('agy-approve') ? (
+              <>
+                {t('PCの画面で承認を待っています。', 'The PC screen is waiting for an approval. ')}
+                <strong>{t('この agy は nyan-remote を通さずに起動しています', 'This agy was not started through nyan-remote')}</strong>
+                {t(
+                  '。PCで答えてください（新しいターミナルで agy を起こし直すと、スマホから答えられます）。',
+                  '. Please answer on the PC (start agy again in a new terminal to answer from the phone).',
+                )}
+              </>
+            ) : (
+              <>
+                {t('PCの画面で承認を待っています。', 'The PC screen is waiting for an approval. ')}
+                <strong>{t('agy の承認は、まだスマホからは答えられません', 'agy approvals can’t be answered from the phone yet')}</strong>
+                {t('。PCで答えてください。', '. Please answer on the PC.')}
+              </>
+            )
           ) : isCodex(session) && wait.kind !== 'unknown' ? (
             session?.waitingFor === 'input needed' ? (
               <>

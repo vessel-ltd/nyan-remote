@@ -297,3 +297,13 @@ test('★★ auto-approve duration is sent as a name only and not attached when 
     '⚠️⚠️ duration name not delivered (choosing 24h gives 3h) / duration attached to off',
   )
 })
+
+test('★ the session list keeps the agent’s `at` (the "needs you" cleanup reads it); a non-string is dropped', async () => {
+  const at = '2026-11-20T00:00:10.000Z'
+  const withAt = recording(() => ({ status: 200, body: { machine: 'm', at, sessions: [] } }))
+  assert.equal((await withAt.transport.listSessions({ history: false })).at, at)
+  const odd = recording(() => ({ status: 200, body: { machine: 'm', at: 7, sessions: [] } }))
+  assert.equal((await odd.transport.listSessions({ history: false })).at, undefined)
+  const old = recording(() => ({ status: 200, body: { machine: 'm', sessions: [] } }))
+  assert.equal('at' in (await old.transport.listSessions({ history: false })), false)
+})

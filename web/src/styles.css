@@ -557,6 +557,27 @@ a.row:active {
   color: var(--bad);
 }
 
+/* ★ Answers that did not go through (`ui/LostAnswers.tsx`): over every view, below the notch.
+   ⚠️ A long command must neither push the reason and the Dismiss button out of sight nor cover the whole screen:
+      words wrap anywhere and the bar scrolls within a third of the screen (codex review) */
+.lostbar {
+  position: fixed;
+  top: max(8px, env(safe-area-inset-top));
+  left: 8px;
+  right: 8px;
+  z-index: 50;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 6px;
+  max-height: 33vh;
+  overflow-y: auto;
+}
+
+.lostbar .notice {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
 .notice.warn {
   border-color: color-mix(in srgb, var(--warn) 35%, transparent);
   color: var(--warn);

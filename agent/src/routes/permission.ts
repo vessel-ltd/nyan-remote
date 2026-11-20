@@ -58,6 +58,7 @@ import { announceToLeader } from '../teamHooks.ts'
 import { membershipOf } from '../team.ts'
 import { hasHidden } from '../../../shared/reveal.ts'
 import { isCodexSessionId } from '../codex/daemon.ts'
+import { agyDelivery, agyDeliveryMessage } from '../agy/cards.ts'
 import { resolveAgentTranscript } from '../claude/subagentTranscript.ts'
 import { parseTranscriptPath } from './hook.ts'
 import { t } from '../../../shared/i18n.ts'
@@ -307,9 +308,18 @@ export interface AnswerBody {
 }
 
 /** The reply from the phone */
-export async function permissionAnswer(ctx: Ctx): Promise<{ ok: boolean; reason?: string }> {
+export async function permissionAnswer(ctx: Ctx): Promise<{ ok: boolean; reason?: string; at?: string }> {
   const body = await readJsonBody<AnswerBody>(ctx.req)
-  return answerPermission(body, actorOf(ctx.identity))
+  // ★ An agy card is answered by typing a key (`agy/cards.ts`): its outcome is known only after the key went out,
+  //   so the phone waits for it (a key that never reached agy must not read as answered / codex review).
+  //   ⚠️ Taken before answering (answering starts the typing)
+  const delivery = typeof body.key === 'string' ? agyDelivery(body.key) : undefined
+  const r = answerPermission(body, actorOf(ctx.identity))
+  if (!r.ok || !delivery) return r
+  const d = await delivery
+  if (d && !d.ok) return { ok: false, reason: agyDeliveryMessage(d.reason) }
+  // ★ When it took effect, by this agent's clock (the phone closes the notifications shown before it)
+  return d ? { ...r, at: new Date().toISOString() } : r
 }
 
 /**
@@ -374,6 +384,16 @@ export function answerPermission(
       reason: t(
         'Codex の承認には理由を付けられません。理由を消して、もう一度 拒否してください。',
         'A Codex approval cannot carry a reason. Clear the reason and deny again.',
+      ),
+    }
+  }
+  // ★ An agy card is answered with one key (`agy/keys.ts` `AGY_CARD_KEYS`): no reason can go with it either
+  if (target?.tool === 'agy' && fb.message) {
+    return {
+      ok: false,
+      reason: t(
+        'agy の承認には理由を付けられません。理由を消して、もう一度 拒否してください。',
+        'An agy approval cannot carry a reason. Clear the reason and deny again.',
       ),
     }
   }

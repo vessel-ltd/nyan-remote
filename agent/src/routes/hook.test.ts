@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { shouldRing, statusLabel, UNKNOWN_LABEL } from '../../../shared/types.ts'
+import { sessionTag, shouldRing, statusLabel, UNKNOWN_LABEL } from '../../../shared/types.ts'
 import { test } from 'node:test'
 import { hasPermissionHook } from '../claude/permissionHook.ts'
 import { holdQuiet, listPending, resetPending, waitForDecision } from '../permission.ts'
@@ -60,11 +60,16 @@ test('toPushPayload: carries only identifiers and state (never leaks conversatio
   assert.equal(payload.body, '完了 · PC-A · claude-r\nanswer-analytics')
   assert.equal(payload.at, '2026-08-11T10:21:38.299Z')
   assert.equal(payload.tag, 'PC-A/.claude-r/abc-123')
+  // ★ the phone closes it with the same builder (after denying an agy card)
+  assert.equal(payload.tag, sessionTag('PC-A', '.claude-r', 'abc-123'))
+  assert.equal(sessionTag('m'.repeat(80), 'a', 's'), `${'m'.repeat(64)}/a/s`)
   assert.equal(payload.url, '/#/s/abc-123')
 
   // ★ No extra keys. Whenever this grows, always consider whether it violates §6.2
   //   ⚠️ `完了` (done) rings, so `silent` is not added
-  assert.deepEqual(Object.keys(payload).sort(), ['at', 'body', 'event', 'tag', 'title', 'url'])
+  //   ★ `session` (an identifier) and, for "needs you" only, `waiting` (state): the open app closes one that is over
+  assert.deepEqual(Object.keys(payload).sort(), ['at', 'body', 'event', 'session', 'tag', 'title', 'url'])
+  assert.equal(payload.session, 'abc-123')
 
   // ★ Well below the 4KB limit
   assert.ok(JSON.stringify(payload).length < 512)
@@ -428,8 +433,10 @@ test('★ toPushPayload: swapping the wording does not change what is carried (�
   assert.equal(payload.silent, true)
   assert.deepEqual(
     Object.keys(payload).sort(),
-    ['at', 'body', 'event', 'silent', 'tag', 'title', 'url'],
+    ['at', 'body', 'event', 'session', 'silent', 'tag', 'title', 'url'],
   )
+  assert.equal(toPushPayload(STOP_EVENT, '要対応').waiting, true)
+  assert.equal(toPushPayload(STOP_EVENT, '完了').waiting, undefined)
 
   // ★ Wordings that ring do not get a `silent` key at all (the sw checks `=== true`)
   assert.equal(toPushPayload(STOP_EVENT, '完了').silent, undefined)

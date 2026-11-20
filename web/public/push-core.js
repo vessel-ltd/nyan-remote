@@ -29,7 +29,7 @@ self.addEventListener('push', (event) => {
   //    misjudge "approvals raised afterwards" as old and **remove live notifications**.
   //    ⇒ If unknown, don't clean up (keep this separate from the display `ts`).
   const pruneAt = data.at ? Date.parse(data.at) : Number.NaN
-  event.waitUntil(
+  const show = () =>
     self.registration.showNotification(title, {
       body: data.body || '',
       tag: data.tag || 'tmux-agent',
@@ -53,10 +53,67 @@ self.addEventListener('push', (event) => {
       //    ⚠️ **Never determine the owner by prefix-matching the tag** (`perm-<machine>-<key>`).
       //    Both host name and key may contain `-`, so a push from `pc-b` would
       //    prefix-match `pc-b-wsl` notifications too and **close another machine's live notifications**.
-      data: { url: data.url || '/', machine: data.machine },
-    }).then(() => closeResolvedPermissions(data, pruneAt)),
-  )
+      // ★ `at`: the sender's time again, in the data (WebKit has no `Notification.timestamp`; the page reads this to
+      //   close only the notifications shown before an answer took effect / 2026-11-20). Absent ⇒ not closed.
+      data: {
+        url: data.url || '/',
+        machine: data.machine,
+        ...(Number.isNaN(pruneAt) ? {} : { at: pruneAt }),
+        // ★ Which session, and whether it says "needs you" (the open app closes one whose session no longer waits)
+        ...(typeof data.session === 'string' ? { session: data.session } : {}),
+        ...(data.waiting === true ? { waiting: true } : {}),
+      },
+    }).then(() => closeResolvedPermissions(data, pruneAt))
+  // ★ An older push delivered after a newer one with the same tag does not replace it (`keepNewer`). Pushes are handled
+  //   one at a time (two arriving together both read the tray before either wrote / codex review).
+  //   ⚠️ A newer one already tapped (so gone) is not known here: the open app closes a "needs you" that is over.
+  const run = pushChain.then(() => keepNewer(data.tag || 'tmux-agent', pruneAt).then((kept) => (kept ? undefined : show())))
+  pushChain = run.catch(() => undefined)
+  event.waitUntil(run)
 })
+
+/** One push handled at a time (see above) */
+let pushChain = Promise.resolve()
+
+/**
+ * ★ The shown notification with this tag that is newer than this push, by the sender's time (`data.at`), if any.
+ * ⚠️ Delivery order is not guaranteed: a delayed "needs you" arriving after "done" replaced it under the same tag
+ *    and made a finished turn look blocked (codex review 2026-11-20). Unknown times ⇒ none (shown as before).
+ */
+function newerShown(shown, pushAt) {
+  if (typeof pushAt !== 'number' || Number.isNaN(pushAt)) return undefined
+  for (const n of shown) {
+    const at = n && n.data && typeof n.data.at === 'number' ? n.data.at : undefined
+    if (at !== undefined && at > pushAt) return n
+  }
+  return undefined
+}
+
+/**
+ * When a newer notification with this tag is already shown, show it again, silently, instead of this older push
+ * (a push must still show a notification: `userVisibleOnly`). Resolves whether it did.
+ */
+function keepNewer(tag, pushAt) {
+  if (!self.registration.getNotifications) return Promise.resolve(false)
+  return self.registration
+    .getNotifications({ tag })
+    .then((shown) => {
+      const newer = newerShown(shown, pushAt)
+      if (!newer) return false
+      return self.registration
+        .showNotification(newer.title, {
+          body: newer.body,
+          tag,
+          icon: '/icons/notify-256.png',
+          badge: '/icons/badge-96.png',
+          timestamp: newer.data.at,
+          silent: true,
+          data: newer.data,
+        })
+        .then(() => true)
+    })
+    .catch(() => false)
+}
 
 /**
  * ★★ Close notifications for "approvals no longer pending" **piggybacking on this notification** (2026-08-20).

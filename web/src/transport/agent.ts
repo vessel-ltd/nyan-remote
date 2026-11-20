@@ -123,8 +123,8 @@ export class AgentTransport implements Transport {
     answers?: Record<string, string[]>,
     feedback?: string,
     notes?: Record<string, string>,
-  ): Promise<{ ok: boolean; reason?: string }> {
-    return this.post<{ ok: boolean; reason?: string }>('/permission/answer', {
+  ): Promise<{ ok: boolean; reason?: string; at?: string }> {
+    return this.post<{ ok: boolean; reason?: string; at?: string }>('/permission/answer', {
       key,
       behavior,
       ...(answers ? { answers } : {}),
@@ -149,7 +149,13 @@ export class AgentTransport implements Transport {
     //    ★ `?history=1` means everything in every version (new agents default to everything and just
     //      ignore unknown queries).
     const body = await this.get<SessionsPage>(`/sessions?${opts.history ? 'history=1' : 'live=1'}`)
-    return { machine: body.machine, sessions: body.sessions ?? [], ...(body.history ? { history: body.history } : {}) }
+    return {
+      machine: body.machine,
+      // ★ When the agent started reading the rows (the "needs you" cleanup / `SessionsPage.at`). Only a string passes
+      ...(typeof body.at === 'string' ? { at: body.at } : {}),
+      sessions: body.sessions ?? [],
+      ...(body.history ? { history: body.history } : {}),
+    }
   }
 
   getLog(sessionId: string, opts?: LogQuery): Promise<LogPage> {
