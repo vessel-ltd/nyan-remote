@@ -45,6 +45,7 @@ export function Composer({
   ctx,
   model,
   maxBytes,
+  asKeys = true,
   attach,
   onSend,
 }: {
@@ -88,6 +89,8 @@ export function Composer({
    * ⚠️ Required: a caller that forgot it must not get either limit by default
    */
   maxBytes: number
+  /** ★ Whether the text goes as keystrokes (tabs become spaces, `sendTooLong`). A Codex row takes it as is */
+  asKeys?: boolean
   /**
    * ★ Files (2026-11-17 / `ui/attach.ts`): absent ⇒ no 📎 (an agent without `uploads`, or a session it cannot take).
    *   `upload` prepares and sends one file and resolves with the agent's id for it.
@@ -212,7 +215,7 @@ export function Composer({
   }
   useEffect(grow, [text])
 
-  const tooLong = sendTooLong(text, maxBytes)
+  const tooLong = sendTooLong(text, maxBytes, asKeys)
   /**
    * ★★★ Text starting with `/` `!` **cannot be sent** (2026-11-10 / security audit).
    *    Free text never runs a command; the table commands are in the menu (`commands.ts`).

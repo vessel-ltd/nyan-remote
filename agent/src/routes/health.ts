@@ -56,6 +56,8 @@ export async function health(): Promise<AgentHealth> {
       ...AGENT_FEATURES,
       ...(codexEnabled() ? (['codex-sessions', 'codex-log-follow', 'codex-send', 'codex-auto-approve', 'codex-interrupt', 'codex-compact'] as const) : []),
       'agy-log-follow',
+      'agy-send',
+      'agy-interrupt',
     ],
     // ★ The device key for ③. ⚠️ **Omitted** when unusable (the PWA then fails to match and
     //   says "the machine that showed this QR is not among your endpoints" = never send to a false destination)

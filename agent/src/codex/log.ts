@@ -14,6 +14,7 @@
 //    `REFRESH_MIN_MS` per thread.
 
 import type { LogPage } from '../../../shared/types.ts'
+import { countWithin } from '../claude/log.ts'
 import { EPOCH_STEP, newEpoch, ThreadJournal, turnsToEntries, type TurnsPage } from './history.ts'
 
 /** Turns read from the daemon when a thread is opened, and each time older turns are needed */
@@ -190,7 +191,12 @@ export class CodexLogs {
 
     if (opts.since !== null && opts.since !== undefined) {
       await this.#refresh(source, threadId, s, s.loaded ? FOLLOW_TURNS : PAGE_TURNS)
-      return { ...base, entries: s.journal.since(opts.since) ?? [], cursor: null, tail: s.journal.tail }
+      const all = s.journal.since(opts.since)
+      if (!all) return { ...base, entries: [], cursor: null, tail: s.journal.tail }
+      // ★ Cut to fit one relay frame; the phone asks again from where it stopped (`more` / codex review)
+      const n = countWithin(all)
+      if (n >= all.length) return { ...base, entries: all, cursor: null, tail: s.journal.tail }
+      return { ...base, entries: all.slice(0, n), cursor: null, tail: s.journal.after(opts.since, n), more: true }
     }
 
     await this.#refresh(source, threadId, s, PAGE_TURNS)

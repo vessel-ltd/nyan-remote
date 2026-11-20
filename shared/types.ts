@@ -274,6 +274,13 @@ export type AgentFeature =
    * (2026-11-19 / docs/AGY.md). Read-only for now: no send, stop, commands or approvals.
    */
   | 'agy-log-follow'
+  /**
+   * ★ `POST /sessions/:id/message` types into an idle agy started through the relay (2026-11-20 / docs/AGY.md §8).
+   * ⚠️ A row can take it only with `sendRoute: 'keys'` (the agy went through `~/.nyan-remote/bin/agy`).
+   */
+  | 'agy-send'
+  /** ★ `POST /sessions/:id/interrupt` sends ESC to a working agy started through the relay (2026-11-20) */
+  | 'agy-interrupt'
   /** ★ `POST /sessions/:id/message` sends to an idle Codex thread (a new turn on the daemon / 2026-11-15) */
   | 'codex-send'
   /** ★ Auto-approve mode also passes Codex command approvals, and Codex rows carry the mark (2026-11-14) */
@@ -306,9 +313,16 @@ export type AgentFeature =
 export const MAX_SEND_JSON_BYTES = 192 * 1024
 
 /** Whether the screen must refuse `text` before sending it (its own limit, or too big once escaped) */
-export function sendTooLong(text: string, limitBytes: number): boolean {
+export function sendTooLong(text: string, limitBytes: number, asKeys = true): boolean {
   const enc = new TextEncoder()
-  return enc.encode(text).length > limitBytes || enc.encode(JSON.stringify(text)).length > MAX_SEND_JSON_BYTES
+  // ★ Where it goes as keystrokes, also as they put it (a tab becomes four spaces): the agent checks that form (codex
+  //   review: a tab-indented paste passed the screen and was refused). ⚠️ A Codex row takes the text as is (`asKeys`
+  //   false), so it is not held to the expanded size
+  return (
+    enc.encode(text).length > limitBytes ||
+    (asKeys && enc.encode(typedForm(text).text).length > limitBytes) ||
+    enc.encode(JSON.stringify(text)).length > MAX_SEND_JSON_BYTES
+  )
 }
 
 /** The limit the screen allows for an instruction to an agent with these features */
@@ -1254,6 +1268,37 @@ export interface PushStatus {
 
 /* ---- Thread view (M2) ---- */
 
+/**
+ * ★★ A user record cut for the thread (2026-11-20). `fullLength` is the length of the whole text (after `trimEnd`),
+ *   set **only when it was cut** (the text is then its first `max - 1` characters and `…`).
+ *   ⚠️ Without it the phone could never match a sent text longer than the cut against its record
+ *     (sends go up to 64 KB since 2026-11-17, records are cut at 8000 / 20,000 characters) ⇒ "Can't confirm it
+ *     arrived" stayed for ever (`web/src/ui/pending.ts` `textFit`).
+ */
+export function clipUserText(s: string, max: number): { text: string; fullLength?: number; digest?: string } {
+  const t = s.trimEnd()
+  return t.length > max ? { text: `${t.slice(0, max - 1)}…`, fullLength: t.length, digest: textDigest(t) } : { text: t }
+}
+
+/**
+ * ★ A short digest of a whole text (cyrb53 over UTF-16 code units, the same in Node and the browser / codex review).
+ *   A cut record carries it so the phone can check the whole send, not just its head: a same-length edit in the middle
+ *   of a long text, or a PC draft in front, would otherwise fit the wrong send. ⚠️ Not a security check (matching only);
+ *   sent instead of the text's end so a page of long records stays within one relay frame.
+ */
+export function textDigest(s: string): string {
+  let h1 = 0xdeadbeef
+  let h2 = 0x41c6ce57
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i)
+    h1 = Math.imul(h1 ^ c, 2654435761)
+    h2 = Math.imul(h2 ^ c, 1597334677)
+  }
+  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909)
+  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909)
+  return (4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(36)
+}
+
 /** Tool display is folded to one line by default (same as the Claude Code TUI) */
 export interface Foldable {
   /** Body shown when unfolded. Newlines preserved */
@@ -1273,7 +1318,7 @@ export type LogEntry =
    * ⚠️ The UI needs to tell them apart. If it looked the same as what was typed on the PC,
    *    later you could not tell "did I send it from the phone or type it on the PC".
    */
-  | { kind: 'user'; at?: string; text: string; via?: 'inbox' | 'peer'; from?: string }
+  | { kind: 'user'; at?: string; text: string; via?: 'inbox' | 'peer'; from?: string; fullLength?: number; digest?: string }
   | { kind: 'assistant'; at?: string; text: string }
   | { kind: 'thinking'; at?: string; text: string }
   | ({ kind: 'tool_use'; at?: string; name: string; id?: string } & Foldable)
@@ -1360,6 +1405,11 @@ export interface LogPage {
   tail: number
   bytes: number
   /**
+   * ★ Live follow stopped before the end to stay within one relay frame (2026-11-20 / codex review): `tail` is where it
+   *   stopped, so the phone asks again at once. ⚠️ Absent from older agents (they return everything).
+   */
+  more?: true
+  /**
    * ★★ **Body not yet written to the transcript** (2026-08-21).
    *
    * The CLI batches transcript writes, and **flushing stops while it waits for a human answer**
@@ -1397,6 +1447,23 @@ export type AgentEvent =
  * ★ Why the check is in one place: if the UI wrote its own, **its view of the start drifts from that of the agent**
  *   (it actually drifted on invisible characters: the UI showed no warning while the agent was rewriting).
  */
+/**
+ * ★★ A body as keystrokes put it into the TUI (2026-11-20 / codex review): CR as LF, **a tab as four spaces**, other
+ *   control characters dropped. ⚠️ Tabs used to be dropped with the other controls, so pasted code lost its indentation
+ *   silently. A raw Tab is a key in the TUI (completion), so it is never typed as is. `sanitizeForKeys` and the phone's
+ *   matching both use this one function.
+ */
+export function typedForm(text: string): { text: string; dropped: number } {
+  const normalized = text.replace(/\r\n?/g, '\n').replace(/\t/g, '    ')
+  let dropped = 0
+  let out = ''
+  for (const ch of normalized) {
+    if (isDroppedControl(ch.codePointAt(0) ?? 0)) dropped += 1
+    else out += ch
+  }
+  return { text: out, dropped }
+}
+
 export function isDroppedControl(code: number): boolean {
   return (
     (code < 0x20 && code !== 0x0a && code !== 0x0d) ||

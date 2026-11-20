@@ -186,7 +186,16 @@ ${END}`
  * ⚠️ **If the real one cannot be exec'd, search PATH again** (so it starts even after an update changes the path).
  *    When doing so, **exclude our own directory** (otherwise it calls itself forever).
  */
-export function buildWrapper({ real, relay }) {
+export function buildWrapper({ real, relay, name = 'claude' }) {
+  // ★ The same shim fronts agy too (2026-11-20 / docs/AGY.md §8): only the command's name and its print flags differ
+  //   (agy also has `--prompt` as an alias of `--print`). ⚠️ The name must be a plain word (it goes into the script)
+  if (!/^[a-z][a-z0-9-]*$/.test(name)) throw new Error(`bad command name: ${name}`)
+  // ★ agy parses flags the Go way: `-p=…` `--p` `--print=…` `-print` are print mode too (codex review)
+  const printFlags =
+    name === 'agy' ? '-p|-p=*|--p|--p=*|--print|--print=*|-print|-print=*|--prompt|--prompt=*|-prompt|-prompt=*' : '-p|--print'
+  // ★ agy: a directory with the name is not the program (codex review). ⚠️ The claude shim keeps its bytes exactly
+  const runnable = (v) => (name === 'claude' ? `-x "${v}"` : `-f "${v}" ] && [ -x "${v}"`)
+  const notRunnable = (v) => (name === 'claude' ? `! -x "${v}"` : `! -f "${v}" ] || [ ! -x "${v}"`)
   return `#!/bin/sh
 ${SHIM_MARK}（docs/ARCHITECTURE.md §9.7.2）の入口。
 # ⚠️ scripts/install-relay.mjs が生成する。手で直さない（再設置で上書きされる）。
@@ -220,10 +229,10 @@ _ta_n=\${_NYAN_REMOTE_SHIM:-0}
 case $_ta_n in ''|*[!0-9]*|???*) _ta_n=0 ;; esac
 if [ "$_ta_n" -ge 8 ]; then
   if _ta_ja; then
-    echo 'nyan-remote: claude の呼び出しが循環しています（PATH 上のラッパーが claude を呼び直しています）' >&2
+    echo 'nyan-remote: ${name} の呼び出しが循環しています（PATH 上のラッパーが ${name} を呼び直しています）' >&2
     echo '  ⇒ PATH を確認してください。素で起こすなら本物を絶対パスで叩いてください' >&2
   else
-    echo 'nyan-remote: calls to claude are looping (a wrapper on PATH keeps calling claude again)' >&2
+    echo 'nyan-remote: calls to ${name} are looping (a wrapper on PATH keeps calling ${name} again)' >&2
     echo '  => Check your PATH. To start claude directly, run the real one by its absolute path' >&2
   fi
   exit 127
@@ -236,7 +245,7 @@ export _NYAN_REMOTE_SHIM
 #    除外に失敗して自分を拾う）。⇒ **候補が自分と同一ファイル（-ef）なら捨てる**。
 # ⚠️ tr で組み立てると**末尾コロン**が残り、空エントリ ＝ **cwd** が検索対象に入る。
 #    ⇒ IFS=: のループで空を捨て、**絶対パスでない候補は採らない**。
-if [ ! -x "$real" ] || [ "$real" -ef "$0" ]; then
+if [ ${notRunnable('$real')} ] || [ "$real" -ef "$0" ]; then
   real=''
   _ta_ifs=$IFS
   IFS=:
@@ -247,8 +256,8 @@ if [ ! -x "$real" ] || [ "$real" -ef "$0" ]; then
   for _ta_d in $PATH; do
     [ -n "$_ta_d" ] || continue
     case $_ta_d in /*) ;; *) continue ;; esac
-    _ta_c="$_ta_d/claude"
-    [ -x "$_ta_c" ] || continue
+    _ta_c="$_ta_d/${name}"
+    [ ${runnable('$_ta_c')} ] || continue
     [ "$_ta_c" -ef "$0" ] && continue
     real=$_ta_c
     break
@@ -257,11 +266,11 @@ if [ ! -x "$real" ] || [ "$real" -ef "$0" ]; then
   IFS=$_ta_ifs
   unset _ta_ifs _ta_d _ta_c
 fi
-if [ -z "$real" ] || [ ! -x "$real" ]; then
+if [ -z "$real" ] || [ ${notRunnable('$real')} ]; then
   if _ta_ja; then
-    echo 'nyan-remote: 本物の claude が見つかりません（NYAN_REMOTE_NO_RELAY=1 でも素起動できません）' >&2
+    echo 'nyan-remote: 本物の ${name} が見つかりません（NYAN_REMOTE_NO_RELAY=1 でも素起動できません）' >&2
   else
-    echo 'nyan-remote: the real claude was not found (NYAN_REMOTE_NO_RELAY=1 cannot start it either)' >&2
+    echo 'nyan-remote: the real ${name} was not found (NYAN_REMOTE_NO_RELAY=1 cannot start it either)' >&2
   fi
   exit 127
 fi
@@ -277,7 +286,7 @@ python3 -c '' >/dev/null 2>&1 || exec "$real" "$@"
 # ⚠️ 非対話（-p / --print）は必ず素通し。pty を挟むと出力の形が変わる
 for a in "$@"; do
   case "$a" in
-    -p|--print) exec "$real" "$@" ;;
+    ${printFlags}) exec "$real" "$@" ;;
   esac
 done
 exec python3 "$relay" -- "$real" "$@"
@@ -600,6 +609,8 @@ export function ptyProbeArgv(plat, cmd, args) {
 
 const isExecutableSync = (p) => {
   try {
+    // ⚠️ A directory passes X_OK too (codex review 2026-11-20: a folder named `agy` on PATH was taken as the program)
+    if (!statSync(p).isFile()) return false
     accessSync(p, constants.X_OK)
     return true
   } catch {
@@ -613,9 +624,9 @@ const isExecutableSync = (p) => {
  * ⚠️ **Always exclude the shim directory** (embedding ourselves as "the real one" on reinstall
  *    makes it call itself forever at run time).
  */
-export function resolveRealClaude(pathEnv, excludeDir, isExecutable = isExecutableSync) {
+export function resolveRealClaude(pathEnv, excludeDir, isExecutable = isExecutableSync, name = 'claude') {
   const skip = resolve(excludeDir)
-  const shim = join(excludeDir, 'claude')
+  const shim = join(excludeDir, name)
   for (const dir of String(pathEnv ?? '').split(':')) {
     if (!dir) continue
     if (resolve(dir) === skip) continue
@@ -623,7 +634,7 @@ export function resolveRealClaude(pathEnv, excludeDir, isExecutable = isExecutab
     //    of the shim directory, `resolve()` (lexical normalization only) considers it different and
     //    **embeds the shim itself as "the real one"** = an inescapable infinite exec on reinstall.
     //    ⇒ **Drop it if it is the same file (dev+ino)**.
-    const p = join(dir, 'claude')
+    const p = join(dir, name)
     if (!isExecutable(p)) continue
     if (isSameFile(p, shim)) continue
     // ⚠️ Another nyan shim (an old state directory still on PATH, e.g. through an old tail) is not the real one
@@ -635,7 +646,7 @@ export function resolveRealClaude(pathEnv, excludeDir, isExecutable = isExecutab
 }
 
 /** A shim we wrote (line 2 is `SHIM_MARK`)? ⚠️ Unreadable ⇒ no (no basis to exclude it) */
-function isOurShim(p) {
+export function isOurShim(p) {
   // ⚠️ Read only the head: the real claude is a ~350 MB binary (round 10: reading it whole peaked at 1.1 GB)
   let fd
   try {

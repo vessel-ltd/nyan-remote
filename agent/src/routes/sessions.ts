@@ -8,7 +8,7 @@ import { SESSION_LINE_MAX_AGE_MS, sweepSessionLines } from '../claude/sessionLin
 import { scanPanes, sweepPanes, type PaneScan } from '../claude/keys.ts'
 import { hasPendingForSession, listPending } from '../permission.ts'
 import { parseTranscriptPath } from './hook.ts'
-import { readLogSince, readLogSlice } from '../claude/log.ts'
+import { LOG_PAGE_BUDGET_BYTES, readLogSince, readLogSlice } from '../claude/log.ts'
 import { collectSessions, findTranscript } from '../claude/sessions.ts'
 import { HttpError, type Ctx } from '../router.ts'
 import { autoApproveFor } from '../autoApprove.ts'
@@ -224,21 +224,25 @@ export async function sessionLog(ctx: Ctx): Promise<LogPage> {
     const since = intOrNull(ctx.url.searchParams.get('since'))
     let slice
     try {
-      slice = since !== null ? await readLogSince(path, since, agyEntries) : await readLogSlice(path, limit, before ?? undefined, agyEntries)
+      slice =
+        since !== null
+          ? await readLogSince(path, since, agyEntries)
+          : await fitPage(limit, (n) => readLogSlice(path, n, before ?? undefined, agyEntries))
     } catch {
       throw new HttpError(404, t('このセッションの記録はまだありません', 'This session has no transcript yet.'))
     }
-    return { sessionId, account: 'agy', entries: slice.entries, cursor: slice.cursor, tail: slice.tail, bytes: slice.bytes }
+    return { sessionId, account: 'agy', entries: slice.entries, cursor: slice.cursor, tail: slice.tail, bytes: slice.bytes, ...(slice.more ? { more: true as const } : {}) }
   }
   const cfg = config()
   const dirs = await discoverConfigDirs(cfg.configDirs)
   // ★ A Codex thread has no transcript file: its turns are read from the daemon (`codex/log.ts`).
   //   ⚠️ `undefined` = no Codex line lists this id ⇒ fall through to the Claude side as before.
-  const codex = await codexLog(sessionId, {
-    before,
-    since: intOrNull(ctx.url.searchParams.get('since')),
-    limit: clampInt(ctx.url.searchParams.get('limit'), DEFAULT_LIMIT, 1, MAX_LIMIT),
-  })
+  const codexSince = intOrNull(ctx.url.searchParams.get('since'))
+  const codexLimit = clampInt(ctx.url.searchParams.get('limit'), DEFAULT_LIMIT, 1, MAX_LIMIT)
+  const codex =
+    codexSince !== null
+      ? await codexLog(sessionId, { before, since: codexSince, limit: codexLimit })
+      : await fitPage(codexLimit, (n) => codexLog(sessionId, { before, since: null, limit: n }))
   if (codex) return codex
   const found = await findTranscript(dirs, sessionId)
   if (!found) {
@@ -282,7 +286,7 @@ export async function sessionLog(ctx: Ctx): Promise<LogPage> {
   const slice =
     since !== null
       ? await readLogSince(found.path, since)
-      : await readLogSlice(found.path, limit, before ?? undefined)
+      : await fitPage(limit, (n) => readLogSlice(found.path, n, before ?? undefined))
 
   // ★★ Add "text not yet written" (the explanation while waiting for approval).
   // ⚠️ Not returned when reading backwards (before). It is **about now**, so attaching it to old pages mixes things up.
@@ -298,7 +302,26 @@ export async function sessionLog(ctx: Ctx): Promise<LogPage> {
     cursor: slice.cursor,
     tail: slice.tail,
     bytes: slice.bytes,
+    ...(slice.more ? { more: true as const } : {}),
     ...(showInflight ? { inflight: showInflight } : {}),
+  }
+}
+
+/**
+ * ★★ A page must fit one relay frame (`MAX_PAYLOAD_BYTES` 256 KB / 2026-11-20 / codex review). Pages are counted in
+ *   entries (60), and one text entry can be 24 KB (8000 Japanese characters; Codex 20,000), so a page of long messages
+ *   failed to pack, the tunnel closed, and the same page failed again on every retry = the thread never opened.
+ *   ⇒ Halve the entry count until the page fits `PAGE_BUDGET_BYTES` (room is left for `inflight` and the envelope).
+ *   The cursor of a smaller page still continues where it stopped, so the phone just reads more pages.
+ *   ⚠️ Live follow (`since`) is not cut here (it carries only what was appended).
+ */
+export const PAGE_BUDGET_BYTES = LOG_PAGE_BUDGET_BYTES
+export async function fitPage<P extends { entries: readonly unknown[] } | undefined>(limit: number, read: (limit: number) => Promise<P>): Promise<P> {
+  let n = limit
+  for (;;) {
+    const page = await read(n)
+    if (!page || n <= 1 || Buffer.byteLength(JSON.stringify(page.entries), 'utf8') <= PAGE_BUDGET_BYTES) return page
+    n = Math.max(1, Math.floor(n / 2))
   }
 }
 

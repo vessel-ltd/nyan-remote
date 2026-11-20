@@ -24,6 +24,7 @@ import {
   failureMessage,
   findPane,
   sanitizeForKeys,
+  typedTooLong,
   sendKeysToSession,
   writeKeys,
 } from './keys.ts'
@@ -684,4 +685,29 @@ test('★★ writeKeys with a paste: the relay\'s `-` means nothing typed (no En
   const s = await writeKeys(join(dir, 's.sock'), frame, { pasteAck: true })
   assert.equal(s.ok ? 'ok' : s.reason, 'partial')
   assert.ok(!silent.chunks.join('').includes('\r'), 'Enter was sent without an answer')
+})
+
+test('★★ a tab is typed as four spaces, never dropped (pasted code keeps its indentation / codex review)', () => {
+  const r = sanitizeForKeys('if x:\n\treturn 1\r\n')
+  assert.deepEqual(r, { ok: true, value: { text: 'if x:\n    return 1\n', dropped: 0 } })
+  // ⚠️ a leading tab still cannot hide a command
+  assert.deepEqual(sanitizeForKeys('\t/compact'), { ok: false, reason: 'command-like' })
+})
+
+test('★ the screen\'s length check counts tabs as typed (four spaces), like the agent', async () => {
+  const { sendTooLong, MAX_SEND_BYTES } = await import('../../../shared/types.ts')
+  const body = 'a\t'.repeat(15_000)
+  assert.equal(Buffer.byteLength(body) <= MAX_SEND_BYTES, true)
+  assert.equal(sendTooLong(body, MAX_SEND_BYTES), true)
+  // ⚠️ the inbox takes it as is: refused only where it is really typed (`typedTooLong`, after the pane is found)
+  const clean = sanitizeForKeys(body)
+  assert.equal(clean.ok, true)
+  assert.equal(clean.ok && typedTooLong(clean.value.text), true)
+  assert.deepEqual(sanitizeForKeys('a'.repeat(MAX_SEND_BYTES + 1)), { ok: false, reason: 'too-long' })
+})
+
+test('★ a Codex row is not held to the expanded size (it takes the text as is / codex review)', async () => {
+  const { sendTooLong, MAX_SEND_BYTES } = await import('../../../shared/types.ts')
+  const body = 'a\t'.repeat(15_000)
+  assert.equal(sendTooLong(body, MAX_SEND_BYTES, false), false)
 })

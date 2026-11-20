@@ -16,8 +16,9 @@ export function isCodex(session: Pick<SessionSummary, 'tool'> | undefined): bool
 }
 
 /**
- * ★ An Antigravity CLI (agy) row (2026-11-19 / docs/AGY.md). Like Codex, only what its own marks grant; the first
- * version is read-only (list, thread, follow), so sending, stopping, commands and auto-approve stay off.
+ * ★ An Antigravity CLI (agy) row (2026-11-19 / docs/AGY.md). Like Codex, only what its own marks grant: list, thread
+ * and follow (`agy-log-follow`), and — for an agy started through the relay (`sendRoute: 'keys'`) — sending
+ * (`agy-send`) and stopping (`agy-interrupt`). Commands, clearing the input box and auto-approve stay off.
  */
 export function isAgy(session: Pick<SessionSummary, 'tool'> | undefined): boolean {
   return session?.tool === 'agy'
@@ -57,23 +58,41 @@ export function actionFeatures(
  */
 export function canStop(session: Pick<SessionSummary, 'tool' | 'sendRoute'>, features: readonly AgentFeature[] | undefined): boolean {
   if (isCodex(session)) return features?.includes('codex-interrupt') ?? false
+  // ★ agy: one ESC through its relay, so only a row the relay announced
+  if (isAgy(session)) return (features?.includes('agy-interrupt') ?? false) && session.sendRoute === 'keys'
   if (session.tool !== undefined) return false
   return session.sendRoute !== undefined
 }
 
 /** Whether the message box may send to this row. ⚠️ `features` are the **agent's** (not `actionFeatures`). */
-export function canSendTo(session: Pick<SessionSummary, 'tool'> | undefined, features: readonly AgentFeature[] | undefined): boolean {
+export function canSendTo(
+  session: Pick<SessionSummary, 'tool' | 'sendRoute'> | undefined,
+  features: readonly AgentFeature[] | undefined,
+): boolean {
   if (isCodex(session)) return features?.includes('codex-send') ?? false
-  // ⚠️ agy (and any tool this PWA does not know): no sending yet
+  // ★ agy: typed through its relay (only a row the relay announced)
+  if (isAgy(session)) return (features?.includes('agy-send') ?? false) && session?.sendRoute === 'keys'
+  // ⚠️ Any tool this PWA does not know: no sending
   return session?.tool === undefined
+}
+
+/** ★ Whether files may be attached when sending to this row (agy: not yet — it would ask to read outside its folder) */
+export function canAttachTo(session: Pick<SessionSummary, 'tool' | 'sendRoute'> | undefined, features: readonly AgentFeature[] | undefined): boolean {
+  return !isAgy(session) && canSendTo(session, features)
 }
 
 /** What the message box says instead of sending (only for rows it cannot send to). */
 export function sendBlockedNote(
-  session: Pick<SessionSummary, 'tool'> | undefined,
+  session: Pick<SessionSummary, 'tool' | 'sendRoute'> | undefined,
   features: readonly AgentFeature[] | undefined,
 ): string | undefined {
   if (canSendTo(session, features)) return undefined
+  if (isAgy(session) && features?.includes('agy-send')) {
+    return t(
+      'この agy は nyan-remote を通さずに起動しています。新しいターミナルで agy を起こし直すと、スマホから送れます',
+      'This agy was not started through nyan-remote. Start agy again in a new terminal to send to it from the phone',
+    )
+  }
   if (!isCodex(session)) {
     return t(
       'このセッションへの送信は、まだスマホからできません（PC で入力してください）',

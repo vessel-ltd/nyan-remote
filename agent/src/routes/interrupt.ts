@@ -32,6 +32,8 @@ import { shortSessionId } from '../codex/ids.ts'
 import { codexInterrupt, codexLists } from '../codex/run.ts'
 import { HttpError, type Ctx } from '../router.ts'
 import { t } from '../../../shared/i18n.ts'
+import { AGY_STOP_REFUSAL, stopAgy } from '../agy/keys.ts'
+import { AGY_PREFIX, conversationOf } from '../agy/sessions.ts'
 
 /**
  * Failure category → HTTP.
@@ -133,6 +135,26 @@ export async function sessionClear(ctx: Ctx): Promise<InterruptResult> {
   return { ok: true, at }
 }
 
+/**
+ * ★★ Stop an agy conversation (2026-11-20 / docs/AGY.md §8). `undefined` when the id is not an agy row.
+ * One ESC through its relay, only while it works (`agy/keys.ts`). ⚠️ An `agy-` id never reaches the Claude route.
+ */
+export async function agyInterrupt(sessionId: string, stop: typeof stopAgy = stopAgy): Promise<InterruptResult | undefined> {
+  if (!sessionId.startsWith(AGY_PREFIX)) return undefined
+  const conversationId = conversationOf(sessionId)
+  if (!conversationId) throw new HttpError(...AGY_STOP_REFUSAL['not-open']())
+  const res = await stop(conversationId)
+  const short = conversationId.slice(0, 8)
+  if (!res.ok) {
+    console.log(`[agy] stop not sent conversation=${short} reason=${res.reason}`)
+    throw new HttpError(...AGY_STOP_REFUSAL[res.reason ?? 'unreachable']())
+  }
+  const at = new Date().toISOString()
+  broadcast({ type: 'sessions-changed', at })
+  console.log(`[agy] sent ESC to conversation=${short}`)
+  return { ok: true, at }
+}
+
 export async function sessionInterrupt(ctx: Ctx): Promise<InterruptResult> {
   const sessionId = ctx.params['id']
   if (!sessionId) throw new HttpError(400, t('session id が必要です', 'A session id is required.'))
@@ -141,6 +163,9 @@ export async function sessionInterrupt(ctx: Ctx): Promise<InterruptResult> {
   // ★ A Codex thread is stopped by its daemon (`codexStop`); `undefined` = not a Codex row, so the Claude route follows
   const viaCodex = await codexStop(sessionId)
   if (viaCodex) return viaCodex
+  // ★ An agy conversation gets one ESC through its relay (`agyInterrupt`)
+  const viaAgy = await agyInterrupt(sessionId)
+  if (viaAgy) return viaAgy
 
   const dirs = await discoverConfigDirs(config().configDirs)
   // ★★ If it was mid-response, also clear the input box after stopping (`sendStopToSession` / 2026-09-24)

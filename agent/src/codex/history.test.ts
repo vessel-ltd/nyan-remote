@@ -323,3 +323,19 @@ test('"finished" and the compaction label use the one time check: an out-of-rang
   assert.ok(entry?.kind === 'meta')
   assert.match(entry.label, /（2秒）|\(2s\)/)
 })
+
+test('★★ a Codex user message longer than the cut says its whole length (2026-11-20)', () => {
+  const [u] = itemEntries(parseTurn({ id: 't', items: [{ type: 'userMessage', id: 'u', content: [{ type: 'text', text: 'y'.repeat(25_000) }] }] })!.items[0]!)
+  assert.equal(u?.kind === 'user' && u.fullLength, 25_000)
+  assert.equal(u?.kind === 'user' && u.text.length, 20_000)
+})
+
+test('★ journal.after: the position a cut catch-up continues from (codex review)', () => {
+  const j = new ThreadJournal(EPOCH_STEP)
+  j.ingest([turn('t', 'completed', [user('u', 'a'), agent('a', 'b'), agent('b', 'c')])])
+  const from = j.front
+  const all = j.since(from)!
+  assert.equal(all.length, 3)
+  assert.deepEqual(j.since(j.after(from, 2)), all.slice(2))
+  assert.equal(j.after(from, 3), j.tail)
+})

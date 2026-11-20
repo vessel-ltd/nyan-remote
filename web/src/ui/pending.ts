@@ -9,6 +9,8 @@
 //      2. Sending the same text twice means **one enqueue marks both as "delivered"**
 //    → Look **only at what was added after sending**, and **consume one at a time**.
 
+import { textDigest, typedForm } from '../../../shared/types.ts'
+
 export interface PendingSend {
   /** The text sent */
   text: string
@@ -51,6 +53,9 @@ export interface ArrivedEntry {
   via?: string
   /** Record time (ISO). ⚠️ May be missing */
   at?: string
+  /** ★ Set only when the agent cut the text (`clipUserText`): the whole text's length and its digest */
+  fullLength?: number
+  digest?: string
 }
 
 /**
@@ -70,7 +75,7 @@ export function consumePending(pending: PendingSend[], arrivals: ArrivedEntry[])
     // ⚠️ Drop only route-compatible ones (keystrokes: no `via` / inbox: `via: 'inbox'`)
     // ⚠️ Awaiting reply (`sending`) has no route yet, so not dropped here (`noteArrivals` notes it)
     const text = a.text
-    const i = pick(rest, (p) => (p.sending ? undefined : fit(p, a.via, text)))
+    const i = pick(rest, (p) => (p.sending ? undefined : fit(p, a.via, text, a)))
     if (i >= 0) rest.splice(i, 1)
   }
   return rest.length === pending.length ? pending : rest
@@ -96,20 +101,65 @@ function matches(route: PendingSend['route'], via: string | undefined): boolean 
  *   ⚠️ The inbox joins nothing ⇒ `exact` only.
  *   ★ The agent shows records with trailing whitespace removed (`clip` in agent/src/claude/log.ts) ⇒ compare without it.
  *   ⚠️ A `suffix` fit is weaker: an exact fit anywhere wins over it (`pick` / codex, medium #1).
+ *   ★★ A record the agent cut (`fullLength` set / 2026-11-20) holds only the head of the whole text, so it is
+ *     judged by the length and the head (sends go up to 64 KB, records are cut at 8000 / 20,000 characters).
+ *     ⚠️⚠️ This was missed when sends grew to 64 KB on 2026-11-17: a send longer than the cut never matched.
  */
 export type Fit = 'exact' | 'suffix' | undefined
-export function textFit(route: PendingSend['route'] | 'unknown', sent: string, record: string): Fit {
-  const s = sent.trimEnd()
+export function textFit(route: PendingSend['route'] | 'unknown', sent: string, record: string, cut?: Cut): Fit {
+  const k = fitAs(route, sent.trimEnd(), record, cut)
+  // ★ Awaiting the reply the route is unknown: the record may hold the text as keystrokes put it (tabs as spaces,
+  //   controls dropped; Claude keeps the start) or, for agy, also trimmed at the start (codex review: an indented
+  //   paste seen before the reply was never noted, so the reply's `delivered` had nothing left to clear it).
+  //   ⚠️ The strongest fit wins (a weaker suffix fit gets no clock slack on a full reload / codex review)
+  if (k === 'exact' || route !== 'unknown') return k
+  const typed = typedForm(sent).text
+  let best = k
+  for (const s of [typed.trimEnd(), typed.trim()]) {
+    const f = fitAs(route, s, record, cut)
+    if (f === 'exact') return f
+    best ??= f
+  }
+  return best
+}
+export interface Cut {
+  fullLength?: number
+  digest?: string
+}
+
+function fitAs(route: PendingSend['route'] | 'unknown', s: string, record: string, cut: Cut | undefined): Fit {
   // ⚠️ A blank send would be a suffix of every record
   if (s.length === 0) return undefined
+  const joinable = route === 'keys' || route === 'unknown'
+  if (cut?.fullLength !== undefined) return clippedFit(joinable, s, record, cut.fullLength, cut.digest)
   if (record === s) return 'exact'
-  return (route === 'keys' || route === 'unknown') && record.endsWith(s) ? 'suffix' : undefined
+  return joinable && record.endsWith(s) ? 'suffix' : undefined
+}
+
+/**
+ * ★ A cut record: `record` = the first characters of the whole text and `…`, `digest` = the digest of the whole text
+ *   (`textDigest`), which is `fullLength` long.
+ *   exact = same length, the send starts with the head, and the send's digest is the record's.
+ *   suffix = the whole text is longer (a PC draft in front, keystrokes only): the draft is the part of the head before
+ *   where the send starts, so the whole text is rebuilt as draft + send and its digest checked.
+ *   ⚠️ A draft longer than the head cannot be rebuilt ⇒ no fit (the send stays "sending").
+ *   ⚠️ Without `digest` nothing is judged (only the head would say too little / codex review).
+ */
+function clippedFit(joinable: boolean, s: string, record: string, fullLength: number, digest: string | undefined): Fit {
+  if (!record.endsWith('…') || !Number.isInteger(fullLength) || typeof digest !== 'string' || digest === '') return undefined
+  const head = record.slice(0, -1)
+  if (head.length === 0 || fullLength <= head.length) return undefined
+  if (fullLength === s.length) return s.startsWith(head) && textDigest(s) === digest ? 'exact' : undefined
+  if (!joinable || fullLength < s.length) return undefined
+  const from = fullLength - s.length
+  if (from > head.length) return undefined
+  return textDigest(head.slice(0, from) + s) === digest ? 'suffix' : undefined
 }
 
 /** ★ Route and text together (a send awaiting its reply has no route yet, so only its text is judged) */
-function fit(p: PendingSend, via: string | undefined, text: string): Fit {
-  if (p.sending) return textFit('unknown', p.text, text)
-  return matches(p.route, via) ? textFit(p.route, p.text, text) : undefined
+function fit(p: PendingSend, via: string | undefined, text: string, cut?: Cut): Fit {
+  if (p.sending) return textFit('unknown', p.text, text, cut)
+  return matches(p.route, via) ? textFit(p.route, p.text, text, cut) : undefined
 }
 
 /**
@@ -127,7 +177,9 @@ function pick(rest: readonly PendingSend[], f: (p: PendingSend) => Fit): number 
 }
 
 /** ★ Key identifying a record (time, route, text). ⚠️ Used so that "one record is used only once" */
-export const recordKey = (e: ArrivedEntry): string => `${e.at ?? ''}\u0000${e.via ?? ''}\u0000${e.text ?? ''}`
+export const recordKey = (e: ArrivedEntry): string =>
+  // ★ A cut record adds its digest (two long records with the same second and head are different records / codex review)
+  `${e.at ?? ''}\u0000${e.via ?? ''}\u0000${e.text ?? ''}${e.digest ? `\u0000${e.digest}` : ''}`
 
 /**
  * ★★ Stack it at the moment of sending (2026-09-24 / codex round 25, medium #3, #4).
@@ -158,7 +210,7 @@ export function noteArrivals(pending: PendingSend[], arrivals: readonly ArrivedE
     if (key && used?.has(key)) continue
     // ★ Settled and awaiting-reply sends compete together (an exact fit wins either way / `pick`)
     const text = a.text
-    const j = pick(rest, (p) => fit(p, a.via, text))
+    const j = pick(rest, (p) => fit(p, a.via, text, a))
     if (j < 0) continue
     rest = rest[j]!.sending
       ? rest.map((p, k) => (k === j ? { ...p, seen: [...(p.seen ?? []), a] } : p))
@@ -194,7 +246,7 @@ export function finishSend(pending: PendingSend[], id: number, route: PendingSen
     const t = r.reload ? Date.parse(r.at ?? '') : undefined
     const j = pick(list, (q) => {
       if (q.sending) return undefined
-      const k = fit(q, r.via, text)
+      const k = fit(q, r.via, text, r)
       return t === undefined ? k : inTime(k, t, q.at)
     })
     if (j >= 0) list = list.filter((_, k) => k !== j)
@@ -217,7 +269,9 @@ export const RELOAD_SLACK_MS = 5_000
 /** ★ The reload time rule: exact fits get the clock slack, suffix fits need a record at or after the send */
 function inTime(k: Fit, t: number, sentAt: number): Fit {
   if (k === 'exact') return t >= sentAt - RELOAD_SLACK_MS ? k : undefined
-  return k === 'suffix' && t >= sentAt ? k : undefined
+  // ⚠️ Some transcripts keep whole seconds (agy): compare within the second of the send (codex review: a send at
+  //    .300 recorded as :28Z never fit)
+  return k === 'suffix' && t >= Math.floor(sentAt / 1000) * 1000 ? k : undefined
 }
 
 
@@ -233,7 +287,7 @@ export function consumeAfterReload(pending: PendingSend[], entries: readonly Arr
     // ★ Only sends started before that record can match (per-send boundary). Only the oldest one
     // ⚠️⚠️ The clock slack is for exact fits only; a suffix fit needs a record at or after the send
     //    (codex, medium #2: `looks ok` said 4 seconds before sending `ok` cleared the undelivered `ok`)
-    const i = pick(rest, (p) => inTime(fit(p, e.via, text), t, p.at))
+    const i = pick(rest, (p) => inTime(fit(p, e.via, text, e), t, p.at))
     if (i < 0) continue
     used.add(key)
     const p = rest[i]!

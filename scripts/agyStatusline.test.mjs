@@ -7,7 +7,7 @@ import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, 
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
-import { applyAgySettings, main, readCommand } from './install-agy.mjs'
+import { applyAgySettings, main, readCommand, shimStep } from './install-agy.mjs'
 
 const RELAY = new URL('../hooks/agy-statusline.sh', import.meta.url).pathname
 const CID = '062a8f25-9451-42f3-ae93-34a208e99365'
@@ -235,4 +235,62 @@ test('installer: no agy ⇒ nothing; agy ⇒ settings written (backup kept, mode
   writeFileSync(join(root, 'settings.json'), '')
   assert.equal(main(['--uninstall'], h), 0)
   assert.ok(log.mock.callCount() > 0)
+})
+
+test('★★ agy shim: placed only with the shim directory and a real agy on PATH; a file that is not ours is never touched; removal removes only ours', (t) => {
+  const home = mkdtempSync(join(tmpdir(), 'nyan-agy-shim-'))
+  t.after(() => rmSync(home, { recursive: true, force: true }))
+  const realDir = join(home, 'real')
+  mkdirSync(realDir)
+  const real = join(realDir, 'agy')
+  // a stand-in agy that prints its arguments
+  writeFileSync(real, '#!/bin/sh\necho "real agy: $*"\n', { mode: 0o755 })
+  const env = { PATH: `${join(home, '.nyan-remote', 'bin')}:${realDir}:/usr/bin:/bin` }
+  const quiet = (fn) => {
+    const log = console.log
+    console.log = () => {}
+    try {
+      return fn()
+    } finally {
+      console.log = log
+    }
+  }
+  const shim = join(home, '.nyan-remote', 'bin', 'agy')
+  // no shim directory (the typing route is not installed) ⇒ nothing
+  assert.equal(quiet(() => shimStep({ remove: false, dry: false, home, env })), 0)
+  assert.equal(existsSync(shim), false)
+  mkdirSync(join(home, '.nyan-remote', 'bin'), { recursive: true })
+  // no agy on PATH ⇒ nothing
+  quiet(() => shimStep({ remove: false, dry: false, home, env: { PATH: '/usr/bin:/bin' } }))
+  assert.equal(existsSync(shim), false)
+  quiet(() => shimStep({ remove: false, dry: false, home, env }))
+  const body = readFileSync(shim, 'utf8')
+  assert.match(body, /^#!\/bin\/sh\n# nyan-remote: 打鍵で渡す経路/)
+  assert.ok(body.includes(`real='${real}'`))
+  assert.match(body, /-p\|-p=\*\|--p\|--p=\*\|--print\|--print=\*\|-print\|-print=\*\|--prompt\|--prompt=\*\|-prompt\|-prompt=\*\) exec "\$real"/)
+  assert.equal(statSync(shim).mode & 0o777, 0o755)
+  // ★ without a terminal it is agy itself (fail-open), arguments untouched
+  const run = spawnSync(shim, ['-p', 'hi there'], { env: { ...env, HOME: home }, encoding: 'utf8' })
+  assert.equal(run.stdout.trim(), 'real agy: -p hi there')
+  // the shim found first on PATH is never taken as the real one
+  quiet(() => shimStep({ remove: false, dry: false, home, env }))
+  assert.ok(readFileSync(shim, 'utf8').includes(`real='${real}'`))
+  // ★ the saved agy is gone (an update moved it): a folder named agy earlier on PATH is skipped, the program is found
+  const later = join(home, 'later')
+  mkdirSync(join(home, 'early', 'agy'), { recursive: true })
+  mkdirSync(later)
+  writeFileSync(join(later, 'agy'), '#!/bin/sh\necho "moved agy: $*"\n', { mode: 0o755 })
+  rmSync(real)
+  const moved = spawnSync(shim, ['x'], { env: { HOME: home, PATH: `${join(home, 'early')}:${join(home, '.nyan-remote', 'bin')}:${later}:/usr/bin:/bin` }, encoding: 'utf8' })
+  assert.equal(moved.stdout.trim(), 'moved agy: x', moved.stderr)
+  writeFileSync(real, '#!/bin/sh\necho "real agy: $*"\n', { mode: 0o755 })
+  // removal removes ours
+  quiet(() => shimStep({ remove: true, dry: false, home, env }))
+  assert.equal(existsSync(shim), false)
+  // ⚠️ someone else's file at that name: never replaced, never removed
+  writeFileSync(shim, '#!/bin/sh\necho mine\n', { mode: 0o755 })
+  quiet(() => shimStep({ remove: false, dry: false, home, env }))
+  assert.equal(readFileSync(shim, 'utf8'), '#!/bin/sh\necho mine\n')
+  quiet(() => shimStep({ remove: true, dry: false, home, env }))
+  assert.equal(readFileSync(shim, 'utf8'), '#!/bin/sh\necho mine\n')
 })

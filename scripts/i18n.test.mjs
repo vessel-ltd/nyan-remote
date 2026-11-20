@@ -79,7 +79,16 @@ function fixtureRanges(f, srcLines) {
  */
 function onlyShellComments(srcLines, lit) {
   const n = lit.text.split('\n').length
+  // ★ A fragment after a `${…}` starts mid-line, inside a branch opened above it (the agy shim names the command with
+  //   `${name}` in its messages / 2026-11-20) ⇒ which branch the first line is in comes from the lines before it
   let jaBranch = false
+  for (let i = lit.line - 2; i >= 0; i--) {
+    if (/\bif _ta_ja; then\b/.test(srcLines[i])) {
+      jaBranch = true
+      break
+    }
+    if (/^\s*(else|fi)\b/.test(srcLines[i])) break
+  }
   let ok = true
   let seen = false
   for (const l of srcLines.slice(lit.line - 1, lit.line - 1 + n)) {

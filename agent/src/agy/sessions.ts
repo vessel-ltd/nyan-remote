@@ -16,8 +16,9 @@ import { open, readdir, stat, unlink } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, join } from 'node:path'
 import type { SessionStatus, SessionSummary, TitleSource, ToolUsage, UsageWindow } from '../../../shared/types.ts'
-import { aliveProcStartSync } from '../claude/sessionIndex.ts'
-import { stateDir } from '../state.ts'
+import type { PaneRecord } from '../claude/keys.ts'
+import { aliveProcStartSync, sameProcStart } from '../claude/sessionIndex.ts'
+import { readJsonFile, stateDir } from '../state.ts'
 import { t } from '../../../shared/i18n.ts'
 import { HttpError, type Ctx } from '../router.ts'
 
@@ -198,6 +199,8 @@ export interface AgyRowContext {
   promptTitle?: string
   /** The file's time (when agy last changed state) */
   lastActivity: string
+  /** ★ The agy went through the relay (its pane announcement checks out): the phone may type into it / stop it */
+  sendRoute?: 'keys'
 }
 
 export function agyRow(s: AgyState, ctx: AgyRowContext): SessionSummary {
@@ -219,6 +222,7 @@ export function agyRow(s: AgyState, ctx: AgyRowContext): SessionSummary {
     status,
     ...(status === 'waiting' ? { waitingFor: 'permission prompt' } : {}),
     live: true,
+    ...(ctx.sendRoute ? { sendRoute: ctx.sendRoute } : {}),
     ...(s.mode ? { permissionMode: s.mode } : {}),
     ...(s.version ? { cliVersion: s.version } : {}),
     lastActivity: ctx.lastActivity,
@@ -228,6 +232,39 @@ export function agyRow(s: AgyState, ctx: AgyRowContext): SessionSummary {
     ...(s.contextPercent !== undefined ? { contextPercent: s.contextPercent } : {}),
     ...(s.contextTokens !== undefined ? { contextTokens: s.contextTokens } : {}),
   }
+}
+
+/** Why a row has no way in (the pane announcement of its agy) */
+export type AgyPaneFailure = 'no-relay' | 'broken' | 'unverified'
+
+export interface AgyPane {
+  socketPath: string
+  /** The relay saw agy turn bracketed paste on */
+  paste: boolean
+  /**
+   * ★ When the relay registered this agy (epoch ms). A status file written before it belongs to an earlier process that
+   * had the same pid (codex review: a reused pid would tie an old conversation's idle file to a new agy)
+   */
+  startedAt: number
+}
+
+/**
+ * ★ The relay's announcement for this agy pid, checked against the process (pid and start time).
+ * ⚠️ Same checks as Claude's `scanPanes`: missing = not started through the relay; a pid or start time that does not
+ *    match = never typed into (a reused pid is the worst place to type).
+ */
+export async function agyPaneOf(pid: number, aliveProcStart: (pid: number) => string | null | undefined): Promise<AgyPane | AgyPaneFailure> {
+  const rec = await readJsonFile<PaneRecord>(join('panes', `${pid}.json`))
+  if (rec.kind === 'missing') return 'no-relay'
+  if (rec.kind === 'broken') return 'broken'
+  const socketPath = typeof rec.value.socket === 'string' ? rec.value.socket : ''
+  if (!socketPath || rec.value.pid !== pid) return 'broken'
+  const actual = aliveProcStart(pid)
+  const recStart = typeof rec.value.procStart === 'string' ? rec.value.procStart : undefined
+  if (typeof actual !== 'string' || recStart === undefined || !sameProcStart(recStart, actual)) return 'unverified'
+  const startedAt = rec.value.startedAt
+  if (typeof startedAt !== 'number' || !Number.isFinite(startedAt)) return 'broken'
+  return { socketPath, paste: rec.value.paste === true, startedAt }
 }
 
 /** Is this pid a running agy? undefined = cannot tell (then not shown as live) */
@@ -260,6 +297,8 @@ export interface AgyDeps {
   home: string
   isAgy: (pid: number) => boolean
   now: number
+  /** ★ For the pane check (the list: cached; typing: uncached / `agy/keys.ts`). Absent ⇒ the cached one */
+  aliveProcStart?: (pid: number) => string | null | undefined
 }
 
 async function readSmallJson(path: string): Promise<unknown> {
@@ -362,7 +401,18 @@ export async function agyRows(machine: string, deps: AgyDeps = defaultAgyDeps())
       title = head ? promptTitle(head) : undefined
       if (title) titles.set(f.state.conversationId, title)
     }
-    rows.push(agyRow(f.state, { machine, transcriptBytes: bytes, lastActivity: new Date(f.mtimeMs).toISOString(), ...(title ? { promptTitle: title } : {}) }))
+    const pane = await agyPaneOf(f.state.pid, deps.aliveProcStart ?? aliveProcStartSync)
+    // ⚠️ Written before this agy's relay registered ⇒ an earlier process with the same pid wrote it (not this agy's)
+    if (typeof pane !== 'string' && f.mtimeMs < pane.startedAt) continue
+    rows.push(
+      agyRow(f.state, {
+        machine,
+        transcriptBytes: bytes,
+        lastActivity: new Date(f.mtimeMs).toISOString(),
+        ...(title ? { promptTitle: title } : {}),
+        ...(typeof pane === 'string' ? {} : { sendRoute: 'keys' as const }),
+      }),
+    )
   }
   // forget titles of conversations no longer live (bounded)
   const keep = new Set(live.map((f) => f.state.conversationId))

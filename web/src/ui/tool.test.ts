@@ -5,7 +5,7 @@ import { autoApproveView } from './autoApprove.ts'
 import { COMMAND_UI, commandView } from './commands.ts'
 import { applyAutoApprove, synthesizeRows } from './order.ts'
 import { stopView } from './stop.ts'
-import { actionFeatures, canSendTo, canStop, isCodex, sendBlockedNote } from './tool.ts'
+import { actionFeatures, canAttachTo, canSendTo, canStop, isCodex, sendBlockedNote } from './tool.ts'
 
 const ALL: AgentFeature[] = ['slash-commands', 'clear-input', 'auto-approve', 'device-pairing', 'device-handshake', 'log-follow', 'auto-approve-24h', 'codex-sessions', 'codex-log-follow']
 const NO_CODEX_FOLLOW = ALL.filter((f) => f !== 'codex-log-follow')
@@ -159,4 +159,28 @@ test('★ an agy row (2026-11-19): only follow, with its own mark; no send, stop
   assert.deepEqual(actionFeatures(unknown, ALL), [])
   assert.equal(canSendTo(unknown, ALL), false)
   assert.equal(canStop(unknown, ALL), false)
+})
+
+test('★★ agy send and stop (2026-11-20): only with the agent\'s marks AND a row the relay announced; never files, commands or auto-approve', () => {
+  const marks: AgentFeature[] = [...EVERYTHING, 'agy-log-follow', 'agy-send', 'agy-interrupt']
+  const relayed = row({ tool: 'agy', account: 'agy', sendRoute: 'keys' })
+  const plain = row({ tool: 'agy', account: 'agy' })
+  assert.equal(canSendTo(relayed, marks), true)
+  assert.equal(canStop(relayed, marks), true)
+  assert.equal(stopView(relayed, 'ready', marks).show, true)
+  assert.equal(sendBlockedNote(relayed, marks), undefined)
+  assert.equal(canAttachTo(relayed, marks), false, 'no files for agy yet')
+  // the actions on the thread stay as before (no commands, no auto-approve)
+  const f = actionFeatures(relayed, marks)
+  assert.deepEqual(f, ['log-follow'])
+  assert.equal(autoApproveView(relayed, 'ready', f).show, false)
+  // ⚠️ started without the relay: no send, no stop, and the box says how to fix it
+  assert.equal(canSendTo(plain, marks), false)
+  assert.equal(canStop(plain, marks), false)
+  assert.match(sendBlockedNote(plain, marks) ?? '', /nyan-remote/)
+  // ⚠️ an agent without the marks (older): nothing, even with the relay
+  assert.equal(canSendTo(relayed, [...EVERYTHING, 'agy-log-follow']), false)
+  assert.equal(canStop(relayed, [...EVERYTHING, 'agy-log-follow', 'agy-send']), false)
+  // a Claude row still attaches
+  assert.equal(canAttachTo(row(), ALL), true)
 })

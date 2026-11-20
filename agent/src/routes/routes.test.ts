@@ -196,7 +196,7 @@ test('★★★ /health actually returns the feature flags (checking only the co
   })
   const h = await health()
   // ★ plus the agy mark, always on (2026-11-19 / docs/AGY.md); Codex's only while Codex support is on (off here)
-  assert.deepEqual(h.features, [...AGENT_FEATURES, 'agy-log-follow'], '/health does not return the flags (no buttons appear)')
+  assert.deepEqual(h.features, [...AGENT_FEATURES, 'agy-log-follow', 'agy-send', 'agy-interrupt'], '/health does not return the flags (no buttons appear)')
   assert.ok((h.features?.length ?? 0) > 0, 'flags are empty (the trap where 0 items is still green)')
 })
 
@@ -241,7 +241,8 @@ test('★ the pattern is identical to the registered one (not rebuilt from segme
 test('★★ agy ids are refused by every session action they do not have yet (an old PWA shows Claude buttons for them)', async () => {
   const r = buildRouter()
   const id = 'agy-062a8f25-9451-42f3-ae93-34a208e99365'
-  for (const action of ['message', 'interrupt', 'clear', 'command', 'auto-approve']) {
+  // ★ `message` and `interrupt` are agy's own since 2026-11-20 (`agyMessage` / `agyInterrupt`)
+  for (const action of ['clear', 'command', 'auto-approve']) {
     const m = r.match('POST', `/sessions/${id}/${action}`)
     assert.ok(m, action)
     // ⚠️ refused before the handler reads anything (no body, no request object needed)
@@ -251,4 +252,87 @@ test('★★ agy ids are refused by every session action they do not have yet (a
       action,
     )
   }
+})
+
+test('★★ agy message / stop: only `agy-` ids, a malformed one is "not open" (never the Claude routes), files refused, reasons mapped', async () => {
+  const { agyMessage } = await import('./message.ts')
+  const { agyInterrupt } = await import('./interrupt.ts')
+  const id = 'agy-062a8f25-9451-42f3-ae93-34a208e99365'
+  const calls: string[] = []
+  const send = async (cid: string, text: unknown) => {
+    calls.push(`${cid}|${String(text)}`)
+    return { ok: true }
+  }
+  // not an agy id ⇒ undefined (the next route decides)
+  assert.equal(await agyMessage('062a8f25-9451-42f3-ae93-34a208e99365', 'hi', [], send as never), undefined)
+  assert.equal(await agyInterrupt('062a8f25-9451-42f3-ae93-34a208e99365', send as never), undefined)
+  // ⚠️ an `agy-` id that is not one of ours stops here
+  await assert.rejects(agyMessage('agy-nope', 'hi', [], send as never), (e: unknown) => (e as { status?: number }).status === 409)
+  await assert.rejects(agyInterrupt('agy-nope', send as never), (e: unknown) => (e as { status?: number }).status === 409)
+  await assert.rejects(
+    agyMessage(id, 'hi', [{ kind: 'image', path: '/x.png' } as never], send as never),
+    (e: unknown) => (e as { status?: number }).status === 400,
+  )
+  assert.equal(calls.length, 0)
+  const ok = await agyMessage(id, 'hi', [], send as never)
+  assert.equal(ok?.route, 'keys')
+  assert.equal(ok?.delivered, undefined)
+  assert.deepEqual(calls, ['062a8f25-9451-42f3-ae93-34a208e99365|hi'])
+  // ★ agy records the request trimmed ⇒ the phone is told that form (codex review: a leading space never cleared)
+  const trimmed = async () => ({ ok: true, recorded: 'hi' })
+  assert.equal((await agyMessage(id, '  hi', [], trimmed as never))?.delivered, 'hi')
+  // a refusal keeps its own status and words
+  const busy = async () => ({ ok: false, reason: 'busy' })
+  await assert.rejects(agyMessage(id, 'hi', [], busy as never), (e: unknown) => (e as { status?: number }).status === 409)
+  const shortcut = async () => ({ ok: false, reason: 'shortcut-like' })
+  await assert.rejects(agyMessage(id, '?x', [], shortcut as never), (e: unknown) => (e as { status?: number }).status === 400)
+  const soon = async () => ({ ok: false, reason: 'too-soon' })
+  await assert.rejects(agyInterrupt(id, soon as never), (e: unknown) => (e as { status?: number }).status === 429)
+  const stopped = await agyInterrupt(id, (async () => ({ ok: true })) as never)
+  assert.equal(stopped?.ok, true)
+})
+
+test('★★ the registered POST handlers hand `agy-` ids to agy (its own refusal comes back, never a Claude route)', async (t) => {
+  const { mkdtempSync, rmSync } = await import('node:fs')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const { Readable } = await import('node:stream')
+  const root = mkdtempSync(join(tmpdir(), 'nyan-agy-route-'))
+  const prev = process.env.NYAN_REMOTE_STATE_DIR
+  process.env.NYAN_REMOTE_STATE_DIR = root
+  t.after(() => {
+    if (prev === undefined) delete process.env.NYAN_REMOTE_STATE_DIR
+    else process.env.NYAN_REMOTE_STATE_DIR = prev
+    rmSync(root, { recursive: true, force: true })
+  })
+  const r = buildRouter()
+  // ⚠️ upper case: the same conversation as lower case
+  const id = 'agy-062A8F25-9451-42F3-AE93-34A208E99365'
+  for (const action of ['message', 'interrupt']) {
+    const m = r.match('POST', `/sessions/${id}/${action}`)
+    assert.ok(m, action)
+    const req = Object.assign(Readable.from([Buffer.from(JSON.stringify({ text: 'hello' }), 'utf8')]), { headers: { 'content-type': 'application/json' } })
+    await assert.rejects(
+      async () => m.handler({ req, res: {}, url: new URL(`http://agent/sessions/${id}/${action}`), params: m.params, identity: { login: 'test@example.com', deviceId: '100.0.0.1', via: 'dev' } } as never),
+      (err: unknown) => (err as { status?: number }).status === 409 && /agy/.test(String((err as Error).message)),
+      action,
+    )
+  }
+})
+
+test('★★ a log page is cut to fit one relay frame (long messages / codex review)', async () => {
+  const { fitPage, PAGE_BUDGET_BYTES } = await import('./sessions.ts')
+  const { MAX_PAYLOAD_BYTES } = await import('../../../shared/tunnel.ts')
+  const entry = { kind: 'assistant', text: 'あ'.repeat(8000) }
+  const asked: number[] = []
+  const page = await fitPage(60, async (n) => {
+    asked.push(n)
+    return { entries: Array.from({ length: n }, () => entry), cursor: 1 }
+  })
+  assert.ok(Buffer.byteLength(JSON.stringify(page.entries)) <= PAGE_BUDGET_BYTES)
+  assert.ok(PAGE_BUDGET_BYTES + 64 * 1024 < MAX_PAYLOAD_BYTES, 'room for inflight and the envelope')
+  assert.deepEqual(asked, [60, 30, 15, 7, 3])
+  // a single entry is always returned, and a page that is not there passes through
+  assert.equal((await fitPage(1, async () => ({ entries: [entry, entry, entry, entry, entry, entry, entry, entry] }))).entries.length, 8)
+  assert.equal(await fitPage(5, async () => undefined), undefined)
 })

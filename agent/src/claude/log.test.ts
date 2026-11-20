@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import { senderName } from './inbox.ts'
-import { formatAskUserQuestion, readableInput, readLogSince, readLogSlice, toEntries , stripPeerFrame, peerFrom } from './log.ts'
+import { formatAskUserQuestion, LOG_PAGE_BUDGET_BYTES, SINCE_READ_BYTES, readableInput, readLogSince, readLogSlice, toEntries , stripPeerFrame, peerFrom } from './log.ts'
 
 test('toEntries: user text', () => {
   const out = toEntries({
@@ -878,4 +878,105 @@ test('★ a caveat with different wording is not deleted (even with the marker)'
   })
   assert.equal(out.length, 1, 'deleting even ones with different wording')
   assert.equal(out[0]?.kind, 'user')
+})
+
+test('★★ a user record longer than the cut says its whole length (the phone matches long sends by it / 2026-11-20)', () => {
+  const long = 'x'.repeat(9000)
+  const [e] = toEntries({ type: 'user', timestamp: '2026-11-20T00:00:00.000Z', message: { content: `${long}\n` } })
+  assert.equal(e?.kind === 'user' && e.fullLength, 9000)
+  assert.equal(e?.kind === 'user' && e.text.length, 8000)
+  const [short] = toEntries({ type: 'user', message: { content: 'short' } })
+  assert.equal(short?.kind === 'user' && 'fullLength' in short, false, 'no fullLength when nothing was cut')
+})
+
+test('★★ readLogSince: a catch-up of long messages stops within one relay frame and says there is more (codex review)', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'nyan-remote-log-'))
+  try {
+    const file = join(dir, 's.jsonl')
+    const rec = (n: number) => `${JSON.stringify({ type: 'user', message: { content: `${n}${'あ'.repeat(8100)}` } })}\n`
+    await writeFile(file, Array.from({ length: 12 }, (_, i) => rec(i)).join(''))
+    const seen: string[] = []
+    let tail = 0
+    let rounds = 0
+    for (;;) {
+      const got = await readLogSince(file, tail)
+      rounds += 1
+      assert.ok(Buffer.byteLength(JSON.stringify(got.entries)) <= LOG_PAGE_BUDGET_BYTES)
+      for (const e of got.entries) if (e.kind === 'user') seen.push(e.text.slice(0, 2))
+      tail = got.tail
+      if (!got.more) break
+    }
+    assert.ok(rounds > 1, 'it was cut')
+    assert.deepEqual(seen, Array.from({ length: 12 }, (_, i) => `${i}${i < 10 ? 'あ' : ''}`.slice(0, 2)), 'every record once, in order')
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('★ readLogSince: a big backlog is read forward in bounded chunks (codex review: each page reread the whole rest)', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'nyan-remote-log-'))
+  try {
+    const file = join(dir, 's.jsonl')
+    // small records, many of them: more than one read chunk, each page well under the entry budget
+    const pad = 'x'.repeat(2000)
+    const rec = (n: number) => `${JSON.stringify({ type: 'progress', pad, n })}\n${JSON.stringify({ type: 'user', message: { content: `m${n}` } })}\n`
+    const body = Array.from({ length: 2500 }, (_, i) => rec(i)).join('')
+    assert.ok(Buffer.byteLength(body) > SINCE_READ_BYTES)
+    await writeFile(file, body)
+    const first = await readLogSince(file, 0)
+    assert.equal(first.more, true, 'stopped at the chunk')
+    assert.ok(first.tail <= SINCE_READ_BYTES)
+    let tail = first.tail
+    let count = first.entries.length
+    for (let got = await readLogSince(file, tail); ; got = await readLogSince(file, tail)) {
+      count += got.entries.length
+      tail = got.tail
+      if (!got.more) break
+    }
+    assert.equal(count, 2500)
+    assert.equal(tail, Buffer.byteLength(body))
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('★ readLogSince: one record larger than a read chunk is read on only until it ends (codex review)', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'nyan-remote-log-'))
+  try {
+    const file = join(dir, 's.jsonl')
+    const big = `${JSON.stringify({ type: 'progress', pad: 'x'.repeat(SINCE_READ_BYTES + 1000) })}\n`
+    const small = (n: number) => `${JSON.stringify({ type: 'user', message: { content: `m${n}` } })}\n`
+    const rest = Array.from({ length: 3 }, () => `${JSON.stringify({ type: 'progress', pad: 'y'.repeat(SINCE_READ_BYTES - 100) })}\n`).join('')
+    await writeFile(file, big + small(1) + rest + small(2))
+    const got = await readLogSince(file, 0)
+    // stopped within the second chunk: past the big record, not at the end of the file
+    assert.equal(got.more, true)
+    assert.ok(got.tail > Buffer.byteLength(big) && got.tail <= 2 * SINCE_READ_BYTES)
+    assert.deepEqual(got.entries.filter((e) => e.kind === 'user').map((e) => (e as { text: string }).text), ['m1'])
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('★ readLogSince after a record larger than a chunk: complete records are all returned, a half-written one waits (codex review)', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'nyan-remote-log-'))
+  try {
+    const file = join(dir, 's.jsonl')
+    const big = `${JSON.stringify({ type: 'progress', pad: 'x'.repeat(SINCE_READ_BYTES + 1000) })}\n`
+    const short = `${JSON.stringify({ type: 'user', message: { content: 'after' } })}\n`
+    const half = '{"type":"user","message":{"content":"wri'
+    await writeFile(file, big + short + half)
+    const got = await readLogSince(file, 0)
+    // both complete records, the tail exactly after them; the half-written record is not "more" (nothing to read yet)
+    assert.equal(got.tail, Buffer.byteLength(big + short))
+    assert.equal(got.more, undefined)
+    assert.deepEqual(got.entries.filter((e) => e.kind === 'user').map((e) => (e as { text: string }).text), ['after'])
+    const none = await readLogSince(file, got.tail)
+    assert.deepEqual([none.entries.length, none.tail], [0, got.tail])
+    await writeFile(file, 'ting"}}\n', { flag: 'a' })
+    const done = await readLogSince(file, got.tail)
+    assert.deepEqual(done.entries.map((e) => (e as { text: string }).text), ['writing'])
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
 })

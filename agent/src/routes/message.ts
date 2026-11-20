@@ -17,7 +17,7 @@
 //   ⚠️⚠️ Inbox: the receiving model **executes it** as "a request from a peer" (measured: `/tes` ran make test).
 //   ⇒ Nothing falls back to the inbox because of its content.
 
-import { commandLikeMessage, type MessageSendResult } from '../../../shared/types.ts'
+import { commandLikeMessage, typedForm, type MessageSendResult } from '../../../shared/types.ts'
 import { config } from '../config.ts'
 import { discoverConfigDirs } from '../claude/configDirs.ts'
 import { failureMessage, sendToSession, validateText } from '../claude/inbox.ts'
@@ -32,6 +32,8 @@ import { HttpError, readJsonBody, type Ctx } from '../router.ts'
 import { ownerOf } from '../auth.ts'
 import { attachmentLines, UploadError, uploads, type Attachment, type Reserved } from '../uploads.ts'
 import { t } from '../../../shared/i18n.ts'
+import { AGY_SEND_REFUSAL, sendToAgy } from '../agy/keys.ts'
+import { AGY_PREFIX, conversationOf } from '../agy/sessions.ts'
 
 interface Body {
   text?: unknown
@@ -198,10 +200,43 @@ export async function sessionMessage(ctx: Ctx): Promise<MessageResult> {
   }
 }
 
+/**
+ * ★★ Send to an agy conversation (2026-11-20 / docs/AGY.md §8). `undefined` when the id is not an agy row.
+ *
+ * Typed into the agy TUI through its relay (`agy/keys.ts`), only while it is idle. ⚠️ Never another route: agy has no
+ * inbox, and an `agy-` id must never reach the Claude routes. ⚠️ No files yet (agy would need an approval to read a
+ * file outside its workspace). ⚠️ The log line carries the length, never the text.
+ */
+export async function agyMessage(
+  sessionId: string,
+  text: string,
+  files: readonly Attachment[] = [],
+  send: typeof sendToAgy = sendToAgy,
+): Promise<MessageResult | undefined> {
+  if (!sessionId.startsWith(AGY_PREFIX)) return undefined
+  const conversationId = conversationOf(sessionId)
+  if (!conversationId) throw new HttpError(...AGY_SEND_REFUSAL['not-open']())
+  if (files.length > 0) throw new HttpError(400, t('agy にはまだファイルを送れません。', 'Files cannot be sent to agy yet.'))
+  const res = await send(conversationId, text)
+  const short = conversationId.slice(0, 8)
+  if (!res.ok) {
+    console.log(`[agy] not sent conversation=${short} reason=${res.reason}`)
+    throw new HttpError(...AGY_SEND_REFUSAL[res.reason ?? 'unreachable']())
+  }
+  const at = new Date().toISOString()
+  broadcast({ type: 'sessions-changed', at })
+  console.log(`[agy] typed into conversation=${short} ${text.length} chars`)
+  // ★ `delivered` = what agy records (it trims the request), so the phone's "sending" line clears
+  return { ok: true, at, route: 'keys', ...(res.recorded !== undefined && res.recorded !== text ? { delivered: res.recorded } : {}) }
+}
+
 async function deliver(sessionId: string, said: string, files: readonly Attachment[]): Promise<MessageResult> {
   // ★ A Codex thread goes to its daemon (`codexMessage`); `undefined` = not a Codex row, so the Claude routes follow
   const viaCodex = await codexMessage(sessionId, said, undefined, files)
   if (viaCodex) return viaCodex
+  // ★ An agy conversation is typed into its TUI (`agyMessage`); never the Claude routes
+  const viaAgy = await agyMessage(sessionId, said, files)
+  if (viaAgy) return viaAgy
   // ★ Claude reads a file given by its path in the text (measured: images and PDF, with its own Read tool)
   const text = withAttachments(said, files)
 
@@ -223,7 +258,9 @@ async function deliver(sessionId: string, said: string, files: readonly Attachme
         `[keys] Sent as keystrokes session=${short} ${text.length} chars${extra}`,
       ),
     )
-    return { ok: true, at, route: 'keys', ...(files.length > 0 ? { delivered: text } : {}) }
+    // ★ What the TUI got: attachment lines added, and the keystroke form (tabs as spaces, controls dropped / codex review)
+    const typed = typedForm(text).text
+    return { ok: true, at, route: 'keys', ...(typed !== said ? { delivered: typed } : {}) }
   }
   const decision = decideAfterKeys(keys.reason)
   if (decision.kind === 'error') throw new HttpError(decision.status, keys.message ?? t('送れませんでした', 'Could not send.'))

@@ -8,7 +8,7 @@
 //    is ever needed, add a separate endpoint (out of scope for M2).
 
 import { type FileHandle, open } from 'node:fs/promises'
-import type { LogEntry } from '../../../shared/types.ts'
+import { clipUserText, type LogEntry } from '../../../shared/types.ts'
 import { senderName } from './inbox.ts'
 import { t } from '../../../shared/i18n.ts'
 
@@ -30,6 +30,28 @@ export interface LogSlice {
   cursor: number | null
   tail: number
   bytes: number
+  /** ★ Live follow stopped early to fit one relay frame (`LOG_PAGE_BUDGET_BYTES`); `tail` is where it stopped */
+  more?: true
+}
+
+/**
+ * ★★ What one page of entries may weigh (2026-11-20 / codex review). A relay frame holds 256 KB (`MAX_PAYLOAD_BYTES`),
+ *   and one text entry can be 24 KB (8000 Japanese characters; Codex 60 KB), so a page or a catch-up of long messages
+ *   failed to pack, the tunnel closed, and the same request failed again on every retry. Room is left for `inflight`
+ *   and the envelope. ⚠️ At least one record is always returned (a single huge record is not split).
+ */
+export const LOG_PAGE_BUDGET_BYTES = 160 * 1024
+/** ★ How much of the file one catch-up reads at most (the rest comes with `more`) */
+export const SINCE_READ_BYTES = 4 * 1024 * 1024
+
+/** ★ How many of these entries fit the budget, at least one */
+export function countWithin(entries: readonly unknown[], budget = LOG_PAGE_BUDGET_BYTES): number {
+  let total = 2
+  for (let i = 0; i < entries.length; i++) {
+    total += Buffer.byteLength(JSON.stringify(entries[i]), 'utf8') + 1
+    if (total > budget) return Math.max(1, i)
+  }
+  return entries.length
 }
 
 /** For body text. Keeps newlines (it is a chat view) */
@@ -323,7 +345,7 @@ export function toEntries(rec: Rec): LogEntry[] {
       {
         kind: 'user',
         at,
-        text: clip(prompt, TEXT_MAX),
+        ...clipUserText(prompt, TEXT_MAX),
         via: isFromThisAgent(at2['origin']) ? 'inbox' : 'peer',
         from: peerFrom(at2['origin']),
       },
@@ -343,7 +365,7 @@ export function toEntries(rec: Rec): LogEntry[] {
         {
           kind: 'user',
           at,
-          text: clip(text, TEXT_MAX),
+          ...clipUserText(text, TEXT_MAX),
           // ★ Only what we sent is "from the phone". Anything else is "from another session"
           via: isFromThisAgent(origin) ? 'inbox' : 'peer',
           from: peerFrom(origin),
@@ -383,12 +405,12 @@ export function toEntries(rec: Rec): LogEntry[] {
         }
       }
       const text = textOf(content)
-      if (text.trim()) out.unshift({ kind: 'user', at, text: clip(text, TEXT_MAX) })
+      if (text.trim()) out.unshift({ kind: 'user', at, ...clipUserText(text, TEXT_MAX) })
       return out
     }
     const text = textOf(content)
     if (!text.trim()) return []
-    return [{ kind: 'user', at, text: clip(text, TEXT_MAX) }]
+    return [{ kind: 'user', at, ...clipUserText(text, TEXT_MAX) }]
   }
 
   if (type === 'assistant') {
@@ -627,9 +649,21 @@ export async function readLogSince(file: string, from: number, map: (rec: Rec) =
     if (from >= size) {
       return { entries: [], cursor: null, tail: size, bytes: size }
     }
-    const len = size - from
-    const buf = Buffer.alloc(len)
-    await fh.read(buf, 0, len, from)
+    // ★ Read forward in a bounded chunk (codex review: each catch-up page reread the whole rest of a big backlog).
+    //   ⚠️ A chunk with no complete record (one record larger than the chunk) reads on, chunk by chunk, only until
+    //   that record ends (codex review: rereading the whole rest held the whole backlog in memory)
+    const parts: Buffer[] = []
+    let len = 0
+    for (;;) {
+      const n = Math.min(size - from - len, SINCE_READ_BYTES)
+      const part = Buffer.alloc(n)
+      await fh.read(part, 0, n, from + len)
+      parts.push(part)
+      len += n
+      if (len >= size - from || part.includes(0x0a)) break
+    }
+    const buf = parts.length === 1 ? parts[0]! : Buffer.concat(parts, len)
+    const cutShort = len < size - from
     // `from` is **the end of a complete line** (the tail returned last time), so the first line is not dropped.
     // ⚠️⚠️ The end may be seen "mid-line" (see lastCompleteTail).
     //    Consume only up to the last newline and **stop tail there too**.
@@ -637,8 +671,23 @@ export async function readLogSince(file: string, from: number, map: (rec: Rec) =
     const nl = buf.lastIndexOf(0x0a)
     // No complete line = nothing to read yet (do not advance tail)
     if (nl < 0) return { entries: [], cursor: null, tail: from, bytes: size }
-    const entries = parseChunk(buf.subarray(0, nl + 1).toString('utf8')).flatMap((r) => map(r))
-    return { entries, cursor: null, tail: from + nl + 1, bytes: size }
+    // ★ Record by record, stopping once the page is full (`LOG_PAGE_BUDGET_BYTES`): the tail stops after the last
+    //   record taken, and `more` tells the phone to ask again. ⚠️ At least one record, however large
+    const entries: LogEntry[] = []
+    let weight = 2
+    let start = 0
+    while (start <= nl) {
+      const end = buf.indexOf(0x0a, start)
+      const got = parseChunk(buf.subarray(start, end + 1).toString('utf8')).flatMap((r) => map(r))
+      const w = got.reduce((n, e) => n + Buffer.byteLength(JSON.stringify(e), 'utf8') + 1, 0)
+      if (entries.length > 0 && weight + w > LOG_PAGE_BUDGET_BYTES) {
+        return { entries, cursor: null, tail: from + start, bytes: size, more: true }
+      }
+      entries.push(...got)
+      weight += w
+      start = end + 1
+    }
+    return { entries, cursor: null, tail: from + nl + 1, bytes: size, ...(cutShort ? { more: true as const } : {}) }
   } finally {
     await fh.close()
   }

@@ -27,7 +27,7 @@ import { dirname, join } from 'node:path'
 import {
   MAX_MESSAGE_BYTES,
   MAX_SEND_BYTES,
-  isDroppedControl,
+  typedForm,
   commandLikeMessage,
   looksLikeCommand,
   type CommandId,
@@ -347,20 +347,22 @@ export function sanitizeForKeys(text: unknown): { ok: true; value: Sanitized } |
   //    ⇒ **Check against the value the implementation finally produces** (mistake type 3 in VERIFY.md).
   //    ⚠️ Four reviewers pointed this out independently. The tests only passed `'/compact'`, an
   //       **already clean string**, so we could not notice.
-  const normalized = text.replace(/\r\n?/g, '\n')
-  let dropped = 0
-  let cleaned = ''
-  for (const ch of normalized) {
-    // ★ Which characters to drop is the single copy in shared (same rule as the UI)
-    if (isDroppedControl(ch.codePointAt(0) ?? 0)) dropped += 1
-    else cleaned += ch
-  }
+  // ★ Which characters to drop (and tabs as spaces) is the single copy in shared (`typedForm`, also used by the UI)
+  const { text: cleaned, dropped } = typedForm(text)
   if (cleaned.trim().length === 0) return { ok: false, reason: 'empty' }
 
   // ★ Refuse before anything else about the body (the reason the user can act on comes first)
   if (looksLikeCommand(cleaned)) return { ok: false, reason: 'command-like' }
-  if (Buffer.byteLength(cleaned, 'utf8') > MAX_KEYS_BYTES) return { ok: false, reason: 'too-long' }
+  // ⚠️ The limit is on the text as sent (the inbox takes it as is). The typed form (tabs as four spaces) is checked
+  //    only once it is really typed (`typedTooLong`, after the pane is found / codex review: a tab-heavy paste to an
+  //    inbox-only row was refused here)
+  if (Buffer.byteLength(text, 'utf8') > MAX_KEYS_BYTES) return { ok: false, reason: 'too-long' }
   return { ok: true, value: { text: cleaned, dropped } }
+}
+
+/** ★ Whether the typed form is over the limit (tabs expand). Checked only where it is really typed */
+export function typedTooLong(typed: string): boolean {
+  return Buffer.byteLength(typed, 'utf8') > MAX_KEYS_BYTES
 }
 
 /** Inputs for one session (★ decided in one place: `resolvePane`) */
@@ -791,6 +793,7 @@ async function sendKeysOnce(
   if ('reason' in target) {
     return { ok: false, reason: target.reason, message: failureMessage(target.reason) }
   }
+  if (typedTooLong(clean.value.text)) return { ok: false, reason: 'too-long', message: failureMessage('too-long') }
   // ⚠️ Check again **after** the target-lookup I/O (an approval may have appeared meanwhile)
   if (pending()) {
     return { ok: false, reason: 'pending-approval', message: failureMessage('pending-approval') }

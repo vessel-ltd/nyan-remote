@@ -9,7 +9,7 @@
 //   ERROR_MESSAGE     { content?, error? }
 // ⚠️ Anything else is skipped (shown as nothing rather than guessed). Tool calls carry no id, so results are not linked.
 
-import type { LogEntry } from '../../../shared/types.ts'
+import { clipUserText, type LogEntry } from '../../../shared/types.ts'
 import { readableInput } from '../claude/log.ts'
 import { userRequestText } from './sessions.ts'
 
@@ -77,9 +77,9 @@ export function agyEntries(rec: Rec): LogEntry[] {
     case 'USER_INPUT': {
       const content = str(rec.content)
       if (!content) return []
-      const text = clip(userRequestText(content))
-      if (!text) return []
-      return rec.source === 'USER_EXPLICIT' ? [{ kind: 'user', ...at, text }] : [{ kind: 'system', ...at, text }]
+      const user = clipUserText(userRequestText(content), TEXT_MAX)
+      if (!user.text) return []
+      return rec.source === 'USER_EXPLICIT' ? [{ kind: 'user', ...at, ...user }] : [{ kind: 'system', ...at, text: user.text }]
     }
     case 'PLANNER_RESPONSE': {
       const out: LogEntry[] = []

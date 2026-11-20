@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { beginSend, consumeAfterReload, consumePending, finishSend, noteArrivals, textFit, type PendingSend } from './pending.ts'
+import { clipUserText, textDigest } from '../../../shared/types.ts'
 
 const sent = (text: string, at = 1): PendingSend => ({ text, at, route: 'inbox' })
 const typed = (text: string, at = 1): PendingSend => ({ text, at, route: 'keys' })
@@ -272,4 +273,67 @@ test('★ attachments: an inbox delivery of the text the agent added to is match
   let r = finishSend(beginSend([], 3, 'look', 1000), 3, 'inbox')
   r = noteArrivals(r, [{ kind: 'user', via: 'inbox', text: delivered, at: '2026-11-17T00:00:02.000Z' }])
   assert.equal(r.length, 1)
+})
+
+test('★★ a send longer than the record cut is matched by length, head and digest (2026-11-20: sends up to 64 KB, records cut at 8000)', () => {
+  const long = `${'a'.repeat(5000)}${'い'.repeat(5000)}`
+  const cut = clipUserText(long, 8000)
+  assert.equal(cut.fullLength, 10000)
+  assert.equal(cut.digest, textDigest(long))
+  // exact: the whole send, all routes
+  assert.equal(textFit('inbox', long, cut.text, cut), 'exact')
+  assert.equal(textFit('keys', `${long} `, cut.text, cut), 'exact', 'trailing whitespace of the send is ignored')
+  assert.deepEqual(consumePending([typed(long)], [{ kind: 'user', ...cut }]), [])
+  // ⚠️ without the cut info (an old agent) it stays unmatched as before, and without the digest nothing is judged
+  assert.equal(textFit('keys', long, cut.text), undefined)
+  assert.equal(textFit('keys', long, cut.text, { fullLength: cut.fullLength }), undefined)
+  // a different length, head, end or middle does not fit
+  assert.equal(textFit('keys', `${long}x`, cut.text, cut), undefined)
+  assert.equal(textFit('keys', `b${long.slice(1)}`, cut.text, cut), undefined)
+  assert.equal(textFit('inbox', `${long.slice(0, -1)}x`, cut.text, cut), undefined, 'differs only past the cut')
+  const edited = `${long.slice(0, 9000)}う${long.slice(9001)}`
+  assert.equal(textFit('inbox', edited, cut.text, cut), undefined, 'a same-length edit in the middle (codex review)')
+  // suffix: a PC draft in front (keystrokes only)
+  const joined = clipUserText(`draft ${long}`, 8000)
+  assert.equal(textFit('keys', long, joined.text, joined), 'suffix')
+  assert.equal(textFit('unknown', long, joined.text, joined), 'suffix')
+  assert.equal(textFit('inbox', long, joined.text, joined), undefined, '⚠️ the inbox joins nothing')
+  assert.equal(textFit('keys', `x${long.slice(1)}`, joined.text, joined), undefined)
+  assert.equal(textFit('keys', `${long.slice(0, -1)}x`, joined.text, joined), undefined)
+  // ★ a long draft that leaves little of the send in the head still fits (the digest checks the whole)
+  const most = clipUserText(`${'z'.repeat(7990)}${long}`, 8000)
+  assert.equal(textFit('keys', long, most.text, most), 'suffix')
+  // ⚠️ a draft longer than the head cannot be rebuilt ⇒ no fit
+  const hidden = clipUserText(`${'z'.repeat(8000)}${long}`, 8000)
+  assert.equal(textFit('keys', long, hidden.text, hidden), undefined)
+  // a short send never fits a cut record by itself
+  assert.equal(textFit('keys', 'いいい', cut.text, cut), undefined)
+})
+
+test('★★ awaiting the reply, a record in the keystroke form still fits (indented, tabs; codex review)', () => {
+  // agy trims the start; keystrokes turn a tab into four spaces
+  assert.equal(textFit('unknown', '  hi', 'hi'), 'exact')
+  assert.equal(textFit('unknown', 'a\tb', 'a    b'), 'exact')
+  const used = new Set<string>()
+  let p = beginSend([], 1, '  look\tat this', 1)
+  p = noteArrivals(p, [{ kind: 'user', text: 'look    at this', at: '2026-01-01T00:00:01Z' }], used)
+  assert.equal(p[0]?.seen?.length, 1, 'noted before the reply')
+  assert.deepEqual(finishSend(p, 1, 'keys', 'look    at this'), [])
+  // ⚠️ once the route is known, the raw text is not loosened (the reply's `delivered` carries the form)
+  assert.equal(textFit('inbox', '  hi', 'hi'), undefined)
+})
+
+test('★ awaiting the reply, an exact fit in the keystroke form beats a suffix fit (full reload clock rule / codex review)', () => {
+  // Claude keeps the leading spaces of a tab-indented send
+  assert.equal(textFit('unknown', '\tx = 1', '    x = 1'), 'exact')
+})
+
+test('★ reload: a suffix fit recorded in whole seconds fits a send started in the same second (agy / codex review)', () => {
+  const sentAt = Date.parse('2026-11-20T12:14:28.300Z')
+  const used = new Set<string>()
+  const rec = { kind: 'user', text: 'draft ok', at: '2026-11-20T12:14:28Z' }
+  assert.deepEqual(consumeAfterReload([{ text: 'ok', at: sentAt, route: 'keys' }], [rec], used), [])
+  // ⚠️ the second before still does not
+  const before = { kind: 'user', text: 'draft ok', at: '2026-11-20T12:14:27Z' }
+  assert.equal(consumeAfterReload([{ text: 'ok', at: sentAt, route: 'keys' }], [before], new Set()).length, 1)
 })

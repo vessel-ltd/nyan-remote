@@ -305,7 +305,7 @@ if [ -z "$SERVICE" ]; then
   # ⚠️⚠️ **Ending here gives "installed but no notifications or approvals"** (2026-09-21 / a real mac).
   #    Without a service, the hooks must be installed **by yourself** after starting the agent.
   say "$(tr2 '⚠️ agent を起こしたあとに、もう一度だけこれを実行してください:' '⚠️ After starting the agent, run this once:')"
-  printf '   cd %s && node scripts/install-permission-hook.mjs && node scripts/install-relay.mjs\n' "$HOME_DIR"
+  printf '   cd %s && node scripts/install-permission-hook.mjs && node scripts/install-relay.mjs && node scripts/install-agy.mjs\n' "$HOME_DIR"
 else
   wait_state || die "$(tr2 "agent が起動していません（見てください: ${LOG_HINT}）" "The agent did not start (see: ${LOG_HINT})")"
   node "$HOME_DIR/scripts/install-permission-hook.mjs"

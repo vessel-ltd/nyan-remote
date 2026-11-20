@@ -31,10 +31,10 @@ export function buildRouter(): Router {
   // ★★ Follow a thread via notifications (⚠️ only devices viewing that session open it / 2026-09-23)
   router.get('/sessions/:id/follow', sessionFollow)
   // ★ Send an instruction from the phone (M4-2). It is an internal feature, so it is isolated in inbox.ts
-  router.post('/sessions/:id/message', notForAgy(sessionMessage))
+  router.post('/sessions/:id/message', sessionMessage)
   // ★ "Stop" (ESC). ⚠️ **POST only** (with GET, merely getting someone to follow a link could stop it).
   //   ⚠️⚠️ Takes no body (the bytes sent are fixed in an agent-side table / routes/interrupt.ts)
-  router.post('/sessions/:id/interrupt', notForAgy(sessionInterrupt))
+  router.post('/sessions/:id/interrupt', sessionInterrupt)
   // ★ Clear the PC's input box (Ctrl-U). ⚠️ Takes no body (the key sent is fixed in the handler)
   //   ⚠️⚠️ The endpoints are separate so there is no "endpoint that can fire anything in the table"
   router.post('/sessions/:id/clear', notForAgy(sessionClear))

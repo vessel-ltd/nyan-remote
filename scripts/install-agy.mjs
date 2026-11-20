@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 // ★ Antigravity CLI (agy) setup for nyan-remote (2026-11-19 / docs/AGY.md §5).
 //
-//   node scripts/install-agy.mjs              place the status line relay in agy's settings
-//   node scripts/install-agy.mjs --uninstall  put the user's status line back exactly (or remove ours)
+//   node scripts/install-agy.mjs              place the status line relay in agy's settings, and the agy shim
+//   node scripts/install-agy.mjs --uninstall  put the user's status line back exactly (or remove ours), remove the shim
 //   node scripts/install-agy.mjs --dry-run    say what would change, change nothing
 //
 // ★ agy hands its status line command the session state (conversation id, `agent_state`, approvals pending, model,
@@ -17,12 +17,13 @@
 // ⚠️ A settings file that is not a JSON object is never touched. Writes go backup → temp file → verify → rename.
 // ⚠️ "Ours" = a quoted path ending in `/hooks/agy-statusline.sh`, alone or with the mark and one quoted argument.
 
-import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from 'node:fs'
+import { chmodSync, closeSync, copyFileSync, existsSync, openSync, lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { t } from '../shared/i18n.ts'
 import { initCliLang } from './lib/lang.mjs'
+import { SHIM_MARK, binDirFor, buildWrapper, resolveRealClaude } from './install-relay.mjs'
 
 export const RELAY = join(fileURLToPath(new URL('..', import.meta.url)), 'hooks', 'agy-statusline.sh')
 const MARK = '--nyan-remote-relay'
@@ -111,10 +112,17 @@ export function ensureStateDir(dir) {
   }
 }
 
-export function main(argv = process.argv.slice(2), home = homedir()) {
+export function main(argv = process.argv.slice(2), home = homedir(), env = process.env) {
   initCliLang()
   const remove = argv.includes('--uninstall') || argv.includes('--remove')
   const dry = argv.includes('--dry-run')
+  const settings = settingsStep({ remove, dry, home })
+  const shim = shimStep({ remove, dry, home, env })
+  return settings || shim
+}
+
+/** The status line part (see the top of this file) */
+function settingsStep({ remove, dry, home }) {
   const root = agyHome(home)
   if (!existsSync(root)) {
     console.log(t('・agy（Antigravity CLI）は入っていないので、何もしません', '- agy (Antigravity CLI) is not installed here; nothing to do'))
@@ -192,6 +200,116 @@ export function main(argv = process.argv.slice(2), home = homedir()) {
   return 0
 }
 
+/** ★ The relay itself (`scripts/relay.py`) the agy shim starts agy through */
+export const RELAY_PY = join(fileURLToPath(new URL('..', import.meta.url)), 'scripts', 'relay.py')
+
+/** ★ Ours = the shape we generate (shebang on line 1, the mark on line 2), the same test as the claude shim's removal */
+function isOurAgyShim(path) {
+  try {
+    if (!lstatSync(path).isFile()) return false
+    return readFileSync(path, 'utf8').startsWith(`#!/bin/sh\n${SHIM_MARK}`)
+  } catch {
+    return false
+  }
+}
+
+/**
+ * ★★ The way in for typing from the phone (2026-11-20 / docs/AGY.md §8): `~/.nyan-remote/bin/agy`, the same shim as
+ * `claude`'s (`buildWrapper` with the name `agy`), starts agy through `scripts/relay.py`.
+ * ⚠️ The shim directory is put first on PATH by `install-relay.mjs` (run before this). Not there ⇒ nothing here.
+ * ⚠️ No real agy on PATH ⇒ no shim (a shim we placed earlier stays: it searches PATH again when it runs).
+ * ⚠️ A file there that we did not write is never touched. Removing removes only ours.
+ * ⚠️ Fail-open like the claude shim: `NYAN_REMOTE_NO_RELAY=1`, no terminal, `-p` / `--print` / `--prompt` ⇒ agy itself.
+ */
+export function shimStep({ remove, dry, home, env = process.env }) {
+  const binDir = binDirFor(home, env)
+  const shimPath = join(binDir, 'agy')
+  // ⚠️ The shim directory must be a real directory (a link could point into someone else's install / codex review)
+  try {
+    if (lstatSync(binDir).isSymbolicLink()) {
+      console.log(t(`⚠️ ${binDir} がリンクなので、agy の入口には触りません`, `⚠️ ${binDir} is a link, so the agy shim is left alone`))
+      return 0
+    }
+  } catch {
+    // not there: handled below
+  }
+  const exists = existsSync(shimPath) || (() => {
+    try {
+      lstatSync(shimPath)
+      return true
+    } catch {
+      return false
+    }
+  })()
+  if (remove) {
+    if (!exists) return 0
+    if (!isOurAgyShim(shimPath)) {
+      console.log(t(`⚠️ ${shimPath} は nyan が置いたものではないので消しません`, `⚠️ ${shimPath} was not placed by nyan; leaving it`))
+      return 0
+    }
+    if (!dry) rmSync(shimPath, { force: true })
+    console.log(t(`・${shimPath} を外しました`, `- removed ${shimPath}`))
+    return 0
+  }
+  if (!existsSync(binDir)) {
+    console.log(t('・打鍵の経路（~/.nyan-remote/bin）が無いので、agy の入口は置きません', '- the typing route (~/.nyan-remote/bin) is not set up, so the agy shim is not placed'))
+    return 0
+  }
+  const real = resolveRealClaude(env.PATH, binDir, undefined, 'agy')
+  if (!real) {
+    console.log(t('・PATH に agy が見つからないので、agy の入口は置きません', '- agy is not on PATH, so the agy shim is not placed'))
+    return 0
+  }
+  if (exists && !isOurAgyShim(shimPath)) {
+    console.log(t(`⚠️ ${shimPath} に nyan のものではないファイルがあるので触りません（スマホから agy へは送れません）`, `⚠️ ${shimPath} exists and is not nyan's; leaving it (agy cannot be typed into from the phone)`))
+    return 0
+  }
+  const body = buildWrapper({ real, relay: RELAY_PY, name: 'agy' })
+  if (exists && readFileSync(shimPath, 'utf8') === body) {
+    console.log(t(`・${shimPath}  変更なし`, `- ${shimPath}  unchanged`))
+    return 0
+  }
+  console.log(t(`・${shimPath}  agy を nyan の relay 経由で起こす入口を置きます（本物: ${real}）`, `- ${shimPath}  placing the shim that starts agy through the nyan relay (real: ${real})`))
+  if (dry) return 0
+  // ⚠️ A fresh temp name, created exclusively: a link left at a fixed name would have us write through it (codex review)
+  const tmp = `${shimPath}.tmp-nyan-${process.pid}-${Date.now()}`
+  try {
+    writeExclusive(tmp, body, 0o755)
+    chmodSync(tmp, 0o755)
+    renameSync(tmp, shimPath)
+  } catch (err) {
+    if (existsSync(tmp) && err?.code !== 'EEXIST') rmSync(tmp, { force: true })
+    // ⚠️ agy is optional: never stops nyan's install or update
+    console.error(t(`⚠️ ${shimPath} を置けませんでした: ${err.message}`, `⚠️ could not place ${shimPath}: ${err.message}`))
+    return 0
+  }
+  console.log(t('✔ 新しいターミナルで起こす agy から、スマホで送信・停止ができます', '✔ agy started in a new terminal can be typed into and stopped from the phone'))
+  return 0
+}
+
+/**
+ * ★ A new file under a name nobody has (`wx`: a link or file already there ⇒ EEXIST, left alone). Once this run made
+ * it, a failed write removes it (a full disk would otherwise leave a part behind / codex review).
+ */
+function writeExclusive(path, body, mode) {
+  const fd = openSync(path, 'wx', mode)
+  let open = true
+  try {
+    writeFileSync(fd, body)
+    open = false
+    closeSync(fd)
+  } catch (err) {
+    // ⚠️ close can fail too (NFS reports a full quota there / codex review): the part is ours to remove either way
+    if (open) {
+      try {
+        closeSync(fd)
+      } catch {}
+    }
+    rmSync(path, { force: true })
+    throw err
+  }
+}
+
 /** Backup → temp file → verify → rename. ★ A settings file that is a link (dotfiles) is written where it points */
 function write(path, next) {
   const target = existsSync(path) ? realpathSync(path) : path
@@ -201,10 +319,16 @@ function write(path, next) {
   } else {
     mkdirSync(dirname(target), { recursive: true })
   }
-  const tmp = `${target}.tmp-nyan`
-  writeFileSync(tmp, `${JSON.stringify(next, null, 2)}\n`, { mode: existsSync(target) ? statSync(target).mode & 0o777 : 0o600 })
-  JSON.parse(readFileSync(tmp, 'utf8'))
-  renameSync(tmp, target)
+  // ⚠️ A fresh name, created exclusively (a link left at a fixed name would be written through / codex review)
+  const tmp = `${target}.tmp-nyan-${process.pid}-${Date.now()}`
+  writeExclusive(tmp, `${JSON.stringify(next, null, 2)}\n`, existsSync(target) ? statSync(target).mode & 0o777 : 0o600)
+  try {
+    JSON.parse(readFileSync(tmp, 'utf8'))
+    renameSync(tmp, target)
+  } catch (err) {
+    rmSync(tmp, { force: true })
+    throw err
+  }
 }
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) process.exitCode = main()

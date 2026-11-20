@@ -12,7 +12,7 @@
 // ⚠️ The PWA's thread is append-only (entries are not replaced by id) ⇒ an item is emitted **once, when it is settled**:
 //    it has `completedAtMs`, or its turn is over. An unfinished command is held back until then.
 
-import type { LogEntry } from '../../../shared/types.ts'
+import { clipUserText, type LogEntry } from '../../../shared/types.ts'
 import { t } from '../../../shared/i18n.ts'
 
 const TEXT_MAX = 20_000
@@ -151,8 +151,8 @@ export function itemEntries(item: CodexItem): LogEntry[] {
   const withAt = at ? { at } : {}
   switch (item.type) {
     case 'userMessage': {
-      const text = clip(userText(r.content), TEXT_MAX)
-      return text ? [{ kind: 'user', ...withAt, text }] : []
+      const user = clipUserText(userText(r.content), TEXT_MAX)
+      return user.text ? [{ kind: 'user', ...withAt, ...user }] : []
     }
     case 'agentMessage': {
       const text = typeof r.text === 'string' ? clip(r.text, TEXT_MAX) : ''
@@ -399,5 +399,10 @@ export class ThreadJournal {
     if (!this.#owns(position) || position > this.tail) return undefined
     // A position older than what we still hold: everything we have is "after" it
     return this.#entries.slice(Math.max(0, position - this.#front))
+  }
+
+  /** Position of the entry `index` places after `position` (for a catch-up cut to fit one frame) */
+  after(position: number, index: number): number {
+    return this.#front + Math.max(0, position - this.#front) + index
   }
 }

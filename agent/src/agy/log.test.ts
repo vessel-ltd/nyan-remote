@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import { test } from 'node:test'
 import { readLogSince, readLogSlice } from '../claude/log.ts'
 import { agyEntries, resultText, toolGist } from './log.ts'
+import { textDigest } from '../../../shared/types.ts'
 
 // The records agy 1.5.12 wrote for a run with a command, a write, a read and an edit (measured 2026-11-19), with
 // example paths
@@ -104,4 +105,16 @@ test('the transcript reads with the byte cursors (page from the end, then follow
   appendFileSync(f, '\n')
   const more = await readLogSince(f, page.tail, agyEntries)
   assert.deepEqual(more.entries.map((e) => e.kind), ['assistant'])
+})
+
+test('★★ an agy request longer than the cut says its whole length (2026-11-20)', () => {
+  const [u] = agyEntries({ step_index: 0, source: 'USER_EXPLICIT', type: 'USER_INPUT', status: 'DONE', created_at: '2026-11-20T00:00:00Z', content: `<USER_REQUEST>\n${'z'.repeat(9000)}\n</USER_REQUEST>` })
+  assert.equal(u?.kind === 'user' && u.fullLength, 9000)
+  assert.equal(u?.kind === 'user' && u.text.length, 8000)
+})
+
+test('★ a cut agy request carries the digest of the whole text (the phone checks a long send by it)', () => {
+  const body = `${'h'.repeat(8000)}${'t'.repeat(1500)}`
+  const [u] = agyEntries({ step_index: 0, source: 'USER_EXPLICIT', type: 'USER_INPUT', status: 'DONE', created_at: '2026-11-20T00:00:00Z', content: `<USER_REQUEST>\n${body}\n</USER_REQUEST>` })
+  assert.equal(u?.kind === 'user' && u.digest, textDigest(body))
 })

@@ -1,4 +1,4 @@
-import { actionFeatures, canSendTo, isAgy, isCodex, sendBlockedNote } from './tool.ts'
+import { actionFeatures, canAttachTo, canSendTo, isAgy, isCodex, sendBlockedNote } from './tool.ts'
 import type { VNode } from 'preact'
 import { subscribeWhileVisible, whileVisible } from '../visibility.ts'
 import { coalesce, followPlan, shouldPull } from './followPlan.ts'
@@ -21,7 +21,7 @@ import { followAction } from './follow.ts'
 import { alreadyInTranscript, sendLimitBytes, type InflightMessage } from '../../../shared/types.ts'
 import { ctxText, formatTokens, modelText } from './tokens.ts'
 import { prepareFile, uploadFile } from './attach.ts'
-import { beginSend, consumeAfterReload, finishSend, noteArrivals, type PendingSend } from './pending.ts'
+import { beginSend, consumeAfterReload, finishSend, noteArrivals, RELOAD_SLACK_MS, type PendingSend } from './pending.ts'
 import { Permissions } from './Permissions.tsx'
 import { sendMark } from './sendMark.ts'
 import {
@@ -47,6 +47,15 @@ import { addedKeys, boundaryVisible, needsPermSignal, permArea, signalTarget } f
 import { accountLabel } from './agentText.ts'
 
 const PAGE = 60
+/** ★ How many older pages a reload looks through for a send still "sending" (`reconcileOlder`) */
+const RECONCILE_PAGES = 5
+/** Where an older-page scan stands (kept when a dropped line cuts it short) */
+interface OlderScan {
+  gen: number
+  back: number | null
+  firstAt: number
+  left: number
+}
 /** Beyond this distance from the bottom, show "to bottom" and stop auto-scrolling */
 const BOTTOM_SLACK = 200
 /** Characters shown when collapsed */
@@ -285,6 +294,8 @@ export function Thread({
    *    until then **nothing on screen reads as "not sent"**.
    */
   const [pending, setPending] = useState<PendingSend[]>([])
+  const pendingRef = useRef(pending)
+  pendingRef.current = pending
   /**
    * ★ A buffer of elements that arrived via polling (last 100).
    * ⚠️ Needed to match what arrived while awaiting the send reply **before stacking** (pending.ts)
@@ -467,7 +478,37 @@ export function Thread({
     setError(undefined)
     setLoading(false)
     requestAnimationFrame(() => settleView())
+    // ⚠️ Not awaited: the follow-up does not wait for it
+    void reconcileOlder({ gen, back: page.cursor, firstAt: Date.parse(page.entries[0]?.at ?? ''), left: RECONCILE_PAGES })
   }
+
+  /**
+   * ★ A reload's page may start after a send that is still "sending" (codex review: the first load failed, the send
+   *   went, and long output before the retry pushed its record onto an older page; pages are smaller since they must
+   *   fit one relay frame). ⇒ Match against older pages too (not shown), back to the oldest such send, at most
+   *   `RECONCILE_PAGES`. Same time and one-use rules as a reload (`consumeAfterReload`).
+   */
+  const reconcileOlder = async (scan: OlderScan): Promise<void> => {
+    let { back, firstAt, left } = scan
+    for (; left > 0 && back !== null; left--) {
+      const open = pendingRef.current
+      if (open.length === 0) return
+      const oldest = Math.min(...open.map((p) => p.at))
+      if (Number.isFinite(firstAt) && firstAt < oldest - RELOAD_SLACK_MS) return
+      try {
+        const older = await transport.getLog(sessionId, { before: back, limit: PAGE })
+        if (scan.gen !== genRef.current) return
+        setPending((prev) => consumeAfterReload(prev, older.entries, usedRef.current))
+        back = older.cursor
+        firstAt = Date.parse(older.entries[0]?.at ?? '')
+      } catch {
+        // ★ A dropped line: pick the scan up again after the next successful follow-up (codex review)
+        if (scan.gen === genRef.current) olderScanRef.current = { gen: scan.gen, back, firstAt, left }
+        return
+      }
+    }
+  }
+  const olderScanRef = useRef<OlderScan | null>(null)
 
   /**
    * Initial load (from the latest).
@@ -537,6 +578,12 @@ export function Thread({
           const page = await transport.getLog(sessionId, { since: tailRef.current })
           // ★ If the generation differs (arrived after moving to another thread), touch nothing
           if (gen !== genRef.current) return
+          // ★ The line is back: resume an older-page scan a dropped line cut short (`reconcileOlder`)
+          const scan = olderScanRef.current
+          if (scan) {
+            olderScanRef.current = null
+            if (scan.gen === gen) void reconcileOlder(scan)
+          }
           // ★★ "Text not yet written" is **replaced every time, before the tail check**.
           //    ⚠️⚠️ If this came after `followAction`, **the feature would not work**
           //    (2026-08-21 `/code-review`, high #1). While waiting for a human answer
@@ -560,6 +607,9 @@ export function Thread({
             return
           }
           tailRef.current = page.tail
+          // ★ The agent stopped before the end to fit one relay frame: ask for the rest at once (coalesced = runs after this one)
+          //   ⚠️ Not while hidden (the foreground callback resumes from the saved tail / codex review)
+          if (page.more && globalThis.document?.visibilityState !== 'hidden') pull()
           if (action === 'advance') return
           const nearBottom =
             window.innerHeight + window.scrollY >= document.body.scrollHeight - BOTTOM_SLACK
@@ -697,6 +747,8 @@ export function Thread({
       }
       root.style.overflowAnchor = 'none'
       setEntries((prev) => [...got, ...prev])
+      // ★ An older page may hold the record of a send still "sending" (codex review)
+      setPending((prev) => consumeAfterReload(prev, got, usedRef.current))
       setCursor(at)
     } catch (err) {
       if (gen === genRef.current) setError(err instanceof Error ? err.message : String(err))
@@ -1208,9 +1260,11 @@ export function Thread({
         model={session ? modelText(session) : undefined}
         // ★ 64 KB where the agent takes it (`long-send`), else the old 4 KB (no 400 from an older agent)
         maxBytes={sendLimitBytes(agentFeatures)}
+        // ★ The typed-form size (tabs as spaces) applies only where it is typed (a Claude row with keys, agy)
+        asKeys={!isCodex(session) && session?.sendRoute === 'keys'}
         // ★ Files (2026-11-17): only where the agent takes them (`uploads`) and this session can be sent to
         attach={
-          agentFeatures?.includes('uploads') && canSend && canSendTo(session, agentFeatures)
+          agentFeatures?.includes('uploads') && canSend && canAttachTo(session, agentFeatures)
             ? { upload: (file, onProgress, control) => prepareFile(file).then((p) => uploadFile(transport, p, onProgress, control)) }
             : undefined
         }
