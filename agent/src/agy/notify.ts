@@ -290,8 +290,16 @@ export class AgyNotifier {
       } else if (to === 'done' && from !== undefined && (ACTIVE.has(from.status) || newTurn)) {
         // Rule 2
         if (!end.answered) continue
-      } else if (to === 'done' && from === undefined && end.answered && end.answeredAt !== undefined && prevAt !== undefined && end.answeredAt >= prevAt - 1000) {
-        // Rule 7
+      } else if (
+        to === 'done' &&
+        (from === undefined || from.status === 'idle') &&
+        end.answered &&
+        end.answeredAt !== undefined &&
+        prevAt !== undefined &&
+        end.answeredAt >= prevAt - 1000
+      ) {
+        // Rule 7 (★ also from `idle`: a parent whose children outlived its answer is idle, and its next answer can
+        //   come before a look sees it working / codex review)
       } else {
         continue
       }

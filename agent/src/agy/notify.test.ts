@@ -935,3 +935,19 @@ test('★ a "needs you" is judged by its card, not the turn: a newer look readin
   await Promise.all([n.look(), n.look()])
   assert.deepEqual(sent, ['要対応'])
 })
+
+test('★ "idle" (its children outlived its answer) to "done" rings "done" when the new answer is newer than the last look', async () => {
+  const r = rig()
+  r.set('working', asking(0))
+  await r.n.look()
+  r.tick(5_000)
+  // the children are over and wrote after the parent's answer: idle, nothing sent
+  r.set('idle', [user(0), { step_index: 1, type: 'PLANNER_RESPONSE', content: 'Started.', created_at: new Date(1_000).toISOString() }])
+  await r.n.look()
+  assert.equal(r.sent.length, 0)
+  r.tick(5_000)
+  // the parent answers after them, before a look sees it working
+  r.set('done', [user(0), { step_index: 3, type: 'PLANNER_RESPONSE', content: 'The check failed.', created_at: new Date(9_000).toISOString() }])
+  await r.n.look()
+  assert.deepEqual(r.sent.map((f) => f.label), ['完了'])
+})

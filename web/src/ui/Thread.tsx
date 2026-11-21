@@ -1138,11 +1138,23 @@ export function Thread({
                file read. ⚠️ The agent's own mark decides the words (an older agent has no agy cards at all) */
             /* ★ A question (`ask_question` / docs/AGY.md §11): answered on the PC for now; stopping would skip it */
             session?.waitingFor === 'input needed' ? (
-              <>
-                {t('PCの画面で agy が質問しています。', 'agy is asking a question on the PC screen. ')}
-                <strong>{t('agy の質問は、まだスマホからは答えられません', 'agy questions can’t be answered from the phone yet')}</strong>
-                {t('。PCで答えてください。', '. Please answer on the PC.')}
-              </>
+              agentFeatures?.includes('agy-question-answer') ? (
+                /* ★ The phone answers questions (docs/AGY.md §13), but this one has no card: say which cases stay on the PC */
+                <>
+                  {t('PCの画面で agy が質問しています。', 'agy is asking a question on the PC screen. ')}
+                  <strong>{t('この質問はスマホに出ていません', 'This question is not on the phone')}</strong>
+                  {t(
+                    '（PC の画面が別の質問や子の画面を出しているとき・nyan-remote を通さずに起動した agy・2つの agy で開いた会話は PC で答えます。今の版より前に起動した agy は、新しいターミナルで起こし直すと、まとめて出た質問や子の質問にも答えられます。子の質問は PC で ctrl+k を押すと開きます）。PCで答えてください。',
+                    ' (it is answered on the PC while the PC shows another question or a subagent’s view, for an agy not started through nyan-remote, or a conversation open in two agys. An agy started before this version answers batches and subagents’ questions from the phone once started again in a new terminal. On the PC, ctrl+k opens a subagent’s question). Please answer on the PC.',
+                  )}
+                </>
+              ) : (
+                <>
+                  {t('PCの画面で agy が質問しています。', 'agy is asking a question on the PC screen. ')}
+                  <strong>{t('agy の質問は、まだスマホからは答えられません', 'agy questions can’t be answered from the phone yet')}</strong>
+                  {t('。PCで答えてください。', '. Please answer on the PC.')}
+                </>
+              )
             ) : session?.agyShared ? (
               <>
                 {t('PCの画面で承認を待っています。', 'The PC screen is waiting for an approval. ')}

@@ -205,6 +205,8 @@ export interface Transport {
     feedback?: string,
     /** ★ Question text → a note (Codex questions only / `InteractionQuestion.note`) */
     notes?: Record<string, string>,
+    /** ★ "Skip" for an agy question (docs/AGY.md §13): the agent refuses a bare deny there (an older PWA said "stop") */
+    skip?: true,
     // ★ `at`: the agent's time the answer took effect (only for an agy card / used to close older notifications)
   ): Promise<{ ok: boolean; reason?: string; at?: string }>
 

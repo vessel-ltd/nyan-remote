@@ -663,10 +663,11 @@ function App() {
     answers?: Record<string, string[]>,
     feedback?: string,
     notes?: Record<string, string>,
+    skip?: true,
   ): Promise<{ ok: boolean; reason?: string; at?: string }> => {
     const tr = transports.find((x) => x.endpoint.id === endpointId)
     if (!tr) return { ok: false, reason: t('接続先が見つかりません', 'Connection not found') }
-    const res = await tr.answerPermission(key, behavior, answers, feedback, notes)
+    const res = await tr.answerPermission(key, behavior, answers, feedback, notes, skip)
     void refresh(new Set([endpointId]))
     return res
   }

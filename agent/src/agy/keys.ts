@@ -45,11 +45,20 @@ import {
   serializeBySession,
   writeControl,
   writeKeys,
+  writeSequence,
+  openKeyLine,
+  type KeyLine,
+  type SequenceChunk,
 } from '../claude/keys.ts'
-import { callBeforeState, readTailRecords, turnEnd } from './pending.ts'
+import { callBeforeState, readTailRecords, turnEnd, type PendingCall } from './pending.ts'
+import { parseAgyQuestion, questionTextsOf, type AgyAnswerPlan, type AgyQuestion, type AgyStep } from './questions.ts'
+import { childViewOf, dialogFits, inChildView, parseBanner, viewOwnerOf, parseDialog, readAgyScreen, sameQuestionText, showsQuestion, type FooterHint, type ScreenDialog } from './screen.ts'
 import {
   AGY_PREFIX,
+  AGY_QUESTION_TOOL,
   agyAsking,
+  agyChildQuestions,
+  agyPendingCall,
   agyConversations,
   agyQuestionInTranscript,
   agyLocksOf,
@@ -60,6 +69,7 @@ import {
   liveAgy,
   parseAgyFile,
   transcriptPathOf,
+  withLocksProbed,
   type AgyDeps,
   type AgyPane,
   type AgyPaneFailure,
@@ -135,6 +145,18 @@ export interface AgyKeysDeps extends AgyDeps {
   readNow?: typeof readNow
   /** How long a card answer waits before its last check (`AGY_ANSWER_SETTLE_MS`; tests shorten it) */
   answerSettleMs?: number
+  /** Between two keys of a question's answer (`AGY_QUESTION_STEP_MS`; tests shorten it) */
+  questionStepMs?: number
+  /** After ctrl+k opens a child's question (`AGY_CHILD_OPEN_MS`; tests shorten it) */
+  childOpenMs?: number
+  /** How long the back ESC waits for the answer to be recorded (`AGY_CHILD_BACK_WAIT_MS`; tests shorten it) */
+  childBackWaitMs?: number
+  /** ★ Reads the agy's screen through its relay (`readAgyScreen`; replaced in tests) */
+  readScreen?: (socketPath: string) => Promise<string | undefined>
+  /** ★ Opens the key line (`openKeyLine`; replaced in tests) */
+  openKeyLine?: (socketPath: string) => Promise<KeyLine | undefined>
+  /** How long a screen change is waited for after a key (`SCREEN_SETTLE_MS`; tests shorten it) */
+  screenSettleMs?: number
 }
 
 export function defaultAgyKeysDeps(): AgyKeysDeps {
@@ -230,6 +252,9 @@ const stopNow = (target: AgyTarget, read: typeof readNow, holds: LockCheck): Exc
   return now ? stopGate(now.state, now.stateMtimeMs, now.transcriptMtimeMs, now.asking) : 'unsure'
 }
 
+/** (no lock probe: for a check whose key only leaves a subagent's view) */
+const noProbe: LockCheck = () => true
+
 const lockCheck = (deps: AgyKeysDeps): LockCheck => {
   const locksOf = deps.locksOf ?? ((p: number) => agyLocksOf(p, deps.home))
   return (pid, conv) => locksOf(pid)?.includes(conv) ?? false
@@ -262,8 +287,10 @@ export type AgySendFailure =
   | 'long-needs-paste'
   | 'unreachable'
   | 'partial'
+  | 'answering'
+  | 'child-view'
 
-export type AgyStopFailure = AgyTargetFailure | 'waiting' | 'asking' | 'subagent' | 'unsure' | 'idle' | 'too-soon' | 'unreachable'
+export type AgyStopFailure = AgyTargetFailure | 'waiting' | 'asking' | 'subagent' | 'unsure' | 'idle' | 'too-soon' | 'unreachable' | 'answering' | 'child-view'
 
 export interface AgyResult<F> {
   ok: boolean
@@ -336,6 +363,17 @@ export const AGY_SEND_REFUSAL: Record<AgySendFailure, () => [number, string]> = 
   ],
   unreachable: () => [502, t('agy への入口が応答しません（送っていません）。', 'The way into agy is not responding (nothing was sent).')],
   partial: () => [500, failureMessage('partial')],
+  answering: () => [
+    409,
+    t('スマホからの答えを agy に打っているところです。終わってから送り直してください。', 'An answer from the phone is being typed into agy. Send again when it is done.'),
+  ],
+  'child-view': () => [
+    409,
+    t(
+      'PC が agy の子（サブエージェント）の画面を開いたままで、親の画面に戻せませんでした（送っていません）。PC で ESC を押して戻ってください。',
+      'The PC shows an agy subagent’s screen and it could not be taken back to the main one (nothing was sent). Press ESC on the PC to go back.',
+    ),
+  ],
 }
 
 export const AGY_STOP_REFUSAL: Record<AgyStopFailure, () => [number, string]> = {
@@ -372,10 +410,66 @@ export const AGY_STOP_REFUSAL: Record<AgyStopFailure, () => [number, string]> = 
   idle: () => [409, t('agy はいま応答していません（止めるものがありません）。', 'agy is not working right now (nothing to stop).')],
   'too-soon': () => [429, t('止める合図を送ったところです。', 'A stop was just sent.')],
   unreachable: () => [502, t('agy への入口が応答しません。', 'The way into agy is not responding.')],
+  answering: () => [409, t('スマホからの答えを agy に打っているところです。終わってからもう一度押してください。', 'An answer from the phone is being typed into agy. Press it again when it is done.')],
+  'child-view': () => [
+    409,
+    t(
+      'PC が agy の子（サブエージェント）の画面を開いたままで、親の画面に戻せませんでした（止めていません）。PC で操作してください。',
+      'The PC shows an agy subagent’s screen and it could not be taken back to the main one (nothing was stopped). Use the PC.',
+    ),
+  ],
 }
 
 const fail = <F extends AgySendFailure>(reason: F): AgyResult<F> => ({ ok: false, reason, message: AGY_SEND_REFUSAL[reason]()[1] })
 const failStop = <F extends AgyStopFailure>(reason: F): AgyResult<F> => ({ ok: false, reason, message: AGY_STOP_REFUSAL[reason]()[1] })
+
+/**
+ * ★ Conversations an answer from the phone is being typed into: a send or a stop for them is refused at once rather
+ * than queued behind it (codex review: a long batch held a stop, and the phone's relay line with it, past the 10 s
+ * another request waits)
+ */
+const answering = new Map<string, number>()
+async function whileAnswering<T>(key: string, fn: () => Promise<T>): Promise<T> {
+  answering.set(key, (answering.get(key) ?? 0) + 1)
+  try {
+    return await fn()
+  } finally {
+    const n = (answering.get(key) ?? 1) - 1
+    if (n <= 0) answering.delete(key)
+    else answering.set(key, n)
+  }
+}
+
+/**
+ * ★★ Takes the PC back to the parent's view before a send or a stop (codex review: a message typed while an earlier
+ * answer left a subagent's view on the PC went into that view, while the phone was told it was sent). Only through a
+ * relay that shows the screen; the same conditions as an answer's going back (`answerOnScreen`): the view's child named
+ * by its header, nothing open in it, nothing pending in its transcript; `may` (the send's or stop's own gate) right
+ * before the key. 'ok' = on the parent's view (or nothing to read the screen with).
+ */
+async function leaveChildView(target: AgyTarget, deps: AgyKeysDeps, may: () => boolean): Promise<'ok' | 'child-view' | 'unsure'> {
+  if (!target.pane.screen) return 'ok'
+  const look = deps.readScreen ?? ((p: string) => readAgyScreen(p))
+  const s = await look(target.pane.socketPath)
+  if (s === undefined || s.trim() === '') return 'unsure'
+  // ⚠️ "Not a child's view" only when the header says so too: a child's header with its footer clipped (a resize
+  //    mid-redraw) is a child's view (codex / agy review)
+  if (!inChildView(s)) return viewOwnerOf(s) === 'parent' ? 'ok' : 'child-view'
+  const viewed = childViewOf(s)
+  if (viewed === undefined || parseDialog(s) !== undefined) return 'child-view'
+  const viewedT = transcriptPathOf(viewed, homeOf(target.transcript, target.conversationId) ?? deps.home)
+  const pending = (): boolean => agyPendingCall(viewedT, readTailRecords) !== null
+  if (pending()) return 'child-view'
+  const res = await writeControl(target.pane.socketPath, SCREEN_KEYS.esc, { beforeWrite: () => !may() || pending() })
+  if (!res.ok) return 'child-view'
+  const end = Date.now() + (deps.screenSettleMs ?? SCREEN_SETTLE_MS)
+  for (;;) {
+    const x = await look(target.pane.socketPath)
+    if (x !== undefined && x.trim() !== '' && !inChildView(x) && viewOwnerOf(x) === 'parent') return 'ok'
+    if (Date.now() >= end) return 'child-view'
+    await new Promise((r) => setTimeout(r, SCREEN_POLL_MS))
+  }
+}
 
 /** ★ Type one message into the agy showing this conversation. ⚠️ Serialized with its stops (same chain key as the row id) */
 export async function sendToAgy(
@@ -386,6 +480,7 @@ export async function sendToAgy(
   const key = keyOf(conversationId)
   const read = deps.readNow ?? readNow
   const holds = lockCheck(deps)
+  if (answering.has(key)) return fail('answering')
   return serializeBySession(key, async () => {
     const clean = sanitizeForKeys(text)
     if (!clean.ok) {
@@ -401,6 +496,10 @@ export async function sendToAgy(
     const typed = agyTyped(clean.value.text)
     const long = needsPaste(typed)
     if (long && !target.pane.paste) return fail('long-needs-paste')
+    // (the state only, not the lock probe again: an ESC on a subagent's view only goes back, and a Mac's `lsof` per
+    //  check added up past the phone's 10 s / codex review)
+    const left = await leaveChildView(target, deps, () => sendNow(target, read, noProbe) === 'ok')
+    if (left !== 'ok') return fail(left)
     // ★ Looked at again right before the body and right before Enter (a card, a turn the PC started)
     let refusedBy: Exclude<AgyGate, 'idle' | 'ok'> | undefined
     const stopHere = (): boolean => {
@@ -436,6 +535,7 @@ export async function stopAgy(
   const key = keyOf(conversationId)
   const read = deps.readNow ?? readNow
   const holds = lockCheck(deps)
+  if (answering.has(key)) return failStop('answering')
   return serializeBySession(key, async () => {
     const prev = lastStopAt.get(key)
     if (prev !== undefined && now() - prev < AGY_STOP_COOLDOWN_MS) return failStop('too-soon')
@@ -443,6 +543,9 @@ export async function stopAgy(
     if (typeof target === 'string') return failStop(target)
     const gate = stopNow(target, read, holds)
     if (gate !== 'ok') return failStop(gate)
+    // (an ESC on a subagent's view only goes back: the stop would not stop anything)
+    const left = await leaveChildView(target, deps, () => stopNow(target, read, noProbe) === 'ok')
+    if (left !== 'ok') return failStop(left)
     let refusedBy: Exclude<AgyGate, 'busy' | 'ok'> | undefined
     const res = await writeControl(target.pane.socketPath, CONTROL_KEYS.escape, {
       beforeWrite: () => {
@@ -539,11 +642,156 @@ export async function answerAgyCard(
   stillWanted?: () => boolean,
 ): Promise<{ ok: true } | { ok: false; reason: AgyCardFailure }> {
   const conv = conversationId.toLowerCase()
-  return serializeBySession(keyOf(conv), async () => {
+  return whileAnswering(keyOf(conv), () => serializeBySession(keyOf(conv), async () => {
     if (!deps.isAgy(mark.pid)) return { ok: false, reason: 'not-open' }
     // ⚠️ The uncached liveness (a reused pid is the worst place to type)
     const pane = await agyPaneOf(mark.pid, deps.aliveProcStart)
     if (typeof pane === 'string') return { ok: false, reason: pane }
+    const target = { conversationId: conv, pid: mark.pid, pane, dir: deps.dir, transcript: transcriptPathOf(conv, deps.home) }
+    // ⚠️ The slow probes (a Mac's `lsof`) made without blocking the agent, just before each check (agy review)
+    if (!sameCardNow(target, mark, await probedChecks(deps, tail, mark.pid))) return { ok: false, reason: 'changed' }
+    await new Promise((r) => setTimeout(r, deps.answerSettleMs ?? AGY_ANSWER_SETTLE_MS))
+    // ★ The PC left on a subagent's view: back to the parent's first (there `1` is dropped and ESC only goes back —
+    //   the card would be neither allowed nor declined / agy review)
+    if (pane.screen) {
+      const before = await probedChecks(deps, tail, mark.pid)
+      const left = await leaveChildView({ ...target, stateFile: '' }, deps, () => sameCardNow(target, mark, before) && (stillWanted === undefined || stillWanted()))
+      if (left !== 'ok') return { ok: false, reason: 'changed' }
+    }
+    const checks = await probedChecks(deps, tail, mark.pid)
+    const res = await writeControl(pane.socketPath, AGY_CARD_KEYS[behavior], {
+      // ⚠️ `stillWanted` last: the card checks can take a while (a Mac's `lsof`), and an expiry during them counts
+      beforeWrite: () => !sameCardNow(target, mark, checks) || (stillWanted !== undefined && !stillWanted()),
+    })
+    if (res.ok) return { ok: true }
+    return { ok: false, reason: res.reason === 'pending-approval' ? 'changed' : 'unreachable' }
+  }))
+}
+
+/**
+ * ★★ Which question the phone answered (docs/AGY.md §13): the agy, the transcript's write that posed it (nothing writes
+ * the transcript while it is up; a subagent's progress can rewrite the status file, so that is not used), the call.
+ */
+export interface AgyQuestionMark {
+  pid: number
+  askedAt: number
+  step: number
+  index: number
+  callAt: number
+  /**
+   * ★ A child agent's question (docs/AGY.md §13): the child's conversation id. `askedAt` / `step` / `index` / `callAt`
+   *   are then of the child's transcript; the keys go through the parent's relay, opened with ctrl+k.
+   */
+  child?: string
+  /** ★ Raised from what the relay's screen showed: answered against the screen (docs/AGY.md §14) */
+  screen?: true
+}
+
+/**
+ * ★ The keys around a child's answer (measured on agy 1.5.13): ctrl+k opens the question the parent's banner shows
+ * (again: stays open), and after the answer the PC stays in the child's view; ESC there goes back to the parent's.
+ * (ESC on the parent's idle prompt does nothing, measured with a child still asking.)
+ */
+export const AGY_CHILD_KEYS = { open: '\x0b', back: '\x1b' } as const
+/** After ctrl+k, before the first answer key: agy switches to the child's view */
+export const AGY_CHILD_OPEN_MS = 600
+/** How long the back ESC waits for agy to record the child's answer (wall time) */
+export const AGY_CHILD_BACK_WAIT_MS = 2000
+
+export type AgyQuestionFailure = AgyCardFailure | 'partial'
+
+/** Between two keys of one answer: agy redraws the next question (a digit on a single-select moves on at once) */
+export const AGY_QUESTION_STEP_MS = 250
+
+/** ★ Whether this question is still the one up now. ⚠️ Synchronous (right before each key) */
+export function sameQuestionNow(
+  target: Pick<AgyTarget, 'conversationId' | 'pid' | 'pane' | 'dir' | 'transcript'>,
+  mark: AgyQuestionMark,
+  checks: {
+    holdsLock: (pid: number, conversationId: string) => boolean
+    shared: (conversationId: string, pid: number, since: number) => boolean | undefined
+    tail?: (path: string) => Record<string, unknown>[]
+  },
+  /**
+   * ★ Whether to run the slow probes (the lock, another agy on it: `lsof` on a Mac). Between the keys of one answer only
+   *   the file reads run (the question the same, this agy's state): a probe per key made a long answer outlast the
+   *   phone's 10 s wait on a slow Mac (codex review). Run before the first key and before the last.
+   */
+  slow = true,
+): boolean {
+  // the slow checks first, the file reads last (as `sameCardNow`)
+  if (slow && !checks.holdsLock(mark.pid, target.conversationId)) return false
+  if (slow && checks.shared(target.conversationId, mark.pid, mark.callAt) !== false) return false
+  if (mark.child !== undefined) return sameChildQuestionNow(target, mark as AgyQuestionMark & { child: string }, checks)
+  let posed: number
+  try {
+    posed = statSync(target.transcript).mtimeMs
+  } catch {
+    return false
+  }
+  // ⚠️ Anything written since (an answer on the PC, a skip) ⇒ not the same question
+  if (posed !== mark.askedAt) return false
+  const p = turnEnd((checks.tail ?? readTailRecords)(target.transcript)).pending
+  if (!p || p.name !== AGY_QUESTION_TOOL || p.step !== mark.step || p.index !== mark.index || p.at !== mark.callAt) return false
+  const f = readAgyPidFile(target.dir, mark.pid)
+  if (!f || f.state.conversationId !== target.conversationId || f.state.confirmationPending || f.state.agentState !== 'tool_use') return false
+  // ★ A child agent's question may be the one open on the PC (§11) — blind; with the screen the dialog shown is checked
+  if (f.state.subagentsActive && !mark.screen) return false
+  if (f.mtimeMs < target.pane.startedAt || f.mtimeMs < mark.askedAt) return false
+  return callBeforeState(p, f.mtimeMs)
+}
+
+/**
+ * ★★ A child's question still the one ctrl+k opens: the parent idle with no card or question of its own, this child the
+ * only one asking (and not one of two given the same prompt), its transcript not written since. ⚠️ Synchronous
+ */
+function sameChildQuestionNow(
+  target: Pick<AgyTarget, 'conversationId' | 'pid' | 'pane' | 'dir' | 'transcript'>,
+  mark: AgyQuestionMark & { child: string },
+  checks: { tail?: (path: string) => Record<string, unknown>[] },
+): boolean {
+  const tail = checks.tail ?? readTailRecords
+  const f = readAgyPidFile(target.dir, mark.pid)
+  if (!f || f.state.conversationId !== target.conversationId || f.state.confirmationPending || f.state.agentState !== 'idle') return false
+  if (f.mtimeMs < target.pane.startedAt) return false
+  const home = homeOf(target.transcript, target.conversationId)
+  if (home === undefined) return false
+  const found = agyChildQuestions(f.state, target.conversationId, home, tail)
+  const kids = found.asking
+  // ★ With the screen, which question ctrl+k opens is read from the banner and the dialog (`answerOnScreen`): here only
+  //   that this child still asks this very question. Blind: it must be the only one asking (and every child seen).
+  const k = mark.screen ? kids.find((x) => x.child === mark.child) : found.complete && kids.length === 1 && !kids[0]!.ambiguous && kids[0]!.child === mark.child ? kids[0] : undefined
+  if (!k) return false
+  return k.askedAt === mark.askedAt && k.call.step === mark.step && k.call.index === mark.index && k.call.at === mark.callAt
+}
+
+/** The home a conversation's transcript path was built from (`transcriptPathOf`) */
+function homeOf(transcript: string, conversationId: string): string | undefined {
+  const tail = join('.gemini', 'antigravity-cli', 'brain', conversationId, '.system_generated', 'logs', 'transcript_full.jsonl')
+  return transcript.endsWith(tail) ? transcript.slice(0, transcript.length - tail.length - 1) : undefined
+}
+
+/**
+ * ★★ Type the phone's answer to an agy question (docs/AGY.md §13): the steps `questions.ts` built, one at a time, each
+ * only while the same question is still up. ⚠️ Nothing from the phone is typed but the notes `questions.ts` cleaned.
+ * A step that does not go out after the first one ⇒ `partial` (the PC shows the question half answered).
+ */
+export async function answerAgyQuestion(
+  conversationId: string,
+  mark: AgyQuestionMark,
+  answer: AgyQuestionAnswer,
+  deps: AgyKeysDeps = defaultAgyKeysDeps(),
+  tail: (path: string) => Record<string, unknown>[] = readTailRecords,
+): Promise<{ ok: true; left?: true } | { ok: false; reason: AgyQuestionFailure }> {
+  const conv = conversationId.toLowerCase()
+  return whileAnswering(keyOf(conv), () => serializeBySession(keyOf(conv), async () => {
+    const steps = answer.kind === 'steps' ? answer.steps : []
+    if (answer.kind === 'steps' && steps.length === 0) return { ok: false, reason: 'changed' }
+    if (!deps.isAgy(mark.pid)) return { ok: false, reason: 'not-open' }
+    const pane = await agyPaneOf(mark.pid, deps.aliveProcStart)
+    if (typeof pane === 'string') return { ok: false, reason: pane }
+    // ★ Typed against the screen only through a relay that shows it (an older one would type the request byte)
+    if (answer.kind !== 'steps' && !pane.screen) return { ok: false, reason: 'changed' }
     const target = { conversationId: conv, pid: mark.pid, pane, dir: deps.dir, transcript: transcriptPathOf(conv, deps.home) }
     const locksOf = deps.locksOf ?? ((pid: number) => agyLocksOf(pid, deps.home))
     const checks = {
@@ -551,13 +799,434 @@ export async function answerAgyCard(
       shared: (c: string, pid: number, since: number) => agyShared(deps.dir, c, pid, deps.isAgy, locksOf, since),
       tail,
     }
-    if (!sameCardNow(target, mark, checks)) return { ok: false, reason: 'changed' }
+    // ⚠️ The slow probes (a Mac's `lsof`) without blocking the agent (codex / agy review)
+    if (!sameQuestionNow(target, mark, await probedChecks(deps, tail, mark.pid))) return { ok: false, reason: 'changed' }
+    // ★ An answer on the PC just before lands in this wait (as a card's)
     await new Promise((r) => setTimeout(r, deps.answerSettleMs ?? AGY_ANSWER_SETTLE_MS))
-    const res = await writeControl(pane.socketPath, AGY_CARD_KEYS[behavior], {
-      // ⚠️ `stillWanted` last: the card checks can take a while (a Mac's `lsof`), and an expiry during them counts
-      beforeWrite: () => !sameCardNow(target, mark, checks) || (stillWanted !== undefined && !stillWanted()),
+    if (answer.kind !== 'steps') return answerOnScreen({ ...target, stateFile: '' }, pane, mark, answer, checks, deps, tail)
+    const stepMs = deps.questionStepMs ?? AGY_QUESTION_STEP_MS
+    const openMs = deps.childOpenMs ?? AGY_CHILD_OPEN_MS
+    const refuse = (slow: boolean) => (): boolean => !sameQuestionNow(target, mark, checks, slow)
+    // ★ One connection for the whole answer (`writeSequence`): a child's question is opened first with ctrl+k (the
+    //   parent's banner), and the PC is taken back to the parent's view after (ESC) — ⚠️ only once the whole answer went
+    //   out, only into this same agy, and only while the child asks nothing: on an open question ESC skips it (codex
+    //   review). Left out otherwise (the child's view stays on the PC).
+    // ★ The slow probes run before the first key and before the last (`sameQuestionNow`'s `slow`)
+    const keys = steps.map((step) => ('key' in step ? step.key : step.text))
+    const chunks: SequenceChunk[] = []
+    if (mark.child !== undefined) chunks.push({ bytes: AGY_CHILD_KEYS.open, pauseMs: 0, beforeWrite: refuse(true) })
+    keys.forEach((bytes, i) => {
+      const pauseMs = i === 0 ? (mark.child !== undefined ? openMs : 0) : stepMs
+      const slow = i === keys.length - 1 || (i === 0 && mark.child === undefined)
+      chunks.push({ bytes, pauseMs, beforeWrite: refuse(slow) })
     })
+    if (mark.child !== undefined) {
+      const childTranscript = transcriptPathOf(mark.child, homeOf(target.transcript, conv) ?? deps.home)
+      // the parent's transcript as the answer starts: a new prompt typed on the PC meanwhile moves it (before the status
+      // line says "working" / codex review)
+      const parentAt = statSync(target.transcript, { throwIfNoEntry: false })?.mtimeMs
+      chunks.push({
+        bytes: AGY_CHILD_KEYS.back,
+        // ★ Sent the moment agy has recorded the answer (asked every 100 ms): the child's next call needs the model to
+        //   answer first (seconds), so the view is taken back before it can open (codex review: a fixed wait let a
+        //   quick next call keep the PC on the child's view)
+        pauseMs: 100,
+        waitMs: deps.childBackWaitMs ?? AGY_CHILD_BACK_WAIT_MS,
+        // ⚠️ Any pending call of the child: its next question, or an approval of its next command (ESC would decline it
+        //    / codex review). The lock was probed right before the last answer key.
+        // ⚠️ And only while the parent is still idle with nothing up (a new turn started on the PC meanwhile would be
+        //    stopped by it / codex review)
+        beforeWrite: () => {
+          const f = readAgyPidFile(target.dir, mark.pid)
+          if (!f || f.state.conversationId !== conv || f.state.agentState !== 'idle' || f.state.confirmationPending) return true
+          if (parentAt === undefined || statSync(target.transcript, { throwIfNoEntry: false })?.mtimeMs !== parentAt) return true
+          return agyPendingCall(childTranscript, tail) !== null
+        },
+        optional: true,
+      })
+    }
+    const res = await writeSequence(pane.socketPath, chunks)
     if (res.ok) return { ok: true }
-    return { ok: false, reason: res.reason === 'pending-approval' ? 'changed' : 'unreachable' }
-  })
+    // ★ Nothing of the answer went out (on a child, at most the ctrl+k: its view open, the question as it was) ⇒ it may
+    //   come back; some of it ⇒ partial (the PC shows it half answered)
+    const answerKeys = res.written - (mark.child !== undefined ? 1 : 0)
+    if (answerKeys > 0) return { ok: false, reason: 'partial' }
+    return { ok: false, reason: res.reason === 'refused' || res.written > 0 ? 'changed' : 'unreachable' }
+  }))
 }
+
+/**
+ * ★★ An answer typed against the screen (docs/AGY.md §14): what the phone chose (`plan`) or "skip", for the question the
+ * card showed. Used when the agy's relay shows its screen (`AgyPane.screen`); a blind relay types fixed `steps`.
+ */
+export type AgyQuestionAnswer =
+  | { kind: 'steps'; steps: readonly AgyStep[] }
+  | { kind: 'plan'; question: AgyQuestion; plan: AgyAnswerPlan }
+  | { kind: 'skip'; question: AgyQuestion }
+
+/** Keys the screen-driven answer types (agy 1.5.13 defaults, measured 2026-11-21) */
+export const SCREEN_KEYS = { down: '\x1b[B', up: '\x1b[A', left: '\x1b[D', right: '\x1b[C', space: ' ', enter: '\r', esc: '\x1b', open: '\x0b' } as const
+/** How long a screen change is waited for after a key */
+/** ★ The write-in field shows about 4 rows (measured, agy 1.5.13 / 1.5.14): with 3 or more filled it may have scrolled */
+const FIELD_FULL_ROWS = 3
+/** ★ How much of a written answer is typed before the field is read again (well under what its rows show) */
+const NOTE_PIECE = 40
+
+/**
+ * A written answer as compared with the field: one Unicode form, every space kept (codex review: "a  b" is not "a b");
+ * only the ends trimmed (a field row is read trimmed). Row boundaries are handled by `fieldShows`.
+ */
+const noteText = (s: string): string => s.normalize('NFC').trim()
+
+/**
+ * ★ Whether the field's rows show this text (`noteText`): the whole of it, or (a field that scrolled) its end. A row
+ * boundary stands for a space between words or for nothing inside CJK text (agy review: a Japanese note wrapped between
+ * two characters never matched); inside a row every space counts. Returns how many characters of the text are shown.
+ */
+function fieldShows(rows: readonly string[], text: string, how: 'whole' | 'end'): number | undefined {
+  const parts = rows.map(noteText).filter((r) => r !== '')
+  if (parts.length === 0) return undefined
+  const esc = (x: string): string => x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const re = new RegExp(`${how === 'whole' ? '^' : ''}${parts.map(esc).join(' ?')}$`, 'u')
+  const m = re.exec(text)
+  return m ? text.length - m.index : undefined
+}
+
+/** The note in pieces of `NOTE_PIECE` characters (never splitting a character) */
+function notePieces(note: string): string[] {
+  const chars = Array.from(note)
+  const out: string[] = []
+  for (let i = 0; i < chars.length; i += NOTE_PIECE) out.push(chars.slice(i, i + NOTE_PIECE).join(''))
+  return out
+}
+export const SCREEN_SETTLE_MS = 2000
+const SCREEN_POLL_MS = 30
+
+class Stop extends Error {
+  readonly reason: 'changed' | 'partial'
+  constructor(reason: 'changed' | 'partial') {
+    super(reason)
+    this.reason = reason
+  }
+}
+
+/**
+ * ★★ Types an answer while reading the screen before and after every key (docs/AGY.md §14). Each key is written only
+ * while the same question is still up (`sameQuestionNow`; the slow probes before the first and the last), and only when
+ * the screen shows what that key is for. Anything else stops it: nothing typed yet ⇒ `changed`, some ⇒ `partial`.
+ */
+/** The lock checks from probes made now, all at once and without blocking (`withLocksProbed`) */
+async function probedChecks(deps: AgyKeysDeps, tail: (path: string) => Record<string, unknown>[], pid?: number): Promise<Parameters<typeof sameQuestionNow>[2]> {
+  const probed = await withLocksProbed(deps)
+  const base = probed.locksOf ?? ((p: number) => agyLocksOf(p, deps.home))
+  // ★ This agy's locks taken now, before what follows (as `withLocksProbed` does for every agy it finds)
+  const now = pid === undefined ? undefined : base(pid)
+  const locksOf = (p: number): string[] | undefined => (p === pid ? now : base(p))
+  return {
+    holdsLock: (pid: number, c: string) => locksOf(pid)?.includes(c) ?? false,
+    shared: (c: string, pid: number, since: number) => agyShared(deps.dir, c, pid, deps.isAgy, locksOf, since),
+    tail,
+  }
+}
+
+async function answerOnScreen(
+  target: AgyTarget,
+  pane: AgyPane,
+  mark: AgyQuestionMark,
+  answer: Exclude<AgyQuestionAnswer, { kind: 'steps' }>,
+  checks: Parameters<typeof sameQuestionNow>[2],
+  deps: AgyKeysDeps,
+  tail: (path: string) => Record<string, unknown>[],
+): Promise<{ ok: true; left?: true } | { ok: false; reason: AgyQuestionFailure }> {
+  const items = answer.question.items
+  const settle = deps.screenSettleMs ?? SCREEN_SETTLE_MS
+  const look = deps.readScreen ?? ((p: string) => readAgyScreen(p))
+  const line = await (deps.openKeyLine ?? openKeyLine)(pane.socketPath)
+  if (!line) return { ok: false, reason: 'unreachable' }
+  let typed = 0
+  /** a key, only while the same question is up (and the slow probes when `slow`) */
+  const press = async (bytes: string, slow = false): Promise<void> => {
+    // ★ The slow probes (a Mac's `lsof`) made just before, without blocking (codex review: a synchronous probe held the
+    //   whole agent — and the phone's 6 s deadline — for seconds)
+    const now = slow ? await probedChecks(deps, tail, mark.pid) : checks
+    const ok = await line.write(bytes, () => !sameQuestionNow(target, mark, now, slow))
+    if (!ok) throw new Stop(typed > 0 ? 'partial' : 'changed')
+    typed++
+  }
+  const screen = async (): Promise<string> => {
+    const s = await look(pane.socketPath)
+    if (s === undefined) throw new Stop(typed > 0 ? 'partial' : 'changed')
+    return s
+  }
+  /** Waits for the screen to show what `want` accepts */
+  const until = async <T>(want: (s: string) => T | undefined): Promise<T> => {
+    const end = Date.now() + settle
+    for (;;) {
+      const got = want(await screen())
+      if (got !== undefined) return got
+      if (Date.now() >= end) throw new Stop(typed > 0 ? 'partial' : 'changed')
+      await new Promise((r) => setTimeout(r, SCREEN_POLL_MS))
+    }
+  }
+  /** ★ A key only where the footer says what it does (a changed meaning ⇒ nothing typed / codex review) */
+  const need = (d: ScreenDialog, ...any: FooterHint[]): void => {
+    if (!any.some((h) => d.hints.has(h))) throw new Stop(typed > 0 ? 'partial' : 'changed')
+  }
+  /** The other questions asked now (`otherQuestions`): a question cut short on the screen must not fit one of them */
+  let otherTexts: string[] = []
+  /** The dialog of question `i`, as the card showed it (text, options and the write-in row) */
+  const dialogOf = (i: number) => (s: string): ScreenDialog | undefined => {
+    const d = parseDialog(s)
+    const it = items[i]!
+    if (!d || d.of !== items.length || d.k !== i + 1 || !dialogFits(d, it)) return undefined
+    if (otherTexts.some((o) => sameQuestionText(d.question, o))) return undefined
+    // ★★ The dialog is in this question's view: the child's (its id in the header) or the parent's (no header) —
+    //    a twin nobody could read cannot take the answer (codex review)
+    const owner = viewOwnerOf(s)
+    if (mark.child !== undefined ? typeof owner !== 'object' || owner.child !== mark.child.toLowerCase() : owner !== 'parent') return undefined
+    return d
+  }
+  /** Any dialog of this batch is open (which question of it) */
+  const batchAt = (s: string): number | undefined => {
+    const d = parseDialog(s)
+    if (!d || d.of !== items.length || d.k < 1 || d.k > items.length) return undefined
+    return dialogOf(d.k - 1)(s) ? d.k - 1 : undefined
+  }
+  const moveTo = async (i: number, to: number): Promise<ScreenDialog> => {
+    let d = await until(dialogOf(i))
+    const at = d.options.findIndex((o) => o.cursor)
+    if (at < 0) throw new Stop(typed > 0 ? 'partial' : 'changed')
+    if (to !== at) need(d, '↑/↓ Navigate')
+    // ★ One step at a time, each seen on the screen before the next (codex review: a burst of arrows went on after the
+    //   dialog could no longer be read)
+    const step = to > at ? 1 : -1
+    for (let n = at; n !== to; n += step) {
+      await press(step > 0 ? SCREEN_KEYS.down : SCREEN_KEYS.up)
+      const next = n + step
+      d = await until((s) => {
+        const x = dialogOf(i)(s)
+        return x && x.options[next]?.cursor ? x : undefined
+      })
+    }
+    return d
+  }
+  const writeNote = async (i: number, note: string, last: boolean): Promise<void> => {
+    const it = items[i]!
+    const row = await moveTo(i, it.options.length)
+    // (Enter on the write-in row opens the field: "enter Write-in"; a multi-select's footer says "enter Submit" there)
+    need(row, 'enter Write-in', ...(it.multi ? (['enter Submit', 'enter Submit All'] as const) : []))
+    await press(SCREEN_KEYS.enter)
+    const opened = await until((s) => {
+      const d = dialogOf(i)(s)
+      return d?.writing ? d : undefined
+    })
+    // ⚠️ agy keeps what was typed in the field before (the PC's draft, an earlier try whose Enter never came): the note
+    //    would be added to it (agy review). Only an earlier try of this note is gone on with (below); anything else stops.
+    const whole = (d: ScreenDialog): boolean => (d.writtenRows ?? 0) < FIELD_FULL_ROWS
+    const before = opened.writtenLines ?? []
+    const pieces = notePieces(note)
+    // ★ Text left in the field by an earlier try of this note (its Enter, or its later pieces, never came): when the
+    //   field shows it whole and it is this note up to one of its pieces, typing goes on from there (codex review: a
+    //   retry was refused for good). Anything else — the PC's draft — stops.
+    let from = 0
+    if (before.length > 0) {
+      if (!whole(opened)) throw new Stop(typed > 0 ? 'partial' : 'changed')
+      from = -1
+      for (let p = pieces.length; p >= 1 && from < 0; p--) if (fieldShows(before, noteText(pieces.slice(0, p).join('')), 'whole') !== undefined) from = p
+      if (from < 0) throw new Stop(typed > 0 ? 'partial' : 'changed')
+    }
+    let field = opened
+    if (from < pieces.length) {
+      // ★ Typed in pieces, each seen in the field before the next: a long note scrolls (the field shows its end), so
+      //   every character is checked while its piece is the end shown (codex review: a "ß" dropped above the visible
+      //   rows went unseen). A field with room shows the whole text, which must be what was typed exactly.
+      let sent = pieces.slice(0, from).join('')
+      for (const piece of pieces.slice(from)) {
+        await press(piece)
+        sent += piece
+        const so = noteText(sent)
+        const tail = noteText(piece).length
+        field = await until((s) => {
+          const d = dialogOf(i)(s)
+          if (!d?.writing) return undefined
+          const rows = d.writtenLines ?? []
+          if (whole(d)) return fieldShows(rows, so, 'whole') !== undefined ? d : undefined
+          const shown = fieldShows(rows, so, 'end')
+          return shown !== undefined && shown >= tail ? d : undefined
+        })
+      }
+    }
+    need(field, 'enter Submit', 'enter Submit All')
+    await press(SCREEN_KEYS.enter, last)
+  }
+  try {
+    // ★ No other question asked now has the same text (the screen tells questions apart by their text): checked here,
+    //   at the answer, not only when the card was raised (codex review: a sibling asked the same question meanwhile)
+    const others = otherQuestions(target, mark, deps, tail)
+    if (others === undefined || others.some((o) => items.some((x) => sameQuestionText(o, x.question)))) throw new Stop('changed')
+    otherTexts = others
+    // ★ A subagent's question: opened from the parent's banner with ctrl+k, unless its dialog is open already
+    let first = await screen()
+    if (batchAt(first) === undefined && inChildView(first) && parseDialog(first) === undefined) {
+      // ★★ The PC is on a subagent's view (an earlier answer left it there, or someone opened it) with nothing open in
+      //    it: ESC there only goes back to the parent's view (its footer says "esc back"; it stops nothing — measured),
+      //    then the parent's banner is read as below. This replaces taking the view back later: every way that record
+      //    got lost left the siblings' questions off the phone (codex / agy review, four rounds / user decision).
+      //    The parent is idle (`sameQuestionNow`), so the parent's view it lands on is never a working one.
+      // ⚠️ The slow probes first, then the screen again, then the key: the viewed child may open a question or an
+      //    approval meanwhile, and ESC would skip or decline it (codex / agy review). The viewed child must not be
+      //    asking either (its question queued, not yet drawn).
+      const now = await probedChecks(deps, tail, mark.pid)
+      const again = await screen()
+      const viewed = childViewOf(again)
+      if (!inChildView(again) || parseDialog(again) !== undefined || viewed === undefined) throw new Stop('changed')
+      const viewedT = transcriptPathOf(viewed, homeOf(target.transcript, target.conversationId) ?? deps.home)
+      // ⚠️ Any call pending there (a question, a command whose approval is about to be drawn — ESC would decline it), or
+      //    none readable: not left (codex / agy review). A long command there keeps the sibling's answer waiting.
+      const asking = (): boolean => agyPendingCall(viewedT, tail) !== null
+      const ok = await line.write(SCREEN_KEYS.esc, () => !sameQuestionNow(target, mark, now, true) || asking())
+      if (!ok) throw new Stop('changed')
+      typed++
+      // (the parent's view: its banner for a subagent's question, the dialog for its own)
+      first = await until((s) => (!inChildView(s) && viewOwnerOf(s) === 'parent' && (mark.child !== undefined ? parseBanner(s) : batchAt(s)) !== undefined ? s : undefined))
+    }
+    if (mark.child !== undefined && batchAt(first) === undefined) {
+      const banner = parseBanner(first)
+      if (banner === undefined || inChildView(first) || !sameQuestionText(banner, items[0]!.question) || otherTexts.some((o) => sameQuestionText(banner, o))) throw new Stop('changed')
+      await press(SCREEN_KEYS.open, true)
+      first = await until((s) => (batchAt(s) !== undefined ? s : undefined))
+    }
+    // ★ The batch from its first question: one the PC went further in is taken back with ← (an open write-in field is
+    //   left with ESC first: there it means "back", never "skip")
+    const found = batchAt(first)
+    if (found === undefined) throw new Stop('changed')
+    let at: number = found
+    if (dialogOf(at)(first)!.writing) {
+      const open = at
+      await press(SCREEN_KEYS.esc)
+      await until((s) => (dialogOf(open)(s) && !dialogOf(open)(s)!.writing ? true : undefined))
+    }
+    while (at > 0) {
+      need((await until(dialogOf(at)))!, '← Back')
+      await press(SCREEN_KEYS.left)
+      const back: number = at - 1
+      await until((s) => (dialogOf(back)(s) && !dialogOf(back)(s)!.writing ? true : undefined))
+      at = back
+    }
+    for (let i = 0; i < items.length; i++) {
+      const it = items[i]!
+      const last = i === items.length - 1
+      let d = await until(dialogOf(i))
+      if (d.writing) {
+        // (the footer says ESC goes back here: `parseDialog` reads no other)
+        await press(SCREEN_KEYS.esc)
+        d = await until((s) => {
+          const x = dialogOf(i)(s)
+          return x && !x.writing ? x : undefined
+        })
+      }
+      if (answer.kind === 'skip') {
+        // (ESC skips here: `parseDialog` reads a dialog without the field open only with the footer "esc Skip")
+        await press(SCREEN_KEYS.esc, last)
+      } else {
+        const p = answer.plan.items[i]!
+        if (!it.multi) {
+          if (p.note !== undefined) await writeNote(i, p.note, last)
+          else if (it.options.length + 1 <= 9) await press(String(p.indexes[0]! + 1), last)
+          else {
+            const on = await moveTo(i, p.indexes[0]!)
+            need(on, 'enter Select', 'enter Submit', 'enter Submit All')
+            await press(SCREEN_KEYS.enter, last)
+          }
+        } else {
+          // ★ Toggle only what differs from the screen (ticks the PC left are put right), then check them all
+          for (let j = 0; j < it.options.length; j++) {
+            const want = p.indexes.includes(j)
+            const now = await until(dialogOf(i))
+            if (now.options[j]!.checked === want) continue
+            // a digit toggles at once (and moves the cursor there); a long list is walked with the cursor
+            if (it.options.length + 1 <= 9) await press(String(j + 1))
+            else {
+              need(await moveTo(i, j), 'space Toggle')
+              await press(SCREEN_KEYS.space)
+            }
+            await until((s) => (dialogOf(i)(s)?.options[j]!.checked === want ? true : undefined))
+          }
+          const all = await until(dialogOf(i))
+          if (all.options.slice(0, it.options.length).some((o, j) => o.checked !== p.indexes.includes(j))) throw new Stop(typed > 0 ? 'partial' : 'changed')
+          if (p.note !== undefined) await writeNote(i, p.note, last)
+          else {
+            // ⚠️ Enter on the write-in row opens the field instead of submitting (codex review): off it first
+            const off = all.options[it.options.length]!.cursor ? await moveTo(i, 0) : all
+            if (last) need(off, 'enter Submit', 'enter Submit All')
+            else need(off, '→ Next')
+            await press(last ? SCREEN_KEYS.enter : SCREEN_KEYS.right, last)
+          }
+        }
+      }
+      // ★ The next question of the batch is up; after the last one, the dialog is gone (else it was not submitted)
+      // ⚠️ "gone" = no row of this batch's questions left at all (an unread footer must not read as gone / codex review)
+      if (!last) await until(dialogOf(i + 1))
+      else await until((s) => (showsQuestion(s, items.map((x) => x.question), items.length) ? undefined : true))
+    }
+    if (mark.child !== undefined) {
+      // ★ Back to the parent's view: only once the screen shows the child's view with no question open, the parent idle
+      //   with nothing up, its transcript unchanged (a new prompt typed on the PC) — else left on the child's view
+      const parentAt = statSync(target.transcript, { throwIfNoEntry: false })?.mtimeMs
+      const childTranscript = transcriptPathOf(mark.child, homeOf(target.transcript, target.conversationId) ?? deps.home)
+      // (and agy has recorded the answer: the child asks nothing now)
+      const ready = await until((s) => (childViewOf(s) === mark.child!.toLowerCase() && parseDialog(s) === undefined && agyPendingCall(childTranscript, tail) === null ? true : undefined)).catch(() => false)
+      let back = false
+      if (ready === true) {
+        back = await line.write(SCREEN_KEYS.esc, () => {
+          const f = readAgyPidFile(target.dir, mark.pid)
+          if (!f || f.state.conversationId !== target.conversationId || f.state.agentState !== 'idle' || f.state.confirmationPending) return true
+          if (parentAt === undefined || statSync(target.transcript, { throwIfNoEntry: false })?.mtimeMs !== parentAt) return true
+          return agyPendingCall(childTranscript, tail) !== null
+        })
+      }
+      // ★ Left on the child's view (the parent was busy): the next answer to a subagent's question goes back first
+      if (!back) return { ok: true, left: true }
+    }
+    return { ok: true }
+  } catch (err) {
+    if (err instanceof Stop) return { ok: false, reason: err.reason }
+    return { ok: false, reason: typed > 0 ? 'partial' : 'changed' }
+  } finally {
+    line.close()
+  }
+}
+
+/**
+ * ★ The texts of every other question asked now (the parent's own, the other subagents'), all of their batch: the
+ * screen tells dialogs apart by text only, so one sharing a text with this batch (any question of either) stops it, and
+ * a question cut short on the screen must not fit one of them. undefined = cannot be read.
+ */
+function otherQuestions(
+  target: Pick<AgyTarget, 'conversationId' | 'dir' | 'transcript'>,
+  mark: AgyQuestionMark,
+  deps: AgyKeysDeps,
+  tail: (path: string) => Record<string, unknown>[],
+): string[] | undefined {
+  const f = readAgyPidFile(target.dir, mark.pid)
+  if (!f) return undefined
+  const home = homeOf(target.transcript, target.conversationId) ?? deps.home
+  const calls: PendingCall[] = []
+  if (mark.child !== undefined) {
+    const own = turnEnd(tail(target.transcript)).pending
+    if (own?.name === AGY_QUESTION_TOOL) calls.push(own)
+  }
+  const kids = agyChildQuestions(f.state, target.conversationId, home, tail)
+  // ⚠️ A running child whose call could not be read may ask the same: not answered (codex / agy review)
+  if (f.state.subagentsActive && !kids.known) return undefined
+  for (const k of kids.asking) if (k.child !== mark.child) calls.push(k.call)
+  // ⚠️ Every question of every call, also one the phone does not take (`questionTextsOf`); one not readable stops it
+  const out: string[] = []
+  for (const c of calls) {
+    const texts = questionTextsOf(c)
+    if (texts === undefined) return undefined
+    out.push(...texts)
+  }
+  return out
+}
+

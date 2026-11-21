@@ -82,13 +82,13 @@ test('parse: what the list uses, and nothing from a file that is not ours', () =
 })
 
 test('status: a card is waiting; working kinds are working; idle after a turn is done, before any is idle', () => {
-  assert.equal(agyStatus({ agentState: 'tool_use', confirmationPending: true, busyAt: 1 }, false), 'waiting')
-  for (const st of ['working', 'tool_use', 'reviewing']) assert.equal(agyStatus({ agentState: st, confirmationPending: false, busyAt: 1 }, false), 'working')
-  assert.equal(agyStatus({ agentState: 'error', confirmationPending: false, busyAt: 0 }, false), 'error')
-  assert.equal(agyStatus({ agentState: 'idle', confirmationPending: false, busyAt: 1_800_000_000 }, false), 'done')
-  assert.equal(agyStatus({ agentState: 'idle', confirmationPending: false, busyAt: 0 }, false), 'idle')
-  assert.equal(agyStatus({ agentState: 'initializing', confirmationPending: false, busyAt: 0 }, false), 'idle')
-  assert.equal(agyStatus({ confirmationPending: false, busyAt: 0 }, false), 'idle')
+  assert.equal(agyStatus({ agentState: 'tool_use', confirmationPending: true, busyAt: 1, subagentsActive: false }, false, false), 'waiting')
+  for (const st of ['working', 'tool_use', 'reviewing']) assert.equal(agyStatus({ agentState: st, confirmationPending: false, busyAt: 1, subagentsActive: false }, false, false), 'working')
+  assert.equal(agyStatus({ agentState: 'error', confirmationPending: false, busyAt: 0, subagentsActive: false }, false, false), 'error')
+  assert.equal(agyStatus({ agentState: 'idle', confirmationPending: false, busyAt: 1_800_000_000, subagentsActive: false }, false, false), 'done')
+  assert.equal(agyStatus({ agentState: 'idle', confirmationPending: false, busyAt: 0, subagentsActive: false }, false, false), 'idle')
+  assert.equal(agyStatus({ agentState: 'initializing', confirmationPending: false, busyAt: 0, subagentsActive: false }, false, false), 'idle')
+  assert.equal(agyStatus({ confirmationPending: false, busyAt: 0, subagentsActive: false }, false, false), 'idle')
 })
 
 test('★★ asking (ask_question / docs/AGY.md §11): only `tool_use`, no card, the pending call is the question, written before the state and not after', (t) => {
@@ -110,8 +110,11 @@ test('★★ asking (ask_question / docs/AGY.md §11): only `tool_use`, no card,
   const tu = { agentState: 'tool_use', confirmationPending: false }
   write(rec([{ name: 'ask_question' }]), at + 5000)
   assert.equal(agyAsking(tu, at + 5250, path), true)
-  assert.equal(agyStatus({ ...tu, busyAt: 1 }, true), 'waiting')
-  const row = agyRow(parseAgyFile({ nyanPid: 4242, input: input(A, { agent_state: 'tool_use' }) }, A)!, { machine: 'pc-a', transcriptBytes: 1, lastActivity: 'x', asking: true })
+  assert.equal(agyStatus({ ...tu, busyAt: 1, subagentsActive: false }, true, false), 'waiting')
+  // ★ a child still running: the conversation is at work though the parent waits (no "done" while it runs)
+  assert.equal(agyStatus({ agentState: 'idle', confirmationPending: false, busyAt: 1, subagentsActive: true }, false, false), 'working')
+  assert.equal(agyStatus({ agentState: 'idle', confirmationPending: false, busyAt: 1, subagentsActive: true }, true, false), 'waiting')
+  const row = agyRow(parseAgyFile({ nyanPid: 4242, input: input(A, { agent_state: 'tool_use' }) }, A)!, { machine: 'pc-a', transcriptBytes: 1, lastActivity: 'x', asking: true, outlived: false })
   assert.equal(row.status, 'waiting')
   assert.equal(row.waitingFor, 'input needed')
   // not while working, nor with a card (that is an approval), nor for another tool
@@ -163,7 +166,7 @@ test('★ subagents (docs/AGY.md §11): any child not known to be over counts as
 
 test('row: tool agy, its own id and account, the mode as the permission chip, waitingFor while a card is up', () => {
   const s = parseAgyFile({ nyanPid: 4242, nyanBusyAt: 5, input: input(A, { tool_confirmation_pending: true, agent_state: 'tool_use', cycle_mode: 'accept-edits' }) }, A)!
-  const row = agyRow(s, { machine: 'pc-a', transcriptBytes: 10, lastActivity: '2026-11-19T12:00:00.000Z', promptTitle: 'Fix the test', asking: false })
+  const row = agyRow(s, { machine: 'pc-a', transcriptBytes: 10, lastActivity: '2026-11-19T12:00:00.000Z', promptTitle: 'Fix the test', asking: false, outlived: false })
   assert.equal(row.tool, 'agy')
   assert.equal(row.sessionId, `agy-${A}`)
   assert.equal(row.account, 'agy')
@@ -176,9 +179,9 @@ test('row: tool agy, its own id and account, the mode as the permission chip, wa
   assert.equal(row.live, true)
   // ⚠️ never the e-mail, the plan or the status line's wrong transcript path
   assert.doesNotMatch(JSON.stringify(row), /example\.com|Google AI Pro|transcript\.jsonl/)
-  const titled = agyRow({ ...s, title: 'Named' }, { machine: 'pc-a', transcriptBytes: 0, lastActivity: 'x', asking: false })
+  const titled = agyRow({ ...s, title: 'Named' }, { machine: 'pc-a', transcriptBytes: 0, lastActivity: 'x', asking: false, outlived: false })
   assert.equal(titled.titleSource, 'ai')
-  assert.equal(agyRow(s, { machine: 'pc-a', transcriptBytes: 0, lastActivity: 'x', asking: false }).titleSource, 'fallback')
+  assert.equal(agyRow(s, { machine: 'pc-a', transcriptBytes: 0, lastActivity: 'x', asking: false, outlived: false }).titleSource, 'fallback')
 })
 
 test('title: the first request without agy’s wrappers; a cut head gives none', () => {

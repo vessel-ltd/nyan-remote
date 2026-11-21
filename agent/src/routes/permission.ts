@@ -58,7 +58,8 @@ import { announceToLeader } from '../teamHooks.ts'
 import { membershipOf } from '../team.ts'
 import { hasHidden } from '../../../shared/reveal.ts'
 import { isCodexSessionId } from '../codex/daemon.ts'
-import { agyDelivery, agyDeliveryMessage } from '../agy/cards.ts'
+import { agyDelivery, agyDeliveryMessage, AGY_DELIVERY_WAIT_MS } from '../agy/cards.ts'
+import { buildAgySteps } from '../agy/questions.ts'
 import { AGY_PREFIX } from '../agy/sessions.ts'
 import { resolveAgentTranscript } from '../claude/subagentTranscript.ts'
 import { parseTranscriptPath } from './hook.ts'
@@ -310,10 +311,21 @@ export interface AnswerBody {
   feedback?: string
   /** ★ Question text → a note (Codex questions only). ⚠️ Text for the model; the answer is built here (`questions.ts`) */
   notes?: Record<string, string>
+  /** ★ "Skip" for an agy question (docs/AGY.md §13): a deny there needs it (an older PWA's button said "deny and stop") */
+  skip?: boolean
+}
+
+export { AGY_DELIVERY_WAIT_MS }
+
+/** The outcome, or 'slow' when it takes longer than `ms` (the outcome is then left to come on its own) */
+export function settledWithin<T>(p: Promise<T>, ms: number): Promise<T | 'slow'> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const slow = new Promise<'slow'>((r) => (timer = setTimeout(() => r('slow'), ms)))
+  return Promise.race([p, slow]).finally(() => clearTimeout(timer))
 }
 
 /** The reply from the phone */
-export async function permissionAnswer(ctx: Ctx): Promise<{ ok: boolean; reason?: string; at?: string }> {
+export async function permissionAnswer(ctx: Ctx, agyWaitMs = AGY_DELIVERY_WAIT_MS): Promise<{ ok: boolean; reason?: string; at?: string }> {
   const body = await readJsonBody<AnswerBody>(ctx.req)
   // ★ An agy card is answered by typing a key (`agy/cards.ts`): its outcome is known only after the key went out,
   //   so the phone waits for it (a key that never reached agy must not read as answered / codex review).
@@ -321,7 +333,12 @@ export async function permissionAnswer(ctx: Ctx): Promise<{ ok: boolean; reason?
   const delivery = typeof body.key === 'string' ? agyDelivery(body.key) : undefined
   const r = answerPermission(body, actorOf(ctx.identity))
   if (!r.ok || !delivery) return r
-  const d = await delivery
+  // ★ The outcome is told when the typing ends within `AGY_DELIVERY_WAIT_MS` (most do). ⚠️ Not longer: a relay line runs
+  //    its requests one at a time, so a longer wait held the phone's next request (an instruction to Claude) past its
+  //    own 10 s timeout — shown as failed, then run (codex review). Past it the answer is told as taken (the typing goes
+  //    on; a question it could not finish rings "needs you" again).
+  const d = await settledWithin(delivery, agyWaitMs)
+  if (d === 'slow') return r
   if (d && !d.ok) return { ok: false, reason: agyDeliveryMessage(d.reason) }
   // ★ When it took effect, by this agent's clock (the phone closes the notifications shown before it)
   return d ? { ...r, at: new Date().toISOString() } : r
@@ -360,11 +377,28 @@ export function answerPermission(
   //    **if it cannot be built here, do not send the allow** (refusing is better than being silently dropped).
   let updatedInput: Record<string, unknown> | undefined
   const codexQuestion = target?.tool === 'codex' && target.interaction?.kind === 'question'
-  // ⚠️ Notes go to Codex questions only (Claude's questions have nowhere to put them: refuse rather than drop)
-  if (body.notes !== undefined && target && !codexQuestion) {
+  // ★ An agy question (docs/AGY.md §13): answered with keys the agent builds from the question it read
+  const agyQuestion = target?.tool === 'agy' && target.interaction?.kind === 'question'
+  // ⚠️ Notes go to Codex and agy questions only (Claude's questions have nowhere to put them: refuse rather than drop)
+  if (body.notes !== undefined && target && !codexQuestion && !agyQuestion) {
     return { ok: false, reason: t('この質問には書き足せません', 'A note cannot be added to this question.') }
   }
-  if (codexQuestion) {
+  if (agyQuestion) {
+    // ⚠️ Never keys from the phone: built here from its labels and notes (`agy/questions.ts` rule 1).
+    //    Deny = skip the questions (ESC per question, built where it is typed)
+    if (behavior === 'allow') {
+      const built = buildAgySteps(found?.meta?.toolInput, body.answers, body.notes)
+      if (!built.ok) return { ok: false, reason: built.message }
+      // ★ Both: the choices (typed against the screen) and, when they fit the digits, the fixed keys (a blind relay)
+      updatedInput = { plan: built.plan, ...(built.steps ? { steps: built.steps } : {}) }
+    } else if (body.skip !== true) {
+      // ⚠️ An older PWA shows "deny and stop" here, but ESC on a question skips it and the turn goes on
+      return {
+        ok: false,
+        reason: t('アプリを開き直して更新してください（質問は「飛ばす」で答えます）。', 'Reopen the app to update it (a question is skipped with "Skip").'),
+      }
+    }
+  } else if (codexQuestion) {
     // ★ Built from the request the agent holds (the ids never left the agent). Deny = stop the turn that asks.
     if (behavior === 'allow') {
       const built = buildCodexAnswers(found?.meta?.toolInput, body.answers, body.notes)

@@ -967,6 +967,133 @@ export function writeControl(
 }
 
 /**
+ * ★ One connection kept open to type keys one at a time, each after its own last check (agy answers read the screen
+ * between keys / docs/AGY.md §14). Like `writeSequence`: the relay takes or loses the connection whole.
+ */
+export interface KeyLine {
+  /** Writes `bytes` unless `refuse()` says no right before; false = refused or the line is broken */
+  write(bytes: string, refuse?: () => boolean): Promise<boolean>
+  close(): void
+}
+
+export function openKeyLine(socketPath: string): Promise<KeyLine | undefined> {
+  return new Promise((resolve) => {
+    const sock = connect(socketPath)
+    let broken = false
+    const timer = setTimeout(() => {
+      sock.destroy()
+      resolve(undefined)
+    }, CONNECT_TIMEOUT_MS)
+    sock.on('error', () => {
+      broken = true
+      clearTimeout(timer)
+      resolve(undefined)
+    })
+    sock.on('close', () => (broken = true))
+    sock.on('connect', () => {
+      clearTimeout(timer)
+      resolve({
+        write(bytes, refuse) {
+          if (broken) return Promise.resolve(false)
+          try {
+            if (refuse?.() === true) return Promise.resolve(false)
+          } catch {
+            return Promise.resolve(false)
+          }
+          return new Promise((r) => sock.write(bytes, (err) => r(!err && !broken)))
+        },
+        close() {
+          sock.end()
+        },
+      })
+    })
+  })
+}
+
+/** One key of `writeSequence` */
+export interface SequenceChunk {
+  bytes: string
+  /** Wait this long before it (after the previous one went out) */
+  pauseMs: number
+  /** Asked right before it is written: true = refuse */
+  beforeWrite?: () => boolean
+  /** ★ A refused optional key is left out and the rest goes on (the sequence still counts as done) */
+  optional?: boolean
+  /** ★ While refused, asked again every 100 ms for up to this long before giving up (0 / absent: asked once) */
+  waitMs?: number
+}
+
+export type SequenceResult =
+  | { ok: true }
+  /** `written`: how many keys went out before it stopped (0 = not a byte) */
+  | { ok: false; reason: 'refused' | 'unreachable'; written: number }
+
+/**
+ * ★★ Several keys through **one** connection, each after its own pause and its own last check (agy question answers /
+ * docs/AGY.md §13). ⚠️ One connection, not one per key: the relay takes or loses a connection whole, so a later key can
+ * never land without an earlier one (codex review: a lost ctrl+k would have let a written answer and its Enter reach
+ * agy's prompt as a new message).
+ */
+export function writeSequence(socketPath: string, chunks: readonly SequenceChunk[]): Promise<SequenceResult> {
+  return new Promise((resolve) => {
+    let done = false
+    let written = 0
+    let timer: NodeJS.Timeout | undefined
+    const finish = (r: SequenceResult): void => {
+      if (done) return
+      done = true
+      if (timer) clearTimeout(timer)
+      resolve(r)
+    }
+    const sock = connect(socketPath)
+    timer = setTimeout(() => {
+      sock.destroy()
+      finish({ ok: false, reason: 'unreachable', written })
+    }, CONNECT_TIMEOUT_MS)
+    sock.on('error', () => {
+      sock.destroy()
+      finish({ ok: false, reason: 'unreachable', written })
+    })
+    sock.on('connect', () => {
+      if (timer) clearTimeout(timer)
+      void (async () => {
+        // ⚠️ A check that throws (a file read failing) ends the sequence as refused: never an unhandled rejection (it
+        //    would end the agent / codex review)
+        try {
+        for (const c of chunks) {
+          if (c.pauseMs > 0) await new Promise((r) => setTimeout(r, c.pauseMs))
+          if (done) return
+          if (c.waitMs) {
+            // ⚠️ By the clock, not by counting sleeps (a slow check stretched the wait / codex review)
+            const until = Date.now() + c.waitMs
+            while (Date.now() < until && !done && c.beforeWrite?.() === true) await new Promise((r) => setTimeout(r, 100))
+          }
+          if (done) return
+          if (c.beforeWrite?.() === true) {
+            if (c.optional) continue
+            finish({ ok: false, reason: 'refused', written })
+            sock.end()
+            return
+          }
+          const ok = await new Promise<boolean>((r) => sock.write(c.bytes, (err) => r(!err)))
+          if (!ok || done) {
+            finish({ ok: false, reason: 'unreachable', written })
+            return
+          }
+          written++
+        }
+        sock.end()
+        finish({ ok: true })
+        } catch {
+          finish({ ok: false, reason: 'refused', written })
+          sock.destroy()
+        }
+      })()
+    })
+  })
+}
+
+/**
  * ★★ Send "stop" once. **Even on failure it is not dropped into the inbox** (the caller has no such path either).
  *
  * ⚠️⚠️ Dropping it would put "please stop" **into the conversation as an instruction** (it does not stop, and pollutes the context).

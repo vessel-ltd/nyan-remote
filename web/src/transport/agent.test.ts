@@ -102,7 +102,7 @@ test('★★ pins down entirely which endpoint, which method and what body are s
     { method: 'POST', path: '/sessions/S%201%2F2/command', body: { id: 'compact' } },
     // ⚠️⚠️ Auto-approve sends **only a boolean** (the duration is decided by the agent)
     { method: 'POST', path: '/sessions/S%201%2F2/auto-approve', body: { on: true } },
-    // ⚠️⚠️ The approval answer has no `updatedInput` (only the chosen label)
+    // ⚠️⚠️ The approval answer has no `updatedInput` (only the chosen label); ⚠️ the usual wait (docs/AGY.md §14)
     { method: 'POST', path: '/permission/answer', body: { key: 'K', behavior: 'allow' } },
     { method: 'POST', path: '/devices/revoke', body: { key: 'KEY' } },
     { method: 'POST', path: '/handshake', body: { init: 'INIT' } },

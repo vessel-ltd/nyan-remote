@@ -42,7 +42,10 @@ import fcntl
 import json
 import os
 import pty
+import codecs
+import re
 import select
+import unicodedata
 import signal
 import socket
 import subprocess
@@ -239,6 +242,336 @@ class PasteWatch:
         return True
 
 
+class Screen:
+    """★★ What the child shows, rebuilt from its output (2026-11-21 / docs/AGY.md §14) — for agy only.
+
+    The agent asks for it before typing an answer into an agy question (`SCREEN_REQUEST`): which question is open, how far
+    a batch went, which options are ticked, where the cursor is, a subagent's banner, a subagent's view. Without it those
+    were guessed from files, and every guess had a case where keys went to the wrong dialog.
+    agy draws inline (measured on 1.5.13): text, CR/LF, cursor up/down/left/right, erase in line / display, erase and
+    delete characters, repeat the last character, reverse index; colours and mode switches are ignored. A sequence not
+    known is skipped (the screen can only be less complete, never invented).
+    ⚠️ Only the visible rows are kept (no scrollback); nothing of it is written anywhere or sent but to the agent's
+       question over the 0600 socket (same user).
+    """
+
+    def __init__(self, rows: int, cols: int) -> None:
+        self.broken = False
+        self.rows = max(1, rows)
+        self.cols = max(1, cols)
+        self.grid = [[" "] * self.cols for _ in range(self.rows)]
+        self.x = 0
+        self.y = 0
+        self.saved = (0, 0)
+        self.last = " "
+        self.pending_wrap = False
+        self.autowrap = True
+        # the scroll region (`ESC[top;bottom r`), rows inclusive
+        self.top = 0
+        self.bottom = self.rows - 1
+        # ★ The main screen while the alternate one is shown (agy draws a subagent's view there: `ESC[?1049h` … `l`)
+        self.main: tuple | None = None
+        self._dec = codecs.getincrementaldecoder("utf-8")("replace")
+        self._esc = ""  # an escape sequence cut across two reads
+
+    def resize(self, rows: int, cols: int) -> None:
+        rows, cols = max(1, rows), max(1, cols)
+        grid = [[" "] * cols for _ in range(rows)]
+        # keep the bottom rows (agy draws at the bottom)
+        off = max(0, self.rows - rows)
+        for r in range(min(rows, self.rows)):
+            src = self.grid[r + off]
+            for c in range(min(cols, self.cols)):
+                grid[r][c] = src[c]
+        self.grid, self.rows, self.cols = grid, rows, cols
+        self.top, self.bottom = 0, rows - 1
+        self.y = min(max(0, self.y - off), rows - 1)
+        self.x = min(self.x, cols - 1)
+        self.pending_wrap = False
+
+    def text(self) -> str:
+        if self.broken:
+            return ""
+        return "\n".join("".join(ch for ch in row if ch is not None).rstrip() for row in self.grid)
+
+    def safe_feed(self, data: bytes) -> None:
+        """★ `feed` that never raises (the relay is in the user's daily path): anything unexpected leaves the screen
+        unreadable (an empty answer: the agent then types nothing), never the session broken"""
+        if self.broken:
+            return
+        try:
+            self.feed(data)
+        except Exception as e:  # noqa: BLE001
+            self.broken = True
+            log(_t(f"画面の組み立てをやめた: {type(e).__name__}", f"stopped rebuilding the screen: {type(e).__name__}"))
+
+    def safe_resize(self, rows: int, cols: int) -> None:
+        if self.broken:
+            return
+        try:
+            self.resize(rows, cols)
+        except Exception as e:  # noqa: BLE001
+            self.broken = True
+            log(_t(f"画面の組み立てをやめた: {type(e).__name__}", f"stopped rebuilding the screen: {type(e).__name__}"))
+
+    # --- drawing ---
+    def _scroll_up(self) -> None:
+        self.grid.pop(self.top)
+        self.grid.insert(self.bottom, [" "] * self.cols)
+
+    def _scroll_down(self) -> None:
+        self.grid.pop(self.bottom)
+        self.grid.insert(self.top, [" "] * self.cols)
+
+    def _linefeed(self) -> None:
+        if self.y == self.bottom:
+            self._scroll_up()
+        elif self.y < self.rows - 1:
+            self.y += 1
+
+    def _put(self, ch: str) -> None:
+        # ★ Zero-width characters (combining accents, variation selectors, joiners) belong to the character before them
+        #   (codex review: "Café" written with a combining accent read as "Cafe" and no label matched)
+        if unicodedata.category(ch) in ("Mn", "Me", "Cf") and ch != "\u00ad":
+            row = self.grid[self.y]
+            c = self.x if self.pending_wrap else self.x - 1
+            if c > 0 and row[c] is None:
+                c -= 1
+            if 0 <= c < self.cols and row[c] is not None:
+                row[c] += ch
+            return
+        w = 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+        if w > self.cols:
+            return
+        if self.pending_wrap or self.x + w > self.cols:
+            if not self.autowrap:
+                self.pending_wrap = False
+                self.x = max(0, self.cols - w)
+            else:
+                self.x = 0
+                self._linefeed()
+                self.pending_wrap = False
+        row = self.grid[self.y]
+        # a wide character half overwritten leaves a blank, not half a glyph
+        if row[self.x] is None and self.x > 0:
+            row[self.x - 1] = " "
+        row[self.x] = ch
+        if w == 2:
+            row[self.x + 1] = None
+        self.x += w
+        self.last = ch
+        if self.x >= self.cols:
+            self.x = self.cols - 1
+            self.pending_wrap = True
+
+    def _erase(self, y: int, x0: int, x1: int) -> None:
+        row = self.grid[y]
+        for c in range(max(0, x0), min(self.cols, x1)):
+            row[c] = " "
+
+    def _private(self, params: str, final: str) -> None:
+        if final not in ("h", "l"):
+            return
+        for p in params[1:].split(";"):
+            if p in ("1049", "1047", "47"):
+                on = final == "h"
+                self.top, self.bottom = 0, self.rows - 1
+                if on and self.main is None:
+                    self.main = (self.grid, self.x, self.y, self.saved)
+                    self.grid = [[" "] * self.cols for _ in range(self.rows)]
+                    self.x = self.y = 0
+                elif not on and self.main is not None:
+                    grid, x, y, saved = self.main
+                    self.main = None
+                    # (the main screen kept its own size; fitted to the current one)
+                    self.grid = [(row + [" "] * self.cols)[: self.cols] for row in grid[-self.rows :]]
+                    while len(self.grid) < self.rows:
+                        self.grid.insert(0, [" "] * self.cols)
+                    self.x, self.y, self.saved = min(x, self.cols - 1), min(y, self.rows - 1), saved
+                self.pending_wrap = False
+            elif p == "7":
+                self.autowrap = final == "h"
+
+    def _csi(self, params: str, final: str) -> None:
+        if params[:1] == "?":
+            self._private(params, final)
+            return
+        if params[:1] in (">", "<", "="):
+            return  # keyboard and other private settings: nothing drawn
+        parts = [p for p in params.split(";")]
+        nums = []
+        for p in parts:
+            try:
+                nums.append(int(p) if p else 0)
+            except ValueError:
+                return
+        n = nums[0] if nums and nums[0] > 0 else 1
+        # ⚠️ Colors and styles (SGR) keep a pending wrap, as terminals do (agy review: a color change at the right edge
+        #    dropped the last column's character)
+        if final == "m":
+            return
+        self.pending_wrap = False
+        if final == "A":
+            self.y = max(0, self.y - n)
+        elif final == "B":
+            self.y = min(self.rows - 1, self.y + n)
+        elif final == "C":
+            self.x = min(self.cols - 1, self.x + n)
+        elif final == "D":
+            self.x = max(0, self.x - n)
+        elif final in ("G", "`"):
+            self.x = min(self.cols - 1, n - 1)
+        elif final == "a":
+            self.x = min(self.cols - 1, self.x + n)
+        elif final == "e":
+            self.y = min(self.rows - 1, self.y + n)
+        elif final == "E":
+            self.x = 0
+            self.y = min(self.rows - 1, self.y + n)
+        elif final == "F":
+            self.x = 0
+            self.y = max(0, self.y - n)
+        elif final == "d":
+            self.y = min(self.rows - 1, n - 1)
+        elif final in ("H", "f"):
+            row = nums[0] if nums and nums[0] > 0 else 1
+            col = nums[1] if len(nums) > 1 and nums[1] > 0 else 1
+            self.y = min(self.rows - 1, row - 1)
+            self.x = min(self.cols - 1, col - 1)
+        elif final == "K":
+            mode = nums[0] if nums else 0
+            if mode == 0:
+                self._erase(self.y, self.x, self.cols)
+            elif mode == 1:
+                self._erase(self.y, 0, self.x + 1)
+            else:
+                self._erase(self.y, 0, self.cols)
+        elif final == "J":
+            mode = nums[0] if nums else 0
+            if mode == 0:
+                self._erase(self.y, self.x, self.cols)
+                for r in range(self.y + 1, self.rows):
+                    self._erase(r, 0, self.cols)
+            elif mode == 1:
+                for r in range(0, self.y):
+                    self._erase(r, 0, self.cols)
+                self._erase(self.y, 0, self.x + 1)
+            else:
+                for r in range(self.rows):
+                    self._erase(r, 0, self.cols)
+        elif final == "X":
+            self._erase(self.y, self.x, self.x + n)
+        elif final == "P":
+            row = self.grid[self.y]
+            del row[self.x:self.x + n]
+            row.extend([" "] * (self.cols - len(row)))
+        elif final == "@":
+            row = self.grid[self.y]
+            # (bounded: a huge count must not stall the relay)
+            row[self.x:self.x] = [" "] * min(n, self.cols)
+            del row[self.cols:]
+        elif final == "b":
+            for _ in range(min(n, self.cols * self.rows)):
+                self._put(self.last)
+        elif final == "L":
+            if self.top <= self.y <= self.bottom:
+                for _ in range(min(n, self.rows)):
+                    self.grid.pop(self.bottom)
+                    self.grid.insert(self.y, [" "] * self.cols)
+        elif final == "M":
+            if self.top <= self.y <= self.bottom:
+                for _ in range(min(n, self.rows)):
+                    self.grid.pop(self.y)
+                    self.grid.insert(self.bottom, [" "] * self.cols)
+        elif final == "S":
+            for _ in range(min(n, self.rows)):
+                self._scroll_up()
+        elif final == "T":
+            for _ in range(min(n, self.rows)):
+                self._scroll_down()
+        elif final == "r":
+            top = nums[0] if nums and nums[0] > 0 else 1
+            bottom = nums[1] if len(nums) > 1 and nums[1] > 0 else self.rows
+            if 1 <= top < bottom <= self.rows:
+                self.top, self.bottom = top - 1, bottom - 1
+            else:
+                self.top, self.bottom = 0, self.rows - 1
+            self.x = self.y = 0
+        # anything else (colours `m`, cursor style ` q`, …): nothing drawn
+
+    _SEQ = re.compile(
+        r"\x1b\[([0-9;:?<>=]*)[ -/]*([@-~])"  # CSI (":" sub-parameters, as in colors)
+        r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"  # OSC
+        r"|\x1b[PX^_][^\x1b]*\x1b\\"  # DCS / SOS / PM / APC
+        r"|\x1b[()*+][0-9A-Za-z]"  # character sets
+        r"|\x1b([0-9A-Za-z=><~}|])"  # two-byte escapes
+    )
+    # an escape sequence that may still be cut at the end of a read
+    _OPEN = re.compile(r"\x1b(?:\[[0-9;:?<>= -/]*|\][^\x07\x1b]*\x1b?|[PX^_][^\x1b]*\x1b?|[()*+])?$")
+
+    def feed(self, data: bytes) -> None:
+        s = self._esc + self._dec.decode(data)
+        self._esc = ""
+        m = self._OPEN.search(s)
+        if m and m.start() < len(s) and len(s) - m.start() < 4096:
+            self._esc = s[m.start():]
+            s = s[:m.start()]
+        pos = 0
+        for m in self._SEQ.finditer(s):
+            self._text(s[pos:m.start()])
+            pos = m.end()
+            if m.group(2) is not None:
+                self._csi(m.group(1) or "", m.group(2))
+            elif m.group(3) is not None:
+                c = m.group(3)
+                if c == "M":
+                    self.pending_wrap = False
+                    if self.y == self.top:
+                        self._scroll_down()
+                    elif self.y > 0:
+                        self.y -= 1
+                elif c == "7":
+                    self.saved = (self.x, self.y)
+                elif c == "8":
+                    self.x = min(max(0, self.saved[0]), self.cols - 1)
+                    self.y = min(max(0, self.saved[1]), self.rows - 1)
+                    self.pending_wrap = False
+                elif c == "D":
+                    self._linefeed()
+                elif c == "E":
+                    self.x = 0
+                    self._linefeed()
+                elif c == "c":
+                    self.__init__(self.rows, self.cols)
+        self._text(s[pos:])
+
+    def _text(self, t: str) -> None:
+        for ch in t:
+            if ch == "\r":
+                self.x = 0
+                self.pending_wrap = False
+            elif ch == "\n":
+                self.pending_wrap = False
+                self._linefeed()
+            elif ch == "\b":
+                self.pending_wrap = False
+                self.x = max(0, self.x - 1)
+            elif ch == "\t":
+                self.x = min(self.cols - 1, (self.x // 8 + 1) * 8)
+            elif ch == "\x1b" or ord(ch) < 0x20 or ord(ch) == 0x7F:
+                continue
+            else:
+                self._put(ch)
+
+
+# ★ The first byte of a connection that asks for the screen (`Screen`, agy only / docs/AGY.md §14): answered with the
+#   screen's text, then closed. Never typed. A control character no keystroke connection starts with (the agent drops
+#   control characters from text; its fixed keys are ESC, Ctrl-U, Ctrl-K, digits, arrows and Enter).
+SCREEN_REQUEST = b"\x02"
+# ★ How long after a resize the screen is not answered (agy redraws for it): an empty reply = not readable now
+SCREEN_RESIZE_QUIET_S = 1.0
+
+
 # ★ The first byte of a keystroke connection that carries a paste (`pasteRequest` in agent/src/claude/keys.ts).
 #   A NUL never starts an ordinary keystroke connection (the agent drops control characters from text; the stop and
 #   clear keys are ESC and Ctrl-U), so the relay knows from one byte, however the stream is split (codex review).
@@ -248,7 +581,7 @@ PASTE_END = b"\x1b[201~"
 MAX_HELD = 1024 * 1024
 
 
-def gate_chunk(state, chunk: bytes):
+def gate_chunk(state, chunk: bytes, screen_on: bool = False):
     """★★ How a keystroke connection's bytes go on (2026-11-17 / codex review rounds 1–2).
 
     A connection whose first byte is `PASTE_REQUEST` carries a long text framed as a bracketed paste (`ESC[200~ … ESC[201~`).
@@ -262,7 +595,11 @@ def gate_chunk(state, chunk: bytes):
     if state is None:
         if chunk[:1] == PASTE_REQUEST:
             return "held", b"", chunk[1:]
+        if chunk[:1] == SCREEN_REQUEST and screen_on:
+            return "screen", b"", b""
         return "pass", chunk, b""
+    if state == "screen":
+        return "screen", b"", b""
     if state == "held":
         return "held", b"", chunk
     if state == "pass":
@@ -335,8 +672,9 @@ def note_paste(reg_path: str | None, mode: bool) -> bool:
         return False
 
 
-def register(child_pid: int, sock_path: str) -> str | None:
-    """Register ourselves. ⚠️ Temp file → rename (never let a half-written file be read / §8.3)."""
+def register(child_pid: int, sock_path: str, screen: bool = False) -> str | None:
+    """Register ourselves. ⚠️ Temp file → rename (never let a half-written file be read / §8.3).
+    ★ `screen`: this relay answers `SCREEN_REQUEST` (an older one would type the byte: the agent asks only when it says so)"""
     d = os.path.join(state_dir(), "panes")
     try:
         os.makedirs(d, mode=0o700, exist_ok=True)
@@ -347,6 +685,7 @@ def register(child_pid: int, sock_path: str) -> str | None:
             "procStart": proc_start(child_pid),
             "socket": sock_path,
             "startedAt": int(time.time() * 1000),
+            **({"screen": True} if screen else {}),
         }
         with open(tmp, "w", encoding="utf-8") as f:
             f.write(json.dumps(body))
@@ -419,6 +758,14 @@ def admit(conn: socket.socket, conns: list) -> bool:
     conn.setblocking(False)
     conns.append(conn)
     return True
+
+
+def winsize_of(packed: bytes | None) -> tuple[int, int] | None:
+    """(rows, cols) from a packed `winsize`; None when unknown"""
+    if not packed or len(packed) < 4:
+        return None
+    rows, cols = struct.unpack("HH", packed[:4])
+    return (rows, cols) if rows > 0 and cols > 0 else None
 
 
 def get_winsize(fd: int) -> bytes | None:
@@ -589,6 +936,8 @@ def main() -> int:
 
     signal.set_wakeup_fd(wake_w)
     winch = {"pending": False}
+    # (when the screen was last resized: not answered for a moment after / `SCREEN_RESIZE_QUIET_S`)
+    resized_at = -1e9
     signal.signal(signal.SIGWINCH, lambda *_: winch.__setitem__("pending", True))
     # ★★ Catch termination signals (2026-08-23).
     #    ⚠️ Without it `finally` does not run and **the terminal is returned raw to the user's shell**
@@ -650,7 +999,12 @@ def main() -> int:
         #    ⚠️ With `claude &` (background start), `setraw` is **stopped by SIGTTOU**.
         #       Registering first leaves "visible as a keystroke target but not a single byte arrives", and
         #       the agent falsely logs "sent as keystrokes" (measured).
-        reg_path = register(pid, sock_path)
+        # ★ The screen, for agy only (docs/AGY.md §14): never for Claude (no cost, nothing kept)
+        view = None
+        if os.path.basename(cmd[0]) == "agy":
+            # (a size not known yet: the usual one, fitted when the terminal tells)
+            view = Screen(*(winsize_of(get_winsize(STDOUT)) or (24, 80)))
+        reg_path = register(pid, sock_path, view is not None)
         if reg_path:
             global _REJECT_PATH
             _REJECT_PATH = rejected_path_for(reg_path)
@@ -659,6 +1013,12 @@ def main() -> int:
         #    ⇒ Put the registration result on the same line (the install script looks at this).
         log(_t(f"起動した pid={pid} 名乗り={'あり' if reg_path else 'なし'}", f"started pid={pid} registered={'yes' if reg_path else 'no'}"))
         paste = PasteWatch()
+
+        def tap(data: bytes) -> bytes:
+            """The child's output read elsewhere goes to the screen too"""
+            if view is not None and data:
+                view.safe_feed(data)
+            return data
         # ★ What the registration says, and when a failed write may be tried again (every 5 s, idle or not)
         published: bool | None = None
         publish_next = 0.0
@@ -698,9 +1058,15 @@ def main() -> int:
 
             if winch["pending"]:
                 winch["pending"] = False
+                # (the child redraws for any resize signal: the screen is not answered for a moment / `SCREEN_RESIZE_QUIET_S`)
+                resized_at = time.monotonic()
                 ws = get_winsize(STDOUT)
                 if ws:
                     set_winsize(master, ws)
+                    size = winsize_of(ws)
+                    # ★ Before the child redraws for it (it gets SIGWINCH from the pty after this)
+                    if view is not None and size:
+                        view.safe_resize(*size)
 
             if wake_r in r:
                 try:
@@ -754,8 +1120,35 @@ def main() -> int:
                     except OSError:
                         chunk = b""
                     if chunk:
-                        state, out, hold = gate_chunk(gates.get(conn), chunk)
+                        state, out, hold = gate_chunk(gates.get(conn), chunk, view is not None)
                         gates[conn] = state
+                        if state == "screen":
+                            # ★ Answer with the screen as of now: first everything the child already wrote (⚠️ not while
+                            #   the terminal is backed up: then the screen may be a little behind)
+                            while view is not None and len(to_screen) < max_buf:
+                                try:
+                                    more = os.read(master, 65536)
+                                except (BlockingIOError, OSError):
+                                    break
+                                if not more:
+                                    break
+                                to_screen += more
+                                view.safe_feed(more)
+                                paste.feed(more)
+                            # ⚠️ Not readable for a moment after a resize: a snapshot taken while agy redraws can show
+                            #    half of one view and half of another (codex review: a subagent's view without its header
+                            #    and footer read as the parent's). The agent then types nothing.
+                            fresh = time.monotonic() - resized_at >= SCREEN_RESIZE_QUIET_S
+                            try:
+                                conn.setblocking(True)
+                                conn.settimeout(1.0)
+                                conn.sendall(view.text().encode("utf-8") if view is not None and fresh else b"")
+                            except OSError:
+                                pass
+                            gates.pop(conn, None)
+                            conns.remove(conn)
+                            conn.close()
+                            continue
                         if hold:
                             h = held.setdefault(conn, bytearray())
                             h.extend(hold)
@@ -797,6 +1190,8 @@ def main() -> int:
                         raise
                 if data:
                     to_screen += data
+                    if view is not None:
+                        view.safe_feed(data)
                     # ★ Bracketed paste on/off (`PasteWatch`): judged right before a held paste is written (below)
                     if paste.feed(data):
                         log(_t(f"貼り付けの印 {'on' if paste.mode else 'off'}", f"bracketed paste {'on' if paste.mode else 'off'}"))
@@ -824,7 +1219,7 @@ def main() -> int:
             if not to_child and not stalled and master in w:
                 pasted = next((c for c, h in held.items() if h.endswith(PASTE_END)), None)
             if pasted is not None:
-                verdict, n, gone = release_paste(bytes(held[pasted]), paste, lambda: os.read(master, 65536), lambda b: os.write(master, b), to_screen, max_buf)
+                verdict, n, gone = release_paste(bytes(held[pasted]), paste, lambda: tap(os.read(master, 65536)), lambda b: os.write(master, b), to_screen, max_buf)
                 if gone:
                     child_gone = True
                 if verdict == "refused":

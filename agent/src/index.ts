@@ -12,7 +12,7 @@ import { AgyCards } from './agy/cards.ts'
 import { homedir } from 'node:os'
 import { aliveProcStartSync } from './claude/sessionIndex.ts'
 import { AgyNotifier } from './agy/notify.ts'
-import { answerAgyCard } from './agy/keys.ts'
+import { answerAgyCard, answerAgyQuestion } from './agy/keys.ts'
 
 /** ★ How often agy cards and notifications are looked at besides the watcher (a missed file event) */
 const AGY_LOOK_MS = 5000
@@ -142,6 +142,8 @@ async function main(): Promise<void> {
     agy: () => ({ ...defaultAgyDeps(), aliveProcStart: aliveProcStartSync }),
     machine: machineName(),
     answer: (conv, mark, behavior, stillWanted) => answerAgyCard(conv, mark, behavior, undefined, undefined, stillWanted),
+    // ★ Questions answered from the phone (docs/AGY.md §13)
+    answerQuestion: (conv, mark, answer) => answerAgyQuestion(conv, mark, answer),
     changed: () => broadcast({ type: 'permissions-changed', machine: machineName(), at: new Date().toISOString() }),
     now: () => new Date(),
     log: (line) => console.log(line),

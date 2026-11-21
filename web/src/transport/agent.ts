@@ -130,13 +130,17 @@ export class AgentTransport implements Transport {
     answers?: Record<string, string[]>,
     feedback?: string,
     notes?: Record<string, string>,
+    skip?: true,
   ): Promise<{ ok: boolean; reason?: string; at?: string }> {
+    // ⚠️ The usual wait: a longer one kept a relay line open past another request's timeout, and that request then ran
+    //    after the phone said it failed (codex review / the agent answers an agy question within `AGY_DELIVERY_WAIT_MS`)
     return this.post<{ ok: boolean; reason?: string; at?: string }>('/permission/answer', {
       key,
       behavior,
       ...(answers ? { answers } : {}),
       ...(feedback ? { feedback } : {}),
       ...(notes ? { notes } : {}),
+      ...(skip ? { skip } : {}),
     })
   }
 

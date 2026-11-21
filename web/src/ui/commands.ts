@@ -172,10 +172,10 @@ export function commandUi(id: ConfirmKind, session: Pick<SessionSummary, 'tool'>
       get body() {
         return t(
           'この agy の承認カードのうち、コマンドの実行と作業フォルダの外の読み取りを、選んだ時間だけ agent が自動で許可します（PC の画面に `1` を打ちます）。' +
-            '⚠️ コマンドは**中身を問わず**走ります。ほかの種類のカードは今までどおり止まり、「要対応」が届きます。agy の質問（選択肢）には自動で答えません（PC で答えてください）。' +
+            '⚠️ コマンドは**中身を問わず**走ります。ほかの種類のカードは今までどおり止まり、「要対応」が届きます。agy の質問（選択肢）には自動で答えません。' +
             'この agy を終えたとき・別の会話に移ったとき・nyan-remote を再起動したときにも切れます。',
           'For the chosen time, the agent automatically allows this agy\'s approval cards for running commands and reading outside its folder (it types `1` on the PC screen). ' +
-            '⚠️ Commands run **regardless of content**. Other kinds of cards still stop as before, and you get "needs you". agy\'s questions (choices) are never answered automatically (answer them on the PC). ' +
+            '⚠️ Commands run **regardless of content**. Other kinds of cards still stop as before, and you get "needs you". agy\'s questions (choices) are never answered automatically. ' +
             'It also ends when this agy exits, moves to another conversation, or nyan-remote restarts.',
         )
       },

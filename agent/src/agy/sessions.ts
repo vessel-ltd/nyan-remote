@@ -11,7 +11,8 @@
 // ⚠️ Row ids are `agy-<conversation id>` so they never meet a Claude session id or a Codex thread id.
 
 import { execFile, execFileSync } from 'node:child_process'
-import { lstatSync, readdirSync, readFileSync, readlinkSync, realpathSync, statSync } from 'node:fs'
+import { createHash } from 'node:crypto'
+import { closeSync, fstatSync, lstatSync, openSync, readdirSync, readFileSync, readlinkSync, readSync, realpathSync, statSync } from 'node:fs'
 import { open, readdir, stat, unlink } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, join } from 'node:path'
@@ -27,7 +28,8 @@ export const AGY_PREFIX = 'agy-'
 /** The label shown where Claude shows its profile (`.claude-r`) */
 export const AGY_ACCOUNT = 'agy'
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
-const MAX_FILE_BYTES = 256 * 1024
+/** ★ A status file carries every child's whole prompt (`subagents[].role`): long briefs passed 256 KiB (codex review) */
+const MAX_FILE_BYTES = 8 * 1024 * 1024
 /** Files of conversations whose agy is gone are removed after this long (nothing reads them) */
 export const AGY_FILE_MAX_AGE_MS = 24 * 60 * 60 * 1000
 
@@ -88,6 +90,13 @@ export interface AgyState {
    *   question opened on the PC (ctrl+k) takes typed text and ESC. The phone neither types nor stops meanwhile.
    */
   subagentsActive: boolean
+  /** It has started children in this run (the status line lists any, finished or not) */
+  hadSubagents: boolean
+  /**
+   * ★ The prompts (`role`) of the children not known to be over (docs/AGY.md §13: matched to the child conversations the
+   *   parent's transcript names). undefined = an entry that cannot be read (then no child is answered from the phone).
+   */
+  activeSubagentRoles?: string[]
   model?: string
   effort?: string
   contextPercent?: number
@@ -132,6 +141,8 @@ export function parseAgyFile(raw: unknown, fileId: string): AgyState | undefined
     ...(str(i.agent_state) ? { agentState: str(i.agent_state) } : {}),
     confirmationPending: i.tool_confirmation_pending === true,
     subagentsActive: subagentsActive(i.subagents),
+    hadSubagents: Array.isArray(i.subagents) && i.subagents.length > 0,
+    ...activeRoles(i.subagents),
     ...(model && str(model.display_name) ? { model: str(model.display_name) } : {}),
     ...(model && str(model.effort) ? { effort: str(model.effort) } : {}),
     ...(used !== undefined && used >= 0 ? { contextPercent: Math.round(used) } : {}),
@@ -155,12 +166,26 @@ export function subagentsActive(v: unknown): boolean {
   return v.some((x) => !isObj(x) || typeof x.status !== 'string' || !SUBAGENT_DONE.has(x.status.toLowerCase()))
 }
 
+function activeRoles(v: unknown): { activeSubagentRoles?: string[] } {
+  if (v === undefined || v === null) return { activeSubagentRoles: [] }
+  if (!Array.isArray(v)) return {}
+  const roles: string[] = []
+  for (const x of v) {
+    if (!isObj(x) || typeof x.status !== 'string') return {}
+    if (SUBAGENT_DONE.has(x.status.toLowerCase())) continue
+    if (typeof x.role !== 'string' || x.role === '') return {}
+    roles.push(x.role)
+  }
+  return { activeSubagentRoles: roles }
+}
+
 /** ★ The tool agy asks the person a question with (docs/AGY.md §11) */
 export const AGY_QUESTION_TOOL = 'ask_question'
 
 /** The last answer per transcript, kept while the file does not change (a question writes nothing while it is up) */
-const askCache = new Map<string, { size: number; mtimeMs: number; pending: PendingCall | undefined }>()
-const ASK_CACHE_MAX = 64
+const askCache = new Map<string, { size: number; mtimeMs: number; pending: PendingCall | undefined; answered: boolean; answeredAt?: number; answerLast?: true; messageAfter?: true; errored?: true }>()
+/** ★ Large enough for every child of a long conversation (codex review: 64 thrashed and re-read them on every look) */
+const ASK_CACHE_MAX = 4096
 
 /**
  * ★★ Whether agy is asking the person a question now (`ask_question` / docs/AGY.md §11). agy's status line says only
@@ -211,7 +236,27 @@ export function agyQuestionInTranscript(transcript: string, tail: (path: string)
 }
 
 /** The pending question; null = none; undefined = the transcript could not be read */
+/** A run that is over: nothing pending, and its last record is the model's answer or an error */
+function over(transcript: string, tail: (path: string) => Record<string, unknown>[]): boolean {
+  if (pendingOf(transcript, tail) !== null) return false
+  const hit = askCache.get(transcript)
+  return hit !== undefined && (hit.answered || hit.errored === true)
+}
+
+/** ★ The transcript's pending call of any tool (a child's next question or approval); null = none; undefined = unreadable */
+export function agyPendingCall(transcript: string, tail: (path: string) => Record<string, unknown>[] = readTailRecords): { call: PendingCall; mtimeMs: number } | null | undefined {
+  return pendingOf(transcript, tail)
+}
+
+
 function questionCall(transcript: string, tail: (path: string) => Record<string, unknown>[]): { call: PendingCall; mtimeMs: number } | null | undefined {
+  const r = pendingOf(transcript, tail)
+  if (!r) return r
+  return r.call.name === AGY_QUESTION_TOOL ? r : null
+}
+
+/** The transcript's pending call (any tool) and its time; null = none; undefined = cannot be read. Cached by size + time */
+function pendingOf(transcript: string, tail: (path: string) => Record<string, unknown>[]): { call: PendingCall; mtimeMs: number } | null | undefined {
   let st: { size: number; mtimeMs: number }
   try {
     st = statSync(transcript)
@@ -221,18 +266,45 @@ function questionCall(transcript: string, tail: (path: string) => Record<string,
   let hit = askCache.get(transcript)
   if (!hit || hit.size !== st.size || hit.mtimeMs !== st.mtimeMs) {
     const records = tail(transcript)
-    const pending = turnEnd(records).pending
+    const end = turnEnd(records)
     // ⚠️ A read that gave nothing from a file that has bytes failed (e.g. out of file descriptors): not remembered,
     //    or the question would stay unseen while the file stays unchanged (codex review)
     if (records.length === 0) return undefined
-    hit = { size: st.size, mtimeMs: st.mtimeMs, pending }
+    // ⚠️ Compact: a call's arguments are kept only for a question (a written file's content stays out of memory)
+    const pending = end.pending && end.pending.name !== AGY_QUESTION_TOOL ? { ...end.pending, args: {} } : end.pending
+    // ★ For `agyChildrenOutlived`: whether the answer is the very last record (then the file's time is the answer's, to
+    //   the millisecond), and whether another agent's message (a child's "[Message] … sender=…") came after it
+    let answerLast = false
+    let messageAfter = false
+    if (end.answered) {
+      for (let i = records.length - 1; i >= 0; i--) {
+        const r = records[i]!
+        if (r['type'] === 'PLANNER_RESPONSE') {
+          answerLast = i === records.length - 1
+          break
+        }
+        if (r['type'] === 'SYSTEM_MESSAGE' && typeof r['content'] === 'string' && /\[Message\] timestamp=\S+ sender=/.test(r['content'])) messageAfter = true
+      }
+    }
+    // the last record of the model's side is an error (a run that failed)
+    const lastOwn = [...records].reverse().find((r) => r['type'] !== 'SYSTEM_MESSAGE')
+    hit = {
+      size: st.size,
+      mtimeMs: st.mtimeMs,
+      ...(lastOwn?.['type'] === 'ERROR_MESSAGE' ? { errored: true as const } : {}),
+      pending,
+      answered: end.answered,
+      ...(end.answeredAt !== undefined ? { answeredAt: end.answeredAt } : {}),
+      ...(answerLast ? { answerLast: true as const } : {}),
+      ...(messageAfter ? { messageAfter: true as const } : {}),
+    }
     askCache.delete(transcript)
     askCache.set(transcript, hit)
     if (askCache.size > ASK_CACHE_MAX) askCache.delete(askCache.keys().next().value as string)
   }
-  const p = hit.pending
-  return p !== undefined && p.name === AGY_QUESTION_TOOL ? { call: p, mtimeMs: st.mtimeMs } : null
+  return hit.pending !== undefined ? { call: hit.pending, mtimeMs: st.mtimeMs } : null
 }
+
 
 /**
  * ★ The list state, in the words a Claude row uses.
@@ -245,8 +317,16 @@ function questionCall(transcript: string, tail: (path: string) => Record<string,
  * ⚠️ A turn stopped with ESC or a declined card also ends `idle` after working, so it reads `done` (agy sends no
  *    signal that tells them apart: no Stop hook for either / measured 2026-11-19).
  */
-export function agyStatus(s: Pick<AgyState, 'agentState' | 'confirmationPending' | 'busyAt'>, asking: boolean): SessionStatus {
+export function agyStatus(
+  s: Pick<AgyState, 'agentState' | 'confirmationPending' | 'busyAt' | 'subagentsActive'>,
+  asking: boolean,
+  /** ★ Its children wrote after the turn's answer (`agyChildrenOutlived`): idle, not "done" */
+  outlived: boolean,
+): SessionStatus {
   if (s.confirmationPending || asking) return 'waiting'
+  // ★ A child agent still running: the conversation is still at work, though the parent waits (docs/AGY.md §13: an
+  //   answered child question otherwise went back to the parent's old "done" and rang "done" again / codex review)
+  if (s.subagentsActive && (s.agentState === 'idle' || s.agentState === undefined)) return 'working'
   switch (s.agentState) {
     case 'working':
     case 'tool_use':
@@ -255,7 +335,7 @@ export function agyStatus(s: Pick<AgyState, 'agentState' | 'confirmationPending'
     case 'error':
       return 'error'
     case 'idle':
-      return s.busyAt > 0 ? 'done' : 'idle'
+      return s.busyAt > 0 && !outlived ? 'done' : 'idle'
     default:
       return 'idle'
   }
@@ -302,6 +382,8 @@ export interface AgyRowContext {
   sendRoute?: 'keys'
   /** ★ A question is up (`agyAsking`). ⚠️ Required: a caller that forgets it would read the row as working */
   asking: boolean
+  /** ★ Its children wrote after the turn's answer (`agyChildrenOutlived`). ⚠️ Required, like `asking` */
+  outlived: boolean
 }
 
 export function agyRow(s: AgyState, ctx: AgyRowContext): SessionSummary {
@@ -311,7 +393,7 @@ export function agyRow(s: AgyState, ctx: AgyRowContext): SessionSummary {
     : ctx.promptTitle
       ? { title: ctx.promptTitle, titleSource: 'prompt' }
       : { title: project, titleSource: 'fallback' }
-  const status = agyStatus(s, ctx.asking)
+  const status = agyStatus(s, ctx.asking, ctx.outlived)
   return {
     machine: ctx.machine,
     account: AGY_ACCOUNT,
@@ -343,6 +425,8 @@ export interface AgyPane {
   socketPath: string
   /** The relay saw agy turn bracketed paste on */
   paste: boolean
+  /** ★ The relay keeps agy's screen and answers 0x02 with it (docs/AGY.md §14). ⚠️ An older one would type the byte */
+  screen: boolean
   /**
    * ★ When the relay registered this agy (epoch ms). A status file written before it belongs to an earlier process that
    * had the same pid (codex review: a reused pid would tie an old conversation's idle file to a new agy)
@@ -366,7 +450,7 @@ export async function agyPaneOf(pid: number, aliveProcStart: (pid: number) => st
   if (typeof actual !== 'string' || recStart === undefined || !sameProcStart(recStart, actual)) return 'unverified'
   const startedAt = rec.value.startedAt
   if (typeof startedAt !== 'number' || !Number.isFinite(startedAt)) return 'broken'
-  return { socketPath, paste: rec.value.paste === true, startedAt }
+  return { socketPath, paste: rec.value.paste === true, screen: (rec.value as { screen?: unknown }).screen === true, startedAt }
 }
 
 /** Is this pid a running agy? undefined = cannot tell (then not shown as live) */
@@ -712,9 +796,11 @@ export function agyOwnRows(machine: string, deps: AgyDeps): SessionSummary[] {
     if (!f || !held?.includes(f.state.conversationId)) continue
     const id = f.state.conversationId
     // ★ A question's wait is named by its own transcript write (`agyQuestionAt`; the notifier's identity of a wait)
-    const askedAt = agyQuestionAt(f.state, f.mtimeMs, transcriptPathOf(id, deps.home))
+    // ★ Its own question, else a running child's (docs/AGY.md §13)
+    const askedAt = agyQuestionWaitAt(f.state, f.mtimeMs, deps.home)
     const asking = askedAt !== undefined
-    byConv.set(id, byConv.has(id) ? null : agyRow(f.state, { machine, transcriptBytes: 0, lastActivity: new Date(askedAt ?? f.mtimeMs).toISOString(), asking }))
+    const outlived = agyChildrenOutlived(f.state, deps.home)
+    byConv.set(id, byConv.has(id) ? null : agyRow(f.state, { machine, transcriptBytes: 0, lastActivity: waitName(f.state, f.mtimeMs, askedAt), asking, outlived }))
   }
   return [...byConv.values()].filter((r): r is SessionSummary => r !== null)
 }
@@ -731,8 +817,8 @@ export function agyOwnRowOf(machine: string, deps: AgyDeps, conversationId: stri
   if (holders.length !== 1) return undefined
   const f = readAgyPidFile(deps.dir, holders[0]!)
   if (!f || f.state.conversationId !== want) return undefined
-  const askedAt = agyQuestionAt(f.state, f.mtimeMs, transcriptPathOf(want, deps.home))
-  return agyRow(f.state, { machine, transcriptBytes: 0, lastActivity: new Date(askedAt ?? f.mtimeMs).toISOString(), asking: askedAt !== undefined })
+  const askedAt = agyQuestionWaitAt(f.state, f.mtimeMs, deps.home)
+  return agyRow(f.state, { machine, transcriptBytes: 0, lastActivity: waitName(f.state, f.mtimeMs, askedAt), asking: askedAt !== undefined, outlived: agyChildrenOutlived(f.state, deps.home) })
 }
 
 /** `pid-<n>.json` files of agys gone for a day, and visit marks a day old, are removed (only ours) */
@@ -873,8 +959,9 @@ export async function agyRows(machine: string, given: AgyDeps = defaultAgyDeps()
     // ★ Not listed before its first message, like Claude (whose list is built from transcripts): a send there is
     //   refused anyway (the gate needs the transcript) / user decision 2026-11-20. ⚠️ A turn that runs or waits on a
     //   card stays listed even then (never hide something that needs an answer)
-    const asking = bytes > 0 && agyAsking(f.state, f.mtimeMs, path)
-    const status = agyStatus(f.state, asking)
+    const asking = bytes > 0 && agyQuestionWaitAt(f.state, f.mtimeMs, deps.home) !== undefined
+    const outlived = bytes > 0 && agyChildrenOutlived(f.state, deps.home)
+    const status = agyStatus(f.state, asking, outlived)
     if (bytes === 0 && status !== 'working' && status !== 'waiting') continue
     let title = titles.get(f.state.conversationId)
     if (title === undefined && !f.state.title && bytes > 0) {
@@ -891,6 +978,7 @@ export async function agyRows(machine: string, given: AgyDeps = defaultAgyDeps()
         transcriptBytes: bytes,
         lastActivity: new Date(f.mtimeMs).toISOString(),
         asking,
+        outlived,
         ...(title ? { promptTitle: title } : {}),
         // ⚠️ A conversation two agys show takes nothing from the phone (`agyConversations`), nor does one whose agy does
         //    not hold its lock (`findAgyTarget` refuses the same)
@@ -940,4 +1028,311 @@ export function agyUsage(files: readonly AgyFile[], nowMs: number): ToolUsage | 
     windows: [...byLen.values()],
     at: new Date(f.mtimeMs).toISOString(),
   }
+}
+
+
+/**
+ * A child conversation's head: who started it and a digest of its prompt (a head never changes, so it is kept). Only a
+ * digest is kept, so the bound can hold every conversation of a large archive (codex review: a 4,096 bound read them
+ * all again on every look once the archive was larger).
+ */
+const heads = new Map<string, ChildHead | null>()
+
+/** `prompt` is the prompt's digest */
+export interface ChildHead {
+  sender: string
+  prompt: string
+}
+const HEADS_MAX = 200_000
+/** The first record holds the whole prompt given to the child (codex review: a 65 KiB one did not fit 64 KiB) */
+const HEAD_BYTES = 1024 * 1024
+
+/** A first record still being written is waited for this long; after that the file is taken as cut (not a child) */
+export const HEAD_STALE_MS = 60_000
+
+/** The digest prompts are compared by (a head's, a running entry's role) */
+export function promptDigest(prompt: string): string {
+  return createHash('sha256').update(prompt, 'utf8').digest('hex')
+}
+const HEAD = /^\[Message\] timestamp=\S+ sender=([0-9a-fA-F-]{36}) priority=\S+ content=([\s\S]*)\n<\/SYSTEM_MESSAGE>\s*$/
+
+/**
+ * ★ Who started a conversation as a child, read from its transcript's first record (measured on agy 1.5.13): a
+ * SYSTEM_MESSAGE "[Message] timestamp=… sender=<parent id> priority=… content=<the prompt>". `prompt` is the prompt's
+ * digest (`promptDigest`). null = not a child (or not readable as one); undefined = cannot be read now.
+ */
+export function childHead(transcript: string): ChildHead | null | undefined {
+  if (heads.has(transcript)) return heads.get(transcript)
+  let fd: number | undefined
+  let buf: Buffer
+  let mtimeMs = 0
+  try {
+    fd = openSync(transcript, 'r')
+    mtimeMs = fstatSync(fd).mtimeMs
+    // ★ 64 KiB first (almost every prompt), the whole bound only when the first line is longer
+    for (const size of [64 * 1024, HEAD_BYTES]) {
+      const b = Buffer.alloc(size)
+      const n = readSync(fd, b, 0, size, 0)
+      buf = b.subarray(0, n)
+      if (buf.includes(0x0a) || n < size) break
+    }
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === 'ENOENT' ? null : undefined
+  } finally {
+    if (fd !== undefined) closeSync(fd)
+  }
+  const nlAt = buf!.indexOf(0x0a)
+  // the first line not complete yet (a child being created): not known now, not remembered; longer than the bound, or
+  // not written for a minute (a file cut when agy was killed while writing it / codex review): never a child we can read
+  if (nlAt < 0) return buf!.length >= HEAD_BYTES || Date.now() - mtimeMs > HEAD_STALE_MS ? remember(transcript, null) : undefined
+  const first = buf!.subarray(0, nlAt).toString('utf8')
+  let head: ChildHead | null = null
+  try {
+    const r = JSON.parse(first) as Record<string, unknown>
+    if (r['type'] === 'SYSTEM_MESSAGE' && typeof r['content'] === 'string') {
+      const body = /<SYSTEM_MESSAGE>\n([\s\S]*)$/.exec(r['content'])
+      const m = body ? HEAD.exec(body[1]!) : null
+      if (m) head = { sender: m[1]!.toLowerCase(), prompt: promptDigest(m[2]!) }
+    }
+  } catch {
+    head = null
+  }
+  return remember(transcript, head)
+}
+
+function remember(transcript: string, head: ChildHead | null): ChildHead | null {
+  heads.set(transcript, head)
+  if (heads.size > HEADS_MAX) heads.delete(heads.keys().next().value as string)
+  return head
+}
+
+/**
+ * A conversation's head; ⚠️ a folder made within the minute with no transcript yet is "cannot tell" (a child being
+ * created: its transcript comes next / codex review), an older one without a transcript is not a child.
+ */
+function headOrFresh(name: string, home: string, brain: string): ChildHead | null | undefined {
+  const head = childHead(transcriptPathOf(name, home))
+  if (head !== null) return head
+  try {
+    if (statSync(transcriptPathOf(name, home), { throwIfNoEntry: false }) !== undefined) return null
+    return Date.now() - statSync(join(brain, name)).mtimeMs <= HEAD_STALE_MS ? undefined : null
+  } catch {
+    return undefined
+  }
+}
+
+/** Every conversation's parent (by its first record), built at most once per `CHILD_INDEX_MS` per home */
+const childIndex = new Map<string, { at: number; dirMtimeMs: number; byParent: Map<string, { id: string; prompt: string }[]>; unread: string[] } | undefined>()
+const CHILD_INDEX_MS = 2000
+
+/**
+ * ★ The children of every parent, from one scan of the conversations (codex review: each status file scanned the whole
+ * archive again, so many saved sessions stalled the agent). undefined = the archive cannot be listed now.
+ */
+function childrenIndex(home: string): { byParent: Map<string, { id: string; prompt: string }[]>; unreadable: boolean } | undefined {
+  const brain = join(agyHome(home), 'brain')
+  let dirMtimeMs: number
+  try {
+    dirMtimeMs = statSync(brain).mtimeMs
+  } catch {
+    return undefined
+  }
+  const hit = childIndex.get(home)
+  // ★ Built again when a conversation was added (the folder's time) or after `CHILD_INDEX_MS`
+  if (hit && hit.dirMtimeMs === dirMtimeMs && Date.now() - hit.at < CHILD_INDEX_MS) {
+    // the ones that could not be read are read again every time (a first record that was being written, a cut file)
+    hit.unread = hit.unread.filter((name) => {
+      const head = headOrFresh(name, home, brain)
+      if (head === undefined) return true
+      if (head) hit.byParent.set(head.sender, [...(hit.byParent.get(head.sender) ?? []), { id: name.toLowerCase(), prompt: head.prompt }])
+      return false
+    })
+    return { byParent: hit.byParent, unreadable: hit.unread.length > 0 }
+  }
+  let names: string[]
+  try {
+    names = readdirSync(brain)
+  } catch {
+    return undefined
+  }
+  const byParent = new Map<string, { id: string; prompt: string }[]>()
+  const unread: string[] = []
+  for (const name of names) {
+    if (!UUID.test(name)) continue
+    const head = headOrFresh(name, home, brain)
+    if (head === undefined) unread.push(name)
+    if (!head) continue
+    const list = byParent.get(head.sender) ?? []
+    list.push({ id: name.toLowerCase(), prompt: head.prompt })
+    byParent.set(head.sender, list)
+  }
+  childIndex.set(home, { at: Date.now(), dirMtimeMs, byParent, unread })
+  return { byParent, unreadable: unread.length > 0 }
+}
+
+export interface AgyChildQuestions {
+  asking: AgyChildQuestion[]
+  /**
+   * ★ The phone may answer a child's question: every running child (by its prompt) is matched by exactly one child
+   *   conversation of this parent, no two running children share a prompt, and every child of this parent could be read.
+   *   ⚠️ Otherwise ctrl+k may open another child's question (codex review) ⇒ the PC.
+   */
+  complete: boolean
+  /**
+   * ★ Every running child's pending call was read (its transcript found and readable), busy siblings or not. With the
+   *   screen the dialog's owner is read from it, but a question nobody could read may share a text: ⇒ the PC (codex /
+   *   agy review)
+   */
+  known: boolean
+}
+
+export interface AgyChildQuestion {
+  /** The child's conversation id */
+  child: string
+  call: PendingCall
+  /** The child transcript's write that posed it (epoch ms) */
+  askedAt: number
+  /** ⚠️ Not matched one-to-one with a running entry (no card for it) */
+  ambiguous: boolean
+}
+
+/**
+ * ★★ The questions this parent's children ask now (docs/AGY.md §13). agy's status line names its children only by
+ * prompt (`role`) and state; their questions go straight to the person (the parent stays idle). The children are found
+ * from their own transcripts' first record ("sender=<parent>"), so a child launched long ago is found as well (codex
+ * review: the parent's transcript tail lost it). A child asks when its transcript's pending call is `ask_question`.
+ * ⚠️ Only while the parent has running children; anything unreadable ⇒ not counted, and `complete` is false.
+ */
+export function agyChildQuestions(
+  state: Pick<AgyState, 'activeSubagentRoles'>,
+  conversationId: string,
+  home: string = homedir(),
+  tail: (path: string) => Record<string, unknown>[] = readTailRecords,
+): AgyChildQuestions {
+  const roles = state.activeSubagentRoles
+  if (!roles) return { asking: [], complete: false, known: false }
+  if (roles.length === 0) return { asking: [], complete: true, known: true }
+  const parent = conversationId.toLowerCase()
+  const index = childrenIndex(home)
+  if (!index) return { asking: [], complete: false, known: false }
+  let complete = !index.unreadable
+  let known = !index.unreadable
+  const children = (index.byParent.get(parent) ?? []).filter((c) => c.id !== parent)
+  const running = new Map<string, number>()
+  for (const r of roles.map(promptDigest)) running.set(r, (running.get(r) ?? 0) + 1)
+  // ★ Every child of a running prompt counts (which of several with the same prompt still runs cannot be told: the
+  //   newest guess left a live older one's question silent / codex review). ⚠️ So a killed child's leftover question
+  //   rings while a new child with the very same prompt runs (accepted: an extra "needs you", never silence).
+  //   Matched one-to-one (and so answerable from the phone) only when exactly one child has the prompt.
+  const live: { id: string; prompt: string; matched: boolean }[] = []
+  for (const [prompt, n] of running) {
+    const same = children.filter((c) => c.prompt === prompt)
+    // ★ Only runs with a call pending can be the one ctrl+k opens: earlier runs of the same prompt that are over —
+    //   finished or failed — do not make it ambiguous (codex review: a rerun's question stayed off the phone)
+    const open = same.filter((c) => pendingOf(transcriptPathOf(c.id, home), tail) !== null)
+    // ⚠️ One-to-one only when every other child of the prompt is known to be over (its run ended with an answer or an
+    //    error): one still thinking may be the running one, and the one with a call pending a killed leftover whose
+    //    question ctrl+k cannot open (codex review)
+    const othersOver = same.every((c) => open.includes(c) || over(transcriptPathOf(c.id, home), tail))
+    // ★ Ambiguous only when one of them could be asking: none with a call pending — e.g. all still thinking — is none
+    //   asking, whichever runs (codex review: two thinking siblings with one prompt kept a third's card off).
+    //   ⚠️ But a running entry with no child found is unseen: it may be the one asking.
+    const matched = n === 1 && open.length === 1 && othersOver
+    if (same.length < n || (open.length > 0 && !matched)) complete = false
+    if (same.length < n) known = false
+    for (const c of same) live.push({ id: c.id, prompt, matched })
+  }
+  // ★ The children's own children (a coordinator's workers, and so on): their questions ring too, never as a card (which
+  //   one ctrl+k opens is not known), and any call of theirs pending keeps the children's cards off (codex review)
+  const seen = new Set<string>([parent, ...live.map((c) => c.id)])
+  const nested: string[] = []
+  const walk = (id: string): void => {
+    for (const g of index.byParent.get(id) ?? []) {
+      if (seen.has(g.id)) continue
+      seen.add(g.id)
+      nested.push(g.id)
+      walk(g.id)
+    }
+  }
+  for (const c of live) walk(c.id)
+  const asking: AgyChildQuestion[] = []
+  const busy: string[] = []
+  for (const id of nested) {
+    const p = pendingOf(transcriptPathOf(id, home), tail)
+    if (p === undefined) complete = known = false
+    if (!p) continue
+    if (p.call.name === AGY_QUESTION_TOOL) asking.push({ child: id, call: p.call, askedAt: p.mtimeMs, ambiguous: true })
+    else busy.push(id)
+  }
+  for (const c of live) {
+    const p = pendingOf(transcriptPathOf(c.id, home), tail)
+    if (p === undefined) complete = known = false
+    if (!p) continue
+    if (p.call.name === AGY_QUESTION_TOOL) asking.push({ child: c.id, call: p.call, askedAt: p.mtimeMs, ambiguous: !c.matched })
+    else busy.push(c.id)
+  }
+  // ⚠️ Another running child with a call of its own pending (running, or waiting for its approval): agy queues the
+  //    children's questions and approvals for ctrl+k, and its approval may be the one opened — the answer's digit would
+  //    approve its command (codex review) ⇒ no child is answered from the phone
+  if (busy.length > 0) complete = false
+  return { asking, complete, known }
+}
+
+/**
+ * ★ When this conversation started waiting for the person's answer to a question (its own, else a running child's),
+ * or undefined. The notifier's identity of the wait (`agyOwnRows`), the row's "needs you" (docs/AGY.md §11, §13).
+ */
+export function agyQuestionWaitAt(
+  s: AgyState,
+  stateMtimeMs: number,
+  home: string = homedir(),
+  tail: (path: string) => Record<string, unknown>[] = readTailRecords,
+): number | undefined {
+  const own = agyQuestionAt(s, stateMtimeMs, transcriptPathOf(s.conversationId, home), tail)
+  // ★ The newest of its own and its children's (a child asking behind the parent's open question rings too / codex review)
+  const kids = agyChildQuestions(s, s.conversationId, home, tail).asking
+  const all = [...(own === undefined ? [] : [own]), ...kids.map((k) => k.askedAt)]
+  return all.length === 0 ? undefined : Math.max(...all)
+}
+
+/**
+ * ★ The name of a waiting row's wait (the notifier's identity, as `lastActivity`): a card is its own state write, a
+ * question the transcript write that posed it — and with a card up, a child's question newer than the card names it
+ * instead (a child asking behind the parent's open approval rang nothing / codex review).
+ */
+function waitName(s: Pick<AgyState, 'confirmationPending'>, stateMtimeMs: number, askedAt: number | undefined): string {
+  if (s.confirmationPending) return new Date(askedAt !== undefined && askedAt > stateMtimeMs ? askedAt : stateMtimeMs).toISOString()
+  return new Date(askedAt ?? stateMtimeMs).toISOString()
+}
+
+/**
+ * ★ A finished turn whose answer is older than its children's last writes is not "done" (codex review: a child failed
+ * after the parent's "I started the check", and the old reply rang "done"). undefined = no such case or cannot tell.
+ */
+export function agyChildrenOutlived(
+  s: Pick<AgyState, 'hadSubagents' | 'subagentsActive' | 'conversationId'>,
+  home: string = homedir(),
+  tail: (path: string) => Record<string, unknown>[] = readTailRecords,
+): boolean {
+  if (!s.hadSubagents || s.subagentsActive) return false
+  const parent = transcriptPathOf(s.conversationId, home)
+  if (pendingOf(parent, tail) === undefined) return false
+  const hit = askCache.get(parent)
+  if (!hit?.answered || hit.answeredAt === undefined) return false
+  // a child's message after the answer: it wrote after it
+  if (hit.messageAfter) return true
+  // ★ When the answer was written: the file's own time when it is the last record (agy's `created_at` is whole
+  //   seconds: a child failing later in the same second was missed / codex review), else the end of its second
+  const answeredAt = hit.answerLast ? hit.mtimeMs : hit.answeredAt + 999
+  const id = s.conversationId.toLowerCase()
+  for (const c of childrenIndex(home)?.byParent.get(id) ?? []) {
+    if (c.id === id) continue
+    const path = transcriptPathOf(c.id, home)
+    try {
+      if (statSync(path).mtimeMs > answeredAt) return true
+    } catch {
+      // gone: nothing to say
+    }
+  }
+  return false
 }

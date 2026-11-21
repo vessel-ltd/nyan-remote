@@ -10,7 +10,7 @@
 
 import { watch, type FSWatcher } from 'node:fs'
 import { mkdir } from 'node:fs/promises'
-import { agyAsking, agyStatus, readAgyFiles, transcriptPathOf } from './sessions.ts'
+import { agyChildrenOutlived, agyQuestionWaitAt, agyStatus, readAgyFiles } from './sessions.ts'
 
 const DEBOUNCE_MS = 300
 
@@ -18,10 +18,10 @@ const DEBOUNCE_MS = 300
 export async function agyStatuses(dir: string, home?: string): Promise<Map<string, string>> {
   const out = new Map<string, string>()
   for (const f of await readAgyFiles(dir)) {
-    const asking = agyAsking(f.state, f.mtimeMs, transcriptPathOf(f.state.conversationId, home))
+    const asking = agyQuestionWaitAt(f.state, f.mtimeMs, home) !== undefined
     // ★ A card and a question both read `waiting`: told apart (an approval followed by a question, the `working` in
     //   between not seen, left the thread saying "approval" / codex review)
-    out.set(f.state.conversationId, `${f.state.pid}:${agyStatus(f.state, asking)}${asking ? ':question' : ''}`)
+    out.set(f.state.conversationId, `${f.state.pid}:${agyStatus(f.state, asking, agyChildrenOutlived(f.state, home))}${asking ? ':question' : ''}`)
   }
   return out
 }

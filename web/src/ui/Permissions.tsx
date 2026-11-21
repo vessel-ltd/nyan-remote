@@ -95,6 +95,8 @@ export function Permissions({
     feedback?: string,
     /** ★ Question text → a note (Codex questions) */
     notes?: Record<string, string>,
+    /** ★ "Skip" for an agy question */
+    skip?: true,
   ) => Promise<{ ok: boolean; reason?: string; at?: string }>
   /** Whether it is shown at the bottom of the thread (the same placement as Claude's Android app) */
   inThread?: boolean
@@ -163,7 +165,9 @@ export function Permissions({
     setBusy(item.key)
     const attempt = nextAttempt()
     try {
-      const res = await onAnswer(item.endpointId, item.key, behavior, answers, feedback, notes)
+      // ★ An agy question's deny is "skip" (the turn goes on); said explicitly (the agent refuses a bare deny there)
+      const agyQuestion = item.tool === 'agy' && item.interaction?.kind === 'question'
+      const res = await onAnswer(item.endpointId, item.key, behavior, answers, feedback, notes, agyQuestion && behavior === 'deny' ? true : undefined)
       if (!res.ok) {
         setMsg((m) => ({ ...m, [item.key]: res.reason ?? t('もう有効ではありません', 'No longer valid') }))
         rememberLost(item, res.reason ?? t('もう有効ではありません', 'No longer valid'), attempt)
@@ -183,7 +187,8 @@ export function Permissions({
       //   ⚠️ Only notifications shown before the answer took effect, by the agent's clock (`res.at`; the phone's clock is
       //      not the agent's). No `at` (an older agent) ⇒ nothing is closed
       const tookEffect = res.at ? Date.parse(res.at) : NaN
-      if (item.tool === 'agy' && behavior === 'deny' && item.sessionId && Number.isFinite(tookEffect)) {
+      // ⚠️ Not after skipping a question: the turn goes on, and the next question's "needs you" can come right after
+      if (item.tool === 'agy' && !agyQuestion && behavior === 'deny' && item.sessionId && Number.isFinite(tookEffect)) {
         // ★ Again a few times: a push already on its way can be shown after this (codex review)
         const sessionId = item.sessionId
         for (const ms of [0, 3000, 10_000, 30_000]) {
@@ -424,9 +429,12 @@ export function Permissions({
                 {/* ★ A Codex question has no "deny": the phone stops the turn that asks (ESC on the PC) */}
                 {p.tool === 'codex' && p.interaction?.kind === 'question'
                   ? t('止める', 'Stop')
-                  : /* ★ agy: declining a card stops its turn (ESC / docs/AGY.md §9) */
-                    p.tool === 'agy'
-                    ? t('拒否して止める', 'Deny and stop')
+                  : /* ★ agy: a question is skipped (ESC per question; the turn goes on / docs/AGY.md §13) */
+                    p.tool === 'agy' && p.interaction?.kind === 'question'
+                    ? t('飛ばす', 'Skip')
+                    : /* ★ agy: declining a card stops its turn (ESC / docs/AGY.md §9) */
+                      p.tool === 'agy'
+                      ? t('拒否して止める', 'Deny and stop')
                     : t('拒否', 'Deny')}
               </button>
             </div>

@@ -45,7 +45,10 @@ import { agyGrantOwner, type AgyGrantOwner } from './grants.ts'
 import { aliveProcStartSync } from '../claude/sessionIndex.ts'
 import { agyLocksOf, agyPaneOf, withLocksProbed, agyPidFiles, agyRow, agyShared, readAgyPidFile, sweepAgyPidFiles, transcriptPathOf, type AgyDeps, type AgyState } from './sessions.ts'
 import { callBeforeState, readTailRecords, turnEnd, type PendingCall } from './pending.ts'
-import type { AgyCardFailure, AgyCardMark } from './keys.ts'
+import type { AgyCardFailure, AgyCardMark, AgyQuestionAnswer, AgyQuestionFailure, AgyQuestionMark } from './keys.ts'
+import { agyQuestionInteraction, parseAgyQuestion, questionTextsOf, skipSteps, type AgyAnswerPlan, type AgyQuestion, type AgyStep } from './questions.ts'
+import { childViewOf, dialogFits, inChildView, parseBanner, parseDialog, readAgyScreen, sameQuestionText, viewOwnerOf } from './screen.ts'
+import { AGY_QUESTION_TOOL, agyChildQuestions, agyPendingCall, agyQuestionAt, agyQuestionWaitAt } from './sessions.ts'
 
 /** ★ The calls whose card was measured, as the tool and input the card helpers know. undefined = stays on the PC */
 export function agyCardTool(call: Pick<PendingCall, 'name' | 'args'>): { toolName: string; input: Record<string, string> } | undefined {
@@ -117,6 +120,13 @@ export interface AgyCardDeps {
   now(): Date
   tail?: (path: string) => Record<string, unknown>[]
   log?: (line: string) => void
+  /**
+   * ★ Types the phone's answer to a question (docs/AGY.md §13 / `keys.ts` `answerAgyQuestion`). Absent ⇒ no question
+   *   cards (they stay on the PC).
+   */
+  answerQuestion?(conversationId: string, mark: AgyQuestionMark, answer: AgyQuestionAnswer): Promise<{ ok: true; left?: true } | { ok: false; reason: AgyQuestionFailure }>
+  /** ★ Reads an agy's screen through its relay (`readAgyScreen`; replaced in tests) */
+  readScreen?: (socketPath: string) => Promise<string | undefined>
   /** Rule 4c (tests shorten it) */
   unconfirmedMs?: number
   /**
@@ -124,7 +134,10 @@ export interface AgyCardDeps {
    * @param card the card's state write (ISO time of the agy's own state file, as the notifier's `cardOf`)
    */
   reraised?: (conversationId: string, card: string, once?: boolean) => void
+  /** (tests) The phone's wait for an answer (`AGY_DELIVERY_WAIT_MS`) */
+  deliveryWaitMs?: number
 }
+
 
 /** Rule 4c: how long the same card may stay up after its key was written before it is shown again */
 export const UNCONFIRMED_MS = 3000
@@ -134,7 +147,7 @@ interface Raised {
   withdraw?: () => void
 }
 
-export type AgyDelivery = { ok: true } | { ok: false; reason: AgyCardFailure }
+export type AgyDelivery = { ok: true; left?: true } | { ok: false; reason: AgyQuestionFailure }
 
 /**
  * ★ Card key → whether its answer's key went out (codex review: the route said "ok" the moment the card was
@@ -148,13 +161,52 @@ export function agyDelivery(key: string): Promise<AgyDelivery | undefined> | und
 }
 
 /** What the phone is told when an answer's key did not go out */
-export function agyDeliveryMessage(reason: AgyCardFailure): string {
+/**
+ * ★ How long the phone's answer waits for an agy answer to be typed (`permissionAnswer`). Short: a relay line runs its
+ * requests one at a time, so every second here delays what is queued behind it (codex review: two long answers made a
+ * Claude instruction time out on the phone and then run). Measured answers took 0.6–1.3 s; a later failure rings again.
+ */
+export const AGY_DELIVERY_WAIT_MS = 1500
+
+export function agyDeliveryMessage(reason: AgyQuestionFailure): string {
+  if (reason === 'partial') {
+    return t(
+      '答えの途中で質問が変わったため、最後まで打てませんでした。PC の画面で続きを答えてください。',
+      'The question changed while the answer was being typed, so it was not finished. Finish it on the PC screen.',
+    )
+  }
   return reason === 'changed'
     ? t(
         'カードが変わりました（PC で答えたか、次のカードが出ています）。もう一度 見てから答えてください。',
         'The card changed (it was answered on the PC, or the next one is up). Look again before answering.',
       )
     : t('agy に届きませんでした。もう一度 押すか、PC で答えてください。', 'It did not reach agy. Press it again, or answer on the PC.')
+}
+
+/** The question's call itself (the same however many times it is looked at) */
+const qCallId = (m: AgyQuestionMark): string => `${m.pid}:${m.child ?? ''}:${m.step}:${m.index}:${m.callAt}`
+const qMarkId = (m: AgyQuestionMark): string => `q:${m.pid}:${m.child ?? ''}:${m.askedAt}:${m.step}:${m.index}:${m.callAt}`
+
+/** ★ A question as a question card (docs/AGY.md §13): the questions and options, nothing to type on the phone */
+export function agyQuestionCard(row: SessionSummary, mark: AgyQuestionMark, q: AgyQuestion, at: string): PermissionRequest {
+  const id = createHash('sha256').update(['agy-question', row.sessionId, mark.pid, mark.child ?? '', mark.askedAt, mark.step, mark.index].join('\0'), 'utf8').digest('hex').slice(0, 24)
+  const first = q.items[0]!.question
+  return {
+    key: withGeneration(`agy:${id}`),
+    origin: `agy:${createHash('sha256').update(['agy-question', row.sessionId, mark.pid, mark.child ?? '', mark.step, mark.index].join('\0'), 'utf8').digest('hex').slice(0, 24)}`,
+    machine: row.machine,
+    account: row.account,
+    project: row.project,
+    sessionId: row.sessionId,
+    toolName: 'AskUserQuestion',
+    tool: 'agy',
+    summary: first.length > 200 ? `${first.slice(0, 199)}…` : first,
+    interaction: agyQuestionInteraction(q),
+    // ★ A child's question: the card says it comes from a subagent (the PC shows only a banner for it)
+    ...(mark.child !== undefined ? { subagent: {} } : {}),
+    ...(q.items.some((x) => hasHidden(x.question, ...x.options)) ? { hidden: true as const } : {}),
+    at,
+  }
 }
 
 const markId = (m: AgyCardMark): string => `${m.pid}:${m.stateMtimeMs}:${m.step}:${m.index}:${m.callAt}`
@@ -180,6 +232,22 @@ export class AgyCards {
   #onPhone = new Set<string>()
   /** The conversations the last look could not tell about */
   #lastUnsure = new Set<string>()
+  /** ★ conversation → the question card on the phone (docs/AGY.md §13), by its mark id */
+  #qRaised = new Map<string, Raised>()
+  /** conversation → the question answered from the phone (not raised again while it stays up; rule 4 as cards) */
+  #qAnswered = new Map<string, string>()
+  /**
+   * ★ Calls left to the PC for good (codex review): an answer typed only in part, or a several-key answer whose question
+   *   is still up after it — raising it again would start over on a dialog that is no longer at its start. Bounded.
+   */
+  #qLeft = new Set<string>()
+  /** Whether a look of questions has been made yet (the first one leaves what is already up to the PC) */
+  #qLooked = false
+  /**
+   * ★ Calls whose answer is being typed now: never raised again meanwhile, whatever a look sees (codex review: a
+   *   sibling's short call hid it for a look, the answered memory was dropped, and a second card was raised mid-answer)
+   */
+  #qTyping = new Set<string>()
   /** The calls auto-approve has tried once (rule 5b: never a second time; the phone's after that). Bounded */
   #autoTried = new Set<string>()
   #run: Promise<void> | undefined
@@ -348,7 +416,7 @@ export class AgyCards {
       const id = markId(w.mark)
       if (this.#raised.has(conv) || this.#answered.get(conv) === id) continue
       // ★ The row as the list builds it, from this agy's own state (the list itself may not show it right now)
-      const row = agyRow(w.state, { machine: this.#deps.machine, transcriptBytes: 0, lastActivity: this.#deps.now().toISOString(), sendRoute: 'keys', asking: false })
+      const row = agyRow(w.state, { machine: this.#deps.machine, transcriptBytes: 0, lastActivity: this.#deps.now().toISOString(), sendRoute: 'keys', asking: false, outlived: false })
       const last = this.#lastInfo.get(conv)
       const info = last?.id === id ? last.info : agyCard(row, w.mark, w.call, this.#deps.now().toISOString())
       if (!info) {
@@ -384,7 +452,283 @@ export class AgyCards {
       changed = true
       void this.#wait(conv, raised, info, w.mark)
     }
+    if (await this.#lookQuestions(deps, unsure)) changed = true
     if (changed) this.#deps.changed()
+  }
+
+  /**
+   * ★★ Questions (`ask_question` / docs/AGY.md §13), raised as question cards: only from an agy started through the
+   * relay that holds the conversation's lock, alone on it, with no child agent running, and of a shape that was measured
+   * (`parseAgyQuestion`). Never answered by auto-approve. Returns whether the set of cards changed.
+   */
+  async #lookQuestions(deps: AgyDeps, unsure: Set<string>): Promise<boolean> {
+    if (!this.#deps.answerQuestion) return false
+    const tail = this.#deps.tail ?? readTailRecords
+    const locksOf = deps.locksOf ?? ((p: number) => agyLocksOf(p, deps.home))
+    const want = new Map<string, { state: AgyState; mark: AgyQuestionMark; q: AgyQuestion }>()
+    const shared = new Set<string>()
+    const firstLook = !this.#qLooked
+    for (const pid of agyPidFiles(deps.dir)) {
+      if (!deps.isAgy(pid)) continue
+      const f = readAgyPidFile(deps.dir, pid)
+      if (!f) continue
+      const conv = f.state.conversationId
+      const path = transcriptPathOf(conv, deps.home)
+      if (f.state.confirmationPending) continue
+      const ownAt = f.state.agentState === 'tool_use' ? agyQuestionAt(f.state, f.mtimeMs, path, tail) : undefined
+      const found = f.state.subagentsActive ? agyChildQuestions(f.state, conv, deps.home, tail) : undefined
+      if (ownAt === undefined && !found?.asking.length) continue
+      const pane = await agyPaneOf(pid, deps.aliveProcStart ?? aliveProcStartSync)
+      if (pane === 'broken' || pane === 'unverified') {
+        unsure.add(conv)
+        continue
+      }
+      if (typeof pane === 'string' || f.mtimeMs < pane.startedAt) continue
+      const locks = locksOf(pid)
+      if (locks === undefined) {
+        unsure.add(conv)
+        continue
+      }
+      if (!locks.includes(conv)) continue
+      // ★ A blind relay: the questions already up at this agent's first look are left to the PC (they still ring), every
+      //   one of them: an agent before a restart may have typed part of an answer, and starting over on a half-done
+      //   dialog would toggle off what it toggled on (codex review). With the screen the answer sees the dialog's state.
+      if (firstLook && !pane.screen) {
+        const ownCall = turnEnd(tail(path)).pending
+        if (ownCall?.name === AGY_QUESTION_TOOL && ownCall.at !== undefined) this.#qLeft.add(`${conv}:${pid}::${ownCall.step}:${ownCall.index}:${ownCall.at}`)
+        for (const k of found?.asking ?? []) {
+          if (k.call.at !== undefined) this.#qLeft.add(`${conv}:${pid}:${k.child}:${k.call.step}:${k.call.index}:${k.call.at}`)
+        }
+      }
+      let pick: { call: PendingCall; askedAt: number; child?: string } | undefined
+      if (pane.screen) {
+        // ★ With the screen (docs/AGY.md §14): the question the PC shows — its open dialog, else a subagent's banner
+        // ⚠️ A running child whose call could not be read may ask the same text: no card (codex / agy review)
+        if (found && !found.known) continue
+        const seen = await this.#onScreen(pane.socketPath, ownAt !== undefined ? turnEnd(tail(path)).pending : undefined, ownAt, found?.asking ?? [])
+        if (seen === 'unsure') {
+          unsure.add(conv)
+          continue
+        }
+        pick = seen
+      } else if (ownAt !== undefined && !f.state.subagentsActive) {
+        // its own question (no child running: a child's question could be the one open on the PC)
+        pick = { call: turnEnd(tail(path)).pending!, askedAt: ownAt }
+      } else if (ownAt === undefined && f.state.agentState === 'idle' && found?.complete && found.asking.length === 1 && !found.asking[0]!.ambiguous) {
+        // the question of its only asking child (ctrl+k opens the one the banner shows; every running child seen)
+        const k = found.asking[0]!
+        pick = { call: k.call, askedAt: k.askedAt, child: k.child }
+      }
+      if (!pick) continue
+      // ⚠️ A subagent's question is answered only while the parent is idle (`sameChildQuestionNow`): a card raised while
+      //    it works would be refused at every answer and raised again (agy review)
+      if (pick.child !== undefined && f.state.agentState !== 'idle') continue
+      const p = pick.call
+      if (!p || p.at === undefined || (pick.child === undefined && !callBeforeState(p, f.mtimeMs))) continue
+      const q = parseAgyQuestion(p, pane.screen)
+      if (!q) continue
+      const sharedNow = want.has(conv) || agyShared(deps.dir, conv, pid, deps.isAgy, locksOf, p.at)
+      if (sharedNow === undefined) {
+        unsure.add(conv)
+        continue
+      }
+      if (sharedNow) {
+        shared.add(conv)
+        continue
+      }
+      want.set(conv, {
+        state: f.state,
+        mark: { pid, askedAt: pick.askedAt, step: p.step, index: p.index, callAt: p.at, ...(pick.child !== undefined ? { child: pick.child } : {}), ...(pane.screen ? { screen: true as const } : {}) },
+        q,
+      })
+    }
+    for (const conv of shared) want.delete(conv)
+    this.#qLooked = true
+    let changed = false
+    for (const [conv, r] of this.#qRaised) {
+      const w = want.get(conv)
+      if (w && qMarkId(w.mark) === r.id) continue
+      if (!w && unsure.has(conv)) continue
+      this.#qRaised.delete(conv)
+      r.withdraw?.()
+      changed = true
+    }
+    for (const [conv, id] of this.#qAnswered) {
+      const w = want.get(conv)
+      if (!w && unsure.has(conv)) continue
+      if (!w || qMarkId(w.mark) !== id) this.#qAnswered.delete(conv)
+    }
+    while (this.#qLeft.size > CALL_MEMORY_MAX) this.#qLeft.delete(this.#qLeft.values().next().value as string)
+    for (const [conv, w] of want) {
+      const id = qMarkId(w.mark)
+      const callKey = `${conv}:${qCallId(w.mark)}`
+      if (this.#qRaised.has(conv) || this.#qAnswered.get(conv) === id || this.#qLeft.has(callKey) || this.#qTyping.has(callKey)) continue
+      const row = agyRow(w.state, { machine: this.#deps.machine, transcriptBytes: 0, lastActivity: new Date(w.mark.askedAt).toISOString(), sendRoute: 'keys', asking: true, outlived: false })
+      const info = agyQuestionCard(row, w.mark, w.q, this.#deps.now().toISOString())
+      const raised: Raised = { id }
+      this.#qRaised.set(conv, raised)
+      changed = true
+      void this.#waitQuestion(conv, raised, info, w.mark, w.q)
+    }
+    return changed
+  }
+
+  /**
+   * ★ Which question the PC shows (docs/AGY.md §14): the one whose dialog is open, else — on the parent's view — the one a
+   * subagent's banner names. Only a question whose text no other asking one shares. 'unsure' = the screen cannot be read.
+   */
+  async #onScreen(
+    socketPath: string,
+    ownCall: PendingCall | undefined,
+    ownAt: number | undefined,
+    kids: readonly { child: string; call: PendingCall; askedAt: number }[],
+  ): Promise<{ call: PendingCall; askedAt: number; child?: string } | undefined | 'unsure'> {
+    const screen = await (this.#deps.readScreen ?? readAgyScreen)(socketPath)
+    if (screen === undefined) return 'unsure'
+    const all: { call: PendingCall; askedAt: number; child?: string; q: AgyQuestion }[] = []
+    // ★ The texts of every asking call, also ones the phone does not take: a dialog or banner fitting one of them is not
+    //   told apart by its text (codex review); a call not readable at all ⇒ no card while it is up
+    const texts: { call: PendingCall; text: string }[] = []
+    for (const c of [...(ownCall && ownAt !== undefined ? [ownCall] : []), ...kids.map((k) => k.call)]) {
+      const ts = questionTextsOf(c)
+      if (ts === undefined) return undefined
+      for (const text of ts) texts.push({ call: c, text })
+    }
+    // ★ No question of the chosen batch shares a text with another call's (the answer refuses that too: a card it would
+    //   always refuse came back after each try / agy review), nor does the text shown
+    const alone = (call: PendingCall, shown: string, q: AgyQuestion): boolean =>
+      !texts.some((x) => x.call !== call && (sameQuestionText(shown, x.text) || q.items.some((it) => sameQuestionText(x.text, it.question))))
+    if (ownCall && ownAt !== undefined) {
+      const q = parseAgyQuestion(ownCall, true)
+      if (q) all.push({ call: ownCall, askedAt: ownAt, q })
+    }
+    for (const k of kids) {
+      const q = parseAgyQuestion(k.call, true)
+      if (q) all.push({ call: k.call, askedAt: k.askedAt, child: k.child, q })
+    }
+    const one = <T>(xs: T[]): T | undefined => (xs.length === 1 ? xs[0] : undefined)
+    const d = parseDialog(screen)
+    if (d) {
+      // ★★ The dialog's owner from the screen (a child's id in the header / the parent's view), and the dialog as the
+      //    answer will check it (options, write-in row, ticks)
+      const owner = viewOwnerOf(screen)
+      if (owner === undefined) return undefined
+      const hit = one(all.filter((c) => c.q.items.length === d.of && c.q.items[d.k - 1] !== undefined && dialogFits(d, c.q.items[d.k - 1]!)))
+      if (!hit || !alone(hit.call, d.question, hit.q)) return undefined
+      if (owner === 'parent' ? hit.child !== undefined : hit.child?.toLowerCase() !== owner.child) return undefined
+      return hit && { call: hit.call, askedAt: hit.askedAt, ...(hit.child !== undefined ? { child: hit.child } : {}) }
+    }
+    if (inChildView(screen)) {
+      // ★ The PC on a subagent's view with nothing open: the banner is not visible, so the card is the oldest asking
+      //   child's question (ctrl+k opens the oldest queued one); the answer goes back to the parent's view first and
+      //   checks the banner shows that question before opening it (`answerOnScreen`)
+      // ⚠️ Only when the answer could go back (`answerOnScreen`): the viewed child named by its header, nothing pending
+      //    there (agy / codex review: a card the answer always refused came back after each try)
+      const viewed = childViewOf(screen)
+      if (viewed === undefined || agyPendingCall(transcriptPathOf(viewed, this.#deps.agy().home), this.#deps.tail ?? readTailRecords) !== null) return undefined
+      // ★ The parent's own question (its dialog is drawn on the parent's view, where the answer goes first / agy review)
+      const own = all.find((c) => c.child === undefined)
+      if (own) return alone(own.call, own.q.items[0]!.question, own.q) ? { call: own.call, askedAt: own.askedAt } : undefined
+      const kids = all.filter((c) => c.child !== undefined).sort((a, b) => a.askedAt - b.askedAt)
+      const oldest = kids[0]
+      if (!oldest || (kids[1] !== undefined && kids[1].askedAt === oldest.askedAt)) return undefined
+      if (!alone(oldest.call, oldest.q.items[0]!.question, oldest.q)) return undefined
+      return { call: oldest.call, askedAt: oldest.askedAt, child: oldest.child! }
+    }
+    const banner = parseBanner(screen)
+    if (banner === undefined) return undefined
+    const hit = one(all.filter((c) => c.child !== undefined && sameQuestionText(banner, c.q.items[0]!.question)))
+    if (!hit || !alone(hit.call, banner, hit.q)) return undefined
+    return hit && { call: hit.call, askedAt: hit.askedAt, child: hit.child! }
+  }
+
+  /**
+   * ★ The name the notifier gives this conversation's wait now (`agyQuestionWaitAt`: the newest question asked, its own
+   * or a child's), for a ring asked for a question: the answered one may be an older child's (codex review: a ring
+   * named after it was dropped while a newer child's question was the wait). Its own time when not readable.
+   */
+  #waitNameOf(mark: AgyQuestionMark): string {
+    const deps = this.#deps.agy()
+    const f = readAgyPidFile(deps.dir, mark.pid)
+    const at = f ? agyQuestionWaitAt(f.state, f.mtimeMs, deps.home) : undefined
+    return new Date(at ?? mark.askedAt).toISOString()
+  }
+
+  /**
+   * The name of this conversation's wait now when a question asked before `before` (epoch ms) still waits in it (see
+   * `#waitNameOf`), else undefined. ⚠️ One asked later rang on its own (codex review: a follow-up rang twice).
+   */
+  #stillWaitingName(mark: AgyQuestionMark, before: number): string | undefined {
+    const deps = this.#deps.agy()
+    const f = readAgyPidFile(deps.dir, mark.pid)
+    const at = f ? agyQuestionWaitAt(f.state, f.mtimeMs, deps.home) : undefined
+    return at === undefined || at >= before ? undefined : new Date(at).toISOString()
+  }
+
+  async #waitQuestion(conv: string, raised: Raised, info: PermissionRequest, mark: AgyQuestionMark, q: AgyQuestion): Promise<void> {
+    let settle!: (d: AgyDelivery | undefined) => void
+    const mine = new Promise<AgyDelivery | undefined>((r) => (settle = r))
+    deliveries.set(info.key, mine)
+    const callKey = `${conv}:${qCallId(mark)}`
+    try {
+      // ★ The question itself stays on the agent: the route builds the keys from it (`questions.ts` rule 1)
+      const decision = await waitForDecision(info, (withdraw) => (raised.withdraw = withdraw), { toolInput: q as unknown as Record<string, unknown> })
+      if (!decision) return
+      if (this.#qRaised.get(conv) === raised) this.#qRaised.delete(conv)
+      this.#qAnswered.set(conv, raised.id)
+      this.#deps.changed()
+      const built = decision.updatedInput as { steps?: unknown; plan?: unknown } | undefined
+      // ★ With the screen: what was chosen, typed against it; blind: the fixed keys (a question that does not fit them
+      //   never had a card there)
+      const answer: AgyQuestionAnswer = mark.screen
+        ? decision.behavior === 'allow'
+          ? { kind: 'plan', question: q, plan: (built?.plan as AgyAnswerPlan | undefined) ?? { items: [] } }
+          : { kind: 'skip', question: q }
+        : { kind: 'steps', steps: decision.behavior === 'allow' ? (Array.isArray(built?.steps) ? (built!.steps as AgyStep[]) : []) : skipSteps(q) }
+      const steps = answer.kind === 'steps' ? answer.steps : []
+      this.#qTyping.add(callKey)
+      const started = Date.now()
+      const res: AgyDelivery = await this.#deps.answerQuestion!(conv, mark, answer).catch(() => ({ ok: false as const, reason: 'unreachable' as const }))
+      settle(res)
+      // ⚠️ One line, nothing of the question or the answer
+      this.#deps.log?.(`[agy] question ${decision.behavior === 'allow' ? 'answer' : 'skip'} conversation=${conv.slice(0, 8)} ${res.ok ? 'typed' : `not typed (${res.reason})`}`)
+      if (!res.ok) {
+        // ⚠️ Half typed: the PC shows it half answered; raising it again would start over ⇒ left to the PC for good (the
+        //    phone is told so). Otherwise it comes back on the next look (if still up)
+        //    ★ With the screen it may come back: the next answer reads the dialog's state and puts it right
+        if (res.reason === 'partial' && !mark.screen) this.#qLeft.add(`${conv}:${qCallId(mark)}`)
+        else if (this.#qAnswered.get(conv) === raised.id) this.#qAnswered.delete(conv)
+        // ★ Past the phone's wait it was told "taken" (`permissionAnswer`): "needs you" rings again so the person looks
+        //   (codex / agy review: the session waited with no alert)
+        if (Date.now() - started >= (this.#deps.deliveryWaitMs ?? AGY_DELIVERY_WAIT_MS)) this.#deps.reraised?.(conv, this.#waitNameOf(mark))
+        void this.sync()
+        return
+      }
+      // ★ Only a one-key answer to the parent's own question may come back (nothing half done on the PC): any other is
+      //   never raised again from now on, whatever the next looks see (codex review: a sibling's question hid it for a
+      //   look, the memory below was dropped, and it came back over a half-done dialog)
+      const again = mark.screen === true || (steps.length === 1 && mark.child === undefined)
+      if (!again) this.#qLeft.add(`${conv}:${qCallId(mark)}`)
+      setTimeout(() => {
+        if (this.#qAnswered.get(conv) !== raised.id) {
+          // ★ Answered. A question still waiting in this conversation (a second subagent's) rings again: the alert was
+          //   named after the newest question, and opening it for the first one dismissed it (codex review)
+          const other = this.#stillWaitingName(mark, started)
+          if (other !== undefined) this.#deps.reraised?.(conv, other)
+          return
+        }
+        this.#qAnswered.delete(conv)
+        // still up: "needs you" rings again so the person looks (on the PC, unless it is shown again)
+        this.#deps.log?.(`[agy] question conversation=${conv.slice(0, 8)} still up after the answer; ${again ? 'shown again' : 'left to the PC'}`)
+        this.#deps.reraised?.(conv, this.#waitNameOf(mark))
+        void this.sync()
+      }, this.#deps.unconfirmedMs ?? UNCONFIRMED_MS).unref?.()
+    } finally {
+      // ★ Only now (after `#qLeft` got it above, in the same run): no look can raise it in between
+      this.#qTyping.delete(callKey)
+      settle(undefined)
+      if (deliveries.get(info.key) === mine) deliveries.delete(info.key)
+    }
   }
 
   /** Rule 5b: type `1` for a card auto-approve passes; a key that does not land sends the card to the phone */
@@ -440,6 +784,7 @@ export class AgyCards {
     this.#answered.set(conv, raised.id)
     this.#deps.changed()
     const behavior = decision.behavior === 'allow' ? 'allow' : 'deny'
+    const started = Date.now()
     const res: AgyDelivery = await this.#deps.answer(conv, mark, behavior).catch(() => ({ ok: false as const, reason: 'unreachable' as const }))
     settle(res)
     // ⚠️ One line, no command text (the card and the PC's screen are the only traces of it)
@@ -447,6 +792,8 @@ export class AgyCards {
     if (!res.ok) {
       // Rule 4: not typed ⇒ the card may come back on the next look (if it is still up)
       if (this.#answered.get(conv) === raised.id) this.#answered.delete(conv)
+      // ★ Past the phone's wait it was told "taken" (`permissionAnswer`): "needs you" rings again (agy review)
+      if (Date.now() - started >= (this.#deps.deliveryWaitMs ?? AGY_DELIVERY_WAIT_MS)) this.#deps.reraised?.(conv, new Date(mark.stateMtimeMs).toISOString())
       void this.sync()
       return
     }
