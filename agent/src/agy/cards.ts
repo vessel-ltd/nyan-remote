@@ -267,6 +267,9 @@ export class AgyCards {
       if (!deps.isAgy(pid)) continue
       const f = readAgyPidFile(deps.dir, pid)
       if (!f?.state.confirmationPending) continue
+      // ★ A child agent not finished: no card on the phone and no auto-answer (its question may be open on the PC and
+      //   would take the `1` or the ESC / docs/AGY.md §11). The card stays on the PC and rings as any waiting row.
+      if (f.state.subagentsActive) continue
       const conv = f.state.conversationId
       // Rule 1: only an agy whose relay checks out (the pane's process is this agy)
       const pane = await agyPaneOf(pid, deps.aliveProcStart ?? aliveProcStartSync)
@@ -345,7 +348,7 @@ export class AgyCards {
       const id = markId(w.mark)
       if (this.#raised.has(conv) || this.#answered.get(conv) === id) continue
       // ★ The row as the list builds it, from this agy's own state (the list itself may not show it right now)
-      const row = agyRow(w.state, { machine: this.#deps.machine, transcriptBytes: 0, lastActivity: this.#deps.now().toISOString(), sendRoute: 'keys' })
+      const row = agyRow(w.state, { machine: this.#deps.machine, transcriptBytes: 0, lastActivity: this.#deps.now().toISOString(), sendRoute: 'keys', asking: false })
       const last = this.#lastInfo.get(conv)
       const info = last?.id === id ? last.info : agyCard(row, w.mark, w.call, this.#deps.now().toISOString())
       if (!info) {

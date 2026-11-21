@@ -162,7 +162,7 @@ test('★ an agy row (2026-11-19): only follow, with its own mark; no send, stop
 })
 
 test('★★ agy send and stop (2026-11-20): only with the agent\'s marks AND a row the relay announced; never files, commands or auto-approve', () => {
-  const marks: AgentFeature[] = [...EVERYTHING, 'agy-log-follow', 'agy-send', 'agy-interrupt']
+  const marks: AgentFeature[] = [...EVERYTHING, 'agy-log-follow', 'agy-send', 'agy-interrupt', 'agy-question']
   const relayed = row({ tool: 'agy', account: 'agy', sendRoute: 'keys' })
   const plain = row({ tool: 'agy', account: 'agy' })
   assert.equal(canSendTo(relayed, marks), true)
@@ -181,6 +181,9 @@ test('★★ agy send and stop (2026-11-20): only with the agent\'s marks AND a 
   // ⚠️ an agent without the marks (older): nothing, even with the relay
   assert.equal(canSendTo(relayed, [...EVERYTHING, 'agy-log-follow']), false)
   assert.equal(canStop(relayed, [...EVERYTHING, 'agy-log-follow', 'agy-send']), false)
+  // ⚠️ an agent before questions (phase 4): its stop sent ESC into a question (skipping it) ⇒ no stop button
+  assert.equal(canStop(relayed, [...EVERYTHING, 'agy-log-follow', 'agy-send', 'agy-interrupt']), false)
+  assert.equal(stopView(relayed, 'ready', [...EVERYTHING, 'agy-log-follow', 'agy-send', 'agy-interrupt']).show, false)
   // a Claude row still attaches
   assert.equal(canAttachTo(row(), ALL), true)
 })

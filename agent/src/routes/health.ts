@@ -58,6 +58,7 @@ export async function health(): Promise<AgentHealth> {
       'agy-log-follow',
       'agy-send',
       'agy-interrupt',
+      'agy-question',
       'agy-approve',
       'agy-auto-approve',
     ],

@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict'
-import { appendFileSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
+import { appendFileSync, chmodSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
 import { createServer, type Server } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import { AGY_CARD_KEYS, agyTyped, answerAgyCard, findAgyTarget, looksLikeAgyShortcut, readNow, sendGate, sendToAgy, stopAgy, stopGate, type AgyKeysDeps } from './keys.ts'
-import { agyRows } from './sessions.ts'
+import { agyOwnRowOf, agyOwnRows, agyRows } from './sessions.ts'
 
 const A = '062a8f25-9451-42f3-ae93-34a208e99365'
 const PID = 4242
@@ -14,23 +14,32 @@ const START = '123456'
 const BASE = Math.floor(Date.now() / 1000)
 
 test('gates: text only while idle and written after the transcript; ESC only while working; a card stops both', () => {
-  const idle = { agentState: 'idle', confirmationPending: false }
-  assert.equal(sendGate(idle, 2000, 1000), 'ok')
-  assert.equal(sendGate(idle, 2000, 2000), 'ok')
+  const idle = { agentState: 'idle', confirmationPending: false, subagentsActive: false }
+  assert.equal(sendGate(idle, 2000, 1000, false), 'ok')
+  assert.equal(sendGate(idle, 2000, 2000, false), 'ok')
   // ⚠️ the transcript moved after the status line said idle (a status line that stopped writing)
-  assert.equal(sendGate(idle, 1000, 2000), 'unsure')
-  assert.equal(sendGate(idle, 2000, undefined), 'unsure')
-  assert.equal(sendGate({ agentState: 'error', confirmationPending: false }, 2, 1), 'ok')
-  for (const s of ['working', 'tool_use', 'reviewing']) assert.equal(sendGate({ agentState: s, confirmationPending: false }, 2, 1), 'busy')
+  assert.equal(sendGate(idle, 1000, 2000, false), 'unsure')
+  assert.equal(sendGate(idle, 2000, undefined, false), 'unsure')
+  assert.equal(sendGate({ agentState: 'error', confirmationPending: false, subagentsActive: false }, 2, 1, false), 'ok')
+  for (const s of ['working', 'tool_use', 'reviewing']) assert.equal(sendGate({ agentState: s, confirmationPending: false, subagentsActive: false }, 2, 1, false), 'busy')
   for (const s of ['initializing', 'authenticating', undefined, 'new-state']) {
-    assert.equal(sendGate({ agentState: s, confirmationPending: false }, 2, 1), 'unsure', String(s))
+    assert.equal(sendGate({ agentState: s, confirmationPending: false, subagentsActive: false }, 2, 1, false), 'unsure', String(s))
   }
-  assert.equal(sendGate({ agentState: 'tool_use', confirmationPending: true }, 2, 1), 'waiting')
+  assert.equal(sendGate({ agentState: 'tool_use', confirmationPending: true, subagentsActive: false }, 2, 1, false), 'waiting')
   // stop
-  assert.equal(stopGate({ agentState: 'working', confirmationPending: false }, 1, 2), 'ok')
-  assert.equal(stopGate({ agentState: 'tool_use', confirmationPending: true }, 1, 2), 'waiting')
-  assert.equal(stopGate(idle, 2, 1), 'idle')
-  assert.equal(stopGate(idle, 1, 2), 'unsure')
+  assert.equal(stopGate({ agentState: 'working', confirmationPending: false, subagentsActive: false }, 1, 2, false), 'ok')
+  assert.equal(stopGate({ agentState: 'tool_use', confirmationPending: true, subagentsActive: false }, 1, 2, false), 'waiting')
+  assert.equal(stopGate(idle, 2, 1, false), 'idle')
+  assert.equal(stopGate(idle, 1, 2, false), 'unsure')
+  // ★ a question (docs/AGY.md §11): no text (it would go into the write-in), no ESC (it skips the question)
+  assert.equal(sendGate({ agentState: 'tool_use', confirmationPending: false, subagentsActive: false }, 2, 1, true), 'asking')
+  assert.equal(stopGate({ agentState: 'tool_use', confirmationPending: false, subagentsActive: false }, 2, 1, true), 'asking')
+  // a card is still a card
+  assert.equal(sendGate({ agentState: 'tool_use', confirmationPending: true, subagentsActive: false }, 2, 1, true), 'waiting')
+  assert.equal(stopGate({ agentState: 'tool_use', confirmationPending: true, subagentsActive: false }, 2, 1, true), 'waiting')
+  // ★ a child agent not finished (its question may be open on the PC and take the keys): neither text nor ESC
+  assert.equal(sendGate({ ...idle, subagentsActive: true }, 2000, 1000, false), 'subagent')
+  assert.equal(stopGate({ agentState: 'working', confirmationPending: false, subagentsActive: true }, 1, 2, false), 'subagent')
 })
 
 test('text: `?` first (the shortcuts panel) is told apart, also behind invisible characters; one space goes after', () => {
@@ -213,6 +222,83 @@ test('target: only the conversation its agy wrote last', async (t) => {
   assert.equal(await findAgyTarget(B, l.deps), 'shared')
 })
 
+test('★★ a question is up (ask_question / docs/AGY.md §11): stop and send are refused, not a byte; the row waits for input', async (t) => {
+  const l = await lab(t)
+  const iso = (sec: number): string => new Date(sec * 1000).toISOString().replace(/\.\d{3}Z$/, 'Z')
+  writeFileSync(
+    l.transcript,
+    [
+      { type: 'USER_INPUT', step_index: 0, created_at: iso(BASE - 20), content: '<USER_REQUEST>\nask me\n</USER_REQUEST>' },
+      { type: 'PLANNER_RESPONSE', step_index: 1, created_at: iso(BASE - 20), tool_calls: [{ name: 'ask_question', args: { questions: '[]' } }] },
+    ]
+      .map((r) => JSON.stringify(r))
+      .join('\n') + '\n',
+  )
+  utimesSync(l.transcript, BASE - 10, BASE - 10)
+  // the status line says only `tool_use`, written after the question
+  l.setState({ agent_state: 'tool_use' }, BASE)
+  // ★ the gap before the status line catches up (the question written, the state still the call before's `tool_use`):
+  //   no "needs you" yet, but ESC is already refused (it would skip the question / codex review)
+  utimesSync(l.transcript, BASE + 1, BASE + 1)
+  assert.equal((await agyRows('pc-a', l.deps))[0]?.status, 'working')
+  assert.equal((await stopAgy(A, l.deps)).reason, 'asking')
+  // ⚠️ the transcript unreadable at that moment (e.g. out of file descriptors): cannot tell ⇒ no ESC
+  chmodSync(l.transcript, 0)
+  // (a new time: not the read remembered above)
+  utimesSync(l.transcript, BASE + 2, BASE + 2)
+  try {
+    assert.equal((await stopAgy(A, l.deps)).reason, 'unsure')
+  } finally {
+    chmodSync(l.transcript, 0o644)
+  }
+  utimesSync(l.transcript, BASE - 10, BASE - 10)
+  const stopped = await stopAgy(A, l.deps)
+  assert.equal(stopped.reason, 'asking')
+  assert.match(stopped.message ?? '', /question|質問/)
+  assert.equal((await sendToAgy(A, 'blue', l.deps)).reason, 'asking')
+  const [row] = await agyRows('pc-a', l.deps)
+  assert.equal(row?.status, 'waiting')
+  assert.equal(row?.waitingFor, 'input needed')
+  // ★ the notifier's rows (each agy's own file) and the guard's single read say the same: it rings "needs you"
+  const [own] = agyOwnRows('pc-a', l.deps)
+  assert.equal(own?.status, 'waiting')
+  assert.equal(own?.waitingFor, 'input needed')
+  assert.equal(agyOwnRowOf('pc-a', l.deps, A)?.status, 'waiting')
+  // ★ the wait is named by the question's transcript write, not the status file's: a subagent's progress rewriting the
+  //   status file while the question stays up is the same wait (it does not ring again / codex review)
+  const named = own?.lastActivity
+  assert.equal(named, new Date((BASE - 10) * 1000).toISOString())
+  l.setState({ agent_state: 'tool_use', subagents: [{ name: 'self', status: 'running' }] }, BASE + 0.5)
+  assert.equal(agyOwnRows('pc-a', l.deps)[0]?.lastActivity, named)
+  assert.equal(agyOwnRowOf('pc-a', l.deps, A)?.lastActivity, named)
+  l.setState({ agent_state: 'tool_use' }, BASE)
+  await settle()
+  assert.equal(l.got.join(''), '')
+  // ★ answered (its result written): working again, and stop goes through
+  appendFileSync(l.transcript, JSON.stringify({ type: 'GENERIC', step_index: 2, created_at: iso(BASE - 19), content: `Created At: ${iso(BASE - 19)}\nA1: blue` }) + '\n')
+  utimesSync(l.transcript, BASE + 1, BASE + 1)
+  l.setState({ agent_state: 'working' }, BASE + 2)
+  assert.equal((await agyRows('pc-a', l.deps))[0]?.status, 'working')
+  // (not stopped for real: the cooldown is shared with the later tests)
+  const tg = await findAgyTarget(A, l.deps)
+  assert.ok(typeof tg === 'object')
+  assert.equal(readNow(tg)?.asking, false)
+})
+
+test('★★ a child agent running (its question may be open on the PC): send and stop refused, not a byte; done ⇒ sends again', async (t) => {
+  const l = await lab(t)
+  l.setState({ subagents: [{ name: 'self', status: 'running' }] })
+  const sent = await sendToAgy(A, '1', l.deps)
+  assert.equal(sent.reason, 'subagent')
+  assert.match(sent.message ?? '', /subagent|サブエージェント/)
+  l.setState({ agent_state: 'working', subagents: [{ name: 'self', status: 'running' }] })
+  assert.equal((await stopAgy(A, l.deps)).reason, 'subagent')
+  await settle()
+  assert.equal(l.got.join(''), '')
+  l.setState({ subagents: [{ name: 'self', status: 'completed' }] })
+  assert.equal((await sendToAgy(A, 'hello', l.deps)).ok, true)
+})
+
 test('★★★ the state changing between the first look and the socket write: not a byte is sent (send and stop)', async (t) => {
   const l = await lab(t)
   // first look: as on disk; every later look: a card is up
@@ -293,6 +379,10 @@ test('★★ a card is answered with `1` (allow) or ESC (deny), only while the s
   l.setState(up)
   l.deps.answerSettleMs = 0
   const mark = { pid: PID, stateMtimeMs: BASE * 1000, step: 1, index: 0, callAt: (BASE - 60) * 1000 }
+  // ★ a child agent running (its question may be open on the PC and would take the key): nothing typed
+  l.setState({ ...up, subagents: [{ name: 'self', status: 'running' }] })
+  assert.deepEqual(await answerAgyCard(A, mark, 'allow', l.deps), { ok: false, reason: 'changed' })
+  l.setState(up)
   assert.deepEqual(await answerAgyCard(A, mark, 'allow', l.deps), { ok: true })
   assert.deepEqual(await answerAgyCard(A, mark, 'deny', l.deps), { ok: true })
   // ★ no longer wanted right before the byte (auto-approve turned off during the wait) ⇒ nothing typed

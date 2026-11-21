@@ -332,8 +332,11 @@ export function Thread({
    *    Treating it as 0 means **saying "cannot be answered" while a live mark exists**
    *    (passing what could not be read with a default = fail-open / CLAUDE.md).
    */
+  // ★ An agy row: the "being checked" count is Claude's approvals (agy cards never wait there), so it does not hold the
+  //   note back (a Claude approval in its quiet seconds hid "answer agy's question on the PC" / codex review)
+  const quietHere = isAgy(session) ? 0 : quietPermissions
   const noAnswerable =
-    permissionsKnown && permissions.length === 0 && quietPermissions === 0 && session?.status === 'waiting'
+    permissionsKnown && permissions.length === 0 && quietHere === 0 && session?.status === 'waiting'
   // ⚠️ The key **includes the endpoint too** (re-reading the same sessionId from another machine is a different matter)
   staleGate.current = armStale(
     staleGate.current,
@@ -1116,7 +1119,7 @@ export function Thread({
           (it may belong to another session / 2026-08-19 codex review, medium #3).
           ⇒ **Say only what we know (being checked on this PC).**
           ★ The proper fix is adding per-session `quiet` to the API (HANDOFF 5.0-h a). This text is interim */}
-      {permissions.length === 0 && quietPermissions > 0 ? (
+      {permissions.length === 0 && quietHere > 0 ? (
         <p class="notice">
           {t(
             `このPCで確認中の承認が ${quietPermissions} 件あります… （このスレッドのものとは限りません）`,
@@ -1133,7 +1136,14 @@ export function Thread({
           {isAgy(session) ? (
             /* ★ agy (2026-11-20 / docs/AGY.md §9): cards come for an agy started through the relay, for a command or a
                file read. ⚠️ The agent's own mark decides the words (an older agent has no agy cards at all) */
-            session?.agyShared ? (
+            /* ★ A question (`ask_question` / docs/AGY.md §11): answered on the PC for now; stopping would skip it */
+            session?.waitingFor === 'input needed' ? (
+              <>
+                {t('PCの画面で agy が質問しています。', 'agy is asking a question on the PC screen. ')}
+                <strong>{t('agy の質問は、まだスマホからは答えられません', 'agy questions can’t be answered from the phone yet')}</strong>
+                {t('。PCで答えてください。', '. Please answer on the PC.')}
+              </>
+            ) : session?.agyShared ? (
               <>
                 {t('PCの画面で承認を待っています。', 'The PC screen is waiting for an approval. ')}
                 <strong>{t('この会話は2つの agy で開かれています', 'This conversation is open in two agys')}</strong>

@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
-import { startAgyWatch } from './watch.ts'
+import { transcriptPathOf } from './sessions.ts'
+import { agyStatuses, startAgyWatch } from './watch.ts'
 
 const A = '062a8f25-9451-42f3-ae93-34a208e99365'
 const file = (state: string, ctx = 1) =>
@@ -44,4 +45,34 @@ test('watch: steady writes (two conversations in turn) still say "changed" witho
     writeFileSync(join(dir, `session-${B}.json`), other(i))
   }
   assert.ok(n >= 1, 'the change was said while writes went on')
+})
+
+test('★ watch: a card and a question are different states (an approval then a question in one response is a change)', async (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'nyan-agy-watch3-'))
+  t.after(() => rmSync(root, { recursive: true, force: true }))
+  const dir = join(root, 'agy')
+  mkdirSync(dir)
+  const tr = transcriptPathOf(A, root)
+  mkdirSync(join(tr, '..'), { recursive: true })
+  const at = '2026-11-21T00:08:03Z'
+  writeFileSync(
+    tr,
+    [
+      { type: 'USER_INPUT', step_index: 0, created_at: at, content: 'x' },
+      { type: 'PLANNER_RESPONSE', step_index: 1, created_at: at, tool_calls: [{ name: 'ask_question', args: {} }] },
+    ]
+      .map((r) => JSON.stringify(r))
+      .join('\n') + '\n',
+  )
+  const sec = Date.parse(at) / 1000
+  utimesSync(tr, sec + 5, sec + 5)
+  const f = join(dir, `session-${A}.json`)
+  writeFileSync(f, JSON.stringify({ nyanPid: 4242, nyanBusyAt: 1, input: { conversation_id: A, cwd: '/home/user/w', agent_state: 'tool_use', tool_confirmation_pending: true } }))
+  utimesSync(f, sec + 6, sec + 6)
+  const card = (await agyStatuses(dir, root)).get(A)
+  writeFileSync(f, file('tool_use'))
+  utimesSync(f, sec + 6, sec + 6)
+  const question = (await agyStatuses(dir, root)).get(A)
+  assert.equal(card, '4242:waiting')
+  assert.equal(question, '4242:waiting:question')
 })

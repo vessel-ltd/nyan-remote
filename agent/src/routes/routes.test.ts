@@ -196,7 +196,7 @@ test('★★★ /health actually returns the feature flags (checking only the co
   })
   const h = await health()
   // ★ plus the agy mark, always on (2026-11-19 / docs/AGY.md); Codex's only while Codex support is on (off here)
-  assert.deepEqual(h.features, [...AGENT_FEATURES, 'agy-log-follow', 'agy-send', 'agy-interrupt', 'agy-approve', 'agy-auto-approve'], '/health does not return the flags (no buttons appear)')
+  assert.deepEqual(h.features, [...AGENT_FEATURES, 'agy-log-follow', 'agy-send', 'agy-interrupt', 'agy-question', 'agy-approve', 'agy-auto-approve'], '/health does not return the flags (no buttons appear)')
   assert.ok((h.features?.length ?? 0) > 0, 'flags are empty (the trap where 0 items is still green)')
 })
 

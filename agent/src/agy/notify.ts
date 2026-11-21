@@ -110,6 +110,8 @@ export const QUIET_UNSURE_MAX = 3
  * an own row). agy writes its state once per card and not again while it stays up (measured: unchanged for 20 s), and
  * no other agy writes that file — unlike the shared transcript, whose last call can be another agy's (codex review,
  * rounds 31–33). ⚠️ A terminal resize while a card is up may write it again: that card then rings once more.
+ * ★ A question (`ask_question`) is named by the transcript write that posed it instead (`agyOwnRows` /
+ *   `agyQuestionAt`): a background subagent's progress rewrites the state file while it stays up.
  */
 function cardOf(row: Pick<SessionSummary, 'status' | 'lastActivity'>): string | undefined {
   return row.status === 'waiting' ? row.lastActivity : undefined

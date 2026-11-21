@@ -423,6 +423,23 @@ test('★★ auto-approve: a card the phone could answer is answered `1` here, n
   assert.equal(agyCards().length, 1)
 })
 
+test('★★ a child agent running: no card on the phone and no auto-answer (its question may be open on the PC); it rings', async (t) => {
+  const l = lab(t)
+  await autoOn(t)
+  l.setState({ subagents: [{ name: 'self', status: 'running' }] })
+  const cards = new AgyCards({ ...l.deps, unconfirmedMs: 10_000 })
+  await cards.sync()
+  await settle()
+  assert.equal(agyCards().length, 0, 'not on the phone')
+  assert.equal(l.answers.length, 0, 'not typed at')
+  assert.equal(cards.autoAnswering(A, new Date(BASE * 1000).toISOString()), false, 'not quiet: the notifier rings it')
+  // the child done (a new state write): auto-approve answers it as before
+  l.setState({ subagents: [{ name: 'self', status: 'completed' }] }, BASE + 1)
+  await cards.sync()
+  await settle()
+  assert.equal(l.answers.length, 1)
+})
+
 test('★★ auto-approve: a key that does not land sends that card to the phone (and rings it); it is not typed again', async (t) => {
   const l = lab(t)
   await autoOn(t)

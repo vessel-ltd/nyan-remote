@@ -21,6 +21,7 @@ import { aliveProcStartSync, sameProcStart } from '../claude/sessionIndex.ts'
 import { readJsonFile, stateDir } from '../state.ts'
 import { t } from '../../../shared/i18n.ts'
 import { HttpError, type Ctx } from '../router.ts'
+import { callBeforeState, readTailRecords, turnEnd, type PendingCall } from './pending.ts'
 
 export const AGY_PREFIX = 'agy-'
 /** The label shown where Claude shows its profile (`.claude-r`) */
@@ -82,6 +83,11 @@ export interface AgyState {
   title?: string
   agentState?: string
   confirmationPending: boolean
+  /**
+   * ★ A child agent (subagent) has not finished (docs/AGY.md §11): its questions go straight to the person, and a
+   *   question opened on the PC (ctrl+k) takes typed text and ESC. The phone neither types nor stops meanwhile.
+   */
+  subagentsActive: boolean
   model?: string
   effort?: string
   contextPercent?: number
@@ -125,6 +131,7 @@ export function parseAgyFile(raw: unknown, fileId: string): AgyState | undefined
     ...(str(i.conversation_title) ? { title: firstLine(str(i.conversation_title)!) } : {}),
     ...(str(i.agent_state) ? { agentState: str(i.agent_state) } : {}),
     confirmationPending: i.tool_confirmation_pending === true,
+    subagentsActive: subagentsActive(i.subagents),
     ...(model && str(model.display_name) ? { model: str(model.display_name) } : {}),
     ...(model && str(model.effort) ? { effort: str(model.effort) } : {}),
     ...(used !== undefined && used >= 0 ? { contextPercent: Math.round(used) } : {}),
@@ -137,8 +144,100 @@ export function parseAgyFile(raw: unknown, fileId: string): AgyState | undefined
 }
 
 /**
+ * The child states that are over (measured: `running` while it works, `completed` after; agy also names `idle`,
+ * `killed`, `waiting`). ⚠️ Any other state, or an entry that cannot be read, counts as not finished (fail-closed).
+ */
+const SUBAGENT_DONE = new Set(['completed', 'killed', 'failed', 'cancelled', 'canceled', 'error', 'done', 'idle'])
+
+export function subagentsActive(v: unknown): boolean {
+  if (v === undefined || v === null) return false
+  if (!Array.isArray(v)) return true
+  return v.some((x) => !isObj(x) || typeof x.status !== 'string' || !SUBAGENT_DONE.has(x.status.toLowerCase()))
+}
+
+/** ★ The tool agy asks the person a question with (docs/AGY.md §11) */
+export const AGY_QUESTION_TOOL = 'ask_question'
+
+/** The last answer per transcript, kept while the file does not change (a question writes nothing while it is up) */
+const askCache = new Map<string, { size: number; mtimeMs: number; pending: PendingCall | undefined }>()
+const ASK_CACHE_MAX = 64
+
+/**
+ * ★★ Whether agy is asking the person a question now (`ask_question` / docs/AGY.md §11). agy's status line says only
+ * `tool_use` (no `tool_confirmation_pending`), so the transcript tells. Measured on agy 1.5.13 (2026-11-21):
+ *   - the question's PLANNER_RESPONSE is written, then the status file once (`tool_use`, ~50–250 ms later), and
+ *     neither is written again while the question is up (20 s);
+ *   - answering writes its GENERIC result (`A1: …`), so the call is no longer the pending one; ESC skips it
+ *     ("User Skipped") and the turn goes on.
+ * ⇒ asking = `tool_use`, no card, the transcript's pending call is `ask_question`, written before this state (rule 9 of
+ *   the cards) and the transcript not written since this state (an older `tool_use` state of the call before).
+ * ⚠️ Anything unclear ⇒ false (the row reads `working`, as before).
+ */
+export function agyAsking(
+  s: Pick<AgyState, 'agentState' | 'confirmationPending'>,
+  stateMtimeMs: number,
+  transcript: string,
+  tail: (path: string) => Record<string, unknown>[] = readTailRecords,
+): boolean {
+  return agyQuestionAt(s, stateMtimeMs, transcript, tail) !== undefined
+}
+
+/**
+ * ★ `agyAsking`, giving the question's own time: the transcript's write that posed it (epoch ms). The notifier tells
+ * questions apart by it, not by the status file's write: a background subagent's progress rewrites the status file
+ * while the parent's question stays up, which rang the same question again (codex review). Nothing else writes the
+ * transcript while the question is up.
+ */
+export function agyQuestionAt(
+  s: Pick<AgyState, 'agentState' | 'confirmationPending'>,
+  stateMtimeMs: number,
+  transcript: string,
+  tail: (path: string) => Record<string, unknown>[] = readTailRecords,
+): number | undefined {
+  if (s.confirmationPending || s.agentState !== 'tool_use') return undefined
+  const q = questionCall(transcript, tail)
+  return q !== undefined && q !== null && q.mtimeMs <= stateMtimeMs && callBeforeState(q.call, stateMtimeMs) ? q.mtimeMs : undefined
+}
+
+/**
+ * ★ The transcript's pending call when it is a question, with the transcript's time; no ordering check against the
+ * status line. ⚠️ For refusing ESC (`keys.ts` `stopGate`): the status file is written up to ~250 ms after the
+ * question, and an ESC in that gap would skip it (codex review). Showing "needs you" still needs `agyAsking`.
+ * undefined = cannot tell (the transcript could not be read: the caller refuses the ESC / codex review).
+ */
+export function agyQuestionInTranscript(transcript: string, tail: (path: string) => Record<string, unknown>[] = readTailRecords): boolean | undefined {
+  const q = questionCall(transcript, tail)
+  return q === undefined ? undefined : q !== null
+}
+
+/** The pending question; null = none; undefined = the transcript could not be read */
+function questionCall(transcript: string, tail: (path: string) => Record<string, unknown>[]): { call: PendingCall; mtimeMs: number } | null | undefined {
+  let st: { size: number; mtimeMs: number }
+  try {
+    st = statSync(transcript)
+  } catch {
+    return undefined
+  }
+  let hit = askCache.get(transcript)
+  if (!hit || hit.size !== st.size || hit.mtimeMs !== st.mtimeMs) {
+    const records = tail(transcript)
+    const pending = turnEnd(records).pending
+    // ⚠️ A read that gave nothing from a file that has bytes failed (e.g. out of file descriptors): not remembered,
+    //    or the question would stay unseen while the file stays unchanged (codex review)
+    if (records.length === 0) return undefined
+    hit = { size: st.size, mtimeMs: st.mtimeMs, pending }
+    askCache.delete(transcript)
+    askCache.set(transcript, hit)
+    if (askCache.size > ASK_CACHE_MAX) askCache.delete(askCache.keys().next().value as string)
+  }
+  const p = hit.pending
+  return p !== undefined && p.name === AGY_QUESTION_TOOL ? { call: p, mtimeMs: st.mtimeMs } : null
+}
+
+/**
  * ★ The list state, in the words a Claude row uses.
  * - a card is up ⇒ `waiting` (only while agy says so; the flag comes with `tool_use`)
+ * - ★ a question is up (`asking`, from `agyAsking`) ⇒ `waiting`
  * - `working` / `tool_use` / `reviewing` ⇒ `working`
  * - `error` ⇒ `error`
  * - `idle` after a turn this conversation was seen working in ⇒ `done`; before any ⇒ `idle`
@@ -146,8 +245,8 @@ export function parseAgyFile(raw: unknown, fileId: string): AgyState | undefined
  * ⚠️ A turn stopped with ESC or a declined card also ends `idle` after working, so it reads `done` (agy sends no
  *    signal that tells them apart: no Stop hook for either / measured 2026-11-19).
  */
-export function agyStatus(s: Pick<AgyState, 'agentState' | 'confirmationPending' | 'busyAt'>): SessionStatus {
-  if (s.confirmationPending) return 'waiting'
+export function agyStatus(s: Pick<AgyState, 'agentState' | 'confirmationPending' | 'busyAt'>, asking: boolean): SessionStatus {
+  if (s.confirmationPending || asking) return 'waiting'
   switch (s.agentState) {
     case 'working':
     case 'tool_use':
@@ -201,6 +300,8 @@ export interface AgyRowContext {
   lastActivity: string
   /** ★ The agy went through the relay (its pane announcement checks out): the phone may type into it / stop it */
   sendRoute?: 'keys'
+  /** ★ A question is up (`agyAsking`). ⚠️ Required: a caller that forgets it would read the row as working */
+  asking: boolean
 }
 
 export function agyRow(s: AgyState, ctx: AgyRowContext): SessionSummary {
@@ -210,7 +311,7 @@ export function agyRow(s: AgyState, ctx: AgyRowContext): SessionSummary {
     : ctx.promptTitle
       ? { title: ctx.promptTitle, titleSource: 'prompt' }
       : { title: project, titleSource: 'fallback' }
-  const status = agyStatus(s)
+  const status = agyStatus(s, ctx.asking)
   return {
     machine: ctx.machine,
     account: AGY_ACCOUNT,
@@ -220,7 +321,8 @@ export function agyRow(s: AgyState, ctx: AgyRowContext): SessionSummary {
     project,
     ...title,
     status,
-    ...(status === 'waiting' ? { waitingFor: 'permission prompt' } : {}),
+    // ★ A question: the words a Codex question uses (the phone tells it apart from an approval)
+    ...(status === 'waiting' ? { waitingFor: s.confirmationPending ? 'permission prompt' : 'input needed' } : {}),
     live: true,
     ...(ctx.sendRoute ? { sendRoute: ctx.sendRoute } : {}),
     ...(s.mode ? { permissionMode: s.mode } : {}),
@@ -609,7 +711,10 @@ export function agyOwnRows(machine: string, deps: AgyDeps): SessionSummary[] {
     const f = readAgyPidFile(deps.dir, pid)
     if (!f || !held?.includes(f.state.conversationId)) continue
     const id = f.state.conversationId
-    byConv.set(id, byConv.has(id) ? null : agyRow(f.state, { machine, transcriptBytes: 0, lastActivity: new Date(f.mtimeMs).toISOString() }))
+    // ★ A question's wait is named by its own transcript write (`agyQuestionAt`; the notifier's identity of a wait)
+    const askedAt = agyQuestionAt(f.state, f.mtimeMs, transcriptPathOf(id, deps.home))
+    const asking = askedAt !== undefined
+    byConv.set(id, byConv.has(id) ? null : agyRow(f.state, { machine, transcriptBytes: 0, lastActivity: new Date(askedAt ?? f.mtimeMs).toISOString(), asking }))
   }
   return [...byConv.values()].filter((r): r is SessionSummary => r !== null)
 }
@@ -625,7 +730,9 @@ export function agyOwnRowOf(machine: string, deps: AgyDeps, conversationId: stri
   const holders = candidates.filter((p) => locksOf(p)?.includes(want))
   if (holders.length !== 1) return undefined
   const f = readAgyPidFile(deps.dir, holders[0]!)
-  return f && f.state.conversationId === want ? agyRow(f.state, { machine, transcriptBytes: 0, lastActivity: new Date(f.mtimeMs).toISOString() }) : undefined
+  if (!f || f.state.conversationId !== want) return undefined
+  const askedAt = agyQuestionAt(f.state, f.mtimeMs, transcriptPathOf(want, deps.home))
+  return agyRow(f.state, { machine, transcriptBytes: 0, lastActivity: new Date(askedAt ?? f.mtimeMs).toISOString(), asking: askedAt !== undefined })
 }
 
 /** `pid-<n>.json` files of agys gone for a day, and visit marks a day old, are removed (only ours) */
@@ -766,7 +873,8 @@ export async function agyRows(machine: string, given: AgyDeps = defaultAgyDeps()
     // ★ Not listed before its first message, like Claude (whose list is built from transcripts): a send there is
     //   refused anyway (the gate needs the transcript) / user decision 2026-11-20. ⚠️ A turn that runs or waits on a
     //   card stays listed even then (never hide something that needs an answer)
-    const status = agyStatus(f.state)
+    const asking = bytes > 0 && agyAsking(f.state, f.mtimeMs, path)
+    const status = agyStatus(f.state, asking)
     if (bytes === 0 && status !== 'working' && status !== 'waiting') continue
     let title = titles.get(f.state.conversationId)
     if (title === undefined && !f.state.title && bytes > 0) {
@@ -782,6 +890,7 @@ export async function agyRows(machine: string, given: AgyDeps = defaultAgyDeps()
         machine,
         transcriptBytes: bytes,
         lastActivity: new Date(f.mtimeMs).toISOString(),
+        asking,
         ...(title ? { promptTitle: title } : {}),
         // ⚠️ A conversation two agys show takes nothing from the phone (`agyConversations`), nor does one whose agy does
         //    not hold its lock (`findAgyTarget` refuses the same)

@@ -64,7 +64,8 @@ export function actionFeatures(
 export function canStop(session: Pick<SessionSummary, 'tool' | 'sendRoute'>, features: readonly AgentFeature[] | undefined): boolean {
   if (isCodex(session)) return features?.includes('codex-interrupt') ?? false
   // ★ agy: one ESC through its relay, so only a row the relay announced
-  if (isAgy(session)) return (features?.includes('agy-interrupt') ?? false) && session.sendRoute === 'keys'
+  // ⚠️ and only an agent that refuses it during a question (`agy-question`: an older one sent ESC, which skips it)
+  if (isAgy(session)) return (features?.includes('agy-interrupt') ?? false) && (features?.includes('agy-question') ?? false) && session.sendRoute === 'keys'
   if (session.tool !== undefined) return false
   return session.sendRoute !== undefined
 }

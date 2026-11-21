@@ -292,6 +292,11 @@ export type AgentFeature =
   /** ★ `POST /sessions/:id/interrupt` sends ESC to a working agy started through the relay (2026-11-20) */
   | 'agy-interrupt'
   /**
+   * ★ agy questions (`ask_question`) show as "needs you" and the stop refuses them (2026-11-21 / docs/AGY.md §11).
+   * ⚠️ The phone shows agy's stop only with it: an older agent's stop sent ESC into a question (it skips it).
+   */
+  | 'agy-question'
+  /**
    * ★ agy approval cards come to `/permissions` and are answered with a key through the relay (2026-11-20 /
    *   docs/AGY.md §9). Only the thread's note uses it (the cards themselves need nothing new on the phone).
    */

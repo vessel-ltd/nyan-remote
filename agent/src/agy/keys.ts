@@ -49,7 +49,9 @@ import {
 import { callBeforeState, readTailRecords, turnEnd } from './pending.ts'
 import {
   AGY_PREFIX,
+  agyAsking,
   agyConversations,
+  agyQuestionInTranscript,
   agyLocksOf,
   agyPaneOf,
   agyShared,
@@ -64,24 +66,30 @@ import {
   type AgyState,
 } from './sessions.ts'
 
-/** What agy's state allows: a send, a stop */
-export type AgyGate = 'ok' | 'busy' | 'waiting' | 'unsure' | 'idle'
+/**
+ * What agy's state allows: a send, a stop (★ `asking`: a question is up; `subagent`: a child agent has not finished —
+ * its question may be open on the PC and would take the keys / docs/AGY.md §11)
+ */
+export type AgyGate = 'ok' | 'busy' | 'waiting' | 'asking' | 'subagent' | 'unsure' | 'idle'
 
 const WORKING = new Set(['working', 'tool_use', 'reviewing'])
 const SETTLED = new Set(['idle', 'error'])
 
 /**
  * ★ May text be typed now? (rules 1 and 2 above)
- * - a card is up ⇒ `waiting`; a turn runs ⇒ `busy`
+ * - a card is up ⇒ `waiting`; a question is up ⇒ `asking` (typed text would go into its write-in); a turn runs ⇒ `busy`
  * - idle / error ⇒ `ok` only when the status line wrote it at or after the transcript's last write; else `unsure`
  * - anything else (starting, signing in, unknown) ⇒ `unsure`
  */
 export function sendGate(
-  s: Pick<AgyState, 'agentState' | 'confirmationPending'>,
+  s: Pick<AgyState, 'agentState' | 'confirmationPending' | 'subagentsActive'>,
   stateMtimeMs: number,
   transcriptMtimeMs: number | undefined,
+  asking: boolean,
 ): Exclude<AgyGate, 'idle'> {
   if (s.confirmationPending) return 'waiting'
+  if (asking) return 'asking'
+  if (s.subagentsActive) return 'subagent'
   if (s.agentState && WORKING.has(s.agentState)) return 'busy'
   if (!s.agentState || !SETTLED.has(s.agentState)) return 'unsure'
   if (transcriptMtimeMs === undefined || stateMtimeMs < transcriptMtimeMs) return 'unsure'
@@ -91,15 +99,20 @@ export function sendGate(
 /**
  * ★ May ESC be sent now? Only while a turn runs and no card is up (ESC on a card declines it: that is the card's own
  * answer, left to the PC / phase 3). Idle ⇒ nothing to stop (or `unsure` when the transcript moved past the status line).
+ * ★ Not while a question is up: ESC skips it ("User Skipped") and the turn goes on without the answer (measured
+ *   2026-11-21 / docs/AGY.md §11).
  */
 export function stopGate(
-  s: Pick<AgyState, 'agentState' | 'confirmationPending'>,
+  s: Pick<AgyState, 'agentState' | 'confirmationPending' | 'subagentsActive'>,
   stateMtimeMs: number,
   transcriptMtimeMs: number | undefined,
+  asking: boolean,
 ): Exclude<AgyGate, 'busy'> {
   if (s.confirmationPending) return 'waiting'
+  if (asking) return 'asking'
+  if (s.subagentsActive) return 'subagent'
   if (s.agentState && WORKING.has(s.agentState)) return 'ok'
-  const settled = sendGate(s, stateMtimeMs, transcriptMtimeMs)
+  const settled = sendGate(s, stateMtimeMs, transcriptMtimeMs, false)
   return settled === 'ok' ? 'idle' : 'unsure'
 }
 
@@ -159,7 +172,7 @@ export async function findAgyTarget(conversationId: string, deps: AgyKeysDeps): 
  * socket's connect / timer callbacks. Anything unreadable, or a file now naming another pid ⇒ undefined (= refuse).
  */
 export function readNow(target: Pick<AgyTarget, 'conversationId' | 'pid' | 'pane' | 'dir' | 'stateFile' | 'transcript'>):
-  | { state: AgyState; stateMtimeMs: number; transcriptMtimeMs: number | undefined }
+  | { state: AgyState; stateMtimeMs: number; transcriptMtimeMs: number | undefined; asking: boolean }
   | undefined {
   try {
     const stateMtimeMs = statSync(target.stateFile).mtimeMs
@@ -186,7 +199,16 @@ export function readNow(target: Pick<AgyTarget, 'conversationId' | 'pid' | 'pane
     } catch {
       transcriptMtimeMs = undefined
     }
-    return { state, stateMtimeMs, transcriptMtimeMs }
+    // ★ For ESC, a question already in the transcript counts before the status line says so (`agyQuestionInTranscript`)
+    let asking = agyAsking(state, stateMtimeMs, target.transcript)
+    if (!asking && !state.confirmationPending && state.agentState !== undefined && WORKING.has(state.agentState)) {
+      const q = agyQuestionInTranscript(target.transcript)
+      // ⚠️ A transcript that cannot be read while a turn runs: cannot tell whether a question is up ⇒ refused
+      //    (an ESC would skip one / codex review)
+      if (q === undefined) return undefined
+      asking = q
+    }
+    return { state, stateMtimeMs, transcriptMtimeMs, asking }
   } catch {
     return undefined
   }
@@ -199,13 +221,13 @@ type LockCheck = (pid: number, conversationId: string) => boolean
 const sendNow = (target: AgyTarget, read: typeof readNow, holds: LockCheck): Exclude<AgyGate, 'idle'> => {
   if (!holds(target.pid, target.conversationId)) return 'unsure'
   const now = read(target)
-  return now ? sendGate(now.state, now.stateMtimeMs, now.transcriptMtimeMs) : 'unsure'
+  return now ? sendGate(now.state, now.stateMtimeMs, now.transcriptMtimeMs, now.asking) : 'unsure'
 }
 
 const stopNow = (target: AgyTarget, read: typeof readNow, holds: LockCheck): Exclude<AgyGate, 'busy'> => {
   if (!holds(target.pid, target.conversationId)) return 'unsure'
   const now = read(target)
-  return now ? stopGate(now.state, now.stateMtimeMs, now.transcriptMtimeMs) : 'unsure'
+  return now ? stopGate(now.state, now.stateMtimeMs, now.transcriptMtimeMs, now.asking) : 'unsure'
 }
 
 const lockCheck = (deps: AgyKeysDeps): LockCheck => {
@@ -230,6 +252,8 @@ export type AgySendFailure =
   | AgyTargetFailure
   | 'busy'
   | 'waiting'
+  | 'asking'
+  | 'subagent'
   | 'unsure'
   | 'shortcut-like'
   | 'command-like'
@@ -239,7 +263,7 @@ export type AgySendFailure =
   | 'unreachable'
   | 'partial'
 
-export type AgyStopFailure = AgyTargetFailure | 'waiting' | 'unsure' | 'idle' | 'too-soon' | 'unreachable'
+export type AgyStopFailure = AgyTargetFailure | 'waiting' | 'asking' | 'subagent' | 'unsure' | 'idle' | 'too-soon' | 'unreachable'
 
 export interface AgyResult<F> {
   ok: boolean
@@ -278,6 +302,17 @@ export const AGY_SEND_REFUSAL: Record<AgySendFailure, () => [number, string]> = 
     t('agy が応答中です。終わってから送るか、止めてから送ってください。', 'agy is working. Send when it has finished, or stop it first.'),
   ],
   waiting: () => [409, t('agy が承認を待っています。PC で答えてください。', 'agy is waiting for an approval. Please answer on the PC.')],
+  asking: () => [
+    409,
+    t('agy が質問しています。PC で答えてください（スマホからはまだ答えられません）。', 'agy is asking a question. Please answer it on the PC (it can’t be answered from the phone yet).'),
+  ],
+  subagent: () => [
+    409,
+    t(
+      'agy の子（サブエージェント）が動いています。PC で子の質問を開いていると送った文がそこに入るため、子が終わるまでスマホからは送れません。',
+      'An agy subagent is running. Text sent now could go into its question if it is open on the PC, so sending from the phone waits until it has finished.',
+    ),
+  ],
   unsure: () => [
     409,
     t('agy の状態を確かめられませんでした（送っていません）。少し待ってから送り直してください。', 'Could not tell what agy is doing (nothing was sent). Wait a moment and send again.'),
@@ -321,6 +356,17 @@ export const AGY_STOP_REFUSAL: Record<AgyStopFailure, () => [number, string]> = 
   waiting: () => [
     409,
     t('agy が承認を待っています。PC で答えてください（止めるとその承認を断ることになります）。', 'agy is waiting for an approval. Please answer on the PC (stopping would decline it).'),
+  ],
+  asking: () => [
+    409,
+    t('agy が質問しています。PC で答えてください（止めるとその質問を飛ばして先に進みます）。', 'agy is asking a question. Please answer it on the PC (stopping would skip it and go on).'),
+  ],
+  subagent: () => [
+    409,
+    t(
+      'agy の子（サブエージェント）が動いています。PC で子の質問を開いていると止める合図がそれを飛ばすため、スマホからは止められません（PC で操作してください）。',
+      'An agy subagent is running. A stop could skip its question if it is open on the PC, so it cannot be stopped from the phone (use the PC).',
+    ),
   ],
   unsure: () => [409, t('agy の状態を確かめられませんでした。少し待ってからもう一度押してください。', 'Could not tell what agy is doing. Wait a moment and press it again.')],
   idle: () => [409, t('agy はいま応答していません（止めるものがありません）。', 'agy is not working right now (nothing to stop).')],
@@ -467,6 +513,8 @@ export function sameCardNow(
   // ★ The state file last of all (the transcript read can take a moment / codex review)
   const f = readAgyPidFile(target.dir, mark.pid)
   if (!f || f.state.conversationId !== target.conversationId || !f.state.confirmationPending) return false
+  // ★ A child agent not finished: its question may be open on the PC and would take the key (docs/AGY.md §11)
+  if (f.state.subagentsActive) return false
   if (f.mtimeMs !== mark.stateMtimeMs || f.mtimeMs < target.pane.startedAt) return false
   // ★ `cards.ts` rule 9: the call is not newer than this agy's "card is up" state
   return callBeforeState(p, f.mtimeMs)
