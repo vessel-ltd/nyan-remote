@@ -96,10 +96,15 @@ export function sendGate(
   stateMtimeMs: number,
   transcriptMtimeMs: number | undefined,
   asking: boolean,
+  /**
+   * ★ The relay's screen shows the parent's view with its input box and nothing open (`parentViewShown`): text goes
+   *   to the parent's prompt even while subagents run (measured 2026-11-22: the parent answered, the child ran on)
+   */
+  parentShown = false,
 ): Exclude<AgyGate, 'idle'> {
   if (s.confirmationPending) return 'waiting'
   if (asking) return 'asking'
-  if (s.subagentsActive) return 'subagent'
+  if (s.subagentsActive && !parentShown) return 'subagent'
   if (s.agentState && WORKING.has(s.agentState)) return 'busy'
   if (!s.agentState || !SETTLED.has(s.agentState)) return 'unsure'
   if (transcriptMtimeMs === undefined || stateMtimeMs < transcriptMtimeMs) return 'unsure'
@@ -117,12 +122,14 @@ export function stopGate(
   stateMtimeMs: number,
   transcriptMtimeMs: number | undefined,
   asking: boolean,
+  /** ★ As `sendGate`: on the parent's view, ESC interrupts the parent's turn only (the children run on / measured) */
+  parentShown = false,
 ): Exclude<AgyGate, 'busy'> {
   if (s.confirmationPending) return 'waiting'
   if (asking) return 'asking'
-  if (s.subagentsActive) return 'subagent'
+  if (s.subagentsActive && !parentShown) return 'subagent'
   if (s.agentState && WORKING.has(s.agentState)) return 'ok'
-  const settled = sendGate(s, stateMtimeMs, transcriptMtimeMs, false)
+  const settled = sendGate(s, stateMtimeMs, transcriptMtimeMs, false, parentShown)
   return settled === 'ok' ? 'idle' : 'unsure'
 }
 
@@ -159,6 +166,8 @@ export interface AgyKeysDeps extends AgyDeps {
   screenSettleMs?: number
   /** (tests) `AGY_COMPACT_DEADLINE_MS` */
   compactDeadlineMs?: number
+  /** (tests) `AGY_STOP_CONFIRM_MS` */
+  stopConfirmMs?: number
 }
 
 export function defaultAgyKeysDeps(): AgyKeysDeps {
@@ -242,16 +251,40 @@ export function readNow(target: Pick<AgyTarget, 'conversationId' | 'pid' | 'pane
  *   writes (codex review). First, so the files are read last. */
 type LockCheck = (pid: number, conversationId: string) => boolean
 
-const sendNow = (target: AgyTarget, read: typeof readNow, holds: LockCheck): Exclude<AgyGate, 'idle'> => {
+const sendNow = (target: AgyTarget, read: typeof readNow, holds: LockCheck, parentShown = false): Exclude<AgyGate, 'idle'> => {
   if (!holds(target.pid, target.conversationId)) return 'unsure'
   const now = read(target)
-  return now ? sendGate(now.state, now.stateMtimeMs, now.transcriptMtimeMs, now.asking) : 'unsure'
+  return now ? sendGate(now.state, now.stateMtimeMs, now.transcriptMtimeMs, now.asking, parentShown) : 'unsure'
 }
 
-const stopNow = (target: AgyTarget, read: typeof readNow, holds: LockCheck): Exclude<AgyGate, 'busy'> => {
+const stopNow = (target: AgyTarget, read: typeof readNow, holds: LockCheck, parentShown = false): Exclude<AgyGate, 'busy'> => {
   if (!holds(target.pid, target.conversationId)) return 'unsure'
   const now = read(target)
-  return now ? stopGate(now.state, now.stateMtimeMs, now.transcriptMtimeMs, now.asking) : 'unsure'
+  return now ? stopGate(now.state, now.stateMtimeMs, now.transcriptMtimeMs, now.asking, parentShown) : 'unsure'
+}
+
+/**
+ * ★ A send would not land as a plain prompt: the input box not readable as one row (a draft wrapped onto more rows,
+ * the slash list pushing it off a short pane, something open over it — codex / agy review), or holding a draft that
+ * starts like a command (`/`, `!`, `?`, also behind invisible characters): the text would be joined to it and run.
+ */
+export function unsafeDraft(screen: string | undefined): boolean {
+  if (screen === undefined) return true
+  const box = inputRowOf(screen)
+  if (box === undefined) return true
+  return /^[/!?]/.test(visibleHead(box))
+}
+
+/**
+ * ★★ Whether the relay's screen shows the parent's view ready for a send or a stop while subagents run (docs/AGY.md
+ * §15): no subagent header, not a subagent's view, no dialog open, its input box on the screen. ⚠️ A subagent's
+ * question or approval opens only with ctrl+k (on its view): a send there would go into it, so that is refused.
+ */
+async function parentViewShown(target: AgyTarget, deps: AgyKeysDeps): Promise<boolean> {
+  if (!target.pane.screen) return false
+  const s = await (deps.readScreen ?? ((p: string) => readAgyScreen(p)))(target.pane.socketPath)
+  if (s === undefined || s.trim() === '') return false
+  return viewOwnerOf(s) === 'parent' && !inChildView(s) && parseDialog(s) === undefined && inputRowOf(s) !== undefined
 }
 
 /** (no lock probe: for a check whose key only leaves a subagent's view) */
@@ -295,7 +328,7 @@ export type AgySendFailure =
   | 'draft'
   | 'too-soon'
 
-export type AgyStopFailure = AgyTargetFailure | 'waiting' | 'asking' | 'subagent' | 'unsure' | 'idle' | 'too-soon' | 'unreachable' | 'answering' | 'child-view'
+export type AgyStopFailure = AgyTargetFailure | 'waiting' | 'asking' | 'subagent' | 'unsure' | 'idle' | 'too-soon' | 'unreachable' | 'answering' | 'child-view' | 'not-stopped'
 
 export interface AgyResult<F> {
   ok: boolean
@@ -341,8 +374,8 @@ export const AGY_SEND_REFUSAL: Record<AgySendFailure, () => [number, string]> = 
   subagent: () => [
     409,
     t(
-      'agy の子（サブエージェント）が動いています。PC で子の質問を開いていると送った文がそこに入るため、子が終わるまでスマホからは送れません。',
-      'An agy subagent is running. Text sent now could go into its question if it is open on the PC, so sending from the phone waits until it has finished.',
+      'agy の子（サブエージェント）が動いていて、PC の画面が親の入力欄を出していないため送れません（子の質問を開いている・古い中継など）。PC で親の画面に戻すか、子が終わってから送ってください。',
+      'An agy subagent is running and the PC does not show the main input box (a subagent’s question is open, or an older relay), so it cannot be sent. Go back to the main screen on the PC, or send when the subagent has finished.',
     ),
   ],
   unsure: () => [
@@ -382,8 +415,8 @@ export const AGY_SEND_REFUSAL: Record<AgySendFailure, () => [number, string]> = 
   draft: () => [
     409,
     t(
-      'PC の agy の入力欄に打ちかけの文があります（つながって送られてしまうので、圧縮していません）。PC で消すか送ってから押してください。',
-      'There is unsent text in the agy input box on the PC (it would be sent along with it, so nothing was done). Clear or send it on the PC, then press again.',
+      'PC の agy の入力欄に打ちかけの文があるか、入力欄が見えない状態です（つながって送られ、コマンドとして走るおそれがあるので、何もしていません）。PC で消すか閉じてから、もう一度してください。',
+      'The agy input box on the PC holds unsent text or is not on the screen (this would be joined to it and could run as a command, so nothing was done). Clear or close it on the PC, then try again.',
     ),
   ],
   'too-soon': () => [429, t('圧縮の合図を送ったところです。', 'A compact was just sent.')],
@@ -422,8 +455,8 @@ export const AGY_STOP_REFUSAL: Record<AgyStopFailure, () => [number, string]> = 
   subagent: () => [
     409,
     t(
-      'agy の子（サブエージェント）が動いています。PC で子の質問を開いていると止める合図がそれを飛ばすため、スマホからは止められません（PC で操作してください）。',
-      'An agy subagent is running. A stop could skip its question if it is open on the PC, so it cannot be stopped from the phone (use the PC).',
+      'agy の子（サブエージェント）が動いていて、PC の画面が親の画面になっていないため止められません（子の質問を開いている・古い中継など）。PC で操作してください。',
+      'An agy subagent is running and the PC does not show the main screen (a subagent’s question is open, or an older relay), so it cannot be stopped from the phone. Use the PC.',
     ),
   ],
   unsure: () => [409, t('agy の状態を確かめられませんでした。少し待ってからもう一度押してください。', 'Could not tell what agy is doing. Wait a moment and press it again.')],
@@ -431,6 +464,13 @@ export const AGY_STOP_REFUSAL: Record<AgyStopFailure, () => [number, string]> = 
   'too-soon': () => [429, t('止める合図を送ったところです。', 'A stop was just sent.')],
   unreachable: () => [502, t('agy への入口が応答しません。', 'The way into agy is not responding.')],
   answering: () => [409, t('スマホからの答えを agy に打っているところです。終わってからもう一度押してください。', 'An answer from the phone is being typed into agy. Press it again when it is done.')],
+  'not-stopped': () => [
+    409,
+    t(
+      '止める合図を送りましたが、agy はまだ応答中です（PC の入力欄で開いていた一覧や候補を閉じるのに使われたのかもしれません）。もう一度押してください。',
+      'The stop was sent, but agy is still working (it may have closed a list or suggestions open in the PC’s input box). Press it again.',
+    ),
+  ],
   'child-view': () => [
     409,
     t(
@@ -511,19 +551,31 @@ export async function sendToAgy(
     const target = await findAgyTarget(conversationId, deps)
     if (typeof target === 'string') return fail(target)
     if (typedTooLong(clean.value.text)) return fail('too-long')
-    const gate = sendNow(target, read, holds)
+    // ★ Subagents running: allowed through a relay that shows the screen, once it shows the parent's view (below)
+    //   (whether they run is read from the state file: no extra lock probe)
+    const first = read(target)
+    const withKids = first?.state.subagentsActive === true
+    const gate = sendNow(target, () => first, holds, withKids)
     if (gate !== 'ok') return fail(gate)
     const typed = agyTyped(clean.value.text)
     const long = needsPaste(typed)
     if (long && !target.pane.paste) return fail('long-needs-paste')
     // (the state only, not the lock probe again: an ESC on a subagent's view only goes back, and a Mac's `lsof` per
     //  check added up past the phone's 10 s / codex review)
-    const left = await leaveChildView(target, deps, () => sendNow(target, read, noProbe) === 'ok')
+    const left = await leaveChildView(target, deps, () => sendNow(target, read, noProbe, withKids) === 'ok')
     if (left !== 'ok') return fail(left)
+    // ★ The slow lock probe first (without blocking), then the screen, then only quick checks right before each key: a
+    //   card the parent opens meanwhile shows on the screen, which is read after the probe (codex review)
+    const probe = withKids ? await probedChecks(deps, readTailRecords, target.pid) : undefined
+    if (withKids && !(await parentViewShown(target, deps))) return fail('subagent')
+    // ⚠️ A draft left in the box that starts like a command ("/", "!", "?"): the text would be joined to it and run as
+    //    that command — "/" + "exit the tests" closes agy (codex review). Read on a relay that shows the screen.
+    if (target.pane.screen && unsafeDraft(await (deps.readScreen ?? ((p: string) => readAgyScreen(p)))(target.pane.socketPath))) return fail('draft')
+    const keyHolds: LockCheck = probe ? probe.holdsLock : holds
     // ★ Looked at again right before the body and right before Enter (a card, a turn the PC started)
     let refusedBy: Exclude<AgyGate, 'idle' | 'ok'> | undefined
     const stopHere = (): boolean => {
-      const g = sendNow(target, read, holds)
+      const g = sendNow(target, read, keyHolds, withKids)
       if (g === 'ok') return false
       refusedBy = g
       return true
@@ -638,6 +690,8 @@ export async function compactAgy(
 
 /** ★ Do not send ESC twice within this (a double tap / two phones); remembered only when it was sent */
 export const AGY_STOP_COOLDOWN_MS = 1500
+/** ★ How long a stop waits for agy's state to leave "working" (measured ~85 ms after the ESC, 1.5.14) */
+export const AGY_STOP_CONFIRM_MS = 1500
 const lastStopAt = new Map<string, number>()
 
 /** ★ Stop the turn the agy showing this conversation runs (one ESC) */
@@ -655,15 +709,23 @@ export async function stopAgy(
     if (prev !== undefined && now() - prev < AGY_STOP_COOLDOWN_MS) return failStop('too-soon')
     const target = await findAgyTarget(conversationId, deps)
     if (typeof target === 'string') return failStop(target)
-    const gate = stopNow(target, read, holds)
+    // ★ Subagents running: allowed once the screen shows the parent's view (ESC there stops the parent's turn only)
+    const first = read(target)
+    const withKids = first?.state.subagentsActive === true
+    const gate = stopNow(target, () => first, holds, withKids)
     if (gate !== 'ok') return failStop(gate)
     // (an ESC on a subagent's view only goes back: the stop would not stop anything)
-    const left = await leaveChildView(target, deps, () => stopNow(target, read, noProbe) === 'ok')
+    const left = await leaveChildView(target, deps, () => stopNow(target, read, noProbe, withKids) === 'ok')
     if (left !== 'ok') return failStop(left)
+    // ★ As a send: the lock probe first, then the screen, then quick checks right before the ESC (a parent's approval
+    //   opened during a slow probe would be declined by it / codex review)
+    const probe = withKids ? await probedChecks(deps, readTailRecords, target.pid) : undefined
+    if (withKids && !(await parentViewShown(target, deps))) return failStop('subagent')
+    const keyHolds: LockCheck = probe ? probe.holdsLock : holds
     let refusedBy: Exclude<AgyGate, 'busy' | 'ok'> | undefined
     const res = await writeControl(target.pane.socketPath, CONTROL_KEYS.escape, {
       beforeWrite: () => {
-        const g = stopNow(target, read, holds)
+        const g = stopNow(target, read, keyHolds, withKids)
         if (g === 'ok') return false
         refusedBy = g
         return true
@@ -672,6 +734,17 @@ export async function stopAgy(
     await noteControl(key, 'escape', res.ok ? undefined : res.reason)
     if (!res.ok) return failStop(res.reason === 'pending-approval' ? (refusedBy ?? 'unsure') : 'unreachable')
     lastStopAt.set(key, now())
+    // ★ Told as stopped only once agy's state leaves "working" (measured ~85 ms): an ESC something open in the PC's box
+    //   took instead (the slash list, `@` suggestions …) leaves the turn running — said so, never a second ESC (what it
+    //   would do on the PC is not known / codex review, user decision)
+    const end = Date.now() + (deps.stopConfirmMs ?? AGY_STOP_CONFIRM_MS)
+    for (;;) {
+      // ⚠️ Only a state read and not working confirms it (an unreadable one does not / codex review)
+      const s = read(target)?.state.agentState
+      if (s !== undefined && !WORKING.has(s)) break
+      if (Date.now() >= end) return failStop('not-stopped')
+      await new Promise((r) => setTimeout(r, 50))
+    }
     for (const [id, at] of lastStopAt) if (now() - at >= AGY_STOP_COOLDOWN_MS && id !== key) lastStopAt.delete(id)
     return { ok: true }
   })

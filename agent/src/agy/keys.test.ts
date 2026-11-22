@@ -200,9 +200,12 @@ test('★★ stop: one ESC while working; refused when idle, on a card, and righ
   l.setState({ agent_state: 'tool_use', tool_confirmation_pending: true })
   assert.equal((await stopAgy(A, l.deps, clock)).reason, 'waiting')
   l.setState({ agent_state: 'working' })
+  stopsAfter(l, 1)
   assert.equal((await stopAgy(A, l.deps, clock)).ok, true)
   assert.equal((await stopAgy(A, l.deps, clock)).reason, 'too-soon')
   now += 2000
+  // (working again: a new turn)
+  stopsAfter(l, 2)
   assert.equal((await stopAgy(A, l.deps, clock)).ok, true)
   await settle()
   assert.deepEqual(l.got, ['\x1b', '\x1b'])
@@ -1130,6 +1133,15 @@ function idleChild(l: { deps: { home: string } }, id: string): void {
   writeFileSync(p, [{ type: 'SYSTEM_MESSAGE', step_index: 0, content: 'x' }, { type: 'PLANNER_RESPONSE', step_index: 1, content: 'Reported back.' }].map((r) => JSON.stringify(r)).join('\n') + '\n')
 }
 
+/** agy leaving "working" once it has taken `n` ESCs (measured ~85 ms after a stop's ESC) */
+function stopsAfter(l: Lab, n: number): void {
+  l.deps.readNow = (target) => {
+    const now = readNow(target)
+    const escs = l.got.join('').split('\x1b').length - 1
+    return now && escs >= n ? { ...now, state: { ...now.state, agentState: 'idle' } } : now
+  }
+}
+
 async function screenLab(t: { after(fn: () => void): void }, qs: { question: string; options: string[]; multi: boolean }[], child = false) {
   const l = await lab(t)
   const iso = (sec: number): string => new Date(sec * 1000).toISOString().replace(/\.\d{3}Z$/, 'Z')
@@ -1732,7 +1744,8 @@ function childViewUntilEsc(l: Lab, child: string): void {
   const pane = join(l.root, 'panes', `${PID}.json`)
   writeFileSync(pane, JSON.stringify({ ...JSON.parse(readFileSync(pane, 'utf8')), screen: true }))
   const view = ['  main › self', '  ● running', `  ID: ${child}`, '', '  ↑/↓ scroll · ctrl+home top', '  ctrl+o expand · shift+k kill · esc back', '   Gemini 4 Neon · high'].join('\n')
-  l.deps.readScreen = async () => (l.got.some((x) => x.includes('\x1b')) ? '> \n? for shortcuts' : view)
+  // (agy's parent view, its input box between two rules)
+  l.deps.readScreen = async () => (l.got.some((x) => x.includes('\x1b')) ? ['  ok', '─'.repeat(60), '>', '─'.repeat(60), '? for shortcuts'].join('\n') : view)
   l.deps.screenSettleMs = 300
 }
 
@@ -1764,6 +1777,7 @@ test('★★ stop: on a (finished) subagent’s view, back to the parent’s vie
   idleChild(l, K2)
   childViewUntilEsc(l, K2)
   l.setState({ agent_state: 'working' })
+  stopsAfter(l, 2)
   const res = await stopAgy(A, l.deps)
   assert.equal(res.ok, true, res.message)
   await settle()
@@ -2000,4 +2014,155 @@ test('★★ compact: the box pushed off a short pane by the list (not readable)
     l.got.length === 0 ? ['  ok', RULE, '>', RULE, '? for shortcuts'].join('\n') : ['> /compact', '> /compact  Compact the conversation now (summarize', '  ↑/↓ Navigate · enter Select'].join('\n')
   assert.equal((await compactAgy(A, l.deps, () => Date.now() + 2e8)).reason, 'partial')
   assert.deepEqual(l.got, ['/compact', '\x15'])
+})
+
+/** The pane says the relay shows the screen; the screen is `screen` */
+function withScreenPane(l: Lab, screen: () => string): void {
+  const pane = join(l.root, 'panes', `${PID}.json`)
+  writeFileSync(pane, JSON.stringify({ ...JSON.parse(readFileSync(pane, 'utf8')), screen: true }))
+  l.deps.readScreen = async () => screen()
+  l.deps.screenSettleMs = 200
+}
+const RULE60 = '─'.repeat(60)
+const parentView = (extra: string[] = []): string => ['  hi', ...extra, RULE60, '>', RULE60, '  ● Agent(self: Runner)  Generating · 9s', '? for shortcuts      Gemini 4 Neon · high · 1 subagent(s)'].join('\n')
+
+test('★★ send / stop while a subagent runs: through a relay showing the parent’s view (input box, nothing open)', async (t) => {
+  const l = await lab(t)
+  const kids = { subagents: [{ name: 'self', role: 'run', status: 'running' }] }
+  l.setState(kids)
+  withScreenPane(l, () => parentView())
+  const res = await sendToAgy(A, 'hello there', l.deps)
+  assert.equal(res.ok, true, res.message)
+  await settle()
+  assert.deepEqual(l.got, ['hello there \r'])
+  // (a child's banner on the parent's view is fine: text goes to the parent's prompt)
+  l.got.length = 0
+  withScreenPane(l, () => parentView([' ┃ self has a question', ' ┃ ? Which hill?', ' ┃ ctrl+k answer · alt+j manage']))
+  assert.equal((await sendToAgy(A, 'again', l.deps)).ok, true)
+  // stop: the parent working, ESC once (it stops the parent's turn only)
+  l.got.length = 0
+  l.setState({ agent_state: 'working', ...kids })
+  withScreenPane(l, () => parentView())
+  stopsAfter(l, 1)
+  const stop = await stopAgy(A, l.deps, () => Date.now() + 3e8)
+  assert.equal(stop.ok, true, stop.message)
+  await settle()
+  assert.deepEqual(l.got, ['\x1b'])
+})
+
+test('★★ send / stop while a subagent runs: refused when the screen is not the parent’s ready view, or not readable', async (t) => {
+  const l = await lab(t)
+  const kids = { subagents: [{ name: 'self', role: 'run', status: 'running' }] }
+  l.setState(kids)
+  // an older relay (no screen)
+  assert.equal((await sendToAgy(A, 'hello', l.deps)).reason, 'subagent')
+  // a subagent's question open on the PC (its view, a dialog)
+  withScreenPane(l, () => ['  main › self', '  ● running', `  ID: ${K2}`, '', 'Question 1/1: Which hill?', '> 1. east', '  2. west', '  3. Write-in...', '  ↑/↓ Navigate · enter Select · esc Skip'].join('\n'))
+  assert.equal((await sendToAgy(A, 'hello', l.deps)).ok, false)
+  // a dialog drawn while the input box still shows (whatever it is: text would go to it)
+  withScreenPane(l, () => parentView(['Question 1/1: Which hill?', '> 1. east', '  2. Write-in...', '  ↑/↓ Navigate · enter Select · esc Skip']))
+  assert.equal((await sendToAgy(A, 'hello', l.deps)).reason, 'subagent')
+  // the parent's view without its input box (an overlay)
+  withScreenPane(l, () => ['  hi', '  something drawn over it', '? for shortcuts'].join('\n'))
+  assert.equal((await sendToAgy(A, 'hello', l.deps)).reason, 'subagent')
+  l.setState({ agent_state: 'working', ...kids })
+  assert.equal((await stopAgy(A, l.deps, () => Date.now() + 4e8)).reason, 'subagent')
+  await settle()
+  assert.equal(l.got.join(''), '')
+})
+
+test('★ send while a subagent runs adds no lock probe', async (t) => {
+  const count = async (kids: boolean): Promise<number> => {
+    const l = await lab(t)
+    if (kids) l.setState({ subagents: [{ name: 'self', role: 'run', status: 'running' }] })
+    withScreenPane(l, () => parentView())
+    const locks = l.deps.locksOf!
+    let n = 0
+    l.deps.locksOf = (p: number) => (n++, locks(p))
+    assert.equal((await sendToAgy(A, 'hello', l.deps)).ok, true)
+    return n
+  }
+  // (one probe made before the screen read serves the checks right before each key)
+  assert.ok((await count(true)) <= (await count(false)))
+})
+
+test('★★ stop while a subagent runs: the lock probe comes before the screen read (a card opening during it is seen)', async (t) => {
+  const l = await lab(t)
+  const kids = { subagents: [{ name: 'self', role: 'run', status: 'running' }] }
+  l.setState({ agent_state: 'working', ...kids })
+  let card = false
+  withScreenPane(l, () => (card ? ['  hi', 'Command', 'Run this command?', '> 1. Yes, run command', '  4. No, cancel', '  ↑/↓ Navigate · tab Amend', 'esc to cancel'].join('\n') : parentView()))
+  const locks = l.deps.locksOf!
+  // the parent opens a command approval while the lock probe runs (its status file not rewritten yet)
+  let n = 0
+  l.deps.locksOf = (p: number) => (++n === 3 && (card = true), locks(p))
+  assert.equal((await stopAgy(A, l.deps, () => Date.now() + 5e8)).reason, 'subagent')
+  await settle()
+  assert.equal(l.got.join(''), '')
+})
+
+test('★★ send: a draft in the PC’s box starting like a command ("/", "!", "?") refuses the send (it would run joined to it)', async (t) => {
+  const l = await lab(t)
+  for (const draft of ['/', '/ex', '!', '?', '\u200b/exit']) {
+    withScreenPane(l, () => ['  hi', RULE60, `> ${draft}`, RULE60, '? for shortcuts'].join('\n'))
+    assert.equal((await sendToAgy(A, 'exit the test container', l.deps)).reason, 'draft', draft)
+  }
+  // with subagents running too
+  l.setState({ subagents: [{ name: 'self', role: 'run', status: 'running' }] })
+  withScreenPane(l, () => ['  hi', RULE60, '> /', RULE60, '? for shortcuts'].join('\n'))
+  assert.equal((await sendToAgy(A, 'exit', l.deps)).reason, 'draft')
+  await settle()
+  assert.equal(l.got.join(''), '')
+  // an ordinary draft is joined as before (as for Claude)
+  l.setState({})
+  withScreenPane(l, () => ['  hi', RULE60, '> abc', RULE60, '? for shortcuts'].join('\n'))
+  assert.equal((await sendToAgy(A, 'more', l.deps)).ok, true)
+})
+
+test('★★ send: the input box not readable as one row (a wrapped draft, the slash list pushing it off a short pane): refused', async (t) => {
+  const l = await lab(t)
+  // a short pane: "/" typed on the PC, the list pushed the box's rules off
+  withScreenPane(l, () => ['> /', '> /compact  Compact the conversation now (summarize', '  ↑/↓ Navigate · enter Select'].join('\n'))
+  assert.equal((await sendToAgy(A, 'exit the test container', l.deps)).reason, 'draft')
+  // a draft wrapped onto a second row
+  withScreenPane(l, () => ['  hi', RULE60, '> !rm -rf build && make', '  && make test', RULE60, '? for shortcuts'].join('\n'))
+  assert.equal((await sendToAgy(A, 'go', l.deps)).reason, 'draft')
+  await settle()
+  assert.equal(l.got.join(''), '')
+})
+
+test('★ send: the screen readable at the first look but not when the draft is checked: refused (nothing typed)', async (t) => {
+  const l = await lab(t)
+  let looks = 0
+  withScreenPane(l, () => ['  hi', RULE60, '>', RULE60, '? for shortcuts'].join('\n'))
+  const read = l.deps.readScreen!
+  l.deps.readScreen = async (p) => (++looks === 1 ? read(p) : undefined)
+  assert.equal((await sendToAgy(A, 'hello', l.deps)).reason, 'draft')
+  await settle()
+  assert.equal(l.got.join(''), '')
+})
+
+
+test('★★ stop: told as stopped only once agy leaves "working"; an ESC taken by something open in the PC’s box is said so', async (t) => {
+  const l = await lab(t)
+  l.setState({ agent_state: 'working' })
+  l.deps.stopConfirmMs = 200
+  // agy stays working (the ESC closed the slash list or `@` suggestions on the PC)
+  const res = await stopAgy(A, l.deps, () => Date.now() + 9e8)
+  assert.equal(res.reason, 'not-stopped')
+  await settle()
+  assert.equal(l.got.join(''), '\x1b', 'one ESC, never a second')
+  // it stops: told so
+  l.got.length = 0
+  stopsAfter(l, 1)
+  assert.equal((await stopAgy(A, l.deps, () => Date.now() + 9.5e8)).ok, true)
+})
+
+test('★ stop: the state unreadable while confirming does not count as stopped', async (t) => {
+  const l = await lab(t)
+  l.setState({ agent_state: 'working' })
+  l.deps.stopConfirmMs = 150
+  // after the ESC, the status file cannot be read (the hook removed it on a failed write)
+  l.deps.readNow = (target) => (l.got.join('').includes('\x1b') ? undefined : readNow(target))
+  assert.equal((await stopAgy(A, l.deps, () => Date.now() + 9.9e8)).reason, 'not-stopped')
 })
