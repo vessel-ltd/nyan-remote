@@ -16,7 +16,6 @@ import { permissionAnswer, permissionRequest, permissions } from './permission.t
 import { pushStatus, pushSubscribe, pushTest, pushUnsubscribe } from './push.ts'
 import { sessionFollow, sessionLog, sessions } from './sessions.ts'
 import { uploadRoutes } from './uploads.ts'
-import { notForAgy } from '../agy/sessions.ts'
 
 export function buildRouter(): Router {
   const router = new Router()
@@ -37,7 +36,7 @@ export function buildRouter(): Router {
   router.post('/sessions/:id/interrupt', sessionInterrupt)
   // ★ Clear the PC's input box (Ctrl-U). ⚠️ Takes no body (the key sent is fixed in the handler)
   //   ⚠️⚠️ The endpoints are separate so there is no "endpoint that can fire anything in the table"
-  router.post('/sessions/:id/clear', notForAgy(sessionClear))
+  router.post('/sessions/:id/clear', sessionClear)
   // ★ Slash commands from the table (`/compact` / `/exit`). ⚠️ Only the **id** is taken from the body.
   //   ⚠️⚠️ Free text never runs them (text starting with `/` `!` is refused / keys.ts `sanitizeForKeys`)
   // ★ agy rows are handled inside (`agyCommand`: compact only, never the Claude route / docs/AGY.md §12)

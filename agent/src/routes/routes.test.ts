@@ -128,9 +128,7 @@ test('★★★ pin the endpoint ↔ handler mapping (detect swapped wiring)', (
   ] as const) {
     const m = r.match('POST', path)
     assert.ok(m, `${path} is missing`)
-    // ★ Behind the agy guard (`notForAgy`, 2026-11-19): the handler it wraps
-    const wired = (m?.handler as { inner?: unknown } | undefined)?.inner ?? m?.handler
-    assert.equal(wired, handler, `${path} is not wired to ${name} (swapped wiring)`)
+    assert.equal(m?.handler, handler, `${path} is not wired to ${name} (swapped wiring)`)
   }
   // ★ The four are **different handlers** (wiring them to the same one would be meaningless)
   assert.equal(new Set([sessionInterrupt, sessionClear, sessionCommand, sessionAutoApprove]).size, 4)
@@ -196,7 +194,7 @@ test('★★★ /health actually returns the feature flags (checking only the co
   })
   const h = await health()
   // ★ plus the agy mark, always on (2026-11-19 / docs/AGY.md); Codex's only while Codex support is on (off here)
-  assert.deepEqual(h.features, [...AGENT_FEATURES, 'agy-log-follow', 'agy-send', 'agy-interrupt', 'agy-question', 'agy-question-answer', 'agy-compact', 'agy-approve', 'agy-auto-approve'], '/health does not return the flags (no buttons appear)')
+  assert.deepEqual(h.features, [...AGENT_FEATURES, 'agy-log-follow', 'agy-send', 'agy-interrupt', 'agy-question', 'agy-question-answer', 'agy-compact', 'agy-clear', 'agy-approve', 'agy-auto-approve'], '/health does not return the flags (no buttons appear)')
   assert.ok((h.features?.length ?? 0) > 0, 'flags are empty (the trap where 0 items is still green)')
 })
 
@@ -238,22 +236,34 @@ test('★ the pattern is identical to the registered one (not rebuilt from segme
   }
 })
 
-test('★★ agy ids are refused by every session action they do not have yet (an old PWA shows Claude buttons for them)', async () => {
-  const r = buildRouter()
+test('★★ agy clear: only `agy-` ids, a malformed one is "not open" (never the Claude route), reasons mapped', async () => {
+  const { agyClear } = await import('./interrupt.ts')
   const id = 'agy-062a8f25-9451-42f3-ae93-34a208e99365'
-  // ★ `message` and `interrupt` are agy's own since 2026-11-20 (`agyMessage` / `agyInterrupt`)
-  // ★ `auto-approve` is agy's too since 2026-11-20 (an "on" needs the agy's way in: below)
-  // ★ `command` is agy's since 2026-11-22: compact only, never the Claude route (`agyCommand`, tested below)
-  for (const action of ['clear']) {
-    const m = r.match('POST', `/sessions/${id}/${action}`)
-    assert.ok(m, action)
-    // ⚠️ refused before the handler reads anything (no body, no request object needed)
-    await assert.rejects(
-      async () => m.handler({ params: m.params } as never),
-      (err: unknown) => (err as { status?: number }).status === 400,
-      action,
-    )
+  const calls: string[] = []
+  const clear = async (cid: string) => (calls.push(cid), { ok: true })
+  assert.equal(await agyClear('062a8f25-9451-42f3-ae93-34a208e99365', clear as never), undefined)
+  await assert.rejects(agyClear('agy-nope', clear as never), (e: unknown) => (e as { status?: number }).status === 409)
+  assert.equal(calls.length, 0)
+  assert.equal((await agyClear(id, clear as never))?.ok, true)
+  assert.deepEqual(calls, ['062a8f25-9451-42f3-ae93-34a208e99365'])
+  // ⚠️ a clear that throws: the route refuses, and nothing is left unhandled (it would end the agent / codex review)
+  let unhandled = 0
+  const count = (): void => void unhandled++
+  process.on('unhandledRejection', count)
+  await assert.rejects(agyClear(id, (async () => { throw new Error('socket') }) as never))
+  await new Promise((r) => setTimeout(r, 20))
+  process.off('unhandledRejection', count)
+  assert.equal(unhandled, 0)
+  for (const [reason, status] of [['waiting', 409], ['not-cleared', 409], ['no-box', 409], ['unreachable', 502]] as const) {
+    await assert.rejects(agyClear(id, (async () => ({ ok: false, reason })) as never), (e: unknown) => (e as { status?: number }).status === status, reason)
   }
+})
+
+test('★ agy operations answer the phone in time (a slow one is told as such; the work itself is bounded by its own deadline)', async () => {
+  const { agyInTime } = await import('./interrupt.ts')
+  assert.equal(await agyInTime(Promise.resolve(7), 50), 7)
+  const slow = new Promise((r) => setTimeout(() => r('late'), 200))
+  await assert.rejects(agyInTime(slow, 20), (e: unknown) => (e as { status?: number }).status === 504)
 })
 
 test('★★ agy message / stop: only `agy-` ids, a malformed one is "not open" (never the Claude routes), files refused, reasons mapped', async () => {
@@ -310,7 +320,7 @@ test('★★ the registered POST handlers hand `agy-` ids to agy (its own refusa
   const r = buildRouter()
   // ⚠️ upper case: the same conversation as lower case
   const id = 'agy-062A8F25-9451-42F3-AE93-34A208E99365'
-  for (const action of ['message', 'interrupt']) {
+  for (const action of ['message', 'interrupt', 'clear']) {
     const m = r.match('POST', `/sessions/${id}/${action}`)
     assert.ok(m, action)
     const req = Object.assign(Readable.from([Buffer.from(JSON.stringify({ text: 'hello' }), 'utf8')]), { headers: { 'content-type': 'application/json' } })

@@ -345,6 +345,28 @@ export function inputRowOf(screen: string): string | undefined {
 }
 
 /**
+ * ★ The rows of agy's input box on the parent's view, also a draft of several lines (measured 1.5.14: "────" /
+ * "> line one" / "  line two" / "────"): the first row without its "> ", the others without their two-space indent;
+ * `['']` when empty, undefined when no input box is on the screen. ⚠️ Ends only at a rule: the slash list below the box
+ * ("> /codesearch …" / "  /config …" / "  ↑/↓ Navigate …") is followed by the footer, not by a rule.
+ */
+export function inputBoxOf(screen: string): string[] | undefined {
+  const rows = screen.split('\n').map((l) => l.replace(/\s+$/, ''))
+  for (let i = rows.length - 2; i >= 1; i--) {
+    const m = /^>(?: (.*))?$/.exec(rows[i]!)
+    // ⚠️ The rules as drawn (flush left): a draft's own "────" line is indented, never one of them (codex review)
+    if (!m || !RULE.test(rows[i - 1]!)) continue
+    const box = [(m[1] ?? '').trim()]
+    for (let j = i + 1; j < rows.length; j++) {
+      if (RULE.test(rows[j]!)) return box
+      if (rows[j] !== '' && !rows[j]!.startsWith('  ')) break
+      box.push(rows[j]!.trim())
+    }
+  }
+  return undefined
+}
+
+/**
  * ★ The slash command list shows this command picked (the cursor on its row, its description after it) and Enter
  * selects it: "> /compact  Compact the conversation now (…)" then "↑/↓ Navigate · enter Select · tab Complete" (1.5.14)
  */

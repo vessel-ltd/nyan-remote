@@ -300,6 +300,8 @@ export type AgentFeature =
   | 'agy-question-answer'
   /** ★ agy's `/compact` from the phone through the table command endpoint (2026-11-22 / docs/AGY.md §12) */
   | 'agy-compact'
+  /** ★ agy's input box on the PC cleared from the phone through `/sessions/:id/clear` (2026-11-22 / docs/AGY.md §16) */
+  | 'agy-clear'
   /**
    * ★ agy approval cards come to `/permissions` and are answered with a key through the relay (2026-11-20 /
    *   docs/AGY.md §9). Only the thread's note uses it (the cards themselves need nothing new on the phone).

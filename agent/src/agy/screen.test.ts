@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
-import { childViewOf, dialogFits, inChildView, inputRowOf, parseBanner, parseDialog, readAgyScreen, slashPicked, viewOwnerOf, sameQuestionText, showsQuestion } from './screen.ts'
+import { childViewOf, dialogFits, inChildView, inputBoxOf, inputRowOf, parseBanner, parseDialog, readAgyScreen, slashPicked, viewOwnerOf, sameQuestionText, showsQuestion } from './screen.ts'
 
 // ★ Screens as the relay rebuilt them from agy 1.5.13 (2026-11-21), trimmed
 const batch = [
@@ -217,6 +217,22 @@ test('★ the input box: empty, a draft, or none on the screen', () => {
   assert.equal(inputRowOf('Question 1/1: Which?\n> 1. a\n  2. Write-in...\n  ↑/↓ Navigate · enter Select · esc Skip'), undefined)
   // (a "> …" line of output not between two rules is not the box)
   assert.equal(inputRowOf('> quoted text\nmore'), undefined)
+})
+
+test('★ the input box with all its rows (a draft of several lines, measured 1.5.14); the slash list under it is not the box', () => {
+  assert.deepEqual(inputBoxOf(parentWith('>')), [''])
+  assert.deepEqual(inputBoxOf(parentWith('> abc')), ['abc'])
+  assert.deepEqual(inputBoxOf(['  ok', RULE, '> line one', '  line two', '', '  four', RULE, '? for shortcuts'].join('\n')), ['line one', 'line two', '', 'four'])
+  // the list below the box: the box above it is read
+  const list = ['> /codesearch    Search code', '  /config         Open settings panel', '  ↑/↓ Navigate · enter Select · tab Complete', 'esc to cancel    auto · Gemini 4 Neon · high']
+  assert.deepEqual(inputBoxOf(parentWith('> /co', list)), ['/co'])
+  // ⚠️ the box pushed off a short pane: only the list (not closed by a rule) ⇒ no box
+  assert.equal(inputBoxOf([RULE, ...list].join('\n')), undefined)
+  assert.equal(inputBoxOf('Question 1/1: Which?\n> 1. a\n  2. Write-in...\n  ↑/↓ Navigate · enter Select · esc Skip'), undefined)
+  // ⚠️ a draft with its own "────" line (indented) is not cut there (codex review)
+  assert.deepEqual(inputBoxOf(['  ok', RULE, '>', `  ${RULE}`, '  text', RULE, '? for shortcuts'].join('\n')), ['', RULE, 'text'])
+  // a row that is not indented ends it (not a box)
+  assert.equal(inputBoxOf([RULE, '> a', 'b', RULE].join('\n')), undefined)
 })
 
 test('★ the slash command list shows /compact picked with "enter Select" (measured 1.5.14)', () => {

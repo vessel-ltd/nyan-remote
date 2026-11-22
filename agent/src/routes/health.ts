@@ -61,6 +61,7 @@ export async function health(): Promise<AgentHealth> {
       'agy-question',
       'agy-question-answer',
       'agy-compact',
+      'agy-clear',
       'agy-approve',
       'agy-auto-approve',
     ],

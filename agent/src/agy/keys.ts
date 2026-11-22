@@ -52,7 +52,7 @@ import {
 } from '../claude/keys.ts'
 import { callBeforeState, readTailRecords, turnEnd, type PendingCall } from './pending.ts'
 import { parseAgyQuestion, questionTextsOf, type AgyAnswerPlan, type AgyQuestion, type AgyStep } from './questions.ts'
-import { childViewOf, dialogFits, inChildView, inputRowOf, parseBanner, slashPicked, viewOwnerOf, parseDialog, readAgyScreen, sameQuestionText, showsQuestion, type FooterHint, type ScreenDialog } from './screen.ts'
+import { childViewOf, dialogFits, inChildView, inputBoxOf, inputRowOf, parseBanner, slashPicked, viewOwnerOf, parseDialog, readAgyScreen, sameQuestionText, showsQuestion, type FooterHint, type ScreenDialog } from './screen.ts'
 import {
   AGY_PREFIX,
   AGY_QUESTION_TOOL,
@@ -62,6 +62,7 @@ import {
   agyConversations,
   agyQuestionInTranscript,
   agyLocksOf,
+  agyLocksOfAsync,
   agyPaneOf,
   agyShared,
   readAgyPidFile,
@@ -168,6 +169,8 @@ export interface AgyKeysDeps extends AgyDeps {
   compactDeadlineMs?: number
   /** (tests) `AGY_STOP_CONFIRM_MS` */
   stopConfirmMs?: number
+  /** (tests) `AGY_CLEAR_DEADLINE_MS` */
+  clearDeadlineMs?: number
 }
 
 export function defaultAgyKeysDeps(): AgyKeysDeps {
@@ -623,6 +626,8 @@ export async function compactAgy(
   if (answering.has(key)) return fail('answering')
   const deadline = Date.now() + (deps.compactDeadlineMs ?? AGY_COMPACT_DEADLINE_MS)
   return serializeBySession(key, async () => {
+    // ⚠️ Waited past its deadline behind another operation: the phone has been answered, nothing is done (codex review)
+    if (Date.now() >= deadline) return fail('unsure')
     const prev = lastCompactAt.get(key)
     if (prev !== undefined && now() - prev < AGY_COMPACT_COOLDOWN_MS) return fail('too-soon')
     const target = await findAgyTarget(conversationId, deps)
@@ -630,7 +635,7 @@ export async function compactAgy(
     if (!target.pane.screen) return fail('no-screen')
     const gate = sendNow(target, read, holds)
     if (gate !== 'ok') return fail(gate)
-    const left = await leaveChildView(target, deps, () => sendNow(target, read, noProbe) === 'ok')
+    const left = await leaveChildView(target, deps, () => Date.now() < deadline && sendNow(target, read, noProbe) === 'ok')
     if (left !== 'ok') return fail(left)
     const look = deps.readScreen ?? ((p: string) => readAgyScreen(p))
     const first = await look(target.pane.socketPath)
@@ -747,6 +752,205 @@ export async function stopAgy(
     }
     for (const [id, at] of lastStopAt) if (now() - at >= AGY_STOP_COOLDOWN_MS && id !== key) lastStopAt.delete(id)
     return { ok: true }
+  })
+}
+
+/**
+ * ★★ Clear the PC's input box of an agy from the phone (2026-11-22 / docs/AGY.md §16). Measured on 1.5.14 (tmux):
+ *  - Ctrl-U deletes from the cursor to the start of its line (only that line of a draft of several lines; what is
+ *    after the cursor stays), also while a turn runs (the turn goes on) and closes the slash list;
+ *  - ctrl+end ("Go to bottom") puts the cursor at the end of the whole draft; Backspace at the start of a line joins
+ *    it to the line above; Ctrl-U and Backspace on an empty box do nothing (idle or working).
+ *  ⇒ ctrl+end once, then Ctrl-U + Backspace per row until the screen shows the box empty.
+ * Only through a relay that shows the screen, only on the parent's view with its box on the screen (a key in a
+ * dialog or a panel would be read as that dialog's key), never while a card or a question is up. Told as cleared only
+ * once the screen shows the box empty.
+ */
+export const AGY_CLEAR_KEYS = { bottom: '\x1b[1;5F', row: '\x15\x7f' } as const
+/**
+ * ★ No more keys after this long from the request, and the last check (a lock probe: a Mac's lsof takes ~2 s) ends by
+ * `AGY_CLEAR_ANSWER_MS`: the phone gives a request 10 s (agy review)
+ */
+export const AGY_CLEAR_DEADLINE_MS = 6000
+export const AGY_CLEAR_ANSWER_MS = 9000
+/** At most this many rounds (a round clears the rows the screen shows) */
+const AGY_CLEAR_ROUNDS = 12
+
+export type AgyClearFailure = AgyTargetFailure | 'waiting' | 'asking' | 'subagent' | 'unsure' | 'unreachable' | 'answering' | 'child-view' | 'no-screen' | 'no-box' | 'not-cleared'
+
+export const AGY_CLEAR_REFUSAL: Record<AgyClearFailure, () => [number, string]> = {
+  'not-open': AGY_SEND_REFUSAL['not-open'],
+  shared: () => [
+    409,
+    t('この会話は2つの agy で開かれています。スマホからは入力欄を消せません（PC で操作してください）。', 'This conversation is open in two agys. Its input box cannot be cleared from the phone (use the PC).'),
+  ],
+  'no-relay': () => [
+    409,
+    t(
+      'この agy は nyan-remote を通さずに起動しています。新しいターミナルで agy を起こし直すと、スマホから入力欄を消せます。',
+      'This agy was not started through nyan-remote. Start agy again in a new terminal to clear its input box from the phone.',
+    ),
+  ],
+  broken: AGY_SEND_REFUSAL.broken,
+  unverified: AGY_STOP_REFUSAL.unverified,
+  waiting: () => [409, t('agy が承認を待っています。PC で答えてください（消すキーがカードに入ってしまうため）。', 'agy is waiting for an approval. Please answer on the PC (the keys would go into the card).')],
+  asking: () => [409, t('agy が質問しています。先に答えてください（消すキーが質問に入ってしまうため）。', 'agy is asking a question. Answer it first (the keys would go into the question).')],
+  subagent: () => [
+    409,
+    t(
+      'agy の子（サブエージェント）が動いていて、PC の画面が親の画面になっていないため消せません。PC で操作してください。',
+      'An agy subagent is running and the PC does not show the main screen, so the input box cannot be cleared. Use the PC.',
+    ),
+  ],
+  unsure: AGY_STOP_REFUSAL.unsure,
+  unreachable: AGY_STOP_REFUSAL.unreachable,
+  answering: AGY_STOP_REFUSAL.answering,
+  'child-view': () => [
+    409,
+    t(
+      'PC が agy の子（サブエージェント）の画面を開いたままで、親の画面に戻せませんでした（何も消していません）。PC で ESC を押して戻ってください。',
+      'The PC shows an agy subagent’s screen and it could not be taken back to the main one (nothing was cleared). Press ESC on the PC to go back.',
+    ),
+  ],
+  'no-screen': () => [
+    409,
+    t(
+      'この agy は古い中継で動いているため、スマホからは入力欄を消せません。新しいターミナルで agy を起こし直すと使えます。',
+      'This agy runs through an older relay, so its input box cannot be cleared from the phone. Start agy again in a new terminal to use it.',
+    ),
+  ],
+  'no-box': () => [
+    409,
+    t(
+      'PC の agy の画面に入力欄が見えません（一覧や設定の画面が開いている・画面が低すぎる、など）。何も打っていません。PC で閉じてからもう一度押してください。',
+      'The agy input box is not on the PC’s screen (a list or a settings screen is open, or the window is too short). Nothing was typed. Close it on the PC and press again.',
+    ),
+  ],
+  'not-cleared': () => [
+    409,
+    t(
+      '消すキーを送りましたが、PC の入力欄が消えたことを確かめられませんでした。PC の画面を見てください。',
+      'The keys to clear it were sent, but it could not be confirmed that the PC’s input box is empty. Check the screen on the PC.',
+    ),
+  ],
+}
+
+const failClear = <F extends AgyClearFailure>(reason: F): AgyResult<F> => ({ ok: false, reason, message: AGY_CLEAR_REFUSAL[reason]()[1] })
+
+/** ★ May the box be cleared now? As a send (no card, no question, the parent's view with subagents) but also mid-turn */
+const clearNow = (target: AgyTarget, read: typeof readNow, holds: LockCheck, parentShown: boolean): Exclude<AgyGate, 'idle' | 'busy'> => {
+  const g = sendNow(target, read, holds, parentShown)
+  return g === 'busy' ? 'ok' : g
+}
+
+/** ★ This agy's locks, probed now without blocking (only its own pid; an lsof cut at `by`): a lock check from it */
+async function ownLockProbe(deps: AgyKeysDeps, target: AgyTarget, by: number): Promise<LockCheck> {
+  const locks = deps.locksOf ? deps.locksOf(target.pid) : await agyLocksOfAsync(target.pid, deps.home, by - Date.now())
+  return (pid, conv) => pid === target.pid && (locks?.includes(conv) ?? false)
+}
+
+export async function clearAgy(conversationId: string, deps: AgyKeysDeps = defaultAgyKeysDeps()): Promise<AgyResult<AgyClearFailure>> {
+  const key = keyOf(conversationId)
+  const read = deps.readNow ?? readNow
+  const holds = lockCheck(deps)
+  if (answering.has(key)) return failClear('answering')
+  const deadline = Date.now() + (deps.clearDeadlineMs ?? AGY_CLEAR_DEADLINE_MS)
+  const answerBy = deadline + AGY_CLEAR_ANSWER_MS - AGY_CLEAR_DEADLINE_MS
+  return serializeBySession(key, async () => {
+    // ⚠️ Waited past its deadline behind another operation: the phone has given up, nothing is done (codex review)
+    if (Date.now() >= deadline) return failClear('unsure')
+    const target = await findAgyTarget(conversationId, deps)
+    if (typeof target === 'string') return failClear(target)
+    if (!target.pane.screen) return failClear('no-screen')
+    const first = read(target)
+    const withKids = first?.state.subagentsActive === true
+    // (no lock probe: `findAgyTarget` has just checked it, and it is probed again below without blocking / agy review)
+    const gate = clearNow(target, () => first, noProbe, withKids)
+    if (gate !== 'ok') return failClear(gate)
+    // ⚠️ Back from a subagent's view only while the parent is idle: mid-turn, a person going back on the PC at that very
+    //    moment would get the ESC on the parent, where it stops the turn (a send is idle-only anyway / codex review)
+    const left = await leaveChildView(target, deps, () => Date.now() < deadline && sendNow(target, read, noProbe, withKids) === 'ok')
+    if (left !== 'ok') return failClear(left)
+    // ★ The slow lock probe of this agy only, once (without blocking), then the screen, then quick checks per key
+    const holdsNow = await ownLockProbe(deps, target, deadline)
+    if (Date.now() >= deadline || !holdsNow(target.pid, target.conversationId)) return failClear('unsure')
+    const look = deps.readScreen ?? ((p: string) => readAgyScreen(p))
+    const boxNow = async (): Promise<string[] | 'off' | undefined> => {
+      const s = await look(target.pane.socketPath)
+      if (s === undefined || s.trim() === '') return undefined
+      // ⚠️ Only the parent's own view with nothing open over it (a key in a dialog is that dialog's key)
+      if (viewOwnerOf(s) !== 'parent' || inChildView(s) || parseDialog(s) !== undefined) return 'off'
+      return inputBoxOf(s) ?? 'off'
+    }
+    const empty = (b: string[]): boolean => b.length === 1 && b[0] === ''
+    const stillHere = async (): Promise<boolean> => {
+      if (Date.now() >= answerBy) return false
+      const again = await ownLockProbe(deps, target, answerBy)
+      return clearNow(target, read, again, withKids) === 'ok'
+    }
+    let box = await boxNow()
+    if (box === undefined) return failClear('unsure')
+    if (box === 'off') return failClear(withKids ? 'subagent' : 'no-box')
+    // ★ Already empty: still only while this agy shows this conversation (a `/new` on the PC shows the new one's box)
+    if (empty(box)) return (await stillHere()) ? { ok: true } : failClear('unsure')
+    if (Date.now() >= deadline) return failClear('unsure')
+    const line = await (deps.openKeyLine ?? openKeyLine)(target.pane.socketPath)
+    if (!line) return failClear('unreachable')
+    try {
+      let refusedBy: Exclude<AgyGate, 'idle' | 'busy' | 'ok'> | undefined
+      const refuse = (): boolean => {
+        if (Date.now() >= deadline) return true
+        const g = clearNow(target, read, holdsNow, withKids)
+        if (g === 'ok') return false
+        refusedBy = g
+        return true
+      }
+      let sent = false
+      const stopped = (): AgyResult<AgyClearFailure> => (sent ? failClear('not-cleared') : failClear(refusedBy ?? 'unsure'))
+      if (!(await line.write(AGY_CLEAR_KEYS.bottom, refuse))) return stopped()
+      sent = true
+      let holds = holdsNow
+      for (let round = 0; round < AGY_CLEAR_ROUNDS; round++) {
+        // ★ Each further round only while this agy still shows this conversation (a `/resume` on the PC between rounds
+        //   would put another conversation's box there / codex review)
+        //   (the probe is what the check right before the keys looks at: a moved lock refuses them)
+        if (round > 0) {
+          holds = await ownLockProbe(deps, target, deadline)
+          // ⚠️ The screen read again after that probe: a subagent's question opened on the PC meanwhile would take the
+          //    keys (codex review)
+          const again = await boxNow()
+          if (!Array.isArray(again)) return failClear('not-cleared')
+          if (empty(again)) return (await stillHere()) ? { ok: true } : failClear('not-cleared')
+          box = again
+        }
+        const check = holds
+        const refuseNow = (): boolean => {
+          if (Date.now() >= deadline) return true
+          return clearNow(target, read, check, withKids) !== 'ok'
+        }
+        // ★ One Ctrl-U + Backspace per row shown (a row wrapped from a long line only costs a key that does nothing)
+        if (!(await line.write(AGY_CLEAR_KEYS.row.repeat(box.length), refuseNow))) return stopped()
+        const before = box.join('\n')
+        const end = Math.min(deadline, Date.now() + (deps.screenSettleMs ?? SCREEN_SETTLE_MS))
+        for (;;) {
+          const x = await boxNow()
+          if (Array.isArray(x)) {
+            // ★ Told as cleared only while this agy still shows this conversation (a probe taken now: a `/new` on the PC
+            //   meanwhile moves the lock before the status line says so / codex review)
+            if (empty(x)) return (await stillHere()) ? { ok: true } : failClear('not-cleared')
+            if (x.join('\n') !== before) {
+              box = x
+              break
+            }
+          }
+          if (Date.now() >= end) return failClear('not-cleared')
+          await new Promise((r) => setTimeout(r, SCREEN_POLL_MS))
+        }
+      }
+      return failClear('not-cleared')
+    } finally {
+      line.close()
+    }
   })
 }
 

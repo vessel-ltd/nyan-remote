@@ -20,8 +20,6 @@ import type { SessionStatus, SessionSummary, TitleSource, ToolUsage, UsageWindow
 import type { PaneRecord } from '../claude/keys.ts'
 import { aliveProcStartSync, sameProcStart } from '../claude/sessionIndex.ts'
 import { readJsonFile, stateDir } from '../state.ts'
-import { t } from '../../../shared/i18n.ts'
-import { HttpError, type Ctx } from '../router.ts'
 import { callBeforeState, readTailRecords, turnEnd, type PendingCall } from './pending.ts'
 
 export const AGY_PREFIX = 'agy-'
@@ -51,23 +49,6 @@ export function conversationOf(sessionId: string): string | undefined {
   if (!sessionId.startsWith(AGY_PREFIX)) return undefined
   const id = sessionId.slice(AGY_PREFIX.length)
   return UUID.test(id) ? id.toLowerCase() : undefined
-}
-
-/**
- * ★ The session actions agy rows do not have yet (send, stop, clear, commands, auto-approve) refuse their ids up
- * front. ⚠️ An older PWA reads an unknown tool as Claude and shows those buttons: auto-approve would otherwise be
- * saved and reported as on for a conversation it never reaches (codex review), and the others would try Claude's ways.
- */
-export function notForAgy<R>(handler: (ctx: Ctx) => R): ((ctx: Ctx) => R) & { inner: (ctx: Ctx) => R } {
-  const guarded = (ctx: Ctx): R => {
-    const id = ctx.params['id']
-    if (id && id.startsWith(AGY_PREFIX)) {
-      throw new HttpError(400, t('agy のセッションには、まだスマホからこの操作はできません（PC で操作してください）', 'This is not available for agy sessions from the phone yet (use the PC).'))
-    }
-    return handler(ctx)
-  }
-  // ★ What it guards, so the route table's wiring test still sees which handler sits behind it
-  return Object.assign(guarded, { inner: handler })
 }
 
 type Obj = Record<string, unknown>
@@ -729,10 +710,10 @@ export function agyLocksOf(pid: number, home: string = homedir()): string[] | un
  * ★ `agyLocksOf` without blocking: the background looks and the list use this (a Mac's `lsof` takes a while, and
  * several agys probed one after another blocked every other request / codex review). Linux's `/proc` is read as is.
  */
-export function agyLocksOfAsync(pid: number, home: string = homedir()): Promise<string[] | undefined> {
+export function agyLocksOfAsync(pid: number, home: string = homedir(), timeoutMs: number = LSOF_OPTS.timeout): Promise<string[] | undefined> {
   if (process.platform === 'linux') return Promise.resolve(agyLocksOf(pid, home))
   return new Promise((resolve) => {
-    execFile('lsof', lsofArgs(pid), LSOF_OPTS, (err, out) => resolve(err ? undefined : lockIds(lsofNames(String(out)), home)))
+    execFile('lsof', lsofArgs(pid), { ...LSOF_OPTS, timeout: Math.max(1, Math.min(timeoutMs, LSOF_OPTS.timeout)) }, (err, out) => resolve(err ? undefined : lockIds(lsofNames(String(out)), home)))
   })
 }
 

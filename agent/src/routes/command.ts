@@ -35,6 +35,7 @@ import { shortSessionId } from '../codex/ids.ts'
 import { codexCompact, codexLists } from '../codex/run.ts'
 import { AGY_SEND_REFUSAL, compactAgy } from '../agy/keys.ts'
 import { AGY_PREFIX, conversationOf } from '../agy/sessions.ts'
+import { agyInTime } from './interrupt.ts'
 
 /**
  * Failure category → HTTP. ★ It is a `Record<CommandFailure, number>`, so **a new reason fails the type check**.
@@ -133,7 +134,8 @@ export async function agyCommand(sessionId: string, id: CommandId, compact: type
   const conv = conversationOf(sessionId)
   if (conv === undefined) throw new HttpError(404, t('この agy の会話は見つかりません。', 'This agy conversation was not found.'))
   if (id !== 'compact') throw new HttpError(400, t('agy の会話では使えません。', 'Not available for agy conversations.'))
-  const res = await compact(conv)
+  // ★ Answered within the phone's 10 s (`agyInTime`; the compaction types nothing past its own deadline)
+  const res = await agyInTime(compact(conv))
   const short = conv.slice(0, 8)
   if (!res.ok) {
     console.log(`[agy] compact not sent conversation=${short} reason=${res.reason}`)

@@ -4,7 +4,7 @@ import { createServer, type Server } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
-import { AGY_CARD_KEYS, compactAgy, agyTyped, answerAgyCard, answerAgyQuestion, type AgyQuestionMark, findAgyTarget, looksLikeAgyShortcut, readNow, sendGate, sendToAgy, stopAgy, stopGate, type AgyKeysDeps } from './keys.ts'
+import { AGY_CARD_KEYS, AGY_CLEAR_KEYS, clearAgy, compactAgy, agyTyped, answerAgyCard, answerAgyQuestion, type AgyQuestionMark, findAgyTarget, looksLikeAgyShortcut, readNow, sendGate, sendToAgy, stopAgy, stopGate, type AgyKeysDeps } from './keys.ts'
 import { agyOwnRowOf, agyOwnRows, agyRows, transcriptPathOf } from './sessions.ts'
 import { readTailRecords } from './pending.ts'
 import { parseAgyQuestion } from './questions.ts'
@@ -1959,8 +1959,13 @@ test('★★ compact: past its deadline (the phone gave up at 10 s) nothing more
   const l = await lab(t)
   compactScreen(l)
   l.deps.compactDeadlineMs = 0
+  // ⚠️ past it in the queue: not even the screen read (codex review)
+  let looked = 0
+  const seen = l.deps.readScreen!
+  l.deps.readScreen = async (p) => (looked++, seen(p))
   assert.equal((await compactAgy(A, l.deps, () => Date.now() + 6e7)).reason, 'unsure')
   assert.deepEqual(l.got, [])
+  assert.equal(looked, 0)
   // the deadline passing while the list is awaited: no Enter, the box cleared
   compactScreen(l)
   l.deps.compactDeadlineMs = 60
@@ -2166,3 +2171,207 @@ test('★ stop: the state unreadable while confirming does not count as stopped'
   l.deps.readNow = (target) => (l.got.join('').includes('\x1b') ? undefined : readNow(target))
   assert.equal((await stopAgy(A, l.deps, () => Date.now() + 9.9e8)).reason, 'not-stopped')
 })
+
+/**
+ * ★ An agy input box as measured on 1.5.14: ctrl+end to the end of the draft, Ctrl-U deletes to the start of the line,
+ * Backspace joins an empty line to the one above (nothing on an empty box). `cursorRow` = where the PC left the cursor.
+ */
+function boxScreen(l: Lab, lines: string[], opts: { ignore?: boolean; cursorRow?: number; under?: string[]; slow?: boolean } = {}): { written: string[] } {
+  const pane = join(l.root, 'panes', `${PID}.json`)
+  writeFileSync(pane, JSON.stringify({ ...JSON.parse(readFileSync(pane, 'utf8')), screen: true }))
+  const RULE = '─'.repeat(60)
+  l.deps.screenSettleMs = 150
+  let box = [...lines]
+  let row = opts.cursorRow ?? box.length - 1
+  const press = (bytes: string): void => {
+    if (opts.ignore) return
+    for (let rest = bytes; rest.length > 0; ) {
+      if (rest.startsWith(AGY_CLEAR_KEYS.bottom)) {
+        row = box.length - 1
+        rest = rest.slice(AGY_CLEAR_KEYS.bottom.length)
+        continue
+      }
+      const k = rest[0]!
+      rest = rest.slice(1)
+      if (k === '\x15') box[row] = ''
+      else if (k === '\x7f' && box[row] === '' && row > 0) {
+        box.splice(row--, 1)
+        // (agy lagging behind: one row per batch)
+        if (opts.slow) return
+      }
+    }
+  }
+  l.deps.readScreen = async () =>
+    ['  ok', RULE, `>${box[0] ? ` ${box[0]}` : ''}`, ...box.slice(1).map((x) => `  ${x}`), RULE, ...(opts.under ?? []), '? for shortcuts      auto · Gemini 4 Neon · high'].join('\n')
+  const written: string[] = []
+  l.deps.openKeyLine = async () => ({
+    write: async (bytes, refuse) => {
+      if (refuse?.()) return false
+      written.push(bytes)
+      press(bytes)
+      return true
+    },
+    close: () => undefined,
+  })
+  return { written }
+}
+
+test('★★ clear: ctrl+end, then Ctrl-U + Backspace per row until the screen shows the box empty (one line, several, mid-turn)', async (t) => {
+  const l = await lab(t)
+  // "/co" left with the slash list open under the box
+  const one = boxScreen(l, ['/co'], { under: ['> /codesearch    Search code', '  /config         Open settings panel', '  ↑/↓ Navigate · enter Select · tab Complete'] })
+  assert.equal((await clearAgy(A, l.deps)).ok, true)
+  assert.deepEqual(one.written, [AGY_CLEAR_KEYS.bottom, AGY_CLEAR_KEYS.row])
+  // three lines, the cursor left on the first one by the PC
+  const three = boxScreen(l, ['l1', 'l2', 'l3 end'], { cursorRow: 0 })
+  assert.equal((await clearAgy(A, l.deps)).ok, true)
+  assert.equal(three.written[0], AGY_CLEAR_KEYS.bottom)
+  // ★ also while a turn runs (the turn goes on: measured)
+  l.setState({ agent_state: 'working' })
+  boxScreen(l, ['draft'])
+  assert.equal((await clearAgy(A, l.deps)).ok, true)
+  // already empty: nothing typed
+  l.setState({})
+  const none = boxScreen(l, [''])
+  assert.equal((await clearAgy(A, l.deps)).ok, true)
+  assert.deepEqual(none.written, [])
+})
+
+test('★★ clear refused, nothing typed: a card, an older relay, no box on the screen; keys agy ignores are not told as cleared', async (t) => {
+  const l = await lab(t)
+  const card = boxScreen(l, ['abc'])
+  l.setState({ agent_state: 'tool_use', tool_confirmation_pending: true })
+  assert.equal((await clearAgy(A, l.deps)).reason, 'waiting')
+  assert.deepEqual(card.written, [])
+  l.setState({})
+  // a list or a panel over the box (no "> …" row closed by a rule): its keys would be that panel's
+  const off = boxScreen(l, ['abc'])
+  const read = l.deps.readScreen!
+  l.deps.readScreen = async (p) => ((await read(p)) ?? '').split('\n').filter((r) => !r.startsWith('─')).join('\n')
+  assert.equal((await clearAgy(A, l.deps)).reason, 'no-box')
+  assert.deepEqual(off.written, [])
+  // ⚠️ the keys sent but the box never seen empty
+  const deaf = boxScreen(l, ['abc'], { ignore: true })
+  assert.equal((await clearAgy(A, l.deps)).reason, 'not-cleared')
+  assert.deepEqual(deaf.written, [AGY_CLEAR_KEYS.bottom, AGY_CLEAR_KEYS.row])
+  // an older relay
+  const pane = join(l.root, 'panes', `${PID}.json`)
+  writeFileSync(pane, JSON.stringify({ ...JSON.parse(readFileSync(pane, 'utf8')), screen: false }))
+  assert.equal((await clearAgy(A, l.deps)).reason, 'no-screen')
+})
+
+test('★ clear: a card that opens after the first key stops it (no key into the card), told as not cleared', async (t) => {
+  const l = await lab(t)
+  const k = boxScreen(l, ['abc'])
+  const open = l.deps.openKeyLine!
+  l.deps.openKeyLine = async (p) => {
+    const line = (await open(p))!
+    return {
+      write: async (bytes, refuse) => {
+        const ok = await line.write(bytes, refuse)
+        if (bytes === AGY_CLEAR_KEYS.bottom) l.setState({ agent_state: 'tool_use', tool_confirmation_pending: true })
+        return ok
+      },
+      close: () => line.close(),
+    }
+  }
+  assert.equal((await clearAgy(A, l.deps)).reason, 'not-cleared')
+  assert.deepEqual(k.written, [AGY_CLEAR_KEYS.bottom])
+})
+
+test('★ clear: past its deadline in the queue nothing is done; a conversation moved meanwhile (`/new` on the PC) is not told as cleared', async (t) => {
+  const l = await lab(t)
+  const late = boxScreen(l, ['abc'])
+  l.deps.clearDeadlineMs = 0
+  // ⚠️ not even the screen read (a subagent's view would otherwise be left with an ESC)
+  let looked = 0
+  const look = l.deps.readScreen!
+  l.deps.readScreen = async (p) => (looked++, look(p))
+  assert.equal((await clearAgy(A, l.deps)).reason, 'unsure')
+  assert.deepEqual(late.written, [])
+  assert.equal(looked, 0)
+  delete l.deps.clearDeadlineMs
+  // the lock moves to another conversation once the keys went (agy has not written its status line yet)
+  const moved = boxScreen(l, ['abc'])
+  const open = l.deps.openKeyLine!
+  l.deps.openKeyLine = async (p) => {
+    const line = (await open(p))!
+    return {
+      write: async (bytes, refuse) => {
+        const ok = await line.write(bytes, refuse)
+        if (bytes !== AGY_CLEAR_KEYS.bottom) l.deps.locksOf = () => ['11111111-2222-3333-4444-555555555555']
+        return ok
+      },
+      close: () => line.close(),
+    }
+  }
+  assert.equal((await clearAgy(A, l.deps)).reason, 'not-cleared')
+  assert.deepEqual(moved.written, [AGY_CLEAR_KEYS.bottom, AGY_CLEAR_KEYS.row])
+})
+
+test('★ clear: an empty box is told as cleared only while this agy still shows this conversation', async (t) => {
+  const l = await lab(t)
+  const none = boxScreen(l, [''])
+  l.deps.locksOf = (p) => (p === PID ? [A] : [])
+  let probes = 0
+  l.deps.locksOf = (p) => (p === PID ? (++probes > 2 ? ['11111111-2222-3333-4444-555555555555'] : [A]) : [])
+  assert.equal((await clearAgy(A, l.deps)).reason, 'unsure')
+  assert.deepEqual(none.written, [])
+})
+
+test('★★ clear from a subagent’s view: back to the parent only while it is idle (mid-turn an ESC landing on the parent would stop it)', async (t) => {
+  const l = await lab(t)
+  idleChild(l, K2)
+  childViewUntilEsc(l, K2)
+  l.setState({ agent_state: 'working' })
+  assert.equal((await clearAgy(A, l.deps)).reason, 'child-view')
+  await settle()
+  assert.equal(l.got.join(''), '', 'no ESC')
+  // idle: back first (the parent's box is empty there)
+  l.setState({})
+  assert.equal((await clearAgy(A, l.deps)).ok, true)
+  await settle()
+  assert.equal(l.got.join(''), '\x1b')
+})
+
+test('★ clear: a further round only while this agy still shows this conversation (a `/resume` on the PC between rounds)', async (t) => {
+  const l = await lab(t)
+  const k = boxScreen(l, ['l1', 'l2', 'l3'], { slow: true })
+  const open = l.deps.openKeyLine!
+  l.deps.openKeyLine = async (p) => {
+    const line = (await open(p))!
+    return {
+      write: async (bytes, refuse) => {
+        const ok = await line.write(bytes, refuse)
+        if (bytes !== AGY_CLEAR_KEYS.bottom) l.deps.locksOf = () => ['11111111-2222-3333-4444-555555555555']
+        return ok
+      },
+      close: () => line.close(),
+    }
+  }
+  assert.equal((await clearAgy(A, l.deps)).reason, 'not-cleared')
+  assert.deepEqual(k.written, [AGY_CLEAR_KEYS.bottom, AGY_CLEAR_KEYS.row.repeat(3)])
+  // agy lagging, nothing moved: rounds until it is empty
+  l.deps.locksOf = (p) => (p === PID ? [A] : [])
+  const lag = boxScreen(l, ['l1', 'l2', 'l3'], { slow: true })
+  const r = await clearAgy(A, l.deps)
+  assert.equal(r.ok, true, `${r.reason} ${JSON.stringify(lag.written)}`)
+  assert.ok(lag.written.length > 2)
+})
+
+test('★ clear: the screen is read again before each further round (a subagent’s question opened on the PC meanwhile gets no key)', async (t) => {
+  const l = await lab(t)
+  const k = boxScreen(l, ['l1', 'l2', 'l3'], { slow: true })
+  const read = l.deps.readScreen!
+  // after the first batch: the round's own check sees the box change, then the question is up
+  let reads = -1
+  l.deps.readScreen = async (p) => (reads >= 0 && ++reads >= 2 ? 'Question 1/1: Which?\n> 1. a\n  2. Write-in...\n  ↑/↓ Navigate · enter Select · esc Skip' : read(p))
+  const open = l.deps.openKeyLine!
+  l.deps.openKeyLine = async (p) => {
+    const line = (await open(p))!
+    return { write: async (bytes, refuse) => { const ok = await line.write(bytes, refuse); if (bytes !== AGY_CLEAR_KEYS.bottom) reads = 0; return ok }, close: () => line.close() }
+  }
+  assert.equal((await clearAgy(A, l.deps)).reason, 'not-cleared')
+  assert.deepEqual(k.written, [AGY_CLEAR_KEYS.bottom, AGY_CLEAR_KEYS.row.repeat(3)])
+})
+

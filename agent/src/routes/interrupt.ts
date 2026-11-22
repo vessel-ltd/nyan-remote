@@ -32,7 +32,7 @@ import { shortSessionId } from '../codex/ids.ts'
 import { codexInterrupt, codexLists } from '../codex/run.ts'
 import { HttpError, type Ctx } from '../router.ts'
 import { t } from '../../../shared/i18n.ts'
-import { AGY_STOP_REFUSAL, stopAgy } from '../agy/keys.ts'
+import { AGY_CLEAR_REFUSAL, AGY_STOP_REFUSAL, clearAgy, stopAgy } from '../agy/keys.ts'
 import { AGY_PREFIX, conversationOf } from '../agy/sessions.ts'
 
 /**
@@ -117,6 +117,9 @@ export async function sessionClear(ctx: Ctx): Promise<InterruptResult> {
   // ⚠️⚠️ **Never read the body**. Only `'clear'` is sent
   // ⚠️ Codex rows have no input box we could reach (and their ids never go to the Claude routes)
   if (isCodexSessionId(sessionId)) throw new HttpError(409, t('Codex のセッションでは使えません。', 'Not available for Codex sessions.'))
+  // ★ An agy conversation: cleared through its relay against the screen (`agyClear`)
+  const viaAgy = await agyClear(sessionId)
+  if (viaAgy) return viaAgy
 
   const dirs = await discoverConfigDirs(config().configDirs)
   const res = await sendControlToSession(dirs, sessionId, 'clear', {
@@ -153,6 +156,54 @@ export async function agyInterrupt(sessionId: string, stop: typeof stopAgy = sto
   broadcast({ type: 'sessions-changed', at })
   console.log(`[agy] sent ESC to conversation=${short}`)
   return { ok: true, at }
+}
+
+/**
+ * ★ An agy operation's answer to the phone within this (the phone gives a request 10 s). A slow probe (a Mac's lsof)
+ * or a wait behind another operation on the same agy can take longer: the phone is told so in time, and the operation
+ * itself types nothing past its own deadline (clear 6 s, compact 8 s), so nothing lands after this answer
+ * (codex review).
+ */
+export const AGY_REPLY_BY_MS = 9500
+
+export async function agyInTime<T>(work: Promise<T>, by: number = AGY_REPLY_BY_MS): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const late = new Promise<never>((_, reject) => {
+    timer = setTimeout(
+      () => reject(new HttpError(504, t('agy での操作が時間内に終わりませんでした。PC の画面を確認してください。', 'The agy operation did not finish in time. Check the screen on the PC.'))),
+      by,
+    )
+  })
+  try {
+    return await Promise.race([work, late])
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+/**
+ * ★★ Clear an agy conversation's input box on the PC (2026-11-22 / docs/AGY.md §16). `undefined` when the id is not an
+ * agy row. Keys through its relay, checked against its screen (`agy/keys.ts`); ⚠️ an `agy-` id never reaches the Claude route.
+ */
+export async function agyClear(sessionId: string, clear: typeof clearAgy = clearAgy): Promise<InterruptResult | undefined> {
+  if (!sessionId.startsWith(AGY_PREFIX)) return undefined
+  const conversationId = conversationOf(sessionId)
+  if (!conversationId) throw new HttpError(...AGY_CLEAR_REFUSAL['not-open']())
+  const work = clear(conversationId)
+  // (a late result is still logged: it says what happened on the PC)
+  // ⚠️ Its own rejection handled too (a detached `.then` alone left it unhandled: Node exits / codex review)
+  work.then(
+    (r) => console.log(`[agy] clear of conversation=${conversationId.slice(0, 8)} ended: ${r.ok ? 'cleared' : r.reason}`),
+    () => undefined,
+  )
+  const res = await agyInTime(work)
+  const short = conversationId.slice(0, 8)
+  if (!res.ok) {
+    console.log(`[agy] input box not cleared conversation=${short} reason=${res.reason}`)
+    throw new HttpError(...AGY_CLEAR_REFUSAL[res.reason ?? 'unreachable']())
+  }
+  console.log(`[agy] cleared the input box of conversation=${short}`)
+  return { ok: true, at: new Date().toISOString() }
 }
 
 export async function sessionInterrupt(ctx: Ctx): Promise<InterruptResult> {

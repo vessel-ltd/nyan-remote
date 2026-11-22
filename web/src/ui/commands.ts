@@ -187,6 +187,23 @@ export function commandUi(id: ConfirmKind, session: Pick<SessionSummary, 'tool'>
       },
     }
   }
+  // ★ agy: the box is cleared against the screen and told as cleared only when seen empty (docs/AGY.md §16)
+  if (id === 'clear' && session?.tool === 'agy') {
+    return {
+      label: base.label,
+      title: base.title,
+      get body() {
+        return t(
+          'PC の agy の入力欄に残っている文字を消します（複数行も）。⚠️ PC で打ちかけていた下書きも消えます（戻せません）。agy が応答中でも消せます（応答は止まりません）。承認や質問が出ているときは消しません。',
+          'Clears any text left in the agy input box on the PC (several lines too). ⚠️ Any draft being typed on the PC is also lost (cannot be undone). It works while agy is working (the response goes on). Nothing is cleared while an approval or a question is up.',
+        )
+      },
+      ok: base.ok,
+      get sent() {
+        return t('PC の入力欄を消しました', 'Cleared the PC input box')
+      },
+    }
+  }
   // ★ agy: `/compact` typed through its relay against the screen (docs/AGY.md §12)
   if (id === 'compact' && session?.tool === 'agy') {
     return {
@@ -319,6 +336,9 @@ export const NEEDS_FEATURE: Record<ConfirmKind, AgentFeature> = {
   'auto-approve': 'auto-approve',
 }
 
+/** ★ What an agy row may run, by the agent's mark (`exit` never: not measured on agy) */
+const AGY_MARKS: Partial<Record<KeyedConfirmKind, AgentFeature>> = { compact: 'agy-compact', clear: 'agy-clear' }
+
 export function commandView(
   session: SessionSummary | undefined,
   /** ⚠️ **Only operations delivered by keystrokes** (`auto-approve` is excluded by type; see above) */
@@ -343,10 +363,11 @@ export function commandView(
     if (id !== 'compact' || !features?.includes('codex-compact')) return { show: false, disabled: true, label: ui.label }
     return phase === 'sending' ? { show: true, disabled: true, label: `${ui.label}…` } : { show: true, disabled: false, label: ui.label }
   }
-  // ★ An agy row: only `compact`, and only with the agent's `agy-compact` (typed through its relay against the screen;
-  //   an agy without the new relay is refused with the reason / docs/AGY.md §12)
+  // ★ An agy row: `compact` with the agent's `agy-compact` (docs/AGY.md §12) and `clear` with its `agy-clear` (§16), both
+  //   through its relay against the screen (an agy without the new relay is refused with the reason)
   if (session.tool === 'agy') {
-    if (id !== 'compact' || !features?.includes('agy-compact') || session.sendRoute !== 'keys') return { show: false, disabled: true, label: ui.label }
+    const mark = AGY_MARKS[id]
+    if (mark === undefined || !features?.includes(mark) || session.sendRoute !== 'keys') return { show: false, disabled: true, label: ui.label }
     return phase === 'sending' ? { show: true, disabled: true, label: `${ui.label}…` } : { show: true, disabled: false, label: ui.label }
   }
   // ⚠️ Any other tool this PWA does not know: no commands (they would reach Claude's routes)

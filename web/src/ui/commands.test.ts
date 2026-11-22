@@ -286,7 +286,7 @@ test('★ a Codex row\'s compact wording: no "draft is sent too", no "the summar
   assert.equal(commandUi('exit', codexRow), COMMAND_UI.exit)
 })
 
-test('★ an agy row: only compact, only with the agent\'s agy-compact, never exit or clear; its own wording, no draft note (2026-11-22)', () => {
+test('★ an agy row: compact only with the agent\'s agy-compact (clear needs agy-clear, exit never); its own wording, no draft note (2026-11-22)', () => {
   const agyRow = { ...codexRow, tool: 'agy' as const, sessionId: 'agy-2c5dbbb6-1916-4f9e-b55c-c2d286a3a63e', sendRoute: 'keys' as const }
   const agentNew: AgentFeature[] = [...ALL, 'agy-log-follow', 'agy-send', 'agy-compact']
   const f = actionFeatures(agyRow, agentNew)
@@ -301,4 +301,21 @@ test('★ an agy row: only compact, only with the agent\'s agy-compact, never ex
   assert.notEqual(ui.body, COMMAND_UI.compact.body)
   assert.ok(/打ちかけ/.test(ui.body))
   assert.ok(/compact/.test(ui.sent))
+})
+
+test('★ an agy row: clear with the agent\'s agy-clear (its own mark, not Claude\'s clear-input); its own wording (2026-11-22)', () => {
+  const agyRow = { ...codexRow, tool: 'agy' as const, sessionId: 'agy-2c5dbbb6-1916-4f9e-b55c-c2d286a3a63e', sendRoute: 'keys' as const }
+  const f = actionFeatures(agyRow, [...ALL, 'agy-log-follow', 'agy-send', 'agy-compact', 'agy-clear'])
+  assert.deepEqual(IDS.filter((id) => commandView(agyRow, id, 'ready', f).show).sort(), ['clear', 'compact'])
+  // ⚠️ an older agent (no agy-clear) ⇒ no clear (its `/clear` refused agy ids)
+  assert.equal(commandView(agyRow, 'clear', 'ready', actionFeatures(agyRow, [...ALL, 'agy-compact'])).show, false)
+  assert.equal(commandView(agyRow, 'clear', 'ready', ['clear-input']).show, false)
+  // an agy without the relay's keys ⇒ none
+  assert.equal(commandView({ ...agyRow, sendRoute: 'inbox' as const }, 'clear', 'ready', f).show, false)
+  const ui = commandUi('clear', agyRow)
+  assert.notEqual(ui.body, COMMAND_UI.clear.body)
+  assert.ok(/応答中/.test(ui.body))
+  assert.equal(confirmNote('clear', agyRow), undefined)
+  // Claude rows keep the table's wording
+  assert.equal(commandUi('clear', { tool: undefined } as never), COMMAND_UI.clear)
 })

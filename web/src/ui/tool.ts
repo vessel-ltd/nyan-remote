@@ -32,6 +32,8 @@ const AGY_GRANTS: ReadonlyArray<readonly [AgentFeature, readonly AgentFeature[]]
   ['agy-auto-approve', ['auto-approve', 'auto-approve-24h']],
   // ★ Compact only (`commandView` reads it for an agy row; `slash-commands` is never granted ⇒ no `exit` / `clear`)
   ['agy-compact', ['agy-compact']],
+  // ★ 2026-11-22: the PC's input box cleared against the screen (`commandView` reads it for an agy row)
+  ['agy-clear', ['agy-clear']],
 ]
 
 /** Codex mark → the Claude-side features the thread may use for a Codex row */
