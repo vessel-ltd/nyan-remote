@@ -33,6 +33,8 @@ import { t } from '../../../shared/i18n.ts'
 import { isCodexSessionId, type CodexSendResult } from '../codex/daemon.ts'
 import { shortSessionId } from '../codex/ids.ts'
 import { codexCompact, codexLists } from '../codex/run.ts'
+import { AGY_SEND_REFUSAL, compactAgy } from '../agy/keys.ts'
+import { AGY_PREFIX, conversationOf } from '../agy/sessions.ts'
 
 /**
  * Failure category → HTTP. ★ It is a `Record<CommandFailure, number>`, so **a new reason fails the type check**.
@@ -121,6 +123,29 @@ export async function codexCommand(
   return { ok: true, at, id }
 }
 
+/**
+ * ★★ A table command for an agy conversation (2026-11-22 / docs/AGY.md §12). `undefined` when the id is not an agy row.
+ * Only `compact`, typed through its relay against the screen (`compactAgy`); ⚠️ an `agy-` id never reaches the Claude
+ * route (same as `agyMessage` / `agyInterrupt`). `exit` is refused (not measured on agy).
+ */
+export async function agyCommand(sessionId: string, id: CommandId, compact: typeof compactAgy = compactAgy): Promise<CommandResult | undefined> {
+  if (!sessionId.startsWith(AGY_PREFIX)) return undefined
+  const conv = conversationOf(sessionId)
+  if (conv === undefined) throw new HttpError(404, t('この agy の会話は見つかりません。', 'This agy conversation was not found.'))
+  if (id !== 'compact') throw new HttpError(400, t('agy の会話では使えません。', 'Not available for agy conversations.'))
+  const res = await compact(conv)
+  const short = conv.slice(0, 8)
+  if (!res.ok) {
+    console.log(`[agy] compact not sent conversation=${short} reason=${res.reason}`)
+    const [status, message] = res.reason ? AGY_SEND_REFUSAL[res.reason]() : [500, t('実行できませんでした', 'Could not run the command.')]
+    throw new HttpError(status, message)
+  }
+  const at = new Date().toISOString()
+  broadcast({ type: 'sessions-changed', at })
+  console.log(`[agy] typed /compact into conversation=${short}`)
+  return { ok: true, at, id }
+}
+
 export async function sessionCommand(ctx: Ctx): Promise<CommandResult> {
   const sessionId = ctx.params['id']
   if (!sessionId) throw new HttpError(400, t('session id が必要です', 'A session id is required.'))
@@ -131,6 +156,9 @@ export async function sessionCommand(ctx: Ctx): Promise<CommandResult> {
   // ★ A Codex thread is compacted by its daemon; `undefined` = not a Codex row, so the Claude route follows
   const viaCodex = await codexCommand(sessionId, id)
   if (viaCodex) return viaCodex
+  // ★ An agy conversation: `/compact` typed through its relay; `undefined` = not an agy row
+  const viaAgy = await agyCommand(sessionId, id)
+  if (viaAgy) return viaAgy
 
   const dirs = await discoverConfigDirs(config().configDirs)
   const res = await sendCommandToSession(dirs, sessionId, id, {

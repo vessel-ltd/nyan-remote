@@ -60,6 +60,7 @@ export async function health(): Promise<AgentHealth> {
       'agy-interrupt',
       'agy-question',
       'agy-question-answer',
+      'agy-compact',
       'agy-approve',
       'agy-auto-approve',
     ],

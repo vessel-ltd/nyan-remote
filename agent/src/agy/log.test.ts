@@ -118,3 +118,13 @@ test('★ a cut agy request carries the digest of the whole text (the phone chec
   const [u] = agyEntries({ step_index: 0, source: 'USER_EXPLICIT', type: 'USER_INPUT', status: 'DONE', created_at: '2026-11-20T00:00:00Z', content: `<USER_REQUEST>\n${body}\n</USER_REQUEST>` })
   assert.equal(u?.kind === 'user' && u.digest, textDigest(body))
 })
+
+test('★ a compaction’s checkpoint is one folded "conversation compacted" line; any other checkpoint stays out', () => {
+  const [e] = agyEntries({ type: 'CHECKPOINT', source: 'SYSTEM', created_at: '2026-11-22T00:00:00Z', content: '# Resuming from a compaction\n\nYou are continuing work on the task…' })
+  assert.equal(e?.kind, 'meta')
+  if (e?.kind === 'meta') {
+    assert.match(e.label, /compacted|圧縮/)
+    assert.match(e.summary, /Resuming from a compaction/)
+  }
+  assert.deepEqual(agyEntries({ type: 'CHECKPOINT', source: 'SYSTEM', content: '# Something else' }), [])
+})

@@ -30,6 +30,8 @@ const AGY_GRANTS: ReadonlyArray<readonly [AgentFeature, readonly AgentFeature[]]
   ['agy-log-follow', ['log-follow']],
   // ★ 2026-11-20: the agent answers its cards with keys (the 24 h choice still needs the agent's own mark)
   ['agy-auto-approve', ['auto-approve', 'auto-approve-24h']],
+  // ★ Compact only (`commandView` reads it for an agy row; `slash-commands` is never granted ⇒ no `exit` / `clear`)
+  ['agy-compact', ['agy-compact']],
 ]
 
 /** Codex mark → the Claude-side features the thread may use for a Codex row */

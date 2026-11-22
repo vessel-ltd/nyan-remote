@@ -7,9 +7,12 @@
 //   PLANNER_RESPONSE  { content?, thinking?, tool_calls?: [{ name, args }] }
 //   GENERIC           a tool's result: { content: 'Created At: …\nCompleted At: …\n<result>', error?, status }
 //   ERROR_MESSAGE     { content?, error? }
+//   CHECKPOINT        { source: 'SYSTEM', content: '# Resuming from a compaction …' } — after `/compact` (1.5.13 / 1.5.14):
+//                     one "conversation compacted" line, its summary folded (docs/AGY.md §12)
 // ⚠️ Anything else is skipped (shown as nothing rather than guessed). Tool calls carry no id, so results are not linked.
 
 import { clipUserText, type LogEntry } from '../../../shared/types.ts'
+import { t } from '../../../shared/i18n.ts'
 import { readableInput } from '../claude/log.ts'
 import { userRequestText } from './sessions.ts'
 
@@ -102,6 +105,12 @@ export function agyEntries(rec: Rec): LogEntry[] {
       const error = str(rec.error)
       const ok = !error && (rec.status === undefined || rec.status === 'DONE')
       return [{ kind: 'tool_result', ...at, ok, ...foldable(resultText(content) || error || '') }]
+    }
+    case 'CHECKPOINT': {
+      // ★ Only the compaction's (measured); any other checkpoint stays skipped (not guessed)
+      const content = str(rec.content) ?? ''
+      if (!/^# Resuming from a compaction\b/.test(content.trimStart())) return []
+      return [{ kind: 'meta', ...at, label: t('会話を圧縮しました', 'Conversation compacted'), ...foldable(content, TEXT_MAX) }]
     }
     case 'ERROR_MESSAGE': {
       const text = (str(rec.error) || str(rec.content) || '').trim()

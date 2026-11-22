@@ -4,7 +4,7 @@ import { createServer, type Server } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
-import { AGY_CARD_KEYS, agyTyped, answerAgyCard, answerAgyQuestion, type AgyQuestionMark, findAgyTarget, looksLikeAgyShortcut, readNow, sendGate, sendToAgy, stopAgy, stopGate, type AgyKeysDeps } from './keys.ts'
+import { AGY_CARD_KEYS, compactAgy, agyTyped, answerAgyCard, answerAgyQuestion, type AgyQuestionMark, findAgyTarget, looksLikeAgyShortcut, readNow, sendGate, sendToAgy, stopAgy, stopGate, type AgyKeysDeps } from './keys.ts'
 import { agyOwnRowOf, agyOwnRows, agyRows, transcriptPathOf } from './sessions.ts'
 import { readTailRecords } from './pending.ts'
 import { parseAgyQuestion } from './questions.ts'
@@ -1881,4 +1881,123 @@ test('★ send: going back from a subagent’s view adds no lock probe (a Mac’
     return n
   }
   assert.equal(await count(true), await count(false))
+})
+
+/** A relay that shows agy's parent view: the box holds `draft`, and after "/compact" is typed the list shows it picked */
+function compactScreen(l: Lab, draft = '', picked = true): void {
+  const pane = join(l.root, 'panes', `${PID}.json`)
+  writeFileSync(pane, JSON.stringify({ ...JSON.parse(readFileSync(pane, 'utf8')), screen: true }))
+  const RULE = '─'.repeat(60)
+  l.deps.screenSettleMs = 200
+  l.deps.readScreen = async () => {
+    // (Ctrl-U clears the box and closes the list)
+    const all = l.got.join('')
+    const typed = all.includes('/compact') && !all.endsWith('\x15')
+    const box = typed ? `> ${draft}/compact` : draft ? `> ${draft}` : '>'
+    const list = typed && picked ? ['> /compact  Compact the conversation now (summarize history to free up the context window)', '  ↑/↓ Navigate · enter Select · tab Complete'] : []
+    return ['  ok', RULE, box, RULE, ...list, '? for shortcuts      auto · Gemini 4 Neon · high'].join('\n')
+  }
+  const written: string[] = []
+  l.deps.openKeyLine = async () => ({
+    write: async (bytes, refuse) => {
+      if (refuse?.()) return false
+      written.push(bytes)
+      l.got.push(bytes)
+      return true
+    },
+    close: () => undefined,
+  })
+}
+
+test('★★ compact: "/compact" typed into the empty box, Enter only once the list shows it picked', async (t) => {
+  const l = await lab(t)
+  compactScreen(l)
+  const res = await compactAgy(A, l.deps, () => Date.now() + 1e7)
+  assert.equal(res.ok, true, res.message)
+  assert.deepEqual(l.got, ['/compact', '\r'])
+  // ⚠️ a second press right after: refused (a double tap must not type it into the running compaction)
+  assert.equal((await compactAgy(A, l.deps, () => Date.now() + 1e7)).reason, 'too-soon')
+})
+
+test('★★ compact refused, nothing typed: a draft in the box, an older relay, agy working, the list not showing it', async (t) => {
+  const l = await lab(t)
+  compactScreen(l, 'abc')
+  const later = (n: number) => () => Date.now() + n * 1e7
+  assert.equal((await compactAgy(A, l.deps, later(2))).reason, 'draft')
+  assert.deepEqual(l.got, [])
+  // an older relay (no screen)
+  const pane = join(l.root, 'panes', `${PID}.json`)
+  writeFileSync(pane, JSON.stringify({ ...JSON.parse(readFileSync(pane, 'utf8')), screen: false }))
+  assert.equal((await compactAgy(A, l.deps, later(3))).reason, 'no-screen')
+  // working
+  compactScreen(l)
+  l.setState({ agent_state: 'working' })
+  assert.equal((await compactAgy(A, l.deps, later(4))).reason, 'busy')
+  assert.deepEqual(l.got, [])
+  // the list never shows it picked (a narrow terminal wraps it): no Enter, and "/compact" taken out of the box again
+  l.setState({})
+  compactScreen(l, '', false)
+  assert.equal((await compactAgy(A, l.deps, later(5))).reason, 'unsure')
+  assert.deepEqual(l.got, ['/compact', '\x15'])
+})
+
+test('★★ compact: past its deadline (the phone gave up at 10 s) nothing more is typed; "/compact" taken back if it was', async (t) => {
+  const l = await lab(t)
+  compactScreen(l)
+  l.deps.compactDeadlineMs = 0
+  assert.equal((await compactAgy(A, l.deps, () => Date.now() + 6e7)).reason, 'unsure')
+  assert.deepEqual(l.got, [])
+  // the deadline passing while the list is awaited: no Enter, the box cleared
+  compactScreen(l)
+  l.deps.compactDeadlineMs = 60
+  const read = l.deps.readScreen!
+  l.deps.readScreen = async (p) => (l.got.length > 0 && (await new Promise((r) => setTimeout(r, 80))), read(p))
+  assert.equal((await compactAgy(A, l.deps, () => Date.now() + 7e7)).reason, 'unsure')
+  assert.deepEqual(l.got, ['/compact', '\x15'])
+})
+
+test('★ compact: stopped with more than "/compact" in the box (the PC person typed): it is not cleared (theirs too)', async (t) => {
+  const l = await lab(t)
+  compactScreen(l, '', false)
+  const RULE = '─'.repeat(60)
+  l.deps.readScreen = async () => ['  ok', RULE, l.got.length > 0 ? '> /compact and more' : '>', RULE, '? for shortcuts'].join('\n')
+  assert.equal((await compactAgy(A, l.deps, () => Date.now() + 8e7)).reason, 'partial')
+  assert.deepEqual(l.got, ['/compact'])
+})
+
+test('★ compact: one lock probe for both keys (a Mac’s lsof per key used up the deadline)', async (t) => {
+  const count = async (compact: boolean): Promise<number> => {
+    const l = await lab(t)
+    compactScreen(l)
+    const locks = l.deps.locksOf!
+    let n = 0
+    l.deps.locksOf = (p: number) => (n++, locks(p))
+    if (compact) assert.equal((await compactAgy(A, l.deps, () => Date.now() + 9e7 + Math.random())).ok, true)
+    else assert.equal((await sendToAgy(A, 'hello', l.deps)).ok, true)
+    return n
+  }
+  // the target, the gate, then one probe for both keys (a send: the target, the gate, before the body, before Enter)
+  assert.equal(await count(true), 3)
+  assert.equal(await count(false), 4)
+})
+
+test('★★ compact: agy stalled (the box still empty after "/compact" was sent): Ctrl-U still goes after it, clearing it when agy takes them', async (t) => {
+  const l = await lab(t)
+  compactScreen(l)
+  const RULE = '─'.repeat(60)
+  // agy never shows what was typed (stalled)
+  l.deps.readScreen = async () => ['  ok', RULE, '>', RULE, '? for shortcuts'].join('\n')
+  assert.equal((await compactAgy(A, l.deps, () => Date.now() + 1e8)).reason, 'unsure')
+  assert.deepEqual(l.got, ['/compact', '\x15'])
+})
+
+test('★★ compact: the box pushed off a short pane by the list (not readable): the Ctrl-U still goes after "/compact"', async (t) => {
+  const l = await lab(t)
+  compactScreen(l)
+  const RULE = '─'.repeat(60)
+  // before typing: the box empty; after: the list fills the pane, the box's rules are gone
+  l.deps.readScreen = async () =>
+    l.got.length === 0 ? ['  ok', RULE, '>', RULE, '? for shortcuts'].join('\n') : ['> /compact', '> /compact  Compact the conversation now (summarize', '  ↑/↓ Navigate · enter Select'].join('\n')
+  assert.equal((await compactAgy(A, l.deps, () => Date.now() + 2e8)).reason, 'partial')
+  assert.deepEqual(l.got, ['/compact', '\x15'])
 })

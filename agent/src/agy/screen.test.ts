@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
-import { childViewOf, dialogFits, inChildView, parseBanner, parseDialog, readAgyScreen, viewOwnerOf, sameQuestionText, showsQuestion } from './screen.ts'
+import { childViewOf, dialogFits, inChildView, inputRowOf, parseBanner, parseDialog, readAgyScreen, slashPicked, viewOwnerOf, sameQuestionText, showsQuestion } from './screen.ts'
 
 // ★ Screens as the relay rebuilt them from agy 1.5.13 (2026-11-21), trimmed
 const batch = [
@@ -205,4 +205,26 @@ test('★★ the subagent view: its footer wrapped between "shift+k kill" and "e
   assert.equal(childViewOf(view), 'd04a8552-963a-46c1-a40c-59104d8ac70f')
   // ⚠️ "esc back" alone without "shift+k kill" before it is not the footer
   assert.equal(inChildView(['> do it', 'esc back', '? for shortcuts'].join('\n')), false)
+})
+
+// ★ agy 1.5.14's parent view, as the relay rebuilt it (2026-11-22)
+const RULE = '─'.repeat(60)
+const parentWith = (box: string, below: string[] = ['? for shortcuts             auto · Gemini 4 Neon · high']) => ['  ok', '', RULE, box, RULE, ...below].join('\n')
+
+test('★ the input box: empty, a draft, or none on the screen', () => {
+  assert.equal(inputRowOf(parentWith('>')), '')
+  assert.equal(inputRowOf(parentWith('> abc')), 'abc')
+  assert.equal(inputRowOf('Question 1/1: Which?\n> 1. a\n  2. Write-in...\n  ↑/↓ Navigate · enter Select · esc Skip'), undefined)
+  // (a "> …" line of output not between two rules is not the box)
+  assert.equal(inputRowOf('> quoted text\nmore'), undefined)
+})
+
+test('★ the slash command list shows /compact picked with "enter Select" (measured 1.5.14)', () => {
+  const shown = parentWith('> /compact', ['> /compact  Compact the conversation now (summarize history to free up the context window)', '  ↑/↓ Navigate · enter Select · tab Complete', 'esc to cancel    auto · Gemini 4 Neon · high'])
+  assert.equal(inputRowOf(shown), '/compact')
+  assert.equal(slashPicked(shown, '/compact', 'Compact the conversation'), true)
+  // another command picked, or no "enter Select": not
+  assert.equal(slashPicked(shown.replace('> /compact  Compact', '> /compare  Compact'), '/compact', 'Compact the conversation'), false)
+  assert.equal(slashPicked(shown.replace('enter Select', 'enter Run'), '/compact', 'Compact the conversation'), false)
+  assert.equal(slashPicked(shown.replace('Compact the conversation now', 'Clear everything'), '/compact', 'Compact the conversation'), false)
 })

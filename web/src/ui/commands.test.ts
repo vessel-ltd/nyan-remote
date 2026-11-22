@@ -285,3 +285,20 @@ test('★ a Codex row\'s compact wording: no "draft is sent too", no "the summar
   assert.equal(commandUi('compact', claudeRow), COMMAND_UI.compact)
   assert.equal(commandUi('exit', codexRow), COMMAND_UI.exit)
 })
+
+test('★ an agy row: only compact, only with the agent\'s agy-compact, never exit or clear; its own wording, no draft note (2026-11-22)', () => {
+  const agyRow = { ...codexRow, tool: 'agy' as const, sessionId: 'agy-2c5dbbb6-1916-4f9e-b55c-c2d286a3a63e', sendRoute: 'keys' as const }
+  const agentNew: AgentFeature[] = [...ALL, 'agy-log-follow', 'agy-send', 'agy-compact']
+  const f = actionFeatures(agyRow, agentNew)
+  assert.deepEqual(IDS.filter((id) => commandView(agyRow, id, 'ready', f).show), ['compact'])
+  assert.equal(commandView(agyRow, 'compact', 'sending', f).disabled, true, 'a double tap sends once')
+  // ⚠️ an agent without the mark ⇒ no button (it would hand the id to the Claude route)
+  for (const id of IDS) assert.equal(commandView(agyRow, id, 'ready', actionFeatures(agyRow, [...ALL, 'agy-log-follow', 'agy-send'])).show, false, id)
+  assert.equal(commandView(agyRow, 'compact', 'ready', ['slash-commands']).show, false)
+  // the agent refuses while a draft is in the box: no "the draft is sent too" note; wording says so
+  assert.equal(confirmNote('compact', agyRow), undefined)
+  const ui = commandUi('compact', agyRow)
+  assert.notEqual(ui.body, COMMAND_UI.compact.body)
+  assert.ok(/打ちかけ/.test(ui.body))
+  assert.ok(/compact/.test(ui.sent))
+})

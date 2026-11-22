@@ -40,7 +40,8 @@ export function buildRouter(): Router {
   router.post('/sessions/:id/clear', notForAgy(sessionClear))
   // ★ Slash commands from the table (`/compact` / `/exit`). ⚠️ Only the **id** is taken from the body.
   //   ⚠️⚠️ Free text never runs them (text starting with `/` `!` is refused / keys.ts `sanitizeForKeys`)
-  router.post('/sessions/:id/command', notForAgy(sessionCommand))
+  // ★ agy rows are handled inside (`agyCommand`: compact only, never the Claude route / docs/AGY.md §12)
+  router.post('/sessions/:id/command', sessionCommand)
   // ★ Toggle auto-approve mode (per session, with an expiry / autoApprove.ts).
   //   ⚠️⚠️ **POST only** (with GET, merely getting someone to follow a link could enable auto-approve)
   //   ★ agy too since 2026-11-20 (its cards are answered with keys / `agy/cards.ts` rule 5b; "on" needs a relayed agy)

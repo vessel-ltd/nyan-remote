@@ -63,6 +63,8 @@ export function confirmNote(kind: ConfirmKind, session: Pick<SessionSummary, 'to
   //    `clear` sends nothing / `auto-approve` **uses not a single keystroke** (it goes through the approval hook)
   // ★ A Codex row is compacted by its daemon: nothing is typed on the PC (`agent/src/routes/command.ts`)
   if (isCodex(session)) return undefined
+  // ★ An agy row: the agent reads the input box and refuses while a draft is there (`compactAgy` / docs/AGY.md §12)
+  if (session?.tool === 'agy') return undefined
   return kind === 'clear' || kind === 'auto-approve' ? undefined : t(DRAFT_WARNING, DRAFT_WARNING_EN)
 }
 
@@ -182,6 +184,26 @@ export function commandUi(id: ConfirmKind, session: Pick<SessionSummary, 'tool'>
       ok: base.ok,
       get sent() {
         return base.sent
+      },
+    }
+  }
+  // ★ agy: `/compact` typed through its relay against the screen (docs/AGY.md §12)
+  if (id === 'compact' && session?.tool === 'agy') {
+    return {
+      label: base.label,
+      title: base.title,
+      get body() {
+        return t(
+          'agy にこれまでの会話を要約させて、文脈を空けます。⚠️ 元には戻せません（要約はスレッドに「会話を圧縮しました」として残ります）。agy が応答中のときや、PC の入力欄に打ちかけの文があるときは送りません。',
+          'Has agy summarize the conversation so far to free up context. ⚠️ This cannot be undone (the summary stays in the thread as "Conversation compacted"). Nothing is sent while agy is working or while there is unsent text in its input box on the PC.',
+        )
+      },
+      ok: base.ok,
+      get sent() {
+        return t(
+          '/compact を打ちました。終わるとスレッドに「会話を圧縮しました」が出ます（数秒かかります）',
+          'Typed /compact. "Conversation compacted" appears in the thread when it is done (it takes a few seconds)',
+        )
       },
     }
   }
@@ -321,7 +343,13 @@ export function commandView(
     if (id !== 'compact' || !features?.includes('codex-compact')) return { show: false, disabled: true, label: ui.label }
     return phase === 'sending' ? { show: true, disabled: true, label: `${ui.label}…` } : { show: true, disabled: false, label: ui.label }
   }
-  // ⚠️ agy (and any tool this PWA does not know): no commands (they would reach Claude's routes)
+  // ★ An agy row: only `compact`, and only with the agent's `agy-compact` (typed through its relay against the screen;
+  //   an agy without the new relay is refused with the reason / docs/AGY.md §12)
+  if (session.tool === 'agy') {
+    if (id !== 'compact' || !features?.includes('agy-compact') || session.sendRoute !== 'keys') return { show: false, disabled: true, label: ui.label }
+    return phase === 'sending' ? { show: true, disabled: true, label: `${ui.label}…` } : { show: true, disabled: false, label: ui.label }
+  }
+  // ⚠️ Any other tool this PWA does not know: no commands (they would reach Claude's routes)
   if (session.tool !== undefined) return { show: false, disabled: true, label: ui.label }
   // ★★★ **Do not show it to agents lacking that endpoint** (multiple machines update one by one, so they always coexist)
   if (!features?.includes(NEEDS_FEATURE[id])) return { show: false, disabled: true, label: ui.label }

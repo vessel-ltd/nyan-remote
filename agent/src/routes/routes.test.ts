@@ -196,7 +196,7 @@ test('★★★ /health actually returns the feature flags (checking only the co
   })
   const h = await health()
   // ★ plus the agy mark, always on (2026-11-19 / docs/AGY.md); Codex's only while Codex support is on (off here)
-  assert.deepEqual(h.features, [...AGENT_FEATURES, 'agy-log-follow', 'agy-send', 'agy-interrupt', 'agy-question', 'agy-question-answer', 'agy-approve', 'agy-auto-approve'], '/health does not return the flags (no buttons appear)')
+  assert.deepEqual(h.features, [...AGENT_FEATURES, 'agy-log-follow', 'agy-send', 'agy-interrupt', 'agy-question', 'agy-question-answer', 'agy-compact', 'agy-approve', 'agy-auto-approve'], '/health does not return the flags (no buttons appear)')
   assert.ok((h.features?.length ?? 0) > 0, 'flags are empty (the trap where 0 items is still green)')
 })
 
@@ -243,7 +243,8 @@ test('★★ agy ids are refused by every session action they do not have yet (a
   const id = 'agy-062a8f25-9451-42f3-ae93-34a208e99365'
   // ★ `message` and `interrupt` are agy's own since 2026-11-20 (`agyMessage` / `agyInterrupt`)
   // ★ `auto-approve` is agy's too since 2026-11-20 (an "on" needs the agy's way in: below)
-  for (const action of ['clear', 'command']) {
+  // ★ `command` is agy's since 2026-11-22: compact only, never the Claude route (`agyCommand`, tested below)
+  for (const action of ['clear']) {
     const m = r.match('POST', `/sessions/${id}/${action}`)
     assert.ok(m, action)
     // ⚠️ refused before the handler reads anything (no body, no request object needed)
@@ -336,4 +337,17 @@ test('★★ a log page is cut to fit one relay frame (long messages / codex rev
   // a single entry is always returned, and a page that is not there passes through
   assert.equal((await fitPage(1, async () => ({ entries: [entry, entry, entry, entry, entry, entry, entry, entry] }))).entries.length, 8)
   assert.equal(await fitPage(5, async () => undefined), undefined)
+})
+
+test('★★ an agy row’s table command: only compact, through `compactAgy`; never the Claude route; refusals said why', async () => {
+  const { agyCommand } = await import('./command.ts')
+  const id = 'agy-2c5dbbb6-1916-4f9e-b55c-c2d286a3a63e'
+  const asked: string[] = []
+  const ok = async (conv: string) => (asked.push(conv), { ok: true })
+  assert.equal(await agyCommand('d0c5a2b1-0000-4000-8000-000000000000', 'compact', ok), undefined, 'not an agy row: the Claude route follows')
+  assert.deepEqual(await agyCommand(id, 'compact', ok).then((r) => r && { ok: r.ok, id: r.id }), { ok: true, id: 'compact' })
+  assert.deepEqual(asked, ['2c5dbbb6-1916-4f9e-b55c-c2d286a3a63e'])
+  await assert.rejects(agyCommand(id, 'exit', ok), (e: { status?: number }) => e.status === 400)
+  const draft = async () => ({ ok: false, reason: 'draft' as const })
+  await assert.rejects(agyCommand(id, 'compact', draft), (e: { status?: number; message?: string }) => e.status === 409 && /draft|打ちかけ|unsent/i.test(e.message ?? ''))
 })

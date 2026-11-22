@@ -52,7 +52,7 @@ import {
 } from '../claude/keys.ts'
 import { callBeforeState, readTailRecords, turnEnd, type PendingCall } from './pending.ts'
 import { parseAgyQuestion, questionTextsOf, type AgyAnswerPlan, type AgyQuestion, type AgyStep } from './questions.ts'
-import { childViewOf, dialogFits, inChildView, parseBanner, viewOwnerOf, parseDialog, readAgyScreen, sameQuestionText, showsQuestion, type FooterHint, type ScreenDialog } from './screen.ts'
+import { childViewOf, dialogFits, inChildView, inputRowOf, parseBanner, slashPicked, viewOwnerOf, parseDialog, readAgyScreen, sameQuestionText, showsQuestion, type FooterHint, type ScreenDialog } from './screen.ts'
 import {
   AGY_PREFIX,
   AGY_QUESTION_TOOL,
@@ -157,6 +157,8 @@ export interface AgyKeysDeps extends AgyDeps {
   openKeyLine?: (socketPath: string) => Promise<KeyLine | undefined>
   /** How long a screen change is waited for after a key (`SCREEN_SETTLE_MS`; tests shorten it) */
   screenSettleMs?: number
+  /** (tests) `AGY_COMPACT_DEADLINE_MS` */
+  compactDeadlineMs?: number
 }
 
 export function defaultAgyKeysDeps(): AgyKeysDeps {
@@ -289,6 +291,9 @@ export type AgySendFailure =
   | 'partial'
   | 'answering'
   | 'child-view'
+  | 'no-screen'
+  | 'draft'
+  | 'too-soon'
 
 export type AgyStopFailure = AgyTargetFailure | 'waiting' | 'asking' | 'subagent' | 'unsure' | 'idle' | 'too-soon' | 'unreachable' | 'answering' | 'child-view'
 
@@ -367,6 +372,21 @@ export const AGY_SEND_REFUSAL: Record<AgySendFailure, () => [number, string]> = 
     409,
     t('スマホからの答えを agy に打っているところです。終わってから送り直してください。', 'An answer from the phone is being typed into agy. Send again when it is done.'),
   ],
+  'no-screen': () => [
+    409,
+    t(
+      'この agy は古い中継で動いているため、スマホからは圧縮できません。新しいターミナルで agy を起こし直すと使えます。',
+      'This agy runs through an older relay, so it cannot be compacted from the phone. Start agy again in a new terminal to use it.',
+    ),
+  ],
+  draft: () => [
+    409,
+    t(
+      'PC の agy の入力欄に打ちかけの文があります（つながって送られてしまうので、圧縮していません）。PC で消すか送ってから押してください。',
+      'There is unsent text in the agy input box on the PC (it would be sent along with it, so nothing was done). Clear or send it on the PC, then press again.',
+    ),
+  ],
+  'too-soon': () => [429, t('圧縮の合図を送ったところです。', 'A compact was just sent.')],
   'child-view': () => [
     409,
     t(
@@ -519,6 +539,100 @@ export async function sendToAgy(
     if (res.reason === 'pending-approval') return fail(refusedBy ?? 'unsure')
     if (res.reason === 'partial' || res.reason === 'unreachable' || res.reason === 'long-needs-paste') return fail(res.reason)
     return fail('unreachable')
+  })
+}
+
+/**
+ * ★★ agy's `/compact` from the phone (docs/AGY.md §12): the table command run through its own endpoint
+ * (`/sessions/:id/command`), never from free text (a `/` start is refused there). Measured on 1.5.13 / 1.5.14: typing
+ * `/compact` in the empty input box shows "> /compact  Compact the conversation now (…)" picked with "enter Select";
+ * Enter runs it (no dialog); the transcript gets `USER_INPUT` "/compact" and a `CHECKPOINT` with the summary.
+ * Only through a relay that shows the screen, and only on what it shows:
+ *  - the same gate as a send (idle, no card, no question, no subagent), the PC taken back from a subagent's view;
+ *  - ⚠️ the input box empty (a draft there would be sent with it as a prompt: "abc/compact");
+ *  - Enter only once the box reads "/compact" and the list shows it picked (else stopped, "/compact" left in the box).
+ */
+export const AGY_COMPACT = { command: '/compact', about: 'Compact the conversation' } as const
+/** Ctrl-U: clears agy's input box (and closes the slash list / measured 1.5.14) */
+const AGY_COMPACT_CLEAR = '\x15'
+export const AGY_COMPACT_COOLDOWN_MS = 3000
+/** ★ No Enter after this long from the request (the phone gives a request 10 s: past it, it was told it failed / codex review) */
+export const AGY_COMPACT_DEADLINE_MS = 8000
+const lastCompactAt = new Map<string, number>()
+
+export async function compactAgy(
+  conversationId: string,
+  deps: AgyKeysDeps = defaultAgyKeysDeps(),
+  now: () => number = Date.now,
+): Promise<AgyResult<AgySendFailure>> {
+  const key = keyOf(conversationId)
+  const read = deps.readNow ?? readNow
+  const holds = lockCheck(deps)
+  if (answering.has(key)) return fail('answering')
+  const deadline = Date.now() + (deps.compactDeadlineMs ?? AGY_COMPACT_DEADLINE_MS)
+  return serializeBySession(key, async () => {
+    const prev = lastCompactAt.get(key)
+    if (prev !== undefined && now() - prev < AGY_COMPACT_COOLDOWN_MS) return fail('too-soon')
+    const target = await findAgyTarget(conversationId, deps)
+    if (typeof target === 'string') return fail(target)
+    if (!target.pane.screen) return fail('no-screen')
+    const gate = sendNow(target, read, holds)
+    if (gate !== 'ok') return fail(gate)
+    const left = await leaveChildView(target, deps, () => sendNow(target, read, noProbe) === 'ok')
+    if (left !== 'ok') return fail(left)
+    const look = deps.readScreen ?? ((p: string) => readAgyScreen(p))
+    const first = await look(target.pane.socketPath)
+    if (first === undefined || first.trim() === '') return fail('unsure')
+    const box = inputRowOf(first)
+    if (box === undefined) return fail('unsure')
+    if (box !== '') return fail('draft')
+    const line = await (deps.openKeyLine ?? openKeyLine)(target.pane.socketPath)
+    if (!line) return fail('unreachable')
+    try {
+      // ★ The lock probes made once, just before the first key, without blocking the agent (`probedChecks`): the Enter
+      //   follows within moments, and a second probe per key (a Mac's lsof, ~2 s) used up the deadline (codex review).
+      //   The state is read right before each key as with any send.
+      const c = await probedChecks(deps, readTailRecords, target.pid)
+      const refuse = (): boolean => sendNow(target, read, c.holdsLock) !== 'ok'
+      const before = refuse
+      if (Date.now() >= deadline) return fail('unsure')
+      if (!(await line.write(AGY_COMPACT.command, before))) return fail('unsure')
+      // ★ Stopped after typing: "/compact" is taken out of the box again (the box was empty before), so the next
+      //   message from the phone is not added to it (codex review). Ctrl-U clears the box and closes the list
+      //   (measured 1.5.14). ★ The box was seen empty before "/compact" was typed, so whatever is in it now is that
+      //   (or someone typing on the PC at this very moment — accepted): the Ctrl-U is sent unless the box is seen
+      //   holding something else. Also when it reads empty (agy stalled before taking the keys: the Ctrl-U goes after
+      //   them) or cannot be read (a short pane pushed it off with the list) — every such case left "/compact" to be
+      //   joined with the next message (codex review, three rounds).
+      const takeBack = async (): Promise<AgyResult<AgySendFailure>> => {
+        const s = await look(target.pane.socketPath)
+        const box = s === undefined ? undefined : inputRowOf(s)
+        if (box !== undefined && box !== AGY_COMPACT.command && box !== '') return fail('partial')
+        if (!(await line.write(AGY_COMPACT_CLEAR))) return fail('partial')
+        const end = Date.now() + (deps.screenSettleMs ?? SCREEN_SETTLE_MS)
+        for (;;) {
+          const x = await look(target.pane.socketPath)
+          if (x !== undefined && inputRowOf(x) === '') return fail('unsure')
+          if (Date.now() >= end) return fail('partial')
+          await new Promise((r) => setTimeout(r, SCREEN_POLL_MS))
+        }
+      }
+      const end = Date.now() + (deps.screenSettleMs ?? SCREEN_SETTLE_MS)
+      for (;;) {
+        const s = await look(target.pane.socketPath)
+        if (s !== undefined && inputRowOf(s) === AGY_COMPACT.command && slashPicked(s, AGY_COMPACT.command, AGY_COMPACT.about)) break
+        if (Date.now() >= end) return await takeBack()
+        await new Promise((r) => setTimeout(r, SCREEN_POLL_MS))
+      }
+      const enter = refuse
+      if (Date.now() >= deadline) return await takeBack()
+      if (!(await line.write('\r', enter))) return await takeBack()
+      lastCompactAt.set(key, now())
+      for (const [id, at] of lastCompactAt) if (now() - at >= AGY_COMPACT_COOLDOWN_MS && id !== key) lastCompactAt.delete(id)
+      return { ok: true }
+    } finally {
+      line.close()
+    }
   })
 }
 

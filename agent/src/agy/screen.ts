@@ -328,3 +328,29 @@ export function sameQuestionText(shown: string, question: string): boolean {
   if (s === q) return true
   return cut && s.length >= Math.min(8, q.length) && q.startsWith(s)
 }
+
+const RULE = /^─{8,}$/
+
+/**
+ * ★ What agy's input box holds on the parent's view: the row "> …" between two rules (measured 1.5.14:
+ * "────" / "> abc" / "────"); '' when empty, undefined when no input box is on the screen (a dialog, a subagent's view).
+ */
+export function inputRowOf(screen: string): string | undefined {
+  const rows = screen.split('\n').map((l) => l.replace(/\s+$/, ''))
+  for (let i = rows.length - 2; i >= 1; i--) {
+    const m = /^>(?: (.*))?$/.exec(rows[i]!)
+    if (m && RULE.test(rows[i - 1]!.trim()) && RULE.test(rows[i + 1]!.trim())) return (m[1] ?? '').trim()
+  }
+  return undefined
+}
+
+/**
+ * ★ The slash command list shows this command picked (the cursor on its row, its description after it) and Enter
+ * selects it: "> /compact  Compact the conversation now (…)" then "↑/↓ Navigate · enter Select · tab Complete" (1.5.14)
+ */
+export function slashPicked(screen: string, command: string, about: string): boolean {
+  const rows = screen.split('\n').map((l) => l.replace(/\s+$/, ''))
+  const at = rows.findIndex((l) => l.startsWith(`> ${command}  `) && l.slice(command.length + 2).trim().startsWith(about))
+  if (at < 0) return false
+  return rows.slice(at + 1, at + 4).some((l) => /(?:^|·\s)enter Select(?:\s·|$)/.test(l.trim()))
+}
