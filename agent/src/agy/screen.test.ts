@@ -198,3 +198,11 @@ test('★ dialogFits: the write-in row reads exactly "Write-in..." — a written
   const text = parseDialog(`Question 1/2: Which features?\n  1. [ ] Export\n  2. [ ] Import\n> 3. Write-in support for surveys\n${footer}`)!
   assert.equal(dialogFits(text, { question: 'Which features?', options: ['Export', 'Import'], multi: true }), false)
 })
+
+test('★★ the subagent view: its footer wrapped between "shift+k kill" and "esc back" (104 columns, "auto" in the status line)', () => {
+  const view = ['  main › self', '  ● done · Gemini 4 Neon (High) · worked 45s · 7 steps', '  ID: d04a8552-963a-46c1-a40c-59104d8ac70f', '', '  ↑/↓ scroll · pgup/pgdown page · ctrl+end bottom · ctrl+home top · ctrl+o expand · shift+k kill', '  esc back', '                                        auto · Gemini 4 Neon · high'].join('\n')
+  assert.equal(inChildView(view), true)
+  assert.equal(childViewOf(view), 'd04a8552-963a-46c1-a40c-59104d8ac70f')
+  // ⚠️ "esc back" alone without "shift+k kill" before it is not the footer
+  assert.equal(inChildView(['> do it', 'esc back', '? for shortcuts'].join('\n')), false)
+})

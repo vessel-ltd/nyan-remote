@@ -252,7 +252,13 @@ export function parseBanner(screen: string): string | undefined {
  */
 export function inChildView(screen: string): boolean {
   const rows = screen.split('\n').map((l) => l.trim()).filter((l) => l !== '')
-  return rows.slice(-2).some((l) => /(?:^|·\s)shift\+k kill · esc back$/.test(l))
+  const footer = /(?:^|·\s)shift\+k kill · esc back$/
+  // ★ agy wraps the footer between hints (dropping the " · "): "… shift+k kill" / "esc back" at 104 columns with
+  //   "auto" in the status line (measured 2026-11-22: a send was refused as "not back to the parent's view")
+  for (let i = Math.max(0, rows.length - 2); i < rows.length; i++) {
+    if (footer.test(rows[i]!) || (i > 0 && footer.test(`${rows[i - 1]} · ${rows[i]}`))) return true
+  }
+  return false
 }
 
 /**
