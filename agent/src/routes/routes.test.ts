@@ -194,7 +194,7 @@ test('★★★ /health actually returns the feature flags (checking only the co
   })
   const h = await health()
   // ★ plus the agy mark, always on (2026-11-19 / docs/AGY.md); Codex's only while Codex support is on (off here)
-  assert.deepEqual(h.features, [...AGENT_FEATURES, 'agy-log-follow', 'agy-send', 'agy-interrupt', 'agy-question', 'agy-question-answer', 'agy-compact', 'agy-clear', 'agy-approve', 'agy-auto-approve'], '/health does not return the flags (no buttons appear)')
+  assert.deepEqual(h.features, [...AGENT_FEATURES, 'agy-log-follow', 'agy-send', 'agy-interrupt', 'agy-question', 'agy-question-answer', 'agy-compact', 'agy-clear', 'agy-files', 'agy-approve', 'agy-auto-approve'], '/health does not return the flags (no buttons appear)')
   assert.ok((h.features?.length ?? 0) > 0, 'flags are empty (the trap where 0 items is still green)')
 })
 
@@ -266,7 +266,7 @@ test('★ agy operations answer the phone in time (a slow one is told as such; t
   await assert.rejects(agyInTime(slow, 20), (e: unknown) => (e as { status?: number }).status === 504)
 })
 
-test('★★ agy message / stop: only `agy-` ids, a malformed one is "not open" (never the Claude routes), files refused, reasons mapped', async () => {
+test('★★ agy message / stop: only `agy-` ids, a malformed one is "not open" (never the Claude routes), files named by path, reasons mapped', async () => {
   const { agyMessage } = await import('./message.ts')
   const { agyInterrupt } = await import('./interrupt.ts')
   const id = 'agy-062a8f25-9451-42f3-ae93-34a208e99365'
@@ -281,15 +281,58 @@ test('★★ agy message / stop: only `agy-` ids, a malformed one is "not open" 
   // ⚠️ an `agy-` id that is not one of ours stops here
   await assert.rejects(agyMessage('agy-nope', 'hi', [], send as never), (e: unknown) => (e as { status?: number }).status === 409)
   await assert.rejects(agyInterrupt('agy-nope', send as never), (e: unknown) => (e as { status?: number }).status === 409)
-  await assert.rejects(
-    agyMessage(id, 'hi', [{ kind: 'image', path: '/x.png' } as never], send as never),
-    (e: unknown) => (e as { status?: number }).status === 400,
-  )
   assert.equal(calls.length, 0)
   const ok = await agyMessage(id, 'hi', [], send as never)
   assert.equal(ok?.route, 'keys')
   assert.equal(ok?.delivered, undefined)
   assert.deepEqual(calls, ['062a8f25-9451-42f3-ae93-34a208e99365|hi'])
+  calls.length = 0
+  // ★★ Files (2026-11-22): named by their agent-side path before the person's text, the same lines as for Claude
+  const { attachmentLines } = await import('../uploads.ts')
+  const files = [
+    { kind: 'image', path: '/home/user/.local/share/nyan-remote/uploads/a.png', size: 2048 },
+    { kind: 'pdf', path: '/home/user/.local/share/nyan-remote/uploads/b.pdf', size: 4096 },
+  ] as const
+  const recorded = async (_c: string, text: unknown) => {
+    calls.push(String(text))
+    return { ok: true, recorded: String(text).trim() }
+  }
+  const withFiles = await agyMessage(id, 'what is in these?', [...files], recorded as never)
+  assert.deepEqual(calls, [`${attachmentLines([...files])}what is in these?`])
+  assert.match(calls[0]!, /uploads\/a\.png[\s\S]*uploads\/b\.pdf[\s\S]*what is in these\?$/)
+  // the phone is told what agy recorded (the file lines with it), so its "sending" line clears
+  assert.equal(withFiles?.delivered, calls[0]!.trim())
+  // files alone: a short request of ours, never an empty send
+  calls.length = 0
+  await agyMessage(id, '  ', [files[0]], recorded as never)
+  assert.ok(calls[0]!.startsWith(attachmentLines([files[0]])) && calls[0]!.trim().length > attachmentLines([files[0]]).trim().length)
+  // ⚠️ the person's own text is judged on its own: `/` `!` `?` at its start stay refused behind the file lines
+  calls.length = 0
+  for (const bad of ['/exit', '!rm x', '?', '  ?help']) {
+    await assert.rejects(agyMessage(id, bad, [files[0]], recorded as never), (e: unknown) => (e as { status?: number }).status === 400, bad)
+  }
+  assert.equal(calls.length, 0, 'nothing typed for a refused text')
+  // ★ typed part-way: the paths are in the PC's box ⇒ a PartialSendError (its files are taken, not released)
+  const { PartialSendError, withReserved } = await import('./message.ts')
+  const partial = async () => ({ ok: false, reason: 'partial' })
+  await assert.rejects(agyMessage(id, 'hi', [files[0]], partial as never), (e: unknown) => e instanceof PartialSendError && (e as { status?: number }).status === 500)
+  await assert.rejects(agyMessage(id, 'hi', [files[0]], (async () => ({ ok: false, reason: 'busy' })) as never), (e: unknown) => !(e instanceof PartialSendError))
+  // ★ withReserved: taken on success and on a part-way send; released on any other failure
+  const seen: string[] = []
+  const reserved = () => {
+    let settled = false
+    return {
+      files: [files[0]],
+      consume: () => { if (!settled) { settled = true; seen.push('consume') } },
+      release: () => { if (!settled) { settled = true; seen.push('release') } },
+    }
+  }
+  assert.equal(await withReserved(reserved() as never, async (f) => f.length), 1)
+  await assert.rejects(withReserved(reserved() as never, async () => { throw new PartialSendError(500, 'x') }))
+  const { HttpError } = await import('../router.ts')
+  await assert.rejects(withReserved(reserved() as never, async () => { throw new HttpError(409, 'x') }))
+  await assert.rejects(withReserved(reserved() as never, async () => { throw new Error('boom') }))
+  assert.deepEqual(seen, ['consume', 'consume', 'release', 'release'])
   // ★ agy records the request trimmed ⇒ the phone is told that form (codex review: a leading space never cleared)
   const trimmed = async () => ({ ok: true, recorded: 'hi' })
   assert.equal((await agyMessage(id, '  hi', [], trimmed as never))?.delivered, 'hi')

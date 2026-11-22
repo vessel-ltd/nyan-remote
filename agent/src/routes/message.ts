@@ -32,7 +32,7 @@ import { HttpError, readJsonBody, type Ctx } from '../router.ts'
 import { ownerOf } from '../auth.ts'
 import { attachmentLines, UploadError, uploads, type Attachment, type Reserved } from '../uploads.ts'
 import { t } from '../../../shared/i18n.ts'
-import { AGY_SEND_REFUSAL, sendToAgy } from '../agy/keys.ts'
+import { AGY_SEND_REFUSAL, looksLikeAgyShortcut, sendToAgy } from '../agy/keys.ts'
 import { AGY_PREFIX, conversationOf } from '../agy/sessions.ts'
 
 interface Body {
@@ -51,6 +51,13 @@ export function withAttachments(text: string, files: readonly Attachment[]): str
   const said = text.trim() === '' ? t('添付したファイルを見てください。', 'Please look at the attached files.') : text
   return `${attachmentLines(files)}${said}`
 }
+
+/**
+ * ★ A send typed part-way (`partial`: the body is in the PC's input box, Enter not sent). Its files are **taken**, not
+ *   released: their paths are already in that box, so the PC can still send them; attaching them again from the phone
+ *   would hand the same file a second time (codex review, 2026-11-22). The files themselves stay on disk as kept files.
+ */
+export class PartialSendError extends HttpError {}
 
 /** ★ This device's files for this send, reserved (single use / `uploads.ts` rule 8) */
 function reserveFiles(ctx: Ctx, ids: unknown): Reserved {
@@ -190,11 +197,21 @@ export async function sessionMessage(ctx: Ctx): Promise<MessageResult> {
   const said = typeof body.text === 'string' ? body.text : ''
   // ★ Files with it: this device's finished uploads, reserved for this send (a concurrent send cannot use them too).
   //   Taken once the send went through; a failed send releases them for the retry
-  const reserved = reserveFiles(ctx, body.attachments)
+  return withReserved(reserveFiles(ctx, body.attachments), (files) => deliver(sessionId, said, files))
+}
+
+/**
+ * ★ Runs one send with its reserved files: taken when it went through **or was typed part-way** (`PartialSendError`),
+ *   released for a retry otherwise.
+ */
+export async function withReserved<T>(reserved: Reserved, send: (files: readonly Attachment[]) => Promise<T>): Promise<T> {
   try {
-    const res = await deliver(sessionId, said, reserved.files)
+    const res = await send(reserved.files)
     reserved.consume()
     return res
+  } catch (e) {
+    if (e instanceof PartialSendError) reserved.consume()
+    throw e
   } finally {
     reserved.release()
   }
@@ -204,8 +221,13 @@ export async function sessionMessage(ctx: Ctx): Promise<MessageResult> {
  * ★★ Send to an agy conversation (2026-11-20 / docs/AGY.md §8). `undefined` when the id is not an agy row.
  *
  * Typed into the agy TUI through its relay (`agy/keys.ts`), only while it is idle. ⚠️ Never another route: agy has no
- * inbox, and an `agy-` id must never reach the Claude routes. ⚠️ No files yet (agy would need an approval to read a
- * file outside its workspace). ⚠️ The log line carries the length, never the text.
+ * inbox, and an `agy-` id must never reach the Claude routes. ⚠️ The log line carries the length, never the text.
+ *
+ * ★ Files (2026-11-22 / docs/AGY.md §17): named by their path before the person's text, as for Claude. Measured on
+ *   1.5.14: agy reads an image, a PDF and a text file given so (its own read tool). The uploads folder is outside the
+ *   workspace, so in its ask-first mode agy shows a "File access" card per file, which reaches the phone (`1` = allow
+ *   this file; the card's "always allow non-workspace access" is never offered there). In auto mode it reads at once.
+ * ⚠️ The person's own text is judged on its own first (`/` `!` `?` at its start stay refused behind the file lines).
  */
 export async function agyMessage(
   sessionId: string,
@@ -216,18 +238,21 @@ export async function agyMessage(
   if (!sessionId.startsWith(AGY_PREFIX)) return undefined
   const conversationId = conversationOf(sessionId)
   if (!conversationId) throw new HttpError(...AGY_SEND_REFUSAL['not-open']())
-  if (files.length > 0) throw new HttpError(400, t('agy にはまだファイルを送れません。', 'Files cannot be sent to agy yet.'))
+  const said = text
+  if (files.length > 0 && looksLikeAgyShortcut(said)) throw new HttpError(...AGY_SEND_REFUSAL['shortcut-like']())
+  text = withAttachments(said, files)
   const res = await send(conversationId, text)
   const short = conversationId.slice(0, 8)
   if (!res.ok) {
     console.log(`[agy] not sent conversation=${short} reason=${res.reason}`)
-    throw new HttpError(...AGY_SEND_REFUSAL[res.reason ?? 'unreachable']())
+    const [status, message] = AGY_SEND_REFUSAL[res.reason ?? 'unreachable']()
+    throw res.reason === 'partial' ? new PartialSendError(status, message) : new HttpError(status, message)
   }
   const at = new Date().toISOString()
   broadcast({ type: 'sessions-changed', at })
   console.log(`[agy] typed into conversation=${short} ${text.length} chars`)
   // ★ `delivered` = what agy records (it trims the request), so the phone's "sending" line clears
-  return { ok: true, at, route: 'keys', ...(res.recorded !== undefined && res.recorded !== text ? { delivered: res.recorded } : {}) }
+  return { ok: true, at, route: 'keys', ...(res.recorded !== undefined && res.recorded !== said ? { delivered: res.recorded } : {}) }
 }
 
 async function deliver(sessionId: string, said: string, files: readonly Attachment[]): Promise<MessageResult> {
@@ -263,7 +288,10 @@ async function deliver(sessionId: string, said: string, files: readonly Attachme
     return { ok: true, at, route: 'keys', ...(typed !== said ? { delivered: typed } : {}) }
   }
   const decision = decideAfterKeys(keys.reason)
-  if (decision.kind === 'error') throw new HttpError(decision.status, keys.message ?? t('送れませんでした', 'Could not send.'))
+  if (decision.kind === 'error') {
+    const message = keys.message ?? t('送れませんでした', 'Could not send.')
+    throw keys.reason === 'partial' ? new PartialSendError(decision.status, message) : new HttpError(decision.status, message)
+  }
   // ⚠️⚠️ Never hand a body starting with `/` or `!` to the inbox (see `inboxRefusal` above)
   if (inboxRefusal(text)) {
     console.log(

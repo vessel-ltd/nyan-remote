@@ -303,6 +303,11 @@ export type AgentFeature =
   /** ★ agy's input box on the PC cleared from the phone through `/sessions/:id/clear` (2026-11-22 / docs/AGY.md §16) */
   | 'agy-clear'
   /**
+   * ★ Files from the phone go to agy too (2026-11-22 / docs/AGY.md §17): named by their path in the typed text.
+   * ⚠️ The phone shows 📎 on an agy row only with it (an older agent refused files for agy).
+   */
+  | 'agy-files'
+  /**
    * ★ agy approval cards come to `/permissions` and are answered with a key through the relay (2026-11-20 /
    *   docs/AGY.md §9). Only the thread's note uses it (the cards themselves need nothing new on the phone).
    */

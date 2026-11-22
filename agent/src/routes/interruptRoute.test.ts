@@ -21,7 +21,7 @@ import { test } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { sessionClear, sessionInterrupt } from './interrupt.ts'
-import { sessionMessage } from './message.ts'
+import { PartialSendError, sessionMessage } from './message.ts'
 import { config, configProblem, loadConfig } from '../config.ts'
 import { discoverConfigDirs } from '../claude/configDirs.ts'
 import { waitForDecision } from '../permission.ts'
@@ -412,4 +412,25 @@ test('★★★ clear-input endpoint: only Ctrl-U arrives, and during an approva
   )
   await new Promise((r) => setTimeout(r, 200))
   assert.equal(f.chunks.length, before, '⚠️⚠️ touches the input box during an approval card')
+})
+
+test('★ a send typed part-way (a card between the body and Enter) is a PartialSendError, so its files are taken (codex review 2026-11-22)', { skip: !hasPython }, async (t) => {
+  const prev = process.env['NYAN_REMOTE_STATE_DIR']
+  const f = await setup('sid-partial')
+  t.after(async () => {
+    for (const s of f.servers) s.close()
+    if (prev === undefined) delete process.env['NYAN_REMOTE_STATE_DIR']
+    else process.env['NYAN_REMOTE_STATE_DIR'] = prev
+    await rm(f.state, { recursive: true, force: true })
+  })
+  const sending = sessionMessage(bodyCtx('sid-partial', 'ふつうの指示'))
+  // ★ Raise a real approval card once the body has arrived (inside the 120 ms before Enter)
+  for (let i = 0; i < 200 && !f.chunks.join('').includes('ふつうの指示'); i++) await new Promise((r) => setTimeout(r, 5))
+  void waitForDecision(
+    { key: 'k-partial', sessionId: 'sid-partial', toolName: 'Bash', summary: 'ls', at: new Date().toISOString(), account: '.claude-test', project: 'p', machine: 'm' },
+    () => {},
+  )
+  await assert.rejects(sending, (err: unknown) => err instanceof PartialSendError && err.status === 500)
+  await new Promise((r) => setTimeout(r, 200))
+  assert.equal(f.chunks.join(''), 'ふつうの指示', 'the body only (no Enter)')
 })

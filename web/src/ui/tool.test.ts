@@ -161,7 +161,7 @@ test('★ an agy row (2026-11-19): only follow, with its own mark; no send, stop
   assert.equal(canStop(unknown, ALL), false)
 })
 
-test('★★ agy send and stop (2026-11-20): only with the agent\'s marks AND a row the relay announced; never files, commands or auto-approve', () => {
+test('★★ agy send and stop (2026-11-20): only with the agent\'s marks AND a row the relay announced; files only with agy-files, never commands or auto-approve', () => {
   const marks: AgentFeature[] = [...EVERYTHING, 'agy-log-follow', 'agy-send', 'agy-interrupt', 'agy-question']
   const relayed = row({ tool: 'agy', account: 'agy', sendRoute: 'keys' })
   const plain = row({ tool: 'agy', account: 'agy' })
@@ -169,7 +169,11 @@ test('★★ agy send and stop (2026-11-20): only with the agent\'s marks AND a 
   assert.equal(canStop(relayed, marks), true)
   assert.equal(stopView(relayed, 'ready', marks).show, true)
   assert.equal(sendBlockedNote(relayed, marks), undefined)
-  assert.equal(canAttachTo(relayed, marks), false, 'no files for agy yet')
+  assert.equal(canAttachTo(relayed, marks), false, 'no files for agy without the agent\'s agy-files')
+  // ★ 2026-11-22: with agy-files, files go to a row it can send to (never to one started without the relay)
+  assert.equal(canAttachTo(relayed, [...marks, 'agy-files']), true)
+  assert.equal(canAttachTo(plain, [...marks, 'agy-files']), false)
+  assert.equal(canAttachTo(relayed, [...EVERYTHING, 'agy-log-follow', 'agy-files']), false, 'agy-files alone does not send')
   // the actions on the thread stay as before (no commands, no auto-approve)
   const f = actionFeatures(relayed, marks)
   assert.deepEqual(f, ['log-follow'])

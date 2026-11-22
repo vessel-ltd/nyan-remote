@@ -86,9 +86,13 @@ export function canSendTo(
   return session?.tool === undefined
 }
 
-/** ★ Whether files may be attached when sending to this row (agy: not yet — it would ask to read outside its folder) */
+/**
+ * ★ Whether files may be attached when sending to this row. agy: only with the agent's `agy-files` (2026-11-22; an
+ *   older agent refused files for agy). ⚠️ `uploads` is checked by the caller as before.
+ */
 export function canAttachTo(session: Pick<SessionSummary, 'tool' | 'sendRoute'> | undefined, features: readonly AgentFeature[] | undefined): boolean {
-  return !isAgy(session) && canSendTo(session, features)
+  if (isAgy(session) && !(features?.includes('agy-files') ?? false)) return false
+  return canSendTo(session, features)
 }
 
 /** What the message box says instead of sending (only for rows it cannot send to). */
