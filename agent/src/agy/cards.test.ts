@@ -4,11 +4,11 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import type { SessionSummary } from '../../../shared/types.ts'
-import { answer, listPending, resetPending } from '../permission.ts'
+import { answer, listPending, pendingWithMeta, resetPending } from '../permission.ts'
 import { resetAutoApprove, setAutoApprove } from '../autoApprove.ts'
 import { resetAgyGrantOwners, setAgyGrantOwner } from './grants.ts'
 import { answerPermission } from '../routes/permission.ts'
-import { AgyCards, agyCard, agyCardTool, agyDelivery, agyDeliveryMessage, type AgyCardDeps } from './cards.ts'
+import { AgyCards, agyCard, agyCardTool, agyDelivery, agyDeliveryMessage, agyQuestionCard, type AgyCardDeps } from './cards.ts'
 import type { AgyCardMark } from './keys.ts'
 import { transcriptPathOf } from './sessions.ts'
 
@@ -1313,4 +1313,70 @@ test('★ a follow-up question asked after the phone’s answer rings on its own
   await cards.sync()
   await new Promise((r) => setTimeout(r, 150))
   assert.deepEqual(reraised, [])
+})
+
+test('★★ a card keeps its input, its call time and its agy beside it; an answer\'s later check reaches the key (teams / docs/TEAM.md §9)', async (t) => {
+  const l = lab(t)
+  const seen: (boolean | undefined)[] = []
+  const cards = new AgyCards({
+    ...l.deps,
+    answer: async (_c, _m, _b, stillWanted) => {
+      seen.push(stillWanted?.())
+      return { ok: true }
+    },
+  })
+  await cards.sync()
+  const [c] = agyCards()
+  const meta = pendingWithMeta().find((p) => p.info.key === c!.key)?.meta
+  assert.deepEqual(meta?.toolInput, { command: 'ls' })
+  assert.equal(meta?.requestedAt, (BASE - 60) * 1000)
+  assert.equal(meta?.agyPid, PID)
+  // ★ the answer's own "still valid" is asked right before the key (a team disbanded meanwhile ⇒ false)
+  assert.equal(answer(c!.key, 'allow', { stillValid: () => false }), true)
+  await settle()
+  assert.deepEqual(seen, [false])
+})
+
+test('★★ a question answer carries its own "still valid" to the keys, and keeps its call time and agy (teams / codex review)', async (t) => {
+  const l = questionLab(t)
+  const asked: (boolean | undefined)[] = []
+  const cards = await l.start({
+    ...l.deps,
+    answerQuestion: async (_c, _m, _a, stillWanted) => {
+      asked.push(stillWanted?.())
+      return { ok: true }
+    },
+  })
+  await cards.sync()
+  const [c] = agyCards()
+  const meta = pendingWithMeta().find((p) => p.info.key === c!.key)?.meta
+  assert.equal(meta?.requestedAt, Math.min((BASE - 60) * 1000, (BASE - 10) * 1000))
+  assert.equal(meta?.agyPid, PID)
+  assert.equal(answerPermission({ key: c!.key, behavior: 'allow', answers: { 'Which colors?': ['blue'] } }, 'team', undefined, () => false).ok, true)
+  await settle()
+  assert.deepEqual(asked, [false])
+})
+
+test('★★ an agy card\'s origin is its call: the same across a status rewrite, another for a different call at the same place (codex review)', () => {
+  const row = { sessionId: `agy-${A}`, machine: 'pc-a', account: 'agy', project: 'p' } as unknown as Parameters<typeof agyCard>[0]
+  const mark = { pid: PID, stateMtimeMs: BASE * 1000, step: 3, index: 0, callAt: (BASE - 60) * 1000 }
+  const call = (cmd: string) => ({ name: 'run_command', args: { CommandLine: cmd } }) as unknown as Parameters<typeof agyCard>[2]
+  const at = new Date().toISOString()
+  const a = agyCard(row, mark, call('ls'), at)!
+  // a status rewrite (a new state time): the same call, the same origin
+  assert.equal(agyCard(row, { ...mark, stateMtimeMs: (BASE + 1) * 1000 }, call('ls'), at)!.origin, a.origin)
+  // after a rewind: another command at the same step and index ⇒ another origin (another ref for the leader)
+  assert.notEqual(agyCard(row, mark, call('rm -rf build'), at)!.origin, a.origin)
+  assert.notEqual(agyCard(row, { ...mark, callAt: mark.callAt + 5000 }, call('ls'), at)!.origin, a.origin)
+})
+
+test('★ an agy question\'s origin is its call too (another question at the same place after a rewind is another origin)', () => {
+  const row = { sessionId: `agy-${A}`, machine: 'pc-a', account: 'agy', project: 'p' } as unknown as Parameters<typeof agyQuestionCard>[0]
+  const mark = { pid: PID, askedAt: (BASE - 10) * 1000, step: 3, index: 0, callAt: (BASE - 60) * 1000 }
+  const q = (question: string) => ({ items: [{ question, options: ['a', 'b'], multi: false }] }) as unknown as Parameters<typeof agyQuestionCard>[2]
+  const at = new Date().toISOString()
+  const a = agyQuestionCard(row, mark, q('Deploy now?'), at)
+  assert.equal(agyQuestionCard(row, { ...mark, askedAt: mark.askedAt + 1 }, q('Deploy now?'), at).origin, a.origin)
+  assert.notEqual(agyQuestionCard(row, mark, q('Delete the branch?'), at).origin, a.origin)
+  assert.notEqual(agyQuestionCard(row, { ...mark, callAt: mark.callAt + 5000 }, q('Deploy now?'), at).origin, a.origin)
 })

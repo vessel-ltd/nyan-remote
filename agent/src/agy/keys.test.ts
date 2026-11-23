@@ -131,6 +131,26 @@ test('★★ send: typed with one space, then Enter — only to an idle agy foun
   assert.equal(rows[0]?.sendRoute, 'keys')
 })
 
+test('★★ a team send is bound to its agy: another pid, or a change right before the keys, types nothing (docs/TEAM.md §9)', async (t) => {
+  const l = await lab(t)
+  const other = await sendToAgy(A, 'hello', l.deps, (target) => target.pid === target.pid + 1)
+  assert.equal(other.reason, 'unsure')
+  // wanted at the target, gone right before the body (the team ended while it waited / the agy moved)
+  let asks = 0
+  const late = await sendToAgy(A, 'hello', l.deps, () => ++asks <= 1)
+  assert.equal(late.reason, 'unsure')
+  await settle()
+  assert.equal(l.got.join(''), '', 'not a byte')
+  // gone right before Enter: the body stays in the box, never submitted (said as partial)
+  asks = 0
+  const half = await sendToAgy(A, 'hello', l.deps, () => ++asks <= 2)
+  assert.equal(half.reason, 'partial')
+  await settle()
+  assert.equal(l.got.join(''), 'hello ', 'no Enter')
+  const ok = await sendToAgy(A, 'hello', l.deps, () => true)
+  assert.equal(ok.ok, true, ok.message)
+})
+
 test('★★ send refused (nothing written): busy, waiting, a stale idle, `?` / `/` first, unknown conversation, no relay', async (t) => {
   const l = await lab(t)
   const id = `agy-${A}`
@@ -395,8 +415,16 @@ test('★★ a card is answered with `1` (allow) or ESC (deny), only while the s
   let asked = 0
   assert.deepEqual(await answerAgyCard(A, mark, 'allow', l.deps, undefined, () => (asked++, false)), { ok: false, reason: 'changed' })
   assert.ok(asked > 0)
+  // ★ the PC answers the card while that last check runs (a team's guard probes processes): nothing typed — the card is
+  //   looked at after it (codex review 2026-11-22)
+  assert.deepEqual(await answerAgyCard(A, mark, 'deny', l.deps, undefined, () => (l.setState(up, BASE + 2), true)), { ok: false, reason: 'changed' })
+  l.setState(up)
+  // ★ asked again after the card check too: a grant that ends during it types nothing (codex review round 17)
+  let asks = 0
+  assert.deepEqual(await answerAgyCard(A, mark, 'allow', l.deps, undefined, () => ++asks <= 1), { ok: false, reason: 'changed' })
+  assert.equal(asks, 2)
   await settle()
-  // (the refused one connected and wrote nothing)
+  // (the refused ones connected and wrote nothing)
   assert.equal(l.got.join(''), '1\x1b')
   assert.deepEqual(AGY_CARD_KEYS, { allow: '1', deny: '\x1b' })
   // ⚠️ the status file was written again (answered on the PC, a new card): nothing is typed
@@ -534,8 +562,15 @@ test('★★ a question answer: the built steps typed in order, only while the s
   l.setState({ agent_state: 'tool_use', subagents: [{ name: 'self', status: 'running' }] }, BASE)
   assert.deepEqual(await answerAgyQuestion(A, mark, { kind: 'steps', steps: steps }, l.deps), { ok: false, reason: 'changed' })
   l.setState({ agent_state: 'tool_use' }, BASE)
+  // ★ no longer wanted after the settle wait (a team disbanded meanwhile / codex review): nothing typed
+  assert.deepEqual(await answerAgyQuestion(A, mark, { kind: 'steps', steps: steps }, l.deps, undefined, () => false), { ok: false, reason: 'changed' })
+  // … and between its keys: the rest is not typed
+  // (asked after the wait, then before and after each key's own check: the first key passes, the second does not)
+  let wanted = 0
+  assert.deepEqual(await answerAgyQuestion(A, mark, { kind: 'steps', steps: steps }, l.deps, undefined, () => ++wanted <= 3), { ok: false, reason: 'partial' })
   await settle()
-  assert.equal(l.got.join(''), '')
+  assert.equal(l.got.join(''), '2')
+  l.got.length = 0
   // ⚠️ answered on the PC after the first key (the transcript written): the rest is not typed ⇒ partial
   let n = 0
   const tail = (p: string): Record<string, unknown>[] => {
@@ -1247,6 +1282,21 @@ test('★★ screen: skip is one ESC per question, each seen on the screen', asy
   const { l, fake, mark, question } = await screenLab(t, qs)
   assert.deepEqual(await answerAgyQuestion(A, mark, { kind: 'skip', question }, l.deps), { ok: true })
   assert.deepEqual(fake.answers, ['User Skipped', 'User Skipped'])
+})
+
+test('★★ screen: a skip stops between questions once it is no longer wanted (a team disbanded meanwhile / codex review)', async (t) => {
+  const qs = [
+    { question: 'Which fruit?', options: ['apple'], multi: false },
+    { question: 'Which colors?', options: ['red'], multi: true },
+  ]
+  const { l, fake, mark, question } = await screenLab(t, qs)
+  // (asked after the wait, then before and after each key's own check)
+  let asked = 0
+  const res = await answerAgyQuestion(A, mark, { kind: 'skip', question }, l.deps, undefined, () => ++asked <= 3)
+  assert.equal(res.ok, false)
+  // the first question skipped, the second one not
+  assert.equal(fake.answers[0], 'User Skipped')
+  assert.notEqual(fake.answers[1], 'User Skipped')
 })
 
 test('★★ screen: nothing typed when the screen shows another question (a different text, another batch, none)', async (t) => {

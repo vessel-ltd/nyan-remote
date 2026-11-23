@@ -18,6 +18,9 @@ import { broadcast } from './events.ts'
 import { createHash, randomBytes } from 'node:crypto'
 import { firstSeenAt, isQuiet, onRequestOver, originOf, pendingWithMeta, setFirstSeenPin } from './permission.ts'
 import { codexRowsNow } from './codex/run.ts'
+import { agyDir, agyLocksOfAsync, conversationOf, defaultAgyDeps, readAgyPidFile, transcriptPathOf, type AgyFile } from './agy/sessions.ts'
+import { defaultAgyKeysDeps, findAgyTarget } from './agy/keys.ts'
+import { readTailRecords, turnEnd } from './agy/pending.ts'
 import {
   disbandTeam,
   expireApprovals,
@@ -60,7 +63,14 @@ export function liveMember(m: TeamMember): boolean {
  *    answer itself always goes to the exact card (`key` with its generation).
  */
 export function delegationView(info: PermissionRequest): PermissionRequest {
-  return { ...info, key: originOf(info), at: firstSeenAt(info) }
+  const seen = firstSeenAt(info)
+  if (info.tool !== 'agy') return { ...info, key: originOf(info), at: seen }
+  // ★★ agy: the call can be made before the grant while its card appears after it (the state file says "working" for a
+  //    moment / codex review) ⇒ the earlier of the call's own time and the first sight. Unknown ⇒ the human's.
+  const asked = pendingWithMeta().find((p) => p.info.key === info.key)?.meta?.requestedAt
+  const seenMs = Date.parse(seen)
+  if (typeof asked !== 'number' || !Number.isFinite(asked) || !Number.isFinite(seenMs)) return { ...info, key: originOf(info), at: 'unknown' }
+  return { ...info, key: originOf(info), at: new Date(Math.min(asked, seenMs)).toISOString() }
 }
 
 /**
@@ -69,6 +79,18 @@ export function delegationView(info: PermissionRequest): PermissionRequest {
  */
 export function requestRef(key: string): string {
   return `r${createHash('sha256').update(key, 'utf8').digest('hex').slice(0, 10)}`
+}
+
+/**
+ * ★ A card's ref. An agy card's is made from its origin, not its key (measured 2026-11-23: agy rewrote its state file
+ *   right after the leader was told, the same call came back under a new key, and the ref in the notice no longer
+ *   matched). The answer still goes to the exact card found now (`teamApprove`), judged again on that card.
+ */
+export function cardRef(info: Pick<PermissionRequest, 'key' | 'origin' | 'tool'>): string {
+  // ⚠️⚠️ Only agy cards: their origin names one call (its place, time and exact input). A Claude card's fallback
+  //    fingerprint is one per turn (a retry after a denial shares it), and a Codex card's origin can be shared by
+  //    sub-approvals of one item (codex review rounds 9 and 12: an old ref answered another request) ⇒ their exact key
+  return requestRef(info.tool === 'agy' && info.origin !== undefined ? info.origin : info.key)
 }
 
 /**
@@ -81,6 +103,7 @@ export function requestRef(key: string): string {
  *    Codex members: `unique` (their rows are reconciled from the daemon's snapshots).
  */
 export async function memberIdentity(m: TeamMember): Promise<'unique' | 'replaced' | 'unknown'> {
+  if (m.tool === 'agy') return agyIdentity(m)
   if (m.tool !== 'claude') return 'unique'
   if (memberGone(m, teamDeps())) return 'replaced'
   if (!liveMember(m)) return 'unknown'
@@ -116,6 +139,46 @@ export async function memberIdentity(m: TeamMember): Promise<'unique' | 'replace
     if (unknown) return 'unknown'
     // The member's own entry missing while its process lives: being rewritten ⇒ unknown, not gone
     return mine ? 'unique' : 'unknown'
+  } catch {
+    return 'unknown'
+  }
+}
+
+/**
+ * ★ An agy member's own state file, when it still names the member's conversation (sync; undefined = it does not, or
+ *   cannot be read). Each agy writes only its own `pid-<pid>.json` (docs/AGY.md §9).
+ */
+export function agyStateNow(m: Pick<TeamMember, 'tool' | 'pid' | 'sessionId'>): AgyFile | undefined {
+  const conv = conversationOf(m.sessionId)
+  if (m.tool !== 'agy' || m.pid === undefined || conv === undefined) return undefined
+  const f = readAgyPidFile(agyDir(), m.pid)
+  return f && f.state.conversationId === conv ? f : undefined
+}
+
+/**
+ * ★★ Who an agy member is now (docs/TEAM.md §9):
+ *    - `unique`: its recorded agy process is the one agent would type into for the conversation (`findAgyTarget`: the
+ *      only agy showing it, holding its lock, through a relay)
+ *    - `replaced`: confirmed otherwise — the process is gone, or its own state file names another conversation (a
+ *      `/resume` or `/new` on the PC)
+ *    - `unknown`: anything else (a second agy on it, a lock probe that failed): the human answers, the member stays
+ */
+async function agyIdentity(m: TeamMember): Promise<'unique' | 'replaced' | 'unknown'> {
+  const conv = conversationOf(m.sessionId)
+  if (conv === undefined || m.pid === undefined) return 'unknown'
+  if (memberGone(m, teamDeps())) return 'replaced'
+  if (!liveMember(m)) return 'unknown'
+  const own = readAgyPidFile(agyDir(), m.pid)
+  if (own && own.state.conversationId !== conv) return 'replaced'
+  // ⚠️ A `/new` on the PC moves agy's lock at once, while its state file names the old conversation until the next
+  //    prompt (codex · agy review): a lock probe that worked and lacks the conversation is a confirmed move
+  const locks = await agyLocksOfAsync(m.pid, defaultAgyDeps().home).catch(() => undefined)
+  if (locks !== undefined && !locks.includes(conv)) return 'replaced'
+  try {
+    const target = await findAgyTarget(conv, defaultAgyKeysDeps())
+    if (typeof target === 'string' || target.pid !== m.pid) return 'unknown'
+    // ⚠️ Still the recorded instance after the (possibly slow) probe
+    return liveMember(m) && agyStateNow(m) ? 'unique' : 'unknown'
   } catch {
     return 'unknown'
   }
@@ -319,14 +382,21 @@ export function cardText(info: PermissionRequest): { text: string; clipped: bool
 export function ownsCard(team: Team, info: PermissionRequest): boolean {
   const member = team.members.find((m) => m.sessionId === info.sessionId)
   if (!member || !cardFromMember(member, info)) return false
+  // ★ agy: only a card its own agy process raised (another agy may have resumed the conversation / codex review)
+  if (member.tool === 'agy') return member.pid !== undefined && pendingWithMeta().find((p) => p.info.key === info.key)?.meta?.agyPid === member.pid
   if (member.tool !== 'claude') return true
   const meta = pendingWithMeta().find((p) => p.info.key === info.key)?.meta
   return underDir(meta?.transcriptPath, member.configDir)
 }
 
+/** The tool's name in a notice (`m2（Codex）`) */
+export function toolTag(member: Pick<TeamMember, 'tool'>): string {
+  return member.tool === 'codex' ? 'Codex' : member.tool === 'agy' ? 'agy' : 'Claude'
+}
+
 /** How the leader answers: refs only (never a key or a label the member chose / codex review r2, high #4) */
-function howToAnswer(member: TeamMember, key: string): string {
-  const ref = requestRef(key)
+function howToAnswer(member: TeamMember, info: Pick<PermissionRequest, 'key' | 'origin' | 'tool'>): string {
+  const ref = cardRef(info)
   return t(
     `答える: nyan team approve ${member.name} ${ref} allow|deny（一覧: nyan team pending）。人のスマホにも知らせてあります。`,
     `Answer: nyan team approve ${member.name} ${ref} allow|deny (list: nyan team pending). The human has been notified too.`,
@@ -353,7 +423,7 @@ export function announceToLeader(info: PermissionRequest): void {
       ),
       // ★ The whole input the leader may answer (already bounded by `cardText`; never cut again / r10 medium #1)
       asMemberData(found.member, cardText(info).text, Number.POSITIVE_INFINITY),
-      howToAnswer(found.member, info.key),
+      howToAnswer(found.member, info),
     ]
     // ⚠️ Checked again right before the bytes go out: still a member, the card still waits, still the leader's (r6 medium #3)
     await tellLeader(found.team, lines.join('\n'), () => cardStillLeaders(found.team, info))
@@ -365,8 +435,15 @@ function cardStillLeaders(team: Team, info: PermissionRequest): boolean {
   return membershipOf(info.sessionId)?.team === team && pendingWithMeta().some((p) => p.info.key === info.key) && leaderMay(team, info).ok
 }
 
-/** The Codex cards already announced to their leader (by exact key; forgotten when no longer waiting) */
-const codexAnnounced = new Set<string>()
+/**
+ * The Codex and agy cards already announced to their leader, by their origin (`originOf`: the same call keeps it when
+ * the card is raised again with a new key — measured: an agy state rewrite raised one card twice, and the leader was
+ * told twice under two refs). ★ Kept while the card is only withdrawn for a while (an agy child's question goes away
+ * while its parent works, and comes back / codex review: told three times); forgotten when it is answered
+ * (`onRequestOver`: a key that did not land raises it again, and the leader is told again) — and the oldest beyond
+ * `ANNOUNCED_MAX`.
+ */
+const announced: Record<'codex' | 'agy', Map<string, object>> = { codex: new Map(), agy: new Map() }
 
 /**
  * ★ A Codex member's thread changed state (the notifier's send, `index.ts`).
@@ -421,28 +498,168 @@ export function codexMemberState(
  * ★ The set of cards changed (`cardsChanged` in `index.ts`): each new Codex card of a member that its leader may answer
  *   is announced to that leader once (the phone rings for it as usual).
  */
-export function codexCardsChanged(): void {
-  const waiting = new Set<string>()
+export function codexCardsChanged(deps: AnnounceDeps = { tell: tellLeader, unique: memberUnique }): void {
+  cardsChangedFor('codex', deps)
+}
+
+/** (tests) How a card is announced: the leader's inbox and the member's identity */
+export interface AnnounceDeps {
+  tell: typeof tellLeader
+  unique: typeof memberUnique
+}
+
+/**
+ * ★ The same for agy (`AgyCards`' `changed`, `index.ts`): each new agy card of a member that its leader may answer is
+ *   announced once (docs/TEAM.md §9). ⚠️ The member's identity is read first (a second agy on the conversation, or one
+ *   that moved on, is not the member: the human answers).
+ */
+export function agyCardsChanged(deps: AnnounceDeps = { tell: tellLeader, unique: memberUnique }): void {
+  cardsChangedFor('agy', deps)
+}
+
+/**
+ * ★ What an announcement is remembered by: an agy card's origin (it names one call, kept through a new key); a Codex
+ *   card's exact key (its origin can be shared by sub-approvals of one item / codex · agy review round 13)
+ */
+function announceId(info: Pick<PermissionRequest, 'key' | 'origin' | 'tool'>): string {
+  return info.tool === 'agy' ? originOf(info) : info.key
+}
+
+function cardsChangedFor(tool: 'codex' | 'agy', deps: AnnounceDeps): void {
+  const announcedCards = announced[tool]
   for (const { info } of pendingWithMeta()) {
-    waiting.add(info.key)
-    if (info.tool !== 'codex' || codexAnnounced.has(info.key)) continue
+    if (info.tool !== tool) continue
+    const origin = announceId(info)
+    if (announcedCards.has(origin)) continue
     const found = membershipOf(info.sessionId)
     if (!found || !leaderMay(found.team, info).ok) continue
-    codexAnnounced.add(info.key)
-    void tellLeader(
-      found.team,
-      [
-        t(
-          `[nyan-team] ${found.member.name}（Codex）が承認を待っています（${oneLineData(info.toolName)}）`,
-          `[nyan-team] ${found.member.name} (Codex) is waiting for an approval (${oneLineData(info.toolName)})`,
-        ),
-        asMemberData(found.member, cardText(info).text, Number.POSITIVE_INFINITY),
-        howToAnswer(found.member, info.key),
-      ].join('\n'),
-      () => cardStillLeaders(found.team, info),
-    )
+    // ★ This attempt's own mark (an older attempt that fails must not erase a newer one's / codex review)
+    const mine = {}
+    announcedCards.set(origin, mine)
+    void (async () => {
+      const unique = tool !== 'agy' || (await deps.unique(found.member))
+      let told = false
+      // ★ The card as it is at each try (agy raises the same call again with a new key when its state file is
+      //   rewritten): the notice names that key, and is written only while that very key still waits — a key that
+      //   changed meanwhile is told again with the new one (codex · agy review: an unusable ref was sent)
+      // ⚠️ Only while this attempt still owns the mark (the card answered meanwhile and raised again has a newer one /
+      //    codex review: two notices for one returned card)
+      const ours = (): boolean => announcedCards.get(origin) === mine
+      for (let attempt = 0; unique && !told && ours() && attempt < 3; attempt++) {
+        const now = pendingWithMeta().find((p) => p.info.tool === tool && announceId(p.info) === origin)?.info
+        if (now === undefined) break
+        told = await deps.tell(
+          found.team,
+          [
+            t(
+              `[nyan-team] ${found.member.name}（${toolTag(found.member)}）が承認を待っています（${oneLineData(now.toolName)}）`,
+              `[nyan-team] ${found.member.name} (${toolTag(found.member)}) is waiting for an approval (${oneLineData(now.toolName)})`,
+            ),
+            asMemberData(found.member, cardText(now).text, Number.POSITIVE_INFINITY),
+            howToAnswer(found.member, now),
+          ].join('\n'),
+          () => ours() && cardStillLeaders(found.team, now),
+        )
+        if (!told && pendingWithMeta().find((p) => p.info.tool === tool && announceId(p.info) === origin)?.info.key === now.key) break
+      }
+      // ★ Not told (not confirmed the member, or the write failed): forgotten, so the next change of the cards tries again
+      if (!told && announcedCards.get(origin) === mine) announcedCards.delete(origin)
+    })()
   }
-  for (const k of [...codexAnnounced]) if (!waiting.has(k)) codexAnnounced.delete(k)
+  // ★ Codex: forgotten once that exact card no longer waits (as before agy members). agy: kept while merely withdrawn
+  if (tool === 'codex') for (const k of [...announcedCards.keys()]) if (!pendingWithMeta().some((p) => p.info.key === k)) announcedCards.delete(k)
+  while (announcedCards.size > ANNOUNCED_MAX) announcedCards.delete(announcedCards.keys().next().value as string)
+}
+
+/** How many announced origins are remembered at most */
+const ANNOUNCED_MAX = 1024
+
+/** (tests) What an agy member's turn-end report reads: its lock, its last words, the leader's inbox */
+export interface AgyDoneDeps {
+  locks(pid: number): Promise<string[] | undefined>
+  lastWords(sessionId: string): { text: string | undefined } | undefined
+  tell: typeof tellLeader
+}
+
+const agyDoneDeps: AgyDoneDeps = {
+  locks: (pid) => agyLocksOfAsync(pid, defaultAgyDeps().home).catch(() => undefined),
+  lastWords: (id) => agyLastWords(id),
+  tell: tellLeader,
+}
+
+/**
+ * ★ An agy member's turn ended "done" (the agy notifier's send, `index.ts`): reported to the leader with its last
+ *   answer instead of ringing the phone — the rule of a Codex member (`codexMemberState`, docs/TEAM.md §4.6).
+ * @param push rings the phone (with the notifier's own "still this state" guard) and says how many devices got it
+ * @returns undefined = not a member's report (the caller pushes as usual); else the count the notifier records —
+ *   1 when the leader was told, or the phone push's own count (0 ⇒ the notifier tries again later / codex review: a
+ *   failed fallback was counted as delivered and nobody heard the completion)
+ */
+export async function agyMemberDone(
+  row: { sessionId: string },
+  label: string,
+  push: () => Promise<number>,
+  deps: AgyDoneDeps = agyDoneDeps,
+  /**
+   * ★ The notifier's own "this completion is still the conversation's state" (its turn read directly): the words are
+   *   read only while it holds (codex review: a next turn ending during the notifier's checks was reported as this one)
+   */
+  current?: () => boolean,
+): Promise<number | undefined> {
+  const found = membershipOf(row.sessionId)
+  if (!found || found.member.tool !== 'agy') return undefined
+  const { team, member } = found
+  if (label !== statusLabel('done')) return undefined
+  // ⚠️ A leader that is gone gets nothing, and a member that is no longer the recorded agy rings as usual
+  if (!leaderLive(team, teamDeps()) || !leaderSessionNow(team) || !liveMember(member) || !agyStateNow(member)) return undefined
+  // ⚠️ The recorded agy must hold the conversation now (a `/new` moved it; a second agy that resumed it is another
+  //    person's: its "done" is theirs / agy review). Cannot tell ⇒ rings as usual
+  // ★ The words first, as of this completion (codex review: a next turn finishing during the lock probe was reported
+  //   as this one's result)
+  // ⚠️ Not this completion any more: the push (with the same guard) settles it — the newer state speaks for itself
+  if (current && !current()) return undefined
+  let read: { text: string | undefined } | undefined
+  try {
+    read = deps.lastWords(row.sessionId)
+  } catch {
+    read = undefined
+  }
+  const conv = conversationOf(row.sessionId)
+  if (conv === undefined || member.pid === undefined || !(await deps.locks(member.pid))?.includes(conv)) return undefined
+  const stillMember = (): boolean => membershipOf(row.sessionId)?.team === team
+  const told =
+    stillMember() &&
+    (await deps.tell(
+      team,
+      [
+        t(`[nyan-team] ${member.name}（agy）のターンが終わりました`, `[nyan-team] ${member.name} (agy) finished its turn`),
+        ...(read?.text ? [asMemberData(member, read.text)] : []),
+        ...(read === undefined ? [t('（結果を読めませんでした。nyan team read で見てください）', '(its result could not be read; see nyan team read)')] : []),
+      ].join('\n'),
+      stillMember,
+    ))
+  // ★ Told: done (its words unreadable were said so — never told twice by a retry / codex review). Not told: the phone
+  //   rings instead, with its own count (a failed push is tried again by the notifier)
+  return told ? 1 : push()
+}
+
+/**
+ * ★ The answer an agy turn ended with: the last model response with no tool call, when the transcript's tail says the
+ *   turn ended answered (`turnEnd`). undefined = cannot be read; `{ text: undefined }` = no answer text.
+ */
+export function agyLastWords(sessionId: string, tail: (path: string) => Record<string, unknown>[] = readTailRecords): { text: string | undefined } | undefined {
+  const conv = conversationOf(sessionId)
+  if (conv === undefined) return undefined
+  const records = tail(transcriptPathOf(conv, defaultAgyDeps().home))
+  if (records.length === 0) return undefined
+  if (!turnEnd(records).answered) return { text: undefined }
+  for (let i = records.length - 1; i >= 0; i--) {
+    const r = records[i]!
+    if (r['type'] !== 'PLANNER_RESPONSE') continue
+    const c = r['content']
+    return { text: typeof c === 'string' && c.trim() !== '' ? c.trim() : undefined }
+  }
+  return { text: undefined }
 }
 
 /** ★ Whether a Claude member's state notification is kept quiet (only "done": errors and needs-attention still ring) */
@@ -550,6 +767,9 @@ export function indexStatusNow(rec: { configDir?: string; pid?: number; sessionI
  *   terminal of the same profile / r22 medium #1). Unreadable ⇒ false (the phone rings: the safe side).
  */
 export function soleProcessSync(m: TeamMember): boolean {
+  // ★ agy: its recorded process still shows the conversation, by its own state file (the lock and the other agys were
+  //   checked by `memberUnique` just before; the key itself is typed only to the card's own agy / `answerAgyCard`)
+  if (m.tool === 'agy') return liveMember(m) && agyStateNow(m) !== undefined
   if (m.tool !== 'claude') return true
   if (!m.configDir || m.pid === undefined) return false
   try {
@@ -662,7 +882,7 @@ export async function sweepTeamsNow(now = Date.now()): Promise<void> {
   for (const team of allTeamsNow()) {
     for (const m of [...team.members]) {
       // ⚠️ Only a confirmed replacement or exit removes a member (an unreadable index is retried next round / r8 medium #2)
-      if (m.tool === 'claude' && (await memberIdentity(m)) === 'replaced' && membershipOf(m.sessionId)?.member === m) sessionEnded(m.sessionId)
+      if ((m.tool === 'claude' || m.tool === 'agy') && (await memberIdentity(m)) === 'replaced' && membershipOf(m.sessionId)?.member === m) sessionEnded(m.sessionId)
     }
   }
 }
@@ -705,7 +925,11 @@ export function codexRowStatus(sessionId: string, status: string): void {
 }
 
 // ★ A request that was waiting at a grant and is now over no longer keeps a later one human-only (`team.ts`)
-onRequestOver((origin) => retirePreexisting(origin))
+onRequestOver((origin) => {
+  retirePreexisting(origin)
+  // ★ Answered: if it comes back (its key did not land), the leader is told again
+  announced.agy.delete(origin)
+})
 
 // ★ While a delegation lasts, the history from before it is kept (`permission.ts`)
 setFirstSeenPin(() => {

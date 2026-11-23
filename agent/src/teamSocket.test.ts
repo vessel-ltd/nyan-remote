@@ -9,8 +9,8 @@ import type { PermissionRequest } from '../../shared/types.ts'
 import { aliveProcStartFreshSync } from './claude/sessionIndex.ts'
 import { resetPending, waitForDecision, type Decision } from './permission.ts'
 import { createTeam, resetTeamsForTest } from './team.ts'
-import { requestRef } from './teamHooks.ts'
-import { answersFromChoices, limitsOf, withoutSharedLabels } from './routes/team.ts'
+import { cardRef } from './teamHooks.ts'
+import { answersFromChoices, limitsOf, refOf, withoutSharedLabels } from './routes/team.ts'
 import { dirProblem, startTeamSocket, teamSocketPath } from './teamSocket.ts'
 
 const root = mkdtempSync(join(tmpdir(), 'nr-team-'))
@@ -99,10 +99,15 @@ test('★★★ the leader answers a delegated member approval through the same 
   try {
     assert.ok(createTeam(LEADER(), [{ sessionId: 'mem-1', tool: 'codex', account: '.codex' }], '3h', Date.now() - 1000).ok)
     const p = pending()
-    const r = await call(sock, 'POST', '/team/approve', { leader: 'lead-x', pid: ME, ref: requestRef(p.info.key), behavior: 'allow' })
+    const r = await call(sock, 'POST', '/team/approve', { leader: 'lead-x', pid: ME, ref: cardRef(p.info), behavior: 'allow' })
     assert.equal(r.status, 200)
     assert.deepEqual(r.json, { ok: true })
-    assert.deepEqual(await p.decided, { behavior: 'allow' })
+    const d = await p.decided
+    assert.equal(d?.behavior, 'allow')
+    // ★ a later key (agy) asks again whether the team still holds the grant (codex review 2026-11-22)
+    assert.equal(d?.stillValid?.(), true)
+    resetTeamsForTest()
+    assert.equal(d?.stillValid?.(), false, 'disbanded ⇒ the key is not typed')
   } finally {
     server.close()
   }
@@ -114,16 +119,16 @@ test('★★★ refused: no delegation, a plan approval, one that waited before 
     const grant = Date.now()
     assert.ok(createTeam(LEADER(), [{ sessionId: 'mem-1', tool: 'codex', account: '.codex' }], '3h', grant).ok)
     const plan = pending({ toolName: 'ExitPlanMode', interaction: { kind: 'plan' } })
-    const r1 = await call(sock, 'POST', '/team/approve', { leader: 'lead-x', pid: ME, ref: requestRef(plan.info.key), behavior: 'allow' })
+    const r1 = await call(sock, 'POST', '/team/approve', { leader: 'lead-x', pid: ME, ref: cardRef(plan.info), behavior: 'allow' })
     assert.equal(r1.json['ok'], false)
     const early = pending({ at: new Date(grant - 60_000).toISOString() })
-    const r2 = await call(sock, 'POST', '/team/approve', { leader: 'lead-x', pid: ME, ref: requestRef(early.info.key), behavior: 'allow' })
+    const r2 = await call(sock, 'POST', '/team/approve', { leader: 'lead-x', pid: ME, ref: cardRef(early.info), behavior: 'allow' })
     assert.equal(r2.json['ok'], false)
     const other = pending({ sessionId: 'stranger' })
-    const r3 = await call(sock, 'POST', '/team/approve', { leader: 'lead-x', pid: ME, ref: requestRef(other.info.key), behavior: 'allow' })
+    const r3 = await call(sock, 'POST', '/team/approve', { leader: 'lead-x', pid: ME, ref: cardRef(other.info), behavior: 'allow' })
     assert.equal(r3.json['ok'], false)
     const ok = pending()
-    const r4 = await call(sock, 'POST', '/team/approve', { leader: 'lead-x', pid: ME + 1, ref: requestRef(ok.info.key), behavior: 'allow' })
+    const r4 = await call(sock, 'POST', '/team/approve', { leader: 'lead-x', pid: ME + 1, ref: cardRef(ok.info), behavior: 'allow' })
     assert.equal(r4.status, 409)
     // ⚠️ none of them was answered
     for (const x of [plan, early, other, ok]) {
@@ -132,7 +137,7 @@ test('★★★ refused: no delegation, a plan approval, one that waited before 
     }
     resetTeamsForTest()
     assert.ok(createTeam(LEADER(), [{ sessionId: 'mem-1', tool: 'codex', account: '.codex' }], undefined).ok)
-    const r5 = await call(sock, 'POST', '/team/approve', { leader: 'lead-x', pid: ME, ref: requestRef(ok.info.key), behavior: 'allow' })
+    const r5 = await call(sock, 'POST', '/team/approve', { leader: 'lead-x', pid: ME, ref: cardRef(ok.info), behavior: 'allow' })
     assert.equal(r5.json['ok'], false)
   } finally {
     server.close()
@@ -180,13 +185,13 @@ test('★★ the leader answers with labels only (notes refused) and never a cli
   try {
     assert.ok(createTeam(LEADER(), [{ sessionId: 'mem-1', tool: 'codex', account: '.codex' }], '3h', Date.now() - 1000).ok)
     const p = pending()
-    const r1 = await call(sock, 'POST', '/team/approve', { leader: 'lead-x', pid: ME, ref: requestRef(p.info.key), behavior: 'allow', notes: { Q: 'free text' } })
+    const r1 = await call(sock, 'POST', '/team/approve', { leader: 'lead-x', pid: ME, ref: cardRef(p.info), behavior: 'allow', notes: { Q: 'free text' } })
     assert.equal(r1.status, 400)
     const long = pending({ detailClipped: true, summary: 'x'.repeat(10) })
-    const r2 = await call(sock, 'POST', '/team/approve', { leader: 'lead-x', pid: ME, ref: requestRef(long.info.key), behavior: 'allow' })
+    const r2 = await call(sock, 'POST', '/team/approve', { leader: 'lead-x', pid: ME, ref: cardRef(long.info), behavior: 'allow' })
     assert.equal(r2.json['ok'], false)
     const list = await call(sock, 'GET', `/team/pending?leader=lead-x&pid=${ME}`)
-    const row = (list.json['pending'] as { ref: string; clipped?: boolean; mayAnswer: boolean }[]).find((x) => x.ref === requestRef(long.info.key))
+    const row = (list.json['pending'] as { ref: string; clipped?: boolean; mayAnswer: boolean }[]).find((x) => x.ref === cardRef(long.info))
     assert.equal(row?.clipped, true)
     assert.equal(row?.mayAnswer, false)
   } finally {
@@ -221,10 +226,10 @@ test('★★★ a request waiting before the grant stays with the human even whe
     await new Promise((r) => setTimeout(r, 5))
     // the daemon reconnects and replays the same request: new key (generation), new `at`
     const replay = pending({ origin: 'codex:same-request', at: new Date(Date.now() + 1000).toISOString() })
-    const r = await call(sock, 'POST', '/team/approve', { leader: 'lead-x', pid: ME, ref: requestRef(replay.info.key), behavior: 'allow' })
+    const r = await call(sock, 'POST', '/team/approve', { leader: 'lead-x', pid: ME, ref: cardRef(replay.info), behavior: 'allow' })
     assert.equal(r.json['ok'], false)
     const fresh = pending({ origin: 'codex:another', at: new Date(Date.now() + 1000).toISOString() })
-    const r2 = await call(sock, 'POST', '/team/approve', { leader: 'lead-x', pid: ME, ref: requestRef(fresh.info.key), behavior: 'allow' })
+    const r2 = await call(sock, 'POST', '/team/approve', { leader: 'lead-x', pid: ME, ref: cardRef(fresh.info), behavior: 'allow' })
     assert.deepEqual(r2.json, { ok: true })
   } finally {
     server.close()
@@ -350,7 +355,7 @@ test('★★ the final guard refuses once the leader process carries another ses
     assert.ok(createTeam(LEADER(), [{ sessionId: 'mem-1', tool: 'codex', account: '.codex' }], '3h', Date.now() - 1000).ok)
     writeFileSync(join(LEADER_DIR, 'sessions', `${ME}.json`), JSON.stringify({ pid: ME, sessionId: 'after-clear' }))
     const p = pending()
-    const r = await call(sock, 'POST', '/team/approve', { leader: 'lead-x', pid: ME, ref: requestRef(p.info.key), behavior: 'allow' })
+    const r = await call(sock, 'POST', '/team/approve', { leader: 'lead-x', pid: ME, ref: cardRef(p.info), behavior: 'allow' })
     assert.equal(r.json['ok'], false)
   } finally {
     writeFileSync(join(LEADER_DIR, 'sessions', `${ME}.json`), JSON.stringify({ pid: ME, sessionId: 'lead-x' }))
@@ -424,4 +429,65 @@ test('★ limits carry each window’s reset time and the reading time, longest 
   // the newest reading of the account has no window left: unknown, never an older window (codex review r5)
   const emptied = { usage: [...one2.usage, { tool: 'claude' as const, account: '.claude-rt', accountKey: 'k1', at: '2026-11-19T11:59:00Z', windows: [] }] }
   assert.equal(limitsOf(emptied, 'claude', '.claude-r'), undefined)
+})
+
+test('★★ agy members (docs/TEAM.md §9): refs are ours; send refuses / ! ? before anything, and an agy it cannot confirm; approvals likewise', async () => {
+  // ★ a ref of our own making, hex only, with its kind
+  assert.match(refOf({ sessionId: 'agy-0f0e0d0c-0b0a-4909-8807-060504030201' }), /^ag-[0-9a-f]{8}$/)
+  assert.match(refOf({ sessionId: 'codex-0123456789abcdef-t1' }), /^cx-[0-9a-f]{8}$/)
+  const { sock, server } = await open()
+  try {
+    // an agy process that is not reachable through a relay here: its identity cannot be confirmed
+    const agy = { sessionId: 'agy-0f0e0d0c-0b0a-4909-8807-060504030201', tool: 'agy' as const, account: 'agy', pid: ME, procStart: String(aliveProcStartFreshSync(ME)) }
+    assert.ok(createTeam(LEADER(), [agy], '3h', Date.now() - 1000).ok)
+    for (const text of ['/exit', '!ls', '?', '  ?help']) {
+      const r = await call(sock, 'POST', '/team/send', { leader: 'lead-x', pid: ME, member: 'm1', text })
+      assert.equal(r.status, 400, text)
+    }
+    const r = await call(sock, 'POST', '/team/send', { leader: 'lead-x', pid: ME, member: 'm1', text: 'hello' })
+    assert.equal(r.status, 409, 'not confirmed as the member ⇒ nothing typed')
+    // ⚠️ its card: listed, but the human answers it while the member cannot be confirmed
+    const info: PermissionRequest = { key: 'agy:k#1', machine: 'pc-a', account: 'agy', project: 'p', sessionId: agy.sessionId, tool: 'agy', toolName: 'Bash', summary: 'date', at: new Date().toISOString() }
+    const p = { info, decided: waitForDecision(info, () => {}, { toolInput: { command: 'date' }, requestedAt: Date.now(), agyPid: ME }) }
+    const list = await call(sock, 'GET', `/team/pending?leader=lead-x&pid=${ME}`)
+    const row = (list.json['pending'] as { mayAnswer: boolean; why?: string; memberTool: string }[])[0]
+    assert.deepEqual([row?.memberTool, row?.mayAnswer, row?.why], ['agy', false, 'member-gone'])
+    const a = await call(sock, 'POST', '/team/approve', { leader: 'lead-x', pid: ME, ref: cardRef(p.info), behavior: 'allow' })
+    assert.equal(a.json['ok'], false)
+    const settled = await Promise.race([p.decided.then(() => true), new Promise((res) => setTimeout(() => res(false), 30))])
+    assert.equal(settled, false)
+  } finally {
+    server.close()
+  }
+})
+
+test('★★ an agy card\'s ref stays valid when the same call comes back under a new key (measured 2026-11-23)', async () => {
+  const { sock, server } = await open()
+  try {
+    assert.ok(createTeam(LEADER(), [{ sessionId: 'agy-0f0e0d0c-0b0a-4909-8807-060504030201', tool: 'agy', account: 'agy', pid: ME, procStart: String(aliveProcStartFreshSync(ME)) }], '3h', Date.now() - 1000).ok)
+    let withdraw: (() => void) | undefined
+    const first: PermissionRequest = { key: 'k-old#1', origin: 'agy:call-1', machine: 'pc-a', account: 'agy', project: 'p', sessionId: 'agy-0f0e0d0c-0b0a-4909-8807-060504030201', tool: 'agy', toolName: 'Bash', summary: 'ls', at: new Date().toISOString() }
+    void waitForDecision(first, (w) => (withdraw = w), { toolInput: { command: 'ls' } })
+    const told = cardRef(first)
+    withdraw?.()
+    const again = { ...first, key: 'k-new#1' }
+    const decided = waitForDecision(again, () => {}, { toolInput: { command: 'ls' } })
+    // (the member cannot be confirmed here — no relay — so the answer is refused, but by the member check: the old ref
+    //  found the card that waits now, not "gone")
+    const r = await call(sock, 'POST', '/team/approve', { leader: 'lead-x', pid: ME, ref: told, behavior: 'allow' })
+    assert.equal(r.json['ok'], false)
+    assert.match(String(r.json['reason']), /no longer the session|作ったときのセッション/)
+    void decided
+  } finally {
+    server.close()
+  }
+})
+
+test('★★★ a Claude card\'s ref is its exact key: a retry after a denial (same fingerprint) is not answered by the old ref (codex · agy review)', () => {
+  // a Claude card has no origin; a retry in the same turn gets the next generation of the same fingerprint
+  assert.notEqual(cardRef({ key: 'prompt-1#1' }), cardRef({ key: 'prompt-1#2' }))
+  // an agy card names its call: the same ref under a new key
+  assert.equal(cardRef({ key: 'a#1', origin: 'agy:x', tool: 'agy' }), cardRef({ key: 'b#1', origin: 'agy:x', tool: 'agy' }))
+  // ⚠️ a Codex card's origin can be shared by sub-approvals of one item: its exact key (codex review round 12)
+  assert.notEqual(cardRef({ key: 'c1#1', origin: 'codex:item', tool: 'codex' }), cardRef({ key: 'c2#1', origin: 'codex:item', tool: 'codex' }))
 })

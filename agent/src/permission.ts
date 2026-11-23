@@ -64,6 +64,12 @@ export interface Decision {
    * ⚠️ Not attached to allow (it is not read)
    */
   message?: string
+  /**
+   * ★ Asked by the side that types the answer later (an agy key goes out after a settle wait): false ⇒ not typed. A
+   *   team's leader passes "still this team, still delegated" (codex review 2026-11-22: a disband during the wait).
+   *   Never part of what a hook returns (`decisionResponse` names its fields).
+   */
+  stillValid?: () => boolean
 }
 
 interface Pending {
@@ -114,6 +120,14 @@ export interface PendingMeta {
   agentId?: string
   /** Tool arguments. Used to match against the transcript's tool_use */
   toolInput?: unknown
+  /**
+   * ★ When the tool asked (epoch ms), when the card itself can appear later (an agy call is written before its state
+   *   says a card is up). A team's leader judges "after the grant" by the earlier of this and the first sight
+   *   (`teamHooks.ts` `delegationView` / codex review 2026-11-22).
+   */
+  requestedAt?: number
+  /** ★ The agy process that raised the card (a team's member is one agy process / `teamHooks.ts` `ownsCard`) */
+  agyPid?: number
 }
 
 const pending = new Map<string, Pending>()
@@ -476,7 +490,7 @@ export function waitForDecision(
 export function answer(
   clientKey: string,
   behavior: Behavior,
-  extra?: Pick<Decision, 'updatedInput' | 'message'>,
+  extra?: Pick<Decision, 'updatedInput' | 'message' | 'stillValid'>,
 ): boolean {
   const entry = pending.get(baseKey(clientKey))
   if (!entry || entry.settled) return false
@@ -487,6 +501,7 @@ export function answer(
     ...(extra?.updatedInput ? { updatedInput: extra.updatedInput } : {}),
     // ⚠️ the reason is only for deny. The CLI does not read it on allow
     ...(behavior === 'deny' && extra?.message ? { message: extra.message } : {}),
+    ...(extra?.stillValid ? { stillValid: extra.stillValid } : {}),
   })
   return true
 }

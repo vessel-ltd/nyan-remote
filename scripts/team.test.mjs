@@ -15,6 +15,8 @@ test('★★ the caller is the nearest claude/codex above us (a Codex started in
   // a confirmed plain terminal, and "cannot tell" (r33 medium #2)
   assert.deepEqual(callerOf(env, 10, tree({ 10: { ppid: 9, comm: 'bash' }, 9: { ppid: 1, comm: 'sshd' } })), { tool: 'terminal' })
   assert.equal(callerOf(env, 10, tree({ 10: { ppid: 9, comm: 'bash' } })), undefined)
+  // ★ agy (a member only): found before a Claude above it, and never a plain terminal (agy review 2026-11-22)
+  assert.deepEqual(callerOf(env, 10, tree({ 10: { ppid: 9, comm: 'bash' }, 9: { ppid: 8, comm: 'agy' }, 8: { ppid: 1, comm: 'claude' } })), { tool: 'agy' })
   // node ← bash ← codex ← bash ← claude: Codex wins (it inherited CLAUDE_CODE_SESSION_ID)
   assert.deepEqual(
     callerOf(env, 10, tree({ 10: { ppid: 9, comm: 'bash' }, 9: { ppid: 8, comm: 'codex' }, 8: { ppid: 7, comm: 'bash' }, 7: { ppid: 1, comm: 'claude' } })),
@@ -162,13 +164,17 @@ test('★ inside a session, list and disband <id> are refused (they are the huma
   const errs = []
   try {
     const env = { NYAN_REMOTE_STATE_DIR: d }
-    for (const caller of [{ tool: 'claude', sessionId: 's', pid: 9 }, { tool: 'claude', pid: 9 }, { tool: 'codex' }, null]) {
+    for (const caller of [{ tool: 'claude', sessionId: 's', pid: 9 }, { tool: 'claude', pid: 9 }, { tool: 'codex' }, { tool: 'agy' }, null]) {
       // null = could not tell (treated like a session: never the human's commands)
       const c = caller ?? undefined
       assert.equal(await main(['disband', 'abcd1234'], { env, out: () => {}, err: (s) => errs.push(s), caller: c ?? { tool: 'unknown' } }), 1)
       assert.equal(await main(['list'], { env, out: () => {}, err: (s) => errs.push(s), caller: c ?? { tool: 'unknown' } }), 1)
     }
     assert.match(errs.join('\n'), /plain terminal|普通の端末/)
+    // ★ an agy cannot lead: the leader's commands are refused with why (agy review 2026-11-22)
+    errs.length = 0
+    assert.equal(await main(['candidates'], { env, out: () => {}, err: (s) => errs.push(s), caller: { tool: 'agy' } }), 1)
+    assert.match(errs.join('\n'), /agy/)
   } finally {
     rmSync(d, { recursive: true, force: true })
   }

@@ -77,7 +77,7 @@ export function parentOf(pid, { readFile = readFileSync, run = execFileSync } = 
 /**
  * ★ Which session runs us: the nearest `claude` or `codex` process above us decides
  *   (a Codex started inside Claude also sees `CLAUDE_CODE_SESSION_ID` / measured 2026-11-18).
- * @returns `{ tool: 'claude', sessionId, pid }` (sessionId may be missing), `{ tool: 'codex' }`,
+ * @returns `{ tool: 'claude', sessionId, pid }` (sessionId may be missing), `{ tool: 'codex' }`, `{ tool: 'agy' }`,
  *          `{ tool: 'terminal' }` (confirmed: walked to the top with neither above us), or undefined (could not tell)
  *          — r33 medium #2: only a confirmed terminal may use the human's commands
  */
@@ -90,6 +90,8 @@ export function callerOf(env = process.env, startPid = process.ppid, up = parent
     const comm = String(p.comm).toLowerCase()
     if (comm === 'claude') return { tool: 'claude', ...(env.CLAUDE_CODE_SESSION_ID ? { sessionId: env.CLAUDE_CODE_SESSION_ID } : {}), pid }
     if (comm === 'codex' || comm.startsWith('codex-')) return { tool: 'codex' }
+    // ★ agy (a member only): never a terminal, never the Claude above it (agy review)
+    if (comm === 'agy') return { tool: 'agy' }
     pid = p.ppid
   }
   return undefined
@@ -189,11 +191,16 @@ export function formatLimits(c, nowMs = Date.now()) {
   return `${parts.join(' · ')}${old ? ` — ${old}` : ''}${shared}`
 }
 
+/** The tool's name as shown (`claude` / `codex` / `agy`) */
+export function toolName(tool) {
+  return tool === 'codex' ? 'Codex' : tool === 'agy' ? 'agy' : 'Claude'
+}
+
 export function formatCandidates(list) {
   if (list.length === 0) return t('候補はありません（ほかに生きているセッションがない）', 'No candidates (no other live session).')
   return list
     .map((c) => {
-      const tags = [c.tool === 'codex' ? 'Codex' : 'Claude', c.account, c.model && `${c.model}${c.effort ? `/${c.effort}` : ''}`, c.status]
+      const tags = [toolName(c.tool), c.account, c.model && `${c.model}${c.effort ? `/${c.effort}` : ''}`, c.status]
         .filter(Boolean)
         .join(' · ')
       const team = c.team ? `  [${t('チーム', 'team')} ${c.team.id} ${c.team.role}]` : ''
@@ -215,13 +222,13 @@ export function formatStatus(s) {
   }
   if (s.leader?.limits) lines.push(`lead  Claude · ${s.leader.account}\n    ${t('上限', 'limits')}: ${formatLimits(s.leader)}`)
   for (const m of s.members) {
-    lines.push(`${m.name}  ${m.tool === 'codex' ? 'Codex' : 'Claude'} · ${m.account} · ${m.status}`)
+    lines.push(`${m.name}  ${toolName(m.tool)} · ${m.account} · ${m.status}`)
     if (m.limits) lines.push(`    ${t('上限', 'limits')}: ${formatLimits(m)}`)
     lines.push(fence(t('題名（データ）', 'title (data)'), m.title).replace(/^/gm, '    '))
     lines.push(
       m.address
         ? `    SendMessage to: ${m.address}`
-        : m.tool === 'codex'
+        : m.tool === 'codex' || (m.tool === 'agy' && m.status !== 'replaced')
           ? `    ${t('送る', 'send')}: nyan team send ${m.name} "<text>"`
           : `    ${t('いまは届きません（受信箱が見つからない／別のプロセスに替わった）', 'not reachable now (no inbox, or replaced by another process)')}`,
     )
@@ -238,7 +245,10 @@ export function formatPending(list) {
         p.clipped ? t('⚠️ 長すぎて全体を表示できません', '⚠️ too long to show whole') : '',
         p.hidden ? t('⚠️ 見えない文字・向きの文字が [U+XXXX] で印になっています', '⚠️ invisible or direction characters are marked [U+XXXX]') : '',
       ].filter(Boolean)
-      const codexNote = p.memberTool === 'codex' ? t('（Codex: 拒否に理由は付けられません）', '(Codex: a denial carries no reason)') : ''
+      const codexNote =
+        p.memberTool === 'codex' || p.memberTool === 'agy'
+          ? t(`（${toolName(p.memberTool)}: 拒否に理由は付けられません）`, `(${toolName(p.memberTool)}: a denial carries no reason)`)
+          : ''
       const head = `${p.member}  ${p.ref}  ${oneLine(p.tool)}  ${verdict}${codexNote ? ` ${codexNote}` : ''}${flags.length ? `\n  ${flags.join('\n  ')}` : ''}`
       // ⚠️ Everything the member supplied stays inside the fence: the command, its directory, questions and options
       const qs = (p.questions ?? []).map((qq, i) => `Q${i + 1}${qq.multiSelect ? ' (multi)' : ''}: ${qq.question}\n${qq.options.map((o, k) => `  ${k + 1}. ${o}`).join('\n')}`)
@@ -255,7 +265,7 @@ export function helpText() {
   nyan team candidates               候補（ほかの生きているセッション）
   nyan team create <ref>… [--approvals 3h|24h]   チームを作る（--approvals でメンバーの承認を任される）
   nyan team status                   自分のチーム（Claude のメンバーの SendMessage の宛先も出る）
-  nyan team send <member> <text>     Codex のメンバーに指示する（- で標準入力から）
+  nyan team send <member> <text>     Codex・agy のメンバーに指示する（- で標準入力から）
   nyan team read <member> [--last n] メンバーの最近の発言を読む
   nyan team pending                  メンバーの承認待ち
   nyan team approve <member> <r…> allow|deny [--choice <番号>|<質問>:<番号>] [--reason <文>]
@@ -268,7 +278,7 @@ export function helpText() {
   nyan team candidates               candidates (the other live sessions)
   nyan team create <ref>… [--approvals 3h|24h]   make a team (--approvals: answer the members' approvals)
   nyan team status                   your team (with each Claude member's SendMessage address)
-  nyan team send <member> <text>     instruct a Codex member (- reads stdin)
+  nyan team send <member> <text>     instruct a Codex or agy member (- reads stdin)
   nyan team read <member> [--last n] read a member's recent messages
   nyan team pending                  the members' waiting approvals
   nyan team approve <member> <r…> allow|deny [--choice <n>|<q>:<n>] [--reason <text>]
@@ -327,6 +337,10 @@ export async function main(argv, { env = process.env, out = console.log, err = c
   if (!humanOnly) {
     if (caller?.tool === 'codex') {
       err(t('✗ Codex をリーダーにするのはまだできません。Claude Code のセッションから使ってください。', '✗ A Codex session cannot lead a team yet. Use it from a Claude Code session.'))
+      return 1
+    }
+    if (caller?.tool === 'agy') {
+      err(t('✗ agy はリーダーになれません（メンバーだけ）。Claude Code のセッションから使ってください。', '✗ agy cannot lead a team (it can only be a member). Use it from a Claude Code session.'))
       return 1
     }
     if (caller?.tool !== 'claude' || !caller.sessionId) {
@@ -401,7 +415,10 @@ export async function main(argv, { env = process.env, out = console.log, err = c
           ...(opts.choice ? { choices: opts.choice.map(String) } : {}),
           ...(typeof opts.reason === 'string' ? { feedback: opts.reason } : {}),
         })
-        if (res.status === 200 && res.json.ok && !json) return show(out, t(`答えました: ${behavior}`, `Answered: ${behavior}`))
+        // ★ An agy key still being typed past the wait: said (agent's own words), not hidden
+        if (res.status === 200 && res.json.ok && !json) {
+          return show(out, `${t(`答えました: ${behavior}`, `Answered: ${behavior}`)}${typeof res.json.note === 'string' ? `\n${res.json.note}` : ''}`)
+        }
         if (res.status === 200 && !res.json.ok) {
           err(`✗ ${res.json.reason ?? 'refused'}`)
           return 1

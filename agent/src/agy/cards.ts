@@ -87,8 +87,10 @@ export function agyCard(row: SessionSummary, mark: AgyCardMark, call: PendingCal
   const cwdClipped = cwd !== undefined && cwd.length > CWD_MAX
   return {
     key: withGeneration(`agy:${id}`),
-    // ★ The same call keeps its origin when the card is raised again (teams' first-seen time / `permission.ts`)
-    origin: `agy:${createHash('sha256').update([row.sessionId, mark.pid, mark.step, mark.index].join('\0'), 'utf8').digest('hex').slice(0, 24)}`,
+    // ★ The same call keeps its origin when the card is raised again (teams' first-seen time and ref / `permission.ts`).
+    //   ⚠️ Bound to the call itself — its time and its exact input — not only its place: after a `/rewind` another
+    //      command can take the same step and index (codex review: an old ref approved it)
+    origin: `agy:${createHash('sha256').update([row.sessionId, mark.pid, mark.step, mark.index, mark.callAt, JSON.stringify(tool.input)].join('\0'), 'utf8').digest('hex').slice(0, 24)}`,
     machine: row.machine,
     account: row.account,
     project: row.project,
@@ -124,7 +126,13 @@ export interface AgyCardDeps {
    * ★ Types the phone's answer to a question (docs/AGY.md §13 / `keys.ts` `answerAgyQuestion`). Absent ⇒ no question
    *   cards (they stay on the PC).
    */
-  answerQuestion?(conversationId: string, mark: AgyQuestionMark, answer: AgyQuestionAnswer): Promise<{ ok: true; left?: true } | { ok: false; reason: AgyQuestionFailure }>
+  answerQuestion?(
+    conversationId: string,
+    mark: AgyQuestionMark,
+    answer: AgyQuestionAnswer,
+    /** ★ The answer's own `Decision.stillValid` (a team's leader: still this team) */
+    stillWanted?: () => boolean,
+  ): Promise<{ ok: true; left?: true } | { ok: false; reason: AgyQuestionFailure }>
   /** ★ Reads an agy's screen through its relay (`readAgyScreen`; replaced in tests) */
   readScreen?: (socketPath: string) => Promise<string | undefined>
   /** Rule 4c (tests shorten it) */
@@ -193,7 +201,8 @@ export function agyQuestionCard(row: SessionSummary, mark: AgyQuestionMark, q: A
   const first = q.items[0]!.question
   return {
     key: withGeneration(`agy:${id}`),
-    origin: `agy:${createHash('sha256').update(['agy-question', row.sessionId, mark.pid, mark.child ?? '', mark.step, mark.index].join('\0'), 'utf8').digest('hex').slice(0, 24)}`,
+    // ⚠️ Bound to the call itself (its time and its questions), as a card's (codex review)
+    origin: `agy:${createHash('sha256').update(['agy-question', row.sessionId, mark.pid, mark.child ?? '', mark.step, mark.index, mark.callAt, JSON.stringify(q.items)].join('\0'), 'utf8').digest('hex').slice(0, 24)}`,
     machine: row.machine,
     account: row.account,
     project: row.project,
@@ -450,7 +459,8 @@ export class AgyCards {
       const raised: Raised = { id }
       this.#raised.set(conv, raised)
       changed = true
-      void this.#wait(conv, raised, info, w.mark)
+      // ★ The card's whole input stays beside it (a team's leader judges by it / `teamHooks.ts` `cardText`)
+      void this.#wait(conv, raised, info, w.mark, agyCardTool(w.call)?.input)
     }
     if (await this.#lookQuestions(deps, unsure)) changed = true
     if (changed) this.#deps.changed()
@@ -672,7 +682,12 @@ export class AgyCards {
     const callKey = `${conv}:${qCallId(mark)}`
     try {
       // ★ The question itself stays on the agent: the route builds the keys from it (`questions.ts` rule 1)
-      const decision = await waitForDecision(info, (withdraw) => (raised.withdraw = withdraw), { toolInput: q as unknown as Record<string, unknown> })
+      const decision = await waitForDecision(info, (withdraw) => (raised.withdraw = withdraw), {
+        toolInput: q as unknown as Record<string, unknown>,
+        // ★ The question's own time (`PendingMeta.requestedAt`): the earlier of the call and the ask
+        requestedAt: Math.min(mark.callAt, mark.askedAt),
+        agyPid: mark.pid,
+      })
       if (!decision) return
       if (this.#qRaised.get(conv) === raised) this.#qRaised.delete(conv)
       this.#qAnswered.set(conv, raised.id)
@@ -688,7 +703,7 @@ export class AgyCards {
       const steps = answer.kind === 'steps' ? answer.steps : []
       this.#qTyping.add(callKey)
       const started = Date.now()
-      const res: AgyDelivery = await this.#deps.answerQuestion!(conv, mark, answer).catch(() => ({ ok: false as const, reason: 'unreachable' as const }))
+      const res: AgyDelivery = await this.#deps.answerQuestion!(conv, mark, answer, decision.stillValid).catch(() => ({ ok: false as const, reason: 'unreachable' as const }))
       settle(res)
       // ⚠️ One line, nothing of the question or the answer
       this.#deps.log?.(`[agy] question ${decision.behavior === 'allow' ? 'answer' : 'skip'} conversation=${conv.slice(0, 8)} ${res.ok ? 'typed' : `not typed (${res.reason})`}`)
@@ -761,12 +776,12 @@ export class AgyCards {
     }, this.#deps.unconfirmedMs ?? UNCONFIRMED_MS).unref?.()
   }
 
-  async #wait(conv: string, raised: Raised, info: PermissionRequest, mark: AgyCardMark): Promise<void> {
+  async #wait(conv: string, raised: Raised, info: PermissionRequest, mark: AgyCardMark, toolInput?: Record<string, string>): Promise<void> {
     let settle!: (d: AgyDelivery | undefined) => void
     const mine = new Promise<AgyDelivery | undefined>((r) => (settle = r))
     deliveries.set(info.key, mine)
     try {
-      await this.#answerOnce(conv, raised, info, mark, settle)
+      await this.#answerOnce(conv, raised, info, mark, settle, toolInput)
     } finally {
       settle(undefined)
       // ⚠️ The same card raised again keeps its key: never remove the newer one's entry
@@ -774,10 +789,15 @@ export class AgyCards {
     }
   }
 
-  async #answerOnce(conv: string, raised: Raised, info: PermissionRequest, mark: AgyCardMark, settle: (d: AgyDelivery) => void): Promise<void> {
-    const decision = await waitForDecision(info, (withdraw) => {
-      raised.withdraw = withdraw
-    })
+  async #answerOnce(conv: string, raised: Raised, info: PermissionRequest, mark: AgyCardMark, settle: (d: AgyDelivery) => void, toolInput?: Record<string, string>): Promise<void> {
+    const decision = await waitForDecision(
+      info,
+      (withdraw) => {
+        raised.withdraw = withdraw
+      },
+      // ★ With the call's own time: a team's leader judges "after the grant" by it (`PendingMeta.requestedAt`)
+      { ...(toolInput ? { toolInput } : {}), requestedAt: mark.callAt, agyPid: mark.pid },
+    )
     // withdrawn (rule 3) or replaced: nothing to type
     if (!decision) return
     if (this.#raised.get(conv) === raised) this.#raised.delete(conv)
@@ -785,7 +805,8 @@ export class AgyCards {
     this.#deps.changed()
     const behavior = decision.behavior === 'allow' ? 'allow' : 'deny'
     const started = Date.now()
-    const res: AgyDelivery = await this.#deps.answer(conv, mark, behavior).catch(() => ({ ok: false as const, reason: 'unreachable' as const }))
+    // ★ A team's leader's answer is asked again right before the key (`Decision.stillValid`: the team still there)
+    const res: AgyDelivery = await this.#deps.answer(conv, mark, behavior, decision.stillValid).catch(() => ({ ok: false as const, reason: 'unreachable' as const }))
     settle(res)
     // ⚠️ One line, no command text (the card and the PC's screen are the only traces of it)
     this.#deps.log?.(`[agy] card ${behavior} conversation=${conv.slice(0, 8)} ${res.ok ? 'typed' : `not typed (${res.reason})`}`)

@@ -28,7 +28,8 @@ export type TeamApprovalDuration = keyof typeof TEAM_APPROVAL_DURATIONS
 /** At most this many members (a leader reading eight threads is already a lot) */
 export const MAX_TEAM_MEMBERS = 8
 
-export type TeamTool = 'claude' | 'codex'
+/** ★ agy (2026-11-22 / docs/TEAM.md §9): a member only (it has no inbox, so it cannot lead) */
+export type TeamTool = 'claude' | 'codex' | 'agy'
 
 export interface TeamLeader {
   sessionId: string
@@ -50,6 +51,7 @@ export interface TeamMember {
   /**
    * ★ A Claude member's process and its start time (codex review, high #1): a member that exits without `SessionEnd`
    *   and is resumed with the same session id is **another instance** — the leader must not answer its approvals.
+   *   ★ An agy member: its agy process (the one that showed the conversation when the team was made).
    *   Absent for Codex members (their thread is checked against the daemon's live rows by `sweepTeams`).
    */
   pid?: number
@@ -334,16 +336,19 @@ export function mayLeaderAnswer(
  *    (The profile **directory** is checked by `teamHooks.ts` `ownsCard`, which has the card's transcript.)
  */
 export function cardFromMember(member: TeamMember, req: Pick<PermissionRequest, 'tool' | 'account' | 'accountUnknown'>): boolean {
-  return member.tool === 'codex' ? req.tool === 'codex' : req.tool !== 'codex' && !req.accountUnknown && req.account === member.account
+  if (member.tool === 'codex') return req.tool === 'codex'
+  // ★ agy: its cards carry `tool: 'agy'` and the conversation's row id (which agy process: `teamHooks.ts` `memberIdentity`)
+  if (member.tool === 'agy') return req.tool === 'agy'
+  return req.tool !== 'codex' && req.tool !== 'agy' && !req.accountUnknown && req.account === member.account
 }
 
-/** ★ A Claude member is the instance the team was made with (pid + start time). Codex members: see `sweepTeams` */
+/** ★ A Claude or agy member is the instance the team was made with (pid + start time). Codex members: see `sweepTeams` */
 export function memberLive(m: TeamMember, deps: TeamDeps): boolean {
   if (m.pid === undefined || m.procStart === undefined) return true
   return instanceState(m.pid, m.procStart, deps) === 'same'
 }
 
-/** A Claude member's process confirmed gone (only this removes it; unknown keeps it) */
+/** A Claude or agy member's process confirmed gone (only this removes it; unknown keeps it) */
 export function memberGone(m: TeamMember, deps: TeamDeps): boolean {
   if (m.pid === undefined || m.procStart === undefined) return false
   return instanceState(m.pid, m.procStart, deps) === 'gone'

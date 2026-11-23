@@ -166,3 +166,23 @@ test('★★ a member waiting at the grant keeps its cards with the human until 
   clearWaitingAtGrant(r.team, 'a')
   assert.ok(mayLeaderAnswer(r.team, req({ sessionId: 'a', tool: 'codex' }), 2000).ok)
 })
+
+test('★★ agy members (2026-11-22 / docs/TEAM.md §9): only agy cards are theirs; bound to their agy process; gone when it exits', () => {
+  const agy = { sessionId: 'agy-0f0e0d0c-0b0a-4909-8807-060504030201', tool: 'agy' as const, account: 'agy', pid: 9, procStart: 'P9' }
+  const r = createTeam(LEADER, [agy, m('a')], '3h', 1000)
+  assert.ok(r.ok)
+  assert.equal(r.team.members[0]!.tool, 'agy')
+  const card = req({ sessionId: agy.sessionId, tool: 'agy', account: 'agy' })
+  assert.ok(mayLeaderAnswer(r.team, card, 2000).ok)
+  // ⚠️ a Claude or Codex card with the agy row id is not the agy member's; an agy card with a Claude member's id is not that member's
+  assert.equal((mayLeaderAnswer(r.team, { ...card, tool: undefined }, 2000) as { reason: string }).reason, 'not-member')
+  assert.equal((mayLeaderAnswer(r.team, { ...card, tool: 'codex' }, 2000) as { reason: string }).reason, 'not-member')
+  assert.equal((mayLeaderAnswer(r.team, req({ tool: 'agy' }), 2000) as { reason: string }).reason, 'not-member')
+  // its agy process: another start time is another agy (pid reuse) ⇒ gone; unknown keeps it
+  const deps = (p9: string | null | undefined): TeamDeps => ({ procStart: (pid) => (pid === 4242 ? 'start-A' : pid === 9 ? p9 : null), sameProcStart: (x, y) => x === y })
+  assert.equal(memberLive(r.team.members[0]!, deps('P9')), true)
+  assert.equal(memberLive(r.team.members[0]!, deps('P9-other')), false)
+  assert.deepEqual(sweepTeams(deps('P9'), undefined).gone, [])
+  assert.deepEqual(sweepTeams(deps(null), undefined).gone, [agy.sessionId])
+  assert.deepEqual(sweepTeams(deps(undefined), undefined).gone, [])
+})

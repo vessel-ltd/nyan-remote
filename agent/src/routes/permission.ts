@@ -355,6 +355,8 @@ export function answerPermission(
   body: AnswerBody,
   actor: string,
   guard?: (target: PermissionRequest | undefined) => { ok: true } | { ok: false; reason: string },
+  /** ★ Asked again right before a later key (agy): `Decision.stillValid` */
+  stillValid?: () => boolean,
 ): { ok: boolean; reason?: string } {
   const key = str(body.key)
   const behavior = str(body.behavior)
@@ -437,7 +439,7 @@ export function answerPermission(
     }
   }
 
-  const ok = answer(key, behavior as Behavior, { updatedInput, message: fb.message })
+  const ok = answer(key, behavior as Behavior, { updatedInput, message: fb.message, ...(stillValid ? { stillValid } : {}) })
   if (ok) {
     console.log(
       `[perm] ${behavior} key=${key.slice(0, 12)}…${key.slice(-4)} by=${actor}` +

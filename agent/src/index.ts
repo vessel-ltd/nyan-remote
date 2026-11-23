@@ -28,7 +28,7 @@ import { seedHookState } from './claude/hookState.ts'
 import { startSessionWatch } from './claude/sessionWatch.ts'
 import { uploads } from './uploads.ts'
 import { CODEX_FOLLOW_TICK_MS, codexFollowTick, codexLastWords, codexRowsNow, startCodex } from './codex/run.ts'
-import { codexCardsChanged, codexMemberState, codexRowStatus, codexSnapshot, sessionEnded } from './teamHooks.ts'
+import { agyCardsChanged, agyMemberDone, codexCardsChanged, codexMemberState, codexRowStatus, codexSnapshot, sessionEnded } from './teamHooks.ts'
 import { startTeamSocket } from './teamSocket.ts'
 import { codexPayload } from './codex/notify.ts'
 import { sendToAll } from './push.ts'
@@ -143,8 +143,12 @@ async function main(): Promise<void> {
     machine: machineName(),
     answer: (conv, mark, behavior, stillWanted) => answerAgyCard(conv, mark, behavior, undefined, undefined, stillWanted),
     // ★ Questions answered from the phone (docs/AGY.md §13)
-    answerQuestion: (conv, mark, answer) => answerAgyQuestion(conv, mark, answer),
-    changed: () => broadcast({ type: 'permissions-changed', machine: machineName(), at: new Date().toISOString() }),
+    answerQuestion: (conv, mark, answer, stillWanted) => answerAgyQuestion(conv, mark, answer, undefined, undefined, stillWanted),
+    changed: () => {
+      broadcast({ type: 'permissions-changed', machine: machineName(), at: new Date().toISOString() })
+      // ★ Teams: each new agy card the leader may answer is announced to it once (`teamHooks.ts` / docs/TEAM.md §9)
+      agyCardsChanged()
+    },
     now: () => new Date(),
     log: (line) => console.log(line),
     // ★ The card came back after a key that did not land: ring "needs you" again (`notify.ts` rule 11)
@@ -191,8 +195,13 @@ async function main(): Promise<void> {
       return agyCards.unsureAbout(conv) ? undefined : false
     },
     // ★ The same text builder and sender as Claude and Codex
-    send: async (row, fields, current) =>
-      (await sendToAll(withPendingPerms(codexPayload(row, fields, new Date().toISOString(), toPushPayload)), undefined, current)).sent,
+    send: async (row, fields, current) => {
+      const push = async (guard?: () => boolean): Promise<number> =>
+        (await sendToAll(withPendingPerms(codexPayload(row, fields, new Date().toISOString(), toPushPayload)), undefined, () => (current?.() ?? true) && (guard?.() ?? true))).sent
+      // ★ A team member (docs/TEAM.md §9): its turn end is reported to the leader instead of ringing; the phone rings
+      //   when that report does not get through (its own count: a failed push is tried again by the notifier)
+      return (await agyMemberDone(row, fields.label, () => push(), undefined, current)) ?? push()
+    },
     log: (line) => console.log(line),
   })
   // ★ Cards first: the notifier asks which card auto-approve is answering (`quiet`), decided by the cards' look

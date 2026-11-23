@@ -539,6 +539,12 @@ export async function sendToAgy(
   conversationId: string,
   text: unknown,
   deps: AgyKeysDeps = defaultAgyKeysDeps(),
+  /**
+   * ★ Asked with the target found, inside the queue, and again right before the body and before Enter: false ⇒ nothing
+   *   (more) typed, 'unsure'. A team's send passes "still the member's own agy, still this team" (docs/TEAM.md §9 /
+   *   codex · agy review: a send queued behind another operation typed into a second agy that had opened it meanwhile).
+   */
+  stillWanted?: (target: Pick<AgyTarget, 'pid'>) => boolean,
 ): Promise<AgyResult<AgySendFailure>> {
   const key = keyOf(conversationId)
   const read = deps.readNow ?? readNow
@@ -553,6 +559,7 @@ export async function sendToAgy(
     if (looksLikeAgyShortcut(clean.value.text)) return fail('shortcut-like')
     const target = await findAgyTarget(conversationId, deps)
     if (typeof target === 'string') return fail(target)
+    if (stillWanted && !stillWanted(target)) return fail('unsure')
     if (typedTooLong(clean.value.text)) return fail('too-long')
     // ★ Subagents running: allowed through a relay that shows the screen, once it shows the parent's view (below)
     //   (whether they run is read from the state file: no extra lock probe)
@@ -565,7 +572,8 @@ export async function sendToAgy(
     if (long && !target.pane.paste) return fail('long-needs-paste')
     // (the state only, not the lock probe again: an ESC on a subagent's view only goes back, and a Mac's `lsof` per
     //  check added up past the phone's 10 s / codex review)
-    const left = await leaveChildView(target, deps, () => sendNow(target, read, noProbe, withKids) === 'ok')
+    // ⚠️ `stillWanted` (slow on a Mac) first, the state last, right before the ESC (agy review)
+    const left = await leaveChildView(target, deps, () => (stillWanted?.(target) ?? true) && sendNow(target, read, noProbe, withKids) === 'ok')
     if (left !== 'ok') return fail(left)
     // ★ The slow lock probe first (without blocking), then the screen, then only quick checks right before each key: a
     //   card the parent opens meanwhile shows on the screen, which is read after the probe (codex review)
@@ -578,6 +586,10 @@ export async function sendToAgy(
     // ★ Looked at again right before the body and right before Enter (a card, a turn the PC started)
     let refusedBy: Exclude<AgyGate, 'idle' | 'ok'> | undefined
     const stopHere = (): boolean => {
+      if (stillWanted && !stillWanted(target)) {
+        refusedBy = 'unsure'
+        return true
+      }
       const g = sendNow(target, read, keyHolds, withKids)
       if (g === 'ok') return false
       refusedBy = g
@@ -1046,13 +1058,17 @@ export async function answerAgyCard(
     //   the card would be neither allowed nor declined / agy review)
     if (pane.screen) {
       const before = await probedChecks(deps, tail, mark.pid)
-      const left = await leaveChildView({ ...target, stateFile: '' }, deps, () => sameCardNow(target, mark, before) && (stillWanted === undefined || stillWanted()))
+      // ⚠️ `stillWanted` (slow on a Mac) first, the card last (codex review, as before the key below)
+      const left = await leaveChildView({ ...target, stateFile: '' }, deps, () => (stillWanted === undefined || stillWanted()) && sameCardNow(target, mark, before))
       if (left !== 'ok') return { ok: false, reason: 'changed' }
     }
     const checks = await probedChecks(deps, tail, mark.pid)
     const res = await writeControl(pane.socketPath, AGY_CARD_KEYS[behavior], {
-      // ⚠️ `stillWanted` last: the card checks can take a while (a Mac's `lsof`), and an expiry during them counts
-      beforeWrite: () => !sameCardNow(target, mark, checks) || (stillWanted !== undefined && !stillWanted()),
+      // ⚠️ The slow lock probes are done above (`checks`). `stillWanted` first — a team's guard probes processes (`ps` on
+      //    a Mac) — and the card itself last, right before the byte (codex review: a card answered on the PC during
+      //    those probes got the team's queued key)
+      // ★ …and once more after it: still wanted when the card check (its own process probes) ends (codex review)
+      beforeWrite: () => (stillWanted !== undefined && !stillWanted()) || !sameCardNow(target, mark, checks) || (stillWanted !== undefined && !stillWanted()),
     })
     if (res.ok) return { ok: true }
     return { ok: false, reason: res.reason === 'pending-approval' ? 'changed' : 'unreachable' }
@@ -1173,6 +1189,12 @@ export async function answerAgyQuestion(
   answer: AgyQuestionAnswer,
   deps: AgyKeysDeps = defaultAgyKeysDeps(),
   tail: (path: string) => Record<string, unknown>[] = readTailRecords,
+  /**
+   * ★ Asked after the settle wait and before each key of a fixed-key answer: false ⇒ nothing (more) typed. A team's
+   *   leader passes "still this team" (`Decision.stillValid` / codex review: a disband during the wait still skipped
+   *   the question). The answer typed against the screen asks it before each of its keys too.
+   */
+  stillWanted?: () => boolean,
 ): Promise<{ ok: true; left?: true } | { ok: false; reason: AgyQuestionFailure }> {
   const conv = conversationId.toLowerCase()
   return whileAnswering(keyOf(conv), () => serializeBySession(keyOf(conv), async () => {
@@ -1194,10 +1216,13 @@ export async function answerAgyQuestion(
     if (!sameQuestionNow(target, mark, await probedChecks(deps, tail, mark.pid))) return { ok: false, reason: 'changed' }
     // ★ An answer on the PC just before lands in this wait (as a card's)
     await new Promise((r) => setTimeout(r, deps.answerSettleMs ?? AGY_ANSWER_SETTLE_MS))
-    if (answer.kind !== 'steps') return answerOnScreen({ ...target, stateFile: '' }, pane, mark, answer, checks, deps, tail)
+    if (stillWanted && !stillWanted()) return { ok: false, reason: 'changed' }
+    if (answer.kind !== 'steps') return answerOnScreen({ ...target, stateFile: '' }, pane, mark, answer, checks, deps, tail, stillWanted)
     const stepMs = deps.questionStepMs ?? AGY_QUESTION_STEP_MS
     const openMs = deps.childOpenMs ?? AGY_CHILD_OPEN_MS
-    const refuse = (slow: boolean) => (): boolean => !sameQuestionNow(target, mark, checks, slow)
+    // ⚠️ `stillWanted` (slow on a Mac) first, the question last
+    const refuse = (slow: boolean) => (): boolean =>
+      (stillWanted !== undefined && !stillWanted()) || !sameQuestionNow(target, mark, checks, slow) || (stillWanted !== undefined && !stillWanted())
     // ★ One connection for the whole answer (`writeSequence`): a child's question is opened first with ctrl+k (the
     //   parent's banner), and the PC is taken back to the parent's view after (ESC) — ⚠️ only once the whole answer went
     //   out, only into this same agy, and only while the child asks nothing: on an open question ESC skips it (codex
@@ -1328,8 +1353,11 @@ async function answerOnScreen(
   checks: Parameters<typeof sameQuestionNow>[2],
   deps: AgyKeysDeps,
   tail: (path: string) => Record<string, unknown>[],
+  /** ★ Asked before each key of the answer (a team's leader: still this team / codex review), then the question */
+  stillWanted?: () => boolean,
 ): Promise<{ ok: true; left?: true } | { ok: false; reason: AgyQuestionFailure }> {
   const items = answer.question.items
+  const unwanted = (): boolean => stillWanted !== undefined && !stillWanted()
   const settle = deps.screenSettleMs ?? SCREEN_SETTLE_MS
   const look = deps.readScreen ?? ((p: string) => readAgyScreen(p))
   const line = await (deps.openKeyLine ?? openKeyLine)(pane.socketPath)
@@ -1340,7 +1368,7 @@ async function answerOnScreen(
     // ★ The slow probes (a Mac's `lsof`) made just before, without blocking (codex review: a synchronous probe held the
     //   whole agent — and the phone's 6 s deadline — for seconds)
     const now = slow ? await probedChecks(deps, tail, mark.pid) : checks
-    const ok = await line.write(bytes, () => !sameQuestionNow(target, mark, now, slow))
+    const ok = await line.write(bytes, () => unwanted() || !sameQuestionNow(target, mark, now, slow) || unwanted())
     if (!ok) throw new Stop(typed > 0 ? 'partial' : 'changed')
     typed++
   }
@@ -1475,7 +1503,7 @@ async function answerOnScreen(
       // ⚠️ Any call pending there (a question, a command whose approval is about to be drawn — ESC would decline it), or
       //    none readable: not left (codex / agy review). A long command there keeps the sibling's answer waiting.
       const asking = (): boolean => agyPendingCall(viewedT, tail) !== null
-      const ok = await line.write(SCREEN_KEYS.esc, () => !sameQuestionNow(target, mark, now, true) || asking())
+      const ok = await line.write(SCREEN_KEYS.esc, () => unwanted() || !sameQuestionNow(target, mark, now, true) || asking())
       if (!ok) throw new Stop('changed')
       typed++
       // (the parent's view: its banner for a subagent's question, the dialog for its own)

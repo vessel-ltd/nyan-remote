@@ -17,6 +17,7 @@ import { sweepResolved } from '../permissionSweep.ts'
 import { HttpError, readJsonBody, type Ctx } from '../router.ts'
 import {
   allTeams,
+  approvalsActive,
   createTeam,
   findMember,
   membershipOf,
@@ -30,10 +31,16 @@ import {
   type Team,
   type TeamMember,
 } from '../team.ts'
-import { asMemberData, cardText, endTeam, soleProcessSync, indexStatusNow, leaderMay, leaderSessionNow, liveMember, memberUnique, ownsCard, revealed, requestRef, teamDeps, tellLeader } from '../teamHooks.ts'
+import { agyStateNow, asMemberData, cardText, endTeam, soleProcessSync, indexStatusNow, leaderMay, leaderSessionNow, liveMember, memberUnique, ownsCard, revealed, cardRef, teamDeps, tellLeader } from '../teamHooks.ts'
+import { agyDelivery, agyDeliveryMessage } from '../agy/cards.ts'
+import { AGY_DELIVERY_WAIT_MS, settledWithin } from './permission.ts'
 import { answerPermission, type AnswerBody } from './permission.ts'
 import { codexMessage } from './message.ts'
 import { codexLabelShared, codexLists, codexLog, codexRowsNow, codexSend, codexStatusKnown } from '../codex/run.ts'
+import { AGY_PREFIX, conversationOf, transcriptPathOf } from '../agy/sessions.ts'
+import { AGY_SEND_REFUSAL, defaultAgyKeysDeps, findAgyTarget, looksLikeAgyShortcut, sendToAgy } from '../agy/keys.ts'
+import { agyEntries } from '../agy/log.ts'
+import type { TeamTool } from '../team.ts'
 import { readFileSync } from 'node:fs'
 import { readdir, stat } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
@@ -92,8 +99,8 @@ function memberOf(team: Team, ref: unknown): TeamMember {
   return m
 }
 
-function toolOf(row: SessionSummary): 'claude' | 'codex' {
-  return row.tool === 'codex' ? 'codex' : 'claude'
+function toolOf(row: SessionSummary): TeamTool {
+  return row.tool === 'codex' ? 'codex' : row.tool === 'agy' ? 'agy' : 'claude'
 }
 
 /**
@@ -107,12 +114,13 @@ export function refOf(row: Pick<SessionSummary, 'sessionId'>): string {
   if (!isCodexSessionId(row.sessionId) && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(row.sessionId)) {
     return row.sessionId.slice(0, 8)
   }
-  return `${isCodexSessionId(row.sessionId) ? 'cx' : 'c'}-${createHash('sha256').update(row.sessionId, 'utf8').digest('hex').slice(0, 8)}`
+  const kind = isCodexSessionId(row.sessionId) ? 'cx' : row.sessionId.startsWith(AGY_PREFIX) ? 'ag' : 'c'
+  return `${kind}-${createHash('sha256').update(row.sessionId, 'utf8').digest('hex').slice(0, 8)}`
 }
 
 interface Candidate {
   ref: string
-  tool: 'claude' | 'codex'
+  tool: TeamTool
   account: string
   title: string
   project: string
@@ -120,7 +128,7 @@ interface Candidate {
   model?: string
   effort?: string
   contextTokens?: number
-  /** Claude: where its own SendMessage reaches it (`uds:<socket>`). Codex: absent (use `nyan team send`) */
+  /** Claude: where its own SendMessage reaches it (`uds:<socket>`). Codex / agy: absent (use `nyan team send`) */
   address?: string
   /** Weekly limit used (0–100) of that profile's login, when known. ⚠️ Kept for an older `nyan team` (use `limits`) */
   weeklyUsedPercent?: number
@@ -142,7 +150,7 @@ interface Limits {
   sameLoginAs?: string[]
 }
 
-export function limitsOf(u: { usage: ToolUsage[] }, tool: 'claude' | 'codex', account: string): Limits | undefined {
+export function limitsOf(u: { usage: ToolUsage[] }, tool: TeamTool, account: string): Limits | undefined {
   // ⚠️ Two homes can share a label (`work/.codex` and `personal/.codex`): then which login a row is cannot be told,
   //    so nothing is shown rather than another login's numbers (codex review r1)
   const found = u.usage.filter((x) => x.tool === tool && x.account === account)
@@ -186,9 +194,9 @@ export async function teamCandidates(ctx: Ctx): Promise<{ candidates: Candidate[
   const out: Candidate[] = []
   for (const row of rows) {
     if (row.sessionId === self) continue
-    // ⚠️ agy conversations cannot be members yet (docs/AGY.md: nothing can be sent to them)
-    if (row.tool === 'agy') continue
     const tool = toolOf(row)
+    // ★ agy (docs/TEAM.md §9): only a conversation nyan can type into (started through the relay, shown by one agy)
+    if (tool === 'agy' && (row.sendRoute !== 'keys' || row.agyShared)) continue
     let address: string | undefined
     if (tool === 'claude') {
       const target = await findTarget(dirs, row.sessionId)
@@ -262,10 +270,10 @@ export async function teamCreate(ctx: Ctx): Promise<unknown> {
 
   const rows = await liveRows()
   const leaderRow = rows.find((r) => r.sessionId === sessionId)
-  const members: { sessionId: string; tool: 'claude' | 'codex'; account: string; pid?: number; procStart?: string; configDir?: string }[] = []
+  const members: { sessionId: string; tool: TeamTool; account: string; pid?: number; procStart?: string; configDir?: string }[] = []
   for (const ref of refs) {
     // ⚠️ Matched only against our own refs (never a prefix of another program's id)
-    if (!/^(c-|cx-)?[0-9a-f]{8}$/.test(ref)) throw new HttpError(400, t(`参照の形が違います: ${ref}`, `Not a candidate ref: ${ref}`))
+    if (!/^(c-|cx-|ag-)?[0-9a-f]{8}$/.test(ref)) throw new HttpError(400, t(`参照の形が違います: ${ref}`, `Not a candidate ref: ${ref}`))
     const hits = rows.filter((r) => r.sessionId !== sessionId && refOf(r) === ref)
     if (hits.length === 0) throw new HttpError(404, t(`「${ref}」に当たる生きているセッションがありません（nyan team candidates で確かめて）`, `No live session matches "${ref}" (check with nyan team candidates).`))
     if (hits.length > 1) throw new HttpError(400, t(`「${ref}」に当たるセッションが複数あります`, `"${ref}" matches more than one session.`))
@@ -279,6 +287,26 @@ export async function teamCreate(ctx: Ctx): Promise<unknown> {
         throw new HttpError(409, t(`「${ref}」のセッションを確かめられません（いま繋がっていない）`, `Cannot verify the session "${ref}" (not reachable now).`))
       }
       members.push({ sessionId: row.sessionId, tool, account: row.account, pid: at.pid, procStart: start, configDir: dirname(at.sessionsDir) })
+    } else if (tool === 'agy') {
+      // ★ Bind an agy member to the agy process that shows the conversation now (the one keys would go to)
+      const conv = conversationOf(row.sessionId)
+      const at = conv === undefined || row.agyShared ? undefined : await findAgyTarget(conv, defaultAgyKeysDeps())
+      const start = at === undefined || typeof at === 'string' ? undefined : aliveProcStartFreshSync(at.pid)
+      if (at === undefined || typeof at === 'string' || typeof start !== 'string') {
+        throw new HttpError(409, t(`「${ref}」の agy を確かめられません（中継を通して起動した agy で、1つだけが開いているときに選べます）`, `Cannot verify the agy "${ref}" (pick one started through the relay, open in one agy only).`))
+      }
+      // ⚠️ Its own state file (`pid-<pid>.json`) must name the conversation: every later check reads it (codex review:
+      //    an agy with only the older per-conversation file was accepted, then shown as replaced and never usable)
+      if (!agyStateNow({ tool, pid: at.pid, sessionId: row.sessionId })) {
+        throw new HttpError(
+          409,
+          t(
+            `「${ref}」の agy の状態がまだ読めません（更新の前から開いている agy など）。その agy で何か1つ送ってから、もう一度作ってください`,
+            `Cannot read the state of the agy "${ref}" yet (an agy opened before an update, for example). Send it anything once, then create the team again.`,
+          ),
+        )
+      }
+      members.push({ sessionId: row.sessionId, tool, account: row.account, pid: at.pid, procStart: start })
     } else {
       members.push({ sessionId: row.sessionId, tool, account: row.account })
     }
@@ -296,8 +324,10 @@ export async function teamCreate(ctx: Ctx): Promise<unknown> {
   if (approvals !== undefined && [...claudeNow.values()].some((st) => st === undefined)) {
     throw new HttpError(409, t('選んだ Claude のセッションの様子をいま確かめられません。少し待ってからもう一度作ってください', 'Cannot read a Claude session’s state right now. Wait a moment and create the team again.'))
   }
+  // ★ agy members are not listed here: each agy card carries the time of its own call (`PendingMeta.requestedAt`), so a
+  //   call made before the grant stays the human's by that alone (agy review: a member held here missed later cards)
   const waitingNow = members
-    .filter((m) => (m.tool === 'codex' ? codexNow.find((r) => r.sessionId === m.sessionId)?.status === 'waiting' : claudeNow.get(m.sessionId) === 'waiting'))
+    .filter((m) => (m.tool === 'codex' ? codexNow.find((r) => r.sessionId === m.sessionId)?.status === 'waiting' : m.tool === 'claude' && claudeNow.get(m.sessionId) === 'waiting'))
     .map((m) => m.sessionId)
   // ⚠️ A grant needs every Codex member's state known now (a line reconnecting lists nothing: a wait that began then
   //    would replay later as "new" / r6 high #2)
@@ -308,7 +338,7 @@ export async function teamCreate(ctx: Ctx): Promise<unknown> {
   if (approvals !== undefined && members.some((m) => m.tool === 'codex' && !codexStatusKnown(m.sessionId))) {
     throw new HttpError(409, t('Codex のセッションの様子をいま確かめられません。少し待ってからもう一度作ってください', 'Cannot read a Codex session’s state right now. Wait a moment and create the team again.'))
   }
-  const cardless = waitingNow.filter((id) => !id.startsWith('codex-') && !pendingWithMeta().some((p) => p.info.sessionId === id))
+  const cardless = waitingNow.filter((id) => !id.startsWith('codex-') && !id.startsWith(AGY_PREFIX) && !pendingWithMeta().some((p) => p.info.sessionId === id))
   // ⚠️ The leader itself, again, synchronously (r21 low #1: its session could end during the baseline reads)
   const leaderNow = aliveProcStartFreshSync(pid)
   if (typeof leaderNow !== 'string' || !sameProcStart(leaderNow, procStart) || !indexNamesSession(dirname(target.sessionsDir), pid, sessionId)) {
@@ -321,7 +351,16 @@ export async function teamCreate(ctx: Ctx): Promise<unknown> {
       (r.team.approvals ? ` approvals=${r.team.approvals.duration}` : ''),
   )
   broadcast({ type: 'sessions-changed', at: new Date().toISOString() })
+  // ★ agy stamps its calls to the second (measured: `2026-11-23T01:06:53Z` for a call made 0.6 s after a grant at
+  //   53.421): a call in the grant's own second reads as before it and stays the human's. The leader's first
+  //   instruction is sent after this reply ⇒ reply once the next second has begun, so its calls are judged after.
+  if (r.team.approvals && r.team.members.some((m) => m.tool === 'agy')) await new Promise((res) => setTimeout(res, untilNextSecondMs(Date.now())))
   return await statusOf(r.team)
+}
+
+/** How long until the next whole second (+ a margin): an agy call's time has whole seconds only */
+export function untilNextSecondMs(now: number): number {
+  return 1000 - (now % 1000) + 20
 }
 
 async function statusOf(team: Team): Promise<unknown> {
@@ -339,6 +378,9 @@ async function statusOf(team: Team): Promise<unknown> {
       const target = await findTarget(dirs, m.sessionId)
       if (!('reason' in target) && target.pid === m.pid && liveMember(m)) address = `uds:${target.socketPath}`
       else replaced = true
+    } else if (m.tool === 'agy') {
+      // ★ No longer the recorded agy on this conversation (it exited, or the PC moved it elsewhere)
+      if (!liveMember(m) || !agyStateNow(m)) replaced = true
     }
     const limits = limitsOf(u, m.tool, m.account)
     members.push({
@@ -382,7 +424,8 @@ interface SendBody extends LeaderBody {
 }
 
 /**
- * ★ An instruction to a **Codex** member (Claude members are reached with Claude's own SendMessage at their address).
+ * ★ An instruction to a **Codex** or **agy** member (Claude members are reached with Claude's own SendMessage at their
+ *   address). agy: typed into its TUI through its relay, only while it is idle (`sendToAgy`, docs/TEAM.md §9).
  * ⚠️⚠️ The body is checked **before** the frame is added: `[nyan-team] …` in front would hide a leading `/` or `!`
  *    (codex design review, medium #1).
  */
@@ -409,6 +452,29 @@ export async function teamSend(ctx: Ctx): Promise<unknown> {
   if (Buffer.byteLength(framed, 'utf8') > MAX_SEND_BYTES) throw new HttpError(400, t('長すぎます', 'Too long.'))
   // ⚠️ Asked right before the daemon write: still this team's member, the leader still the same (r6 medium #3)
   const stillOurs = (): boolean => teamById(team.id) === team && team.members.includes(member) && leaderLive(team, teamDeps()) && leaderSessionNow(team)
+  if (member.tool === 'agy') {
+    // ⚠️ agy opens its shortcut list on a leading `?` (judged on the leader's own text, like `/` `!` above)
+    if (looksLikeAgyShortcut(text)) throw new HttpError(400, AGY_SEND_REFUSAL['shortcut-like']()[1])
+    // ⚠️ Only the recorded agy, still the only one on the conversation (a resume elsewhere, a second agy ⇒ refused)
+    if (!(await memberUnique(member))) throw new HttpError(409, REFUSAL_TEXT['member-gone']!())
+    if (!stillOurs()) throw new HttpError(409, REFUSAL_TEXT['no-team']!())
+    // ⚠️⚠️ Bound to the member's own agy inside the queue and before each key (codex · agy review): a send waiting behind
+    //    another operation must not type into a second agy that opened the conversation, or after the team ended
+    // ★ The process checks (slow: `ps` on a Mac) once, on the first ask — inside the queue, before any screen read —
+    //   then only the quick ones before each key (codex review: a slow check right before Enter let the PC open a
+    //   subagent's dialog in between)
+    let processes: boolean | undefined
+    const res = await sendToAgy(conversationOf(member.sessionId)!, framed, defaultAgyKeysDeps(), (target) => {
+      processes ??= liveMember(member) && leaderLive(team, teamDeps())
+      return processes && target.pid === member.pid && teamById(team.id) === team && team.members.includes(member) && leaderSessionNow(team)
+    })
+    if (!res.ok) {
+      console.log(`[team] send team=${team.id} to=${member.name} not typed (${res.reason})`)
+      throw new HttpError(...AGY_SEND_REFUSAL[res.reason ?? 'unreachable']())
+    }
+    console.log(`[team] send team=${team.id} to=${member.name} ${text.length} chars`)
+    return { ok: true, at: new Date().toISOString() }
+  }
   const res = await codexMessage(member.sessionId, framed, { lists: codexLists, send: (id, text, images) => codexSend(id, text, images, stillOurs) })
   if (!res) throw new HttpError(409, t('この Codex のセッションは、いま開かれていません。', 'This Codex session is not open right now.'))
   console.log(`[team] send team=${team.id} to=${member.name} ${text.length} chars`)
@@ -432,6 +498,24 @@ export async function teamRead(ctx: Ctx): Promise<unknown> {
       if (entries.filter(said).length >= n || got.cursor === null) break
       // ⚠️ A cursor that does not move would loop: stop and say the read is incomplete
       if (before !== null && got.cursor >= before) {
+        incomplete = true
+        break
+      }
+      before = got.cursor
+      if (page === READ_PAGES_MAX - 1) incomplete = true
+    }
+  } else if (member.tool === 'agy') {
+    // ★ The conversation's own transcript (one per conversation id). ⚠️ Not once the recorded agy is gone or moved on
+    if (!liveMember(member) || !agyStateNow(member)) throw new HttpError(409, REFUSAL_TEXT['member-gone']!())
+    entries = []
+    const path = transcriptPathOf(conversationOf(member.sessionId)!)
+    let before: number | undefined
+    for (let page = 0; page < READ_PAGES_MAX; page++) {
+      const got = await readLogSlice(path, 100, before, agyEntries).catch(() => undefined)
+      if (!got) break
+      entries = [...got.entries, ...entries]
+      if (entries.filter(said).length >= n || got.cursor === null) break
+      if (before !== undefined && got.cursor >= before) {
         incomplete = true
         break
       }
@@ -531,7 +615,7 @@ export async function teamPending(ctx: Ctx): Promise<unknown> {
       member: member.name,
       memberTool: member.tool,
       // ★ The name the leader answers with (never the key: it can carry ids the member's CLI chose / r2 high #4)
-      ref: requestRef(info.key),
+      ref: cardRef(info),
       tool: revealed(info.toolName),
       // ★ The whole input (a Claude card) or the command/patch (Codex), with its directory (`cardText` / r9 high #3)
       summary: revealed(shown.text),
@@ -615,7 +699,7 @@ export async function teamApprove(ctx: Ctx): Promise<unknown> {
   // ★ Settle what the PC already answered before looking the card up (r19 medium #1); the final check below is on the
   //   exact card generation, with no await before the answer
   await sweepResolved().catch(() => undefined)
-  const card = pendingWithMeta().find((p) => p.info.sessionId !== undefined && team.members.some((m) => m.sessionId === p.info.sessionId) && requestRef(p.info.key) === ref)
+  const card = pendingWithMeta().find((p) => p.info.sessionId !== undefined && team.members.some((m) => m.sessionId === p.info.sessionId) && cardRef(p.info) === ref)
   if (!card) return { ok: false, reason: REFUSAL_TEXT['gone']!() }
   const member = team.members.find((m) => m.sessionId === card.info.sessionId)!
   // ⚠️⚠️ The member is still the only process with its id (r2 high #1). Checked before the answer; the guard below
@@ -623,23 +707,39 @@ export async function teamApprove(ctx: Ctx): Promise<unknown> {
   if (!(await memberUnique(member))) return { ok: false, reason: REFUSAL_TEXT['member-gone']!() }
   const built = answersFromChoices(card.info, body.choices)
   if (!built.ok) return { ok: false, reason: built.reason }
+  const agyQuestion = card.info.tool === 'agy' && card.info.interaction?.kind === 'question'
   const answer: AnswerBody = {
     key: card.info.key,
     ...(typeof body.behavior === 'string' ? { behavior: body.behavior } : {}),
     ...(built.answers ? { answers: built.answers } : {}),
     ...(typeof body.feedback === 'string' ? { feedback: body.feedback } : {}),
+    // ★ An agy question is declined by skipping it (ESC per question; the turn goes on / docs/AGY.md §13)
+    ...(agyQuestion && body.behavior === 'deny' ? { skip: true } : {}),
   }
-  return answerPermission(answer, teamActor(team), (target) => {
+  // ★ An agy card is answered by typing a key: the leader is told whether it went out, as the phone is (taken before
+  //   answering: answering starts the typing / `permissionAnswer`)
+  const delivery = card.info.tool === 'agy' ? agyDelivery(card.info.key) : undefined
+  const r = answerPermission(answer, teamActor(team), (target) => {
     if (!target) return { ok: false, reason: REFUSAL_TEXT['gone']!() }
     // ⚠️⚠️ Judged again **now**, with no await before the answer (codex review r3, high #1): the team may have been
     //    disbanded, or its leader may have exited, while the member's uniqueness was being read
     if (teamById(team.id) !== team || !leaderLive(team, teamDeps()) || !leaderSessionNow(team)) return { ok: false, reason: REFUSAL_TEXT['no-team']!() }
     // ⚠️ Still the only process of its profile with that session, judged now (r27 medium #3: a second terminal could
     //    appear while the other profiles were being read)
-    if (member.tool === 'claude' && !soleProcessSync(member)) return { ok: false, reason: REFUSAL_TEXT['member-gone']!() }
+    if ((member.tool === 'claude' || member.tool === 'agy') && !soleProcessSync(member)) return { ok: false, reason: REFUSAL_TEXT['member-gone']!() }
     const may = leaderMay(team, target)
     return may.ok ? { ok: true } : { ok: false, reason: REFUSAL_TEXT[may.reason]!() }
-  })
+  }, () =>
+    // ★ Asked again right before an agy key (codex review: a disband or the expiry during its settle wait typed it)
+    // ⚠️ Quick checks only (file reads, memory): the process checks (`ps` on a Mac) ran in the guard above, at the
+    //    answer. A slow check here sat between the card check and the key (codex review rounds 16-17)
+    teamById(team.id) === team && team.members.includes(member) && leaderSessionNow(team) && approvalsActive(team),
+  )
+  if (!r.ok || !delivery) return r
+  const d = await settledWithin(delivery, AGY_DELIVERY_WAIT_MS)
+  if (d === 'slow') return { ...r, note: t('agy にキーを打っている途中です。nyan team pending で確かめてください', 'Still typing the key into agy; check with nyan team pending.') }
+  if (d && !d.ok) return { ok: false, reason: agyDeliveryMessage(d.reason) }
+  return r
 }
 
 interface MemberBody extends LeaderBody {
