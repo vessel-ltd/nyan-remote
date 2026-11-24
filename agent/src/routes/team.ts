@@ -31,7 +31,7 @@ import {
   type Team,
   type TeamMember,
 } from '../team.ts'
-import { agyStateNow, asMemberData, cardText, endTeam, soleProcessSync, indexStatusNow, leaderMay, leaderSessionNow, liveMember, memberUnique, ownsCard, revealed, cardRef, teamDeps, tellLeader } from '../teamHooks.ts'
+import { TEAM_FRAME_CLOSE, TEAM_FRAME_MARK, agyInstructionSent, sendTag, agyStateNow, asMemberData, cardText, endTeam, soleProcessSync, indexStatusNow, leaderMay, leaderSessionNow, liveMember, memberUnique, ownsCard, revealed, cardRef, teamDeps, tellLeader } from '../teamHooks.ts'
 import { agyDelivery, agyDeliveryMessage } from '../agy/cards.ts'
 import { AGY_DELIVERY_WAIT_MS, settledWithin } from './permission.ts'
 import { answerPermission, type AnswerBody } from './permission.ts'
@@ -40,8 +40,9 @@ import { codexLabelShared, codexLists, codexLog, codexRowsNow, codexSend, codexS
 import { AGY_PREFIX, conversationOf, transcriptPathOf } from '../agy/sessions.ts'
 import { AGY_SEND_REFUSAL, defaultAgyKeysDeps, findAgyTarget, looksLikeAgyShortcut, sendToAgy } from '../agy/keys.ts'
 import { agyEntries } from '../agy/log.ts'
+import { lastTurnStart } from '../agy/pending.ts'
 import type { TeamTool } from '../team.ts'
-import { readFileSync } from 'node:fs'
+import { readFileSync, statSync } from 'node:fs'
 import { readdir, stat } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { sessions } from './sessions.ts'
@@ -445,9 +446,11 @@ export async function teamSend(ctx: Ctx): Promise<unknown> {
       ),
     )
   }
+  // ★ agy: this send's own tag in the frame (the safety net knows its prompt by it / docs/TEAM.md §9.2)
+  const tag = member.tool === 'agy' ? ` ${sendTag()}` : ''
   const framed = t(
-    `[nyan-team] リーダー（${shortSessionId(team.leader.sessionId)}）からの指示:\n${text}\n\n（終わったら、結果をこのターンの最後の発言にまとめてください。リーダーはそれを読みます）`,
-    `[nyan-team] Instruction from the team lead (${shortSessionId(team.leader.sessionId)}):\n${text}\n\n(When done, sum up the result in the last message of this turn; the lead reads it.)`,
+    `${TEAM_FRAME_MARK}リーダー（${shortSessionId(team.leader.sessionId)}${tag}）からの指示:\n${text}\n\n${TEAM_FRAME_CLOSE.ja}`,
+    `${TEAM_FRAME_MARK}Instruction from the team lead (${shortSessionId(team.leader.sessionId)}${tag}):\n${text}\n\n${TEAM_FRAME_CLOSE.en}`,
   )
   if (Buffer.byteLength(framed, 'utf8') > MAX_SEND_BYTES) throw new HttpError(400, t('長すぎます', 'Too long.'))
   // ⚠️ Asked right before the daemon write: still this team's member, the leader still the same (r6 medium #3)
@@ -464,15 +467,37 @@ export async function teamSend(ctx: Ctx): Promise<unknown> {
     //   then only the quick ones before each key (codex review: a slow check right before Enter let the PC open a
     //   subagent's dialog in between)
     let processes: boolean | undefined
+    // ★ The safety net's baseline (docs/TEAM.md §9.2): the time and the conversation's last turn, taken at each check
+    //   right before a key — the last one is just before Enter, inside the agy's queue (codex · agy review: taken before
+    //   the queue, a short PC turn in between was taken for the sent one)
+    const path = transcriptPathOf(conversationOf(member.sessionId)!)
+    let sentAtMs = Date.now()
+    let before = lastTurnStart(path)
+    const mtimeOf = (): number | undefined => {
+      try {
+        return statSync(path).mtimeMs
+      } catch {
+        return undefined
+      }
+    }
+    let beforeMtime = mtimeOf()
     const res = await sendToAgy(conversationOf(member.sessionId)!, framed, defaultAgyKeysDeps(), (target) => {
       processes ??= liveMember(member) && leaderLive(team, teamDeps())
-      return processes && target.pid === member.pid && teamById(team.id) === team && team.members.includes(member) && leaderSessionNow(team)
+      const ok = processes && target.pid === member.pid && teamById(team.id) === team && team.members.includes(member) && leaderSessionNow(team)
+      if (ok) {
+        sentAtMs = Date.now()
+        before = lastTurnStart(path)
+        beforeMtime = mtimeOf()
+      }
+      return ok
     })
     if (!res.ok) {
       console.log(`[team] send team=${team.id} to=${member.name} not typed (${res.reason})`)
       throw new HttpError(...AGY_SEND_REFUSAL[res.reason ?? 'unreachable']())
     }
     console.log(`[team] send team=${team.id} to=${member.name} ${text.length} chars`)
+    // ★ The leader is owed how this turn ends, even if no "done" comes (docs/TEAM.md §9.2 / `agyTeamSafetyNet`)
+    agyInstructionSent(member, sentAtMs, before, tag.trim(), beforeMtime)
     return { ok: true, at: new Date().toISOString() }
   }
   const res = await codexMessage(member.sessionId, framed, { lists: codexLists, send: (id, text, images) => codexSend(id, text, images, stillOurs) })

@@ -3,7 +3,7 @@
 // The decisions live in `team.ts` (state and pure checks); this file only wires them to the inbox, the push and the
 // session lifecycle, so `team.ts` stays testable without sockets.
 
-import { readdirSync, readFileSync, realpathSync } from 'node:fs'
+import { readdirSync, readFileSync, realpathSync, statSync } from 'node:fs'
 import { isAbsolute, join, sep } from 'node:path'
 import { reveal } from '../../shared/reveal.ts'
 import { statusLabel, type PermissionRequest } from '../../shared/types.ts'
@@ -18,9 +18,9 @@ import { broadcast } from './events.ts'
 import { createHash, randomBytes } from 'node:crypto'
 import { firstSeenAt, isQuiet, onRequestOver, originOf, pendingWithMeta, setFirstSeenPin } from './permission.ts'
 import { codexRowsNow } from './codex/run.ts'
-import { agyDir, agyLocksOfAsync, conversationOf, defaultAgyDeps, readAgyPidFile, transcriptPathOf, type AgyFile } from './agy/sessions.ts'
+import { agyChildrenSettled, agyDir, agyLocksOfAsync, agyQuestionWaitAt, agyVisitedSince, conversationOf, defaultAgyDeps, readAgyPidFile, transcriptPathOf, type AgyFile } from './agy/sessions.ts'
 import { defaultAgyKeysDeps, findAgyTarget } from './agy/keys.ts'
-import { readTailRecords, turnEnd } from './agy/pending.ts'
+import { lastTurnStart, readTailRecords, TAIL_BYTES, turnEnd } from './agy/pending.ts'
 import {
   disbandTeam,
   expireApprovals,
@@ -44,6 +44,15 @@ import {
 
 /** The sender name the leader sees on our notices (`<cross-session-message from="nyan-team">`) */
 export const TEAM_SENDER = 'nyan-team'
+
+/** ★ What starts every instruction the leader sends a Codex or agy member (`teamSend`): the safety net knows its prompt by it */
+export const TEAM_FRAME_MARK = '[nyan-team] '
+
+/** ★ What ends every such instruction (`teamSend`, in either language): the safety net checks its prompt by it too */
+export const TEAM_FRAME_CLOSE = {
+  ja: '（終わったら、結果をこのターンの最後の発言にまとめてください。リーダーはそれを読みます）',
+  en: '(When done, sum up the result in the last message of this turn; the lead reads it.)',
+} as const
 
 /** At most this much of a member's words goes into one notice (the leader reads more with `nyan team read`) */
 export const NOTICE_TEXT_MAX = 6000
@@ -582,8 +591,10 @@ const ANNOUNCED_MAX = 1024
 /** (tests) What an agy member's turn-end report reads: its lock, its last words, the leader's inbox */
 export interface AgyDoneDeps {
   locks(pid: number): Promise<string[] | undefined>
-  lastWords(sessionId: string): { text: string | undefined } | undefined
+  lastWords(sessionId: string): { text: string | undefined; answered?: boolean; turn?: number; turnAt?: number; prompt?: string; answerAt?: number } | undefined
   tell: typeof tellLeader
+  /** The conversation's last turn (absent = `lastTurnStart` of its transcript) */
+  turn?(sessionId: string): { turn: number; at: number } | undefined
 }
 
 const agyDoneDeps: AgyDoneDeps = {
@@ -603,7 +614,8 @@ const agyDoneDeps: AgyDoneDeps = {
 export async function agyMemberDone(
   row: { sessionId: string },
   label: string,
-  push: () => Promise<number>,
+  /** Rings the phone; given this completion's turn when known (its guard checks that turn / codex review) */
+  push: (turn?: TurnId) => Promise<number>,
   deps: AgyDoneDeps = agyDoneDeps,
   /**
    * ★ The notifier's own "this completion is still the conversation's state" (its turn read directly): the words are
@@ -615,56 +627,627 @@ export async function agyMemberDone(
   if (!found || found.member.tool !== 'agy') return undefined
   const { team, member } = found
   if (label !== statusLabel('done')) return undefined
-  // ⚠️ A leader that is gone gets nothing, and a member that is no longer the recorded agy rings as usual
-  if (!leaderLive(team, teamDeps()) || !leaderSessionNow(team) || !liveMember(member) || !agyStateNow(member)) return undefined
-  // ⚠️ The recorded agy must hold the conversation now (a `/new` moved it; a second agy that resumed it is another
-  //    person's: its "done" is theirs / agy review). Cannot tell ⇒ rings as usual
   // ★ The words first, as of this completion (codex review: a next turn finishing during the lock probe was reported
   //   as this one's result)
   // ⚠️ Not this completion any more: the push (with the same guard) settles it — the newer state speaks for itself
   if (current && !current()) return undefined
-  let read: { text: string | undefined } | undefined
+  let read: { text: string | undefined; answered?: boolean; turn?: number; turnAt?: number; prompt?: string; answerAt?: number } | undefined
   try {
     read = deps.lastWords(row.sessionId)
   } catch {
     read = undefined
   }
+  // ★ This completion's turn, read with its words (before the lock probe: a turn begun meanwhile is not this one /
+  //   codex · agy review). The words' own turn when the same read has it (a prompt appended between two reads paired
+  //   A's words with B's turn); else, for words whose prompt is past the tail, the whole file's last turn when it began
+  //   before them (below). ⚠️ Words not read at all: no turn (codex review: the whole file's turn may be a next one —
+  //   and the notifier's "still current" is cached, so it cannot vouch for it / round 15). ✅ Accepted: the net's report
+  //   of that turn may then be told again.
+  let turn: TurnId | undefined
+  try {
+    if (read?.turn !== undefined && read.turnAt !== undefined) turn = { turn: read.turn, at: read.turnAt }
+    else if (read?.answerAt !== undefined) turn = deps.turn ? deps.turn(row.sessionId) : turnOf(row.sessionId)
+  } catch {
+    turn = undefined
+  }
+  // ⚠️ A turn from the whole file that began after these words were written is a next turn, not theirs (codex review:
+  //    A's words were marked as B's, silencing B's own end): no turn is known then. `>=`: agy dates both in whole
+  //    seconds — the next prompt can share the answer's second (codex review); a prompt past the tail is long before
+  //    its own answer
+  if (turn !== undefined && read?.turn === undefined && read?.answerAt !== undefined && turn.at >= read.answerAt) turn = undefined
+  // ★ The safety net already told the leader this turn: handled — before anything that can fail and ring the phone
+  //   (codex review: a transient read of the leader's index rang it)
+  if (turn !== undefined && wasReported(member, turn)) return 1
+  // ⚠️ The transcript read says its last turn did not end answered: a next prompt came in after the notifier looked
+  //    (codex review: that turn was reported "finished" and marked, silencing its real end). Nothing sent: the notifier
+  //    tries again and drops it once the new turn shows (agy review: `undefined` let the phone ring for it)
+  if (read?.answered === false) return 0
+  // ★ Not told by this path: handled when the net told this turn (waited for in the queue); else the phone — outside
+  //   the queue, with this completion's own turn (codex · agy review: the latest turn, read later, was another one)
+  const notTold = async (): Promise<number | undefined> => {
+    if (await serial(member, async () => turn !== undefined && wasReported(member, turn))) return 1
+    return turn === undefined ? undefined : push(turn)
+  }
+  // ⚠️ A leader that is gone gets nothing, and a member that is no longer the recorded agy rings as usual
+  // ★ Decided in the queue: a net write under way for this turn settles it (agy review: a transient read here rang the
+  //   phone while the net was telling the leader)
+  if (!leaderLive(team, teamDeps()) || !leaderSessionNow(team) || !liveMember(member) || !agyStateNow(member)) {
+    return notTold()
+  }
+  // ⚠️ The recorded agy must hold the conversation now (a `/new` moved it; a second agy that resumed it is another
+  //    person's: its "done" is theirs / agy review). Cannot tell ⇒ rings as usual
+  const owedAtStart = owedBy.get(member)
   const conv = conversationOf(row.sessionId)
-  if (conv === undefined || member.pid === undefined || !(await deps.locks(member.pid))?.includes(conv)) return undefined
+  if (conv === undefined || member.pid === undefined || !(await deps.locks(member.pid))?.includes(conv)) {
+    // ★ The net told it while the lock was probed, or is telling it now (in the queue): handled (no phone / codex review)
+    return notTold()
+  }
   const stillMember = (): boolean => membershipOf(row.sessionId)?.team === team
-  const told =
-    stillMember() &&
-    (await deps.tell(
-      team,
-      [
-        t(`[nyan-team] ${member.name}（agy）のターンが終わりました`, `[nyan-team] ${member.name} (agy) finished its turn`),
-        ...(read?.text ? [asMemberData(member, read.text)] : []),
-        ...(read === undefined ? [t('（結果を読めませんでした。nyan team read で見てください）', '(its result could not be read; see nyan team read)')] : []),
-      ].join('\n'),
-      stillMember,
-    ))
-  // ★ Told: done (its words unreadable were said so — never told twice by a retry / codex review). Not told: the phone
-  //   rings instead, with its own count (a failed push is tried again by the notifier)
-  return told ? 1 : push()
+  // ★ Reports to the leader go one at a time per member (`serial`), and a turn counts as reported only once the leader
+  //   got it (codex · agy review: a mark set before the write silenced the phone when the write then failed)
+  // ⚠️ The phone push runs after the member's report queue is released (codex review: a stalled push held the queue,
+  //    and the net could never tell that member's next turn)
+  const r = await serial(member, async (): Promise<number | 'push'> => {
+    if (turn !== undefined && wasReported(member, turn)) return 1
+    const told =
+      stillMember() &&
+      (await deps.tell(
+        team,
+        [
+          t(`[nyan-team] ${member.name}（agy）のターンが終わりました`, `[nyan-team] ${member.name} (agy) finished its turn`),
+          ...(read?.text ? [asMemberData(member, read.text)] : []),
+          ...(read === undefined ? [t('（結果を読めませんでした。nyan team read で見てください）', '(its result could not be read; see nyan team read)')] : []),
+        ].join('\n'),
+        stillMember,
+      ))
+    // ★ Told: done (its words unreadable were said so — never told twice by a retry / codex review). Not told: the phone
+    //   rings instead, with its own count (a failed push is tried again by the notifier)
+    if (!told) return 'push'
+    // ★ The turn is marked; the net settles a debt only when **its** sent turn is marked (a later turn's "done" does not
+    //   settle an earlier sent turn that stopped / codex review). A turn that cannot be dated settles nothing (codex
+    //   review: a later turn's unreadable "done" erased the stopped instruction's debt) — the net may then tell it too.
+    if (turn !== undefined) {
+      markReported(member, turn)
+      notePrompt(member, turn, read?.prompt)
+      // ★ The instruction's own turn (its tag in the prompt read with the words): the net settles by it even if that
+      //   turn is gone before it looks (codex review: a `/rewind` then got a "cannot tell apart" after this report)
+      const owed = owedBy.get(member)
+      if (owed !== undefined && owed === owedAtStart && owed.tag !== undefined && isInstruction(read?.prompt, owed.tag)) owed.seen = turn
+    }
+    return 1
+  })
+  return r === 'push' ? push(turn) : r
+}
+
+const isObj = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
+
+/** A turn of an agy conversation: its prompt's step and time (`lastTurnStart`) */
+interface TurnId {
+  turn: number
+  at: number
+}
+
+/**
+ * The conversation's last turn read now from its tail (the whole file's only when the tail holds no prompt): the
+ * phone's guard (codex review: the whole-file cache is keyed by size — a `/rewind` to the same size returned an old turn)
+ */
+function turnFresh(sessionId: string): TurnId | undefined {
+  const conv = conversationOf(sessionId)
+  if (conv === undefined) return undefined
+  const path = transcriptPathOf(conv, defaultAgyDeps().home)
+  const e = turnEnd(readTailRecords(path))
+  // ★ A prompt past the tail: the deeper search, uncached (codex · agy review: the phone rang for a long turn the leader
+  //   already got)
+  return e.turn !== undefined && e.turnAt !== undefined ? { turn: e.turn, at: e.turnAt } : lastTurnStart(path)
+}
+
+function turnOf(sessionId: string): TurnId | undefined {
+  const conv = conversationOf(sessionId)
+  return conv === undefined ? undefined : lastTurnStart(transcriptPathOf(conv, defaultAgyDeps().home))
+}
+
+/** One report at a time per member (the notifier's "done" and the net never write for the same member at once) */
+const queue = new WeakMap<TeamMember, Promise<unknown>>()
+function serial<T>(m: TeamMember, fn: () => Promise<T>): Promise<T> {
+  const next = (queue.get(m) ?? Promise.resolve()).then(fn, fn)
+  queue.set(m, next.catch(() => undefined))
+  return next
+}
+
+/**
+ * ★★ The safety net (docs/TEAM.md §9.2): after the leader's `nyan team send`, the leader is owed one report of how that
+ *    turn ended. The notifier's "done" is the usual report (`agyMemberDone`); it can be lost (a transient read, rule 7b's
+ *    timing, a child index not complete), and a turn that ends **without** "done" never sends one (a declined command
+ *    card stops agy's turn: measured 2026-11-24; an error). The leader would wait forever. So each look checks every
+ *    owed member: once the sent turn has ended and stayed so for `AGY_NET_GRACE_MS`, the leader is told.
+ */
+interface Owed {
+  /** When the instruction was sent (ms) */
+  sentAtMs: number
+  /** The conversation's last turn before the send (undefined = none could be read: then by time only) */
+  before?: TurnId
+  /** Since when the sent turn has been seen ended this same way (reset when it is not, or ends otherwise) */
+  quietSince?: number
+  /** The end being timed (another end starts the grace again / agy review) */
+  quietEnded?: Ended
+  /** ★ This send's own tag in its prompt (`sendTag`): a PC prompt that quotes the frame is not it (codex review) */
+  tag?: string
+  /** ★ The sent turn, once found (a `/rewind` that removes it is then known / codex review) */
+  seen?: TurnId
+  /** The transcript's mtime right before the keys (a write after it is the instruction's or later) */
+  beforeMtime?: number
+}
+const owedBy = new WeakMap<TeamMember, Owed>()
+/**
+ * ★ The turns reported to the leader, by either path (step and time: `/rewind` reuses a step / agy review). The newest
+ *   few per member.
+ */
+const reported = new Map<string, string[]>()
+const REPORTED_MAX = 16
+/** How many conversations' reported turns are kept (they outlive the team: a late "done" after a disband / codex review) */
+const REPORTED_CONVERSATIONS_MAX = 256
+const turnKey = (t: TurnId): string => `${t.turn}@${t.at}`
+function wasReported(m: Pick<TeamMember, 'sessionId'>, t: TurnId): boolean {
+  return reported.get(m.sessionId)?.includes(turnKey(t)) === true
+}
+/**
+ * ★ The prompts of turns the notifier's "done" reported (newest few): a debt recorded after that report (a fast turn
+ *   / codex review) still finds its sent turn by its tag, even if the PC removed the turn since
+ */
+const reportedPrompts = new WeakMap<TeamMember, { turn: TurnId; prompt: string }[]>()
+function notePrompt(m: TeamMember, turn: TurnId, prompt: string | undefined): void {
+  if (prompt === undefined) return
+  reportedPrompts.set(m, [...(reportedPrompts.get(m) ?? []), { turn, prompt }].slice(-REPORTED_MAX))
+}
+/** Tests only: forget the reported turns (they outlive teams, so they would carry from one test to the next) */
+export function resetAgyReportedForTest(): void {
+  reported.clear()
+}
+function markReported(m: TeamMember, t: TurnId): void {
+  const list = (reported.get(m.sessionId) ?? []).filter((k) => k !== turnKey(t))
+  list.push(turnKey(t))
+  reported.delete(m.sessionId)
+  reported.set(m.sessionId, list.slice(-REPORTED_MAX))
+  while (reported.size > REPORTED_CONVERSATIONS_MAX) reported.delete(reported.keys().next().value as string)
+}
+/** How long the turn must stay ended before the net speaks (the notifier's "done" comes first when it works) */
+export const AGY_NET_GRACE_MS = 15_000
+/** How long after the keys a member with no turn begun is taken as never having got the instruction */
+export const AGY_NET_NOT_STARTED_MS = 60_000
+/** agy writes a prompt's time in whole seconds (`created_at`): up to this much before the send's own clock */
+const TURN_AT_SLACK_MS = 1000
+
+/** A turn begun after the send: a later step than the last one before it, and not dated before the send */
+function afterSend(turn: TurnId, owed: Owed): boolean {
+  if (turn.at < owed.sentAtMs - TURN_AT_SLACK_MS) return false
+  // ★ Or dated after it: a `/rewind` on the PC makes steps go back (agy · codex review)
+  return owed.before === undefined || turn.turn > owed.before.turn || turn.at > owed.before.at
+}
+
+/**
+ * ★ The leader's instruction went out to an agy member (`teamSend`): the leader is owed how that turn ends.
+ * @param before the conversation's last turn read right before the keys (`lastTurnStart`)
+ */
+export function agyInstructionSent(member: TeamMember, sentAtMs: number, before?: TurnId, tag?: string, beforeMtime?: number): void {
+  if (member.tool !== 'agy') return
+  owedBy.set(member, { sentAtMs, ...(before === undefined ? {} : { before }), ...(tag === undefined ? {} : { tag }), ...(beforeMtime === undefined ? {} : { beforeMtime }) })
+}
+
+/**
+ * ★ Whether a prompt (`USER_INPUT` content) is this instruction: a line of the request carries our frame with the
+ *   send's tag, and the request **ends** with our closing line. ⚠️ Not "opens with": the keys are appended to what the
+ *   PC had typed in the input box (codex review: a draft before the frame made the turn look foreign). A PC question
+ *   that quotes the frame and asks something after it is not the instruction (codex review); one that quotes the whole
+ *   instruction verbatim at its very end cannot be told from it (accepted).
+ */
+export function isInstruction(content: unknown, tag: string | undefined): boolean {
+  if (typeof content !== 'string') return false
+  // ★ Up to the **last** closing tag: the instruction's own text can contain one (codex · agy review)
+  const close = content.lastIndexOf('</USER_REQUEST>')
+  const req = (close >= 0 ? content.slice(0, close) : content).replace(/^\s*<USER_REQUEST>\s*/, '').trimEnd()
+  if (!req.endsWith(TEAM_FRAME_CLOSE.ja) && !req.endsWith(TEAM_FRAME_CLOSE.en)) return false
+  return req.split('\n').some((l) => l.includes(TEAM_FRAME_MARK) && (tag === undefined || l.includes(tag)))
+}
+
+/**
+ * ★ The phone push for an agy row's state, held back for a member's "done" the leader already got (`agyPhoneMayRing`,
+ *   asked before each device). Held back counts as handled (1): 0 would be tried again in 30 s, and ring after the team
+ *   ended (agy review).
+ */
+export async function agyPhoneFallback(
+  sessionId: string,
+  label: string | null | undefined,
+  push: (guard: () => boolean) => Promise<number>,
+  turnNow: ((id: string) => TurnId | undefined) | undefined = turnFresh,
+): Promise<number> {
+  turnNow ??= turnFresh
+  const may = (): boolean => agyPhoneMayRing(sessionId, label, turnNow)
+  return (await push(may)) || (may() ? 0 : 1)
+}
+
+/** ★ A fresh tag for one instruction (in its frame: `teamSend`), so the net knows its prompt */
+export function sendTag(): string {
+  return `#${randomBytes(4).toString('hex')}`
+}
+
+/**
+ * ★ Whether the phone may ring for this agy row's state: not for a member's "done" whose turn the leader already got —
+ *   asked right before each device (codex · agy review: a report landing while the push started)
+ */
+export function agyPhoneMayRing(sessionId: string, label: string | null | undefined, turnNow: (id: string) => TurnId | undefined = turnFresh): boolean {
+  // ⚠️⚠️ Only "done": an error or a card always rings (codex · agy review: the guard silenced them)
+  if (label !== statusLabel('done')) return true
+  // ★ Whether or not it is still a member (the team may have ended since the leader got it / codex review)
+  if (!reported.has(sessionId)) return true
+  const turn = turnNow(sessionId)
+  return turn === undefined || !wasReported({ sessionId }, turn)
+}
+
+/** (tests) What the net reads and how it tells */
+export interface AgyNetDeps {
+  now(): number
+  tail(path: string): Record<string, unknown>[]
+  /** The conversation's last turn from the whole file (`lastTurnStart`: past the tail) */
+  lastTurn(path: string): TurnId | undefined
+  /** The transcript's mtime (ms); undefined = unreadable */
+  transcriptMtime(path: string): number | undefined
+  /** The transcript's size (bytes); undefined = unreadable */
+  transcriptSize(path: string): number | undefined
+  locks(pid: number): Promise<string[] | undefined>
+  tell: typeof tellLeader
+  /** A card or question of this conversation waits in the agent (the leader or the human answers it first) */
+  waiting(sessionId: string): boolean
+  /** The agy waits for the person's answer to a question (its own, or a running child's) */
+  asking(f: AgyFile): boolean
+  /** Another agy than `pid` wrote into the conversation since `since` (`agyVisitedSince`) */
+  othersWrote(conv: string, pid: number, since: number): boolean
+  /** Its children all reported and finished well (`agyChildrenSettled`) */
+  childrenSettled(f: AgyFile): boolean
+}
+
+const agyNetDeps: AgyNetDeps = {
+  now: () => Date.now(),
+  tail: (path) => readTailRecords(path),
+  // ⚠️ Uncached: the cache is keyed by size and scans only near the old end (codex · agy review: after a `/rewind` and
+  //    a longer turn it returned the old turn's identity)
+  lastTurn: (path) => lastTurnStart(path),
+  transcriptMtime: (path) => {
+    try {
+      return statSync(path).mtimeMs
+    } catch {
+      return undefined
+    }
+  },
+  transcriptSize: (path) => {
+    try {
+      return statSync(path).size
+    } catch {
+      return undefined
+    }
+  },
+  locks: (pid) => agyLocksOfAsync(pid, defaultAgyDeps().home).catch(() => undefined),
+  tell: tellLeader,
+  waiting: (id) => pendingWithMeta().some((p) => p.info.sessionId === id),
+  asking: (f) => agyQuestionWaitAt(f.state, f.mtimeMs, defaultAgyDeps().home) !== undefined,
+  othersWrote: (conv, pid, since) => agyVisitedSince(agyDir(), conv, pid, since),
+  childrenSettled: (f) => !f.state.hadSubagents || agyChildrenSettled(f.state, defaultAgyDeps().home),
+}
+
+/** How the sent turn ended; undefined = not (yet) */
+interface Ended {
+  turn: TurnId
+  /** The turn is not the instruction's (a PC prompt that replaced it, or it was removed): no mark settles or is set */
+  foreign?: true
+  kind: 'finished' | 'error' | 'stopped' | 'shared' | 'unreadable' | 'missing'
+  text: string | undefined
+  /** It used subagents and not all of them reported and finished well */
+  childrenUnsure?: boolean
+}
+
+function endedAfterSend(m: TeamMember, owed: Owed, deps: AgyNetDeps): Ended | undefined {
+  const conv = conversationOf(m.sessionId)
+  if (conv === undefined || m.pid === undefined) return undefined
+  const path = transcriptPathOf(conv, defaultAgyDeps().home)
+  const records = deps.tail(path)
+  const size = deps.transcriptSize(path)
+  // ⚠️ Nothing read (a transient failure) is not "ended" (agy review: read as a stop without an answer). Two exceptions
+  //    take the same checks as everything else below: a file empty but there (every prompt rewound away), and one whose
+  //    last record alone is larger than the tail — its result is then too large to read (codex · agy review)
+  // ★ Too large: nothing but the system's records read (a child's message appended after it / codex review)
+  const unreadableTail = size !== undefined && size > TAIL_BYTES && records.every((r) => r['type'] === 'SYSTEM_MESSAGE')
+  if (records.length === 0 && size !== 0 && !unreadableTail) return undefined
+  // ★ The sent turn: the first prompt after the send in the tail; past the tail, the last turn (from the whole file)
+  // ★ The send's own tag first (codex review: with no turn read before the send, a PC prompt in the send's second
+  //   came first and hid the instruction); else by time
+  let at = owed.tag === undefined ? -1 : records.findIndex((r) => r['type'] === 'USER_INPUT' && isInstruction(r['content'], owed.tag))
+  for (let i = 0; at < 0 && i < records.length; i++) {
+    const r = records[i]!
+    if (r['type'] !== 'USER_INPUT') continue
+    const step = typeof r['step_index'] === 'number' ? r['step_index'] : NaN
+    const when = typeof r['created_at'] === 'string' ? Date.parse(r['created_at']) : NaN
+    if (Number.isFinite(step) && Number.isFinite(when) && afterSend({ turn: step, at: when }, owed)) at = i
+  }
+  let turn: TurnId
+  let seg = records
+  /** The sent turn's own records, when its prompt is in the tail (undefined = past the tail) */
+  let own: Record<string, unknown>[] | undefined
+  let superseded = false
+  /** The prompt found is not the leader's instruction (a `/rewind` on the PC replaced it / codex review) */
+  let foreign = false
+  const f = agyStateNow(m)
+  // ⚠️ Its own state unreadable, or a child still running (of the sent turn or a later one): not yet (codex review: a
+  //    later prompt while the sent turn's child still worked; agy review: an unreadable state skipped that)
+  if (f === undefined || f.state.subagentsActive) return undefined
+  // ★ Quiet: its own state idle or error, nothing of it waiting
+  const s = f.state
+  const quiet = (s.agentState === 'idle' || s.agentState === 'error') && !s.confirmationPending && !deps.waiting(m.sessionId) && !deps.asking(f)
+  // ★★ Whether the member's state tells how the transcript stands now — one check for every path (codex · agy review,
+  //    rounds 17–21: a child's message appended to an idle conversation without a new state was handled on one path at
+  //    a time, and each other path waited forever): the state is newer than the transcript's last write, or only the
+  //    system's records came after it. That is judged **by order**, not by a time window (agy's whole-second times put
+  //    the answer in the state's own second): the tail ends with the system's record(s), the newest not dated before
+  //    the state's second, and the last record before them (if any) dated no later than the state. A tail with nothing
+  //    readable but the system's (an oversized record) has nothing else to check.
+  const tm = deps.transcriptMtime(path)
+  const onlySystemAfterState = (): boolean => {
+    if (unreadableTail) return true
+    const dated = (r: Record<string, unknown> | undefined): number => (typeof r?.['created_at'] === 'string' ? Date.parse(r['created_at']) : NaN)
+    let k = records.length
+    while (k > 0 && records[k - 1]!['type'] === 'SYSTEM_MESSAGE') k--
+    const lastSystem = k < records.length ? records[records.length - 1] : undefined
+    const lastOwn = records[k - 1]
+    return lastSystem !== undefined && dated(lastSystem) >= Math.floor(f.mtimeMs / 1000) * 1000 && (lastOwn === undefined || dated(lastOwn) <= f.mtimeMs)
+  }
+  const stateCurrent = tm !== undefined && (f.mtimeMs >= tm || onlySystemAfterState())
+  /** Ended by its own state since the send (the state written after the send, and current) */
+  const settledSinceSend = stateCurrent && f.mtimeMs >= owed.sentAtMs
+  if (at >= 0) {
+    turn = { turn: records[at]!['step_index'] as number, at: Date.parse(records[at]!['created_at'] as string) }
+    foreign = !isInstruction(records[at]!['content'], owed.tag)
+    if (!foreign) owed.seen = turn
+    const next = records.findIndex((r, i) => i > at && r['type'] === 'USER_INPUT')
+    if (next >= 0) {
+      seg = records.slice(0, next)
+      superseded = true
+    }
+    own = records.slice(at, next >= 0 ? next : undefined)
+  } else {
+    const last = deps.lastTurn(path)
+    // ⚠️ No prompt at all: unreadable, unless the file is there and holds none (every prompt rewound away / codex review)
+    if (last === undefined && (size === undefined || records.some((r) => r['type'] === 'USER_INPUT'))) return undefined
+    if (last === undefined || !afterSend(last, owed)) {
+      // ★ The sent turn is gone (a `/rewind` on the PC with nothing typed after): said so once quiet (codex review: it
+      //   waited forever). Known when it was seen; else when the transcript was written after the send (the prompt
+      //   was) and still holds no turn after it, with the member's state written after that
+      if (!quiet) return undefined
+      if (owed.seen !== undefined) return { turn: owed.seen, foreign: true, kind: 'shared', text: undefined }
+      // ★ "Written after the send": against the file's own mtime right before the keys when known (codex review: a
+      //   rewind within a second of Enter never got past the one-second allowance)
+      if (tm === undefined) return undefined
+      // ★ Nothing of the member's own written since the keys (nothing at all, or only the system's records after a state
+      //   from before them), the member quiet a while after them: the instruction never began (the terminal took the
+      //   Enter, for example / codex · agy review: it waited forever)
+      const changed = owed.beforeMtime !== undefined ? tm > owed.beforeMtime : tm >= owed.sentAtMs + TURN_AT_SLACK_MS
+      if (!changed || (stateCurrent && f.mtimeMs < owed.sentAtMs)) {
+        return deps.now() - owed.sentAtMs >= AGY_NET_NOT_STARTED_MS ? { turn: { turn: -2, at: owed.sentAtMs }, foreign: true, kind: 'missing', text: undefined } : undefined
+      }
+      if (!settledSinceSend) return undefined
+      return { turn: { turn: -1, at: owed.sentAtMs }, foreign: true, kind: 'shared', text: undefined }
+    }
+    // ⚠️ Its prompt is past the tail: only a tail with no prompt in it is this turn's (else the prompt is elsewhere)
+    if (records.some((r) => r['type'] === 'USER_INPUT')) return undefined
+    // ⚠️ The sent turn was seen and this is another (a later turn pushed both past the tail): not its words (codex ·
+    //    agy review)
+    if (owed.seen !== undefined && turnKey(last) !== turnKey(owed.seen)) {
+      return quiet ? { turn: owed.seen, foreign: true, kind: 'shared', text: undefined } : undefined
+    }
+    turn = last
+    owed.seen = turn
+  }
+  const e = turnEnd(seg)
+  const tooLarge = unreadableTail
+  // ★ The subagents' caution, whatever the end (codex review: a stop or an error left a worker running unsaid).
+  //   A superseded turn's children cannot be told from the later turn's: unsure whenever it had any (codex review).
+  //   ⚠️ Only for a turn that started subagents itself: an earlier turn's children say nothing of it (agy review)
+  const launched = own === undefined || own.some((r) => r['type'] === 'PLANNER_RESPONSE' && Array.isArray(r['tool_calls']) && (r['tool_calls'] as unknown[]).some((c) => isObj(c) && c['name'] === 'invoke_subagent'))
+  const withCaution = (x: Ended): Ended => (launched && (superseded ? s.hadSubagents : !deps.childrenSettled(f)) ? { ...x, childrenUnsure: true } : x)
+  // ⚠️ Another agy wrote into the conversation since the send, or the prompt found is not the instruction: what the
+  //    transcript says is not known to be its — said so, only once the member is quiet (codex · agy review)
+  // ⚠️ Still the latest turn: also only once its state is current since the send (codex review: a stale idle from before
+  //    the send let "cannot tell apart" through while it worked)
+  const settledNow = quiet && (superseded || settledSinceSend)
+  if (foreign) return settledNow ? { turn, foreign: true, kind: 'shared', text: undefined } : undefined
+  if (deps.othersWrote(conv, m.pid, owed.sentAtMs)) return settledNow ? { turn, kind: 'shared', text: undefined } : undefined
+  if (!superseded) {
+    // ⚠️ Still the latest turn: ended only while the member is quiet and its state is current since the send
+    if (!settledNow) return undefined
+    if (s.agentState === 'error') return withCaution({ turn, kind: 'error', text: undefined })
+    if (tooLarge) return withCaution({ turn, kind: 'unreadable', text: undefined })
+  } else {
+    // ★ A superseded turn that ended on an error says so (codex review) — its last record that is not the system's
+    //   (a child's message can follow the error / codex review)
+    if (!e.answered && [...seg].reverse().find((r) => r['type'] !== 'SYSTEM_MESSAGE')?.['type'] === 'ERROR_MESSAGE') return withCaution({ turn, kind: 'error', text: undefined })
+  }
+  if (!e.answered) return withCaution({ turn, kind: 'stopped', text: undefined })
+  return withCaution({ turn, kind: 'finished', text: answerText(seg) })
+}
+
+function sameEnd(a: Ended, b: Ended | undefined): boolean {
+  // ★ Also the words and the caution (codex review: an interim answer replaced while the inbox was being resolved)
+  return (
+    b !== undefined &&
+    turnKey(a.turn) === turnKey(b.turn) &&
+    a.kind === b.kind &&
+    a.text === b.text &&
+    a.childrenUnsure === b.childrenUnsure
+  )
+}
+
+let netRunning = false
+
+/** ★ One round of the safety net (each agy look, `index.ts`). Never throws */
+export async function agyTeamSafetyNet(deps: AgyNetDeps = agyNetDeps): Promise<void> {
+  if (netRunning) return
+  netRunning = true
+  try {
+    for (const team of allTeamsNow()) {
+      for (const m of [...team.members]) {
+        const owed = owedBy.get(m)
+        if (owed === undefined || m.tool !== 'agy' || m.pid === undefined) continue
+        // ★ The sent turn reported by a "done" before this debt was recorded: found by its tag (codex review)
+        if (owed.seen === undefined && owed.tag !== undefined) {
+          const hit = reportedPrompts.get(m)?.find((x) => afterSend(x.turn, owed) && isInstruction(x.prompt, owed.tag))
+          if (hit) owed.seen = hit.turn
+        }
+        const read = (): Ended | undefined => {
+          try {
+            return endedAfterSend(m, owed, deps)
+          } catch {
+            return undefined
+          }
+        }
+        const ended = read()
+        if (ended === undefined) {
+          owed.quietSince = undefined
+          owed.quietEnded = undefined
+          continue
+        }
+        // ★ That very turn was reported (the notifier's "done"): settled at once (agy review: left for the grace, a later
+        //   PC turn could take its place)
+        // ★ The instruction's own turn (`seen`) reported settles it — even if the PC replaced it since (codex review). A
+        //    mark on a turn that is not the instruction's says nothing of it (a PC prompt that replaced it was reported
+        //    "finished", which had settled the debt / codex · agy review)
+        if (owed.seen !== undefined && wasReported(m, owed.seen)) {
+          owedBy.delete(m)
+          continue
+        }
+        // ★ The grace is timed for this end (another end — new words, another turn — starts it again / agy review)
+        if (owed.quietSince === undefined || !sameEnd(ended, owed.quietEnded)) {
+          owed.quietSince = deps.now()
+          owed.quietEnded = ended
+        }
+        if (deps.now() - owed.quietSince < AGY_NET_GRACE_MS) continue
+        // ⚠️ As `agyMemberDone`: a live leader, the recorded agy still holding the conversation
+        if (!leaderLive(team, teamDeps()) || !leaderSessionNow(team) || !liveMember(m)) continue
+        const conv = conversationOf(m.sessionId)!
+        if (!(await deps.locks(m.pid))?.includes(conv)) continue
+        await serial(m, async () => {
+          // ★ That very turn was reported (the notifier's "done", even before this debt was recorded / agy review): settled
+          if (owed.seen !== undefined && wasReported(m, owed.seen)) {
+            if (owedBy.get(m) === owed) owedBy.delete(m)
+            return
+          }
+          // ⚠️ Still owed the same, still this member, still the same end — also right before the write (codex review:
+          //    a new turn and a question opened while the leader's inbox was being resolved)
+          const stillSo = (): boolean => owedBy.get(m) === owed && membershipOf(m.sessionId)?.member === m && sameEnd(ended, read())
+          // (changed meanwhile: the next look times the new end from the start — `quietEnded`)
+          if (!stillSo()) return
+          const told = await deps.tell(team, netNotice(m, ended), stillSo)
+          if (told) {
+            // ⚠️ A turn that is not the instruction's is not marked (its own "done" still reaches the leader / codex
+            //    review); the instruction's own turn is, whatever was said (agy review: told twice)
+            if (!ended.foreign) markReported(m, ended.turn)
+            if (owedBy.get(m) === owed) owedBy.delete(m)
+            console.log(`[team] safety net told the leader team=${team.id} ${m.name} (${ended.kind})`)
+          } else {
+            // ★ Tried again after another grace (not on every look)
+            owed.quietSince = deps.now()
+          }
+        })
+      }
+    }
+  } catch {
+    // the next look tries again
+  } finally {
+    netRunning = false
+  }
+}
+
+/** The subagents' caution line */
+function subagentCaution(m: TeamMember): string {
+  const read = t(`nyan team read ${m.name} で様子を見られます`, `See nyan team read ${m.name}`)
+  return t(
+    `（サブエージェントがすべて正しく終わったかは確かめられませんでした。まだ動いているか、失敗したかもしれません。${read}）`,
+    `(Not all of its subagents could be confirmed to have finished well — some may still be working, or may have failed. ${read}.)`,
+  )
+}
+
+/** What the leader reads from the net */
+function netNotice(m: TeamMember, e: Ended): string {
+  const caution = e.childrenUnsure ? '\n' + subagentCaution(m) : ''
+  return netNoticeBody(m, e) + (e.kind === 'finished' ? '' : caution)
+}
+
+function netNoticeBody(m: TeamMember, e: Ended): string {
+  const read = t(`nyan team read ${m.name} で様子を見られます`, `See nyan team read ${m.name}`)
+  switch (e.kind) {
+    case 'finished':
+      return [
+        t(`[nyan-team] ${m.name}（agy）のターンが終わりました`, `[nyan-team] ${m.name} (agy) finished its turn`),
+        ...(e.text ? [asMemberData(m, e.text)] : []),
+        ...(e.childrenUnsure ? [subagentCaution(m)] : []),
+      ].join('\n')
+    case 'error':
+      return t(`[nyan-team] ${m.name}（agy）はエラーで止まりました。${read}`, `[nyan-team] ${m.name} (agy) stopped with an error. ${read}.`)
+    case 'missing':
+      return t(
+        `[nyan-team] ${m.name}（agy）は指示を始めていません（送ったキーが届かなかった可能性があります）。${read}。必要なら nyan team send で送り直してください`,
+        `[nyan-team] ${m.name} (agy) has not started your instruction (the keys may not have gone through). ${read}; send it again with nyan team send if needed.`,
+      )
+    case 'unreadable':
+      return t(
+        `[nyan-team] ${m.name}（agy）のターンが終わりましたが、最後の記録が大きすぎて結果を読めませんでした。${read}`,
+        `[nyan-team] ${m.name} (agy) ended its turn, but its last record is too large to read the result. ${read}.`,
+      )
+    case 'shared':
+      return t(
+        `[nyan-team] ${m.name}（agy）の会話が指示のあとに変わりました（別の agy が書き込んだ・PC で指示が巻き戻された）。指示の結果を区別できません。${read}`,
+        `[nyan-team] ${m.name}'s (agy) conversation changed after your instruction (another agy wrote into it, or the PC rewound the instruction), so its result cannot be told apart. ${read}.`,
+      )
+    default:
+      return t(
+        `[nyan-team] ${m.name}（agy）は答えを出さずにターンを止めました（断ったコマンドのカード・PC での中断など）。${read}`,
+        `[nyan-team] ${m.name} (agy) stopped its turn without an answer (a declined command card, or a stop on the PC). ${read}.`,
+      )
+  }
 }
 
 /**
  * ★ The answer an agy turn ended with: the last model response with no tool call, when the transcript's tail says the
  *   turn ended answered (`turnEnd`). undefined = cannot be read; `{ text: undefined }` = no answer text.
  */
-export function agyLastWords(sessionId: string, tail: (path: string) => Record<string, unknown>[] = readTailRecords): { text: string | undefined } | undefined {
+export function agyLastWords(
+  sessionId: string,
+  tail: (path: string) => Record<string, unknown>[] = readTailRecords,
+): { text: string | undefined; answered?: boolean; turn?: number; turnAt?: number; prompt?: string; answerAt?: number } | undefined {
   const conv = conversationOf(sessionId)
   if (conv === undefined) return undefined
   const records = tail(transcriptPathOf(conv, defaultAgyDeps().home))
   if (records.length === 0) return undefined
-  if (!turnEnd(records).answered) return { text: undefined }
+  const e = turnEnd(records)
+  // ★ The turn these words close (its prompt's time): what the safety net and the notifier agree on (`reported`)
+  const at = e.turnAt === undefined || e.turn === undefined ? {} : { turn: e.turn, turnAt: e.turnAt }
+  // ★ Its prompt (the safety net knows its own instruction by the tag in it)
+  const p = [...records].reverse().find((r) => r['type'] === 'USER_INPUT')?.['content']
+  const answerAt = e.answered ? e.answeredAt : undefined
+  return {
+    text: e.answered ? answerText(records) : undefined,
+    answered: e.answered,
+    ...at,
+    ...(typeof p === 'string' ? { prompt: p } : {}),
+    ...(answerAt === undefined ? {} : { answerAt }),
+  }
+}
+
+/** The last model response's text (the caller has seen the turn end answered) */
+function answerText(records: readonly Record<string, unknown>[]): string | undefined {
   for (let i = records.length - 1; i >= 0; i--) {
     const r = records[i]!
     if (r['type'] !== 'PLANNER_RESPONSE') continue
     const c = r['content']
-    return { text: typeof c === 'string' && c.trim() !== '' ? c.trim() : undefined }
+    return typeof c === 'string' && c.trim() !== '' ? c.trim() : undefined
   }
-  return { text: undefined }
+  return undefined
 }
 
 /** ★ Whether a Claude member's state notification is kept quiet (only "done": errors and needs-attention still ring) */

@@ -28,7 +28,7 @@ import { seedHookState } from './claude/hookState.ts'
 import { startSessionWatch } from './claude/sessionWatch.ts'
 import { uploads } from './uploads.ts'
 import { CODEX_FOLLOW_TICK_MS, codexFollowTick, codexLastWords, codexRowsNow, startCodex } from './codex/run.ts'
-import { agyCardsChanged, agyMemberDone, codexCardsChanged, codexMemberState, codexRowStatus, codexSnapshot, sessionEnded } from './teamHooks.ts'
+import { agyCardsChanged, agyMemberDone, agyTeamSafetyNet, agyPhoneFallback, codexCardsChanged, codexMemberState, codexRowStatus, codexSnapshot, sessionEnded } from './teamHooks.ts'
 import { startTeamSocket } from './teamSocket.ts'
 import { codexPayload } from './codex/notify.ts'
 import { sendToAll } from './push.ts'
@@ -205,13 +205,23 @@ async function main(): Promise<void> {
         (await sendToAll(withPendingPerms(codexPayload(row, fields, new Date().toISOString(), toPushPayload)), undefined, () => (current?.() ?? true) && (guard?.() ?? true))).sent
       // ★ A team member (docs/TEAM.md §9): its turn end is reported to the leader instead of ringing; the phone rings
       //   when that report does not get through (its own count: a failed push is tried again by the notifier)
-      return (await agyMemberDone(row, fields.label, () => push(), undefined, current)) ?? push()
+      // ⚠️ A member's "done" is not sent to the phone once the leader got that turn (`agyPhoneFallback`)
+      // ★ With the completion's own turn when known (codex review: the latest turn, read later, was another one)
+      const fallback = (turn?: { turn: number; at: number }): Promise<number> =>
+        agyPhoneFallback(row.sessionId, fields.label, push, turn === undefined ? undefined : () => turn)
+      return (await agyMemberDone(row, fields.label, fallback, undefined, current)) ?? fallback()
     },
     log: (line) => console.log(line),
   })
   // ★ Cards first: the notifier asks which card auto-approve is answering (`quiet`), decided by the cards' look
   const agyLook = (): void => {
-    void agyCards.fresh().then(() => agyNotifier.look())
+    // ★ Then the team safety net (a member's turn the leader was not told about / docs/TEAM.md §9.2)
+    // ★ One card look for both (agy review: two `fresh()` calls ran every look twice)
+    const cards = agyCards.fresh()
+    void cards.then(() => agyNotifier.look())
+    // ★ Then the team safety net — not behind the notifier's queue (codex review: a stalled phone push held it, and a
+    //   member's stop was never told)
+    void cards.then(() => agyTeamSafetyNet())
     void endAgyAutoApproveGone().catch(() => undefined)
   }
   // ★ An agy grant whose agy no longer shows the conversation (it exited, moved on, or this agent restarted and forgot
