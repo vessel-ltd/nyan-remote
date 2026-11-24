@@ -10,7 +10,8 @@ import { resetAgyGrantOwners, setAgyGrantOwner } from './grants.ts'
 import { answerPermission } from '../routes/permission.ts'
 import { AgyCards, agyCard, agyCardTool, agyDelivery, agyDeliveryMessage, agyQuestionCard, type AgyCardDeps } from './cards.ts'
 import type { AgyCardMark } from './keys.ts'
-import { transcriptPathOf } from './sessions.ts'
+import { agyCardAt, agyOwnRows, resetAgyCardNamesForTest, transcriptPathOf } from './sessions.ts'
+import { readTailRecords } from './pending.ts'
 
 const A = '062a8f25-9451-42f3-ae93-34a208e99365'
 const PID = 4242
@@ -82,6 +83,7 @@ interface Lab {
 }
 
 function lab(t: { after(fn: () => void): void }, opts: { pane?: boolean } = {}): Lab {
+  resetAgyCardNamesForTest()
   const root = mkdtempSync(join(tmpdir(), 'nyan-agy-cards-'))
   const prev = process.env.NYAN_REMOTE_STATE_DIR
   process.env.NYAN_REMOTE_STATE_DIR = root
@@ -309,6 +311,110 @@ test('★★ a call newer than the agy’s "card is up" state is not its card (a
   appendFileSync(l.transcript, JSON.stringify({ step_index: 3, type: 'PLANNER_RESPONSE', created_at: new Date((BASE + 30) * 1000).toISOString(), tool_calls: [{ name: 'run_command', args: { CommandLine: 'rm -rf /tmp/x' } }] }) + '\n')
   await new AgyCards(l.deps).sync()
   assert.equal(agyCards().length, 0)
+})
+
+test('★★ the notifier and the cards name one card alike when agy writes its state twice (each saw a different write)', async (t) => {
+  const l = lab(t)
+  await autoOn(t)
+  utimesSync(l.transcript, BASE - 60, BASE - 60)
+  // the notifier's look saw the first write…
+  assert.equal(agyOwnRows('pc-a', l.deps.agy())[0]?.lastActivity, new Date(BASE * 1000).toISOString())
+  // …the cards' first look the second (0.3 s later, the same call)
+  l.setState({}, BASE + 0.3)
+  const cards = new AgyCards({ ...l.deps, unconfirmedMs: 10_000 })
+  await cards.sync()
+  await settle()
+  assert.equal(l.answers.length, 1)
+  assert.equal(cards.autoAnswering(A, new Date(BASE * 1000).toISOString()), true, 'quiet under the name the notifier uses')
+  assert.equal(agyOwnRows('pc-a', l.deps.agy())[0]?.lastActivity, new Date(BASE * 1000).toISOString())
+})
+
+test('★★ …and when the cards saw the first write and the notifier the second', async (t) => {
+  const l = lab(t)
+  // (another call than the other tests': the names given are kept for the whole run)
+  appendFileSync(l.transcript, JSON.stringify({ step_index: 2, type: 'GENERIC', content: `Created At: ${new Date((BASE - 60) * 1000).toISOString()}\nran` }) + '\n')
+  appendFileSync(l.transcript, JSON.stringify({ step_index: 3, type: 'PLANNER_RESPONSE', created_at: new Date((BASE + 10) * 1000).toISOString(), tool_calls: [{ name: 'run_command', args: { CommandLine: 'pwd' } }] }) + '\n')
+  utimesSync(l.transcript, BASE + 10, BASE + 10)
+  l.setState({}, BASE + 20)
+  const cards = new AgyCards({ ...l.deps, unconfirmedMs: 10_000 })
+  await cards.sync()
+  assert.equal(agyCards().length, 1)
+  l.setState({}, BASE + 20.3)
+  assert.equal(agyOwnRows('pc-a', l.deps.agy())[0]?.lastActivity, new Date((BASE + 20) * 1000).toISOString())
+})
+
+test('★ a transcript that moved during the cards\' read does not name the card (codex review)', async (t) => {
+  const l = lab(t)
+  appendFileSync(l.transcript, JSON.stringify({ step_index: 2, type: 'GENERIC', content: `Created At: ${new Date((BASE - 60) * 1000).toISOString()}\nran` }) + '\n')
+  appendFileSync(l.transcript, JSON.stringify({ step_index: 3, type: 'PLANNER_RESPONSE', created_at: new Date((BASE + 30) * 1000).toISOString(), tool_calls: [{ name: 'run_command', args: { CommandLine: 'whoami' } }] }) + '\n')
+  utimesSync(l.transcript, BASE + 30, BASE + 30)
+  l.setState({}, BASE + 40)
+  // the read sees the call, and the file is written meanwhile (its time moves)
+  const tail = (path: string): Record<string, unknown>[] => {
+    const got = readTailRecords(path)
+    utimesSync(path, BASE + 39, BASE + 39)
+    return got
+  }
+  const cards = new AgyCards({ ...l.deps, unconfirmedMs: 10_000, tail })
+  await cards.sync()
+  assert.equal(agyCardAt(PID, A, { step: 3, index: 0, at: (BASE + 30) * 1000 }, (BASE + 41) * 1000), (BASE + 41) * 1000, 'not named by that look')
+})
+
+test('★★ a key that went out, then a state rewrite of the same card during the wait: "needs you" rings again (codex review)', async (t) => {
+  const l = lab(t)
+  const reraised: string[] = []
+  const cards = new AgyCards({ ...l.deps, unconfirmedMs: 60, reraised: (c, card) => reraised.push(`${c}@${card}`) })
+  await cards.sync()
+  answer(agyCards()[0]!.key, 'allow')
+  await settle()
+  // agy rewrites its state for the same card (a resize): it comes back with a new key at once
+  l.setState({}, BASE + 0.3)
+  await cards.sync()
+  await new Promise((r) => setTimeout(r, 100))
+  assert.deepEqual(reraised, [`${A}@${new Date(BASE * 1000).toISOString()}`], 'told under the name the notifier uses')
+  // ⚠️ …also when the look at the timeout could not tell (a lock probe that failed): the last known call is kept
+  const r3: string[] = []
+  let flaky = false
+  resetPending()
+  const c3 = new AgyCards({ ...l.deps, agy: () => ({ ...l.deps.agy(), locksOf: (p: number) => (flaky ? undefined : p === PID ? [A] : []) }), unconfirmedMs: 60, reraised: (c, card) => r3.push(`${c}@${card}`) })
+  l.setState({}, BASE + 0.5)
+  await c3.sync()
+  answer(agyCards()[0]!.key, 'allow')
+  await settle()
+  l.setState({}, BASE + 0.6)
+  await c3.sync()
+  flaky = true
+  await c3.sync()
+  await new Promise((r) => setTimeout(r, 100))
+  assert.equal(r3.length, 1)
+  // ⚠️ …and when the transcript cannot be read at the timeout (not "no card" / codex review)
+  const r4: string[] = []
+  let blind = false
+  resetPending()
+  const c4 = new AgyCards({ ...l.deps, tail: (p: string) => (blind ? [] : readTailRecords(p)), unconfirmedMs: 60, reraised: (c, card) => r4.push(`${c}@${card}`) })
+  l.setState({}, BASE + 0.7)
+  await c4.sync()
+  answer(agyCards()[0]!.key, 'allow')
+  await settle()
+  l.setState({}, BASE + 0.8)
+  await c4.sync()
+  blind = true
+  await c4.sync()
+  await new Promise((r) => setTimeout(r, 100))
+  assert.equal(r4.length, 1)
+  blind = false
+  // ⚠️ answered for real (another call or no card): nothing
+  const r2: string[] = []
+  resetPending()
+  const c2 = new AgyCards({ ...l.deps, unconfirmedMs: 60, reraised: (c, card) => r2.push(`${c}@${card}`) })
+  l.setState({}, BASE + 1)
+  await c2.sync()
+  answer(agyCards()[0]!.key, 'allow')
+  await settle()
+  l.setState({ agent_state: 'working', tool_confirmation_pending: false }, BASE + 2)
+  await c2.sync()
+  await new Promise((r) => setTimeout(r, 100))
+  assert.deepEqual(r2, [])
 })
 
 test('★ a key that went out but left the same card up (no acknowledgement) brings the card back', async (t) => {
@@ -658,16 +764,9 @@ test('★★ an auto-answer still waiting to type gives way once its call reache
     },
   })
   await cards.sync()
-  // a look that cannot read the transcript drops the try; the next shows the call on the phone
-  writeFileSync(l.transcript, '')
-  await cards.sync()
-  writeFileSync(
-    l.transcript,
-    JSON.stringify({ step_index: 0, type: 'USER_INPUT', content: '<USER_REQUEST>\nhi\n</USER_REQUEST>' }) +
-      '\n' +
-      JSON.stringify({ step_index: 1, type: 'PLANNER_RESPONSE', created_at: new Date((BASE - 60) * 1000).toISOString(), tool_calls: [{ name: 'run_command', args: { CommandLine: 'ls' } }] }) +
-      '\n',
-  )
+  // agy rewrites its state for the same call (a new mark): the try is over and the call goes to the phone
+  // (⚠️ a look that cannot read the transcript no longer drops it: that is "cannot tell" / codex review)
+  l.setState({}, BASE + 0.5)
   await cards.sync()
   assert.equal(agyCards().length, 1, 'on the phone')
   go()

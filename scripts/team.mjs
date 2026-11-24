@@ -249,7 +249,8 @@ export function formatPending(list) {
         p.memberTool === 'codex' || p.memberTool === 'agy'
           ? t(`（${toolName(p.memberTool)}: 拒否に理由は付けられません）`, `(${toolName(p.memberTool)}: a denial carries no reason)`)
           : ''
-      const head = `${p.member}  ${p.ref}  ${oneLine(p.tool)}  ${verdict}${codexNote ? ` ${codexNote}` : ''}${flags.length ? `\n  ${flags.join('\n  ')}` : ''}`
+      const sub = p.subagent ? t(' （サブエージェントから）', ' (from a subagent)') : ''
+      const head = `${p.member}  ${p.ref}  ${oneLine(p.tool)}${sub}  ${verdict}${codexNote ? ` ${codexNote}` : ''}${flags.length ? `\n  ${flags.join('\n  ')}` : ''}`
       // ⚠️ Everything the member supplied stays inside the fence: the command, its directory, questions and options
       const qs = (p.questions ?? []).map((qq, i) => `Q${i + 1}${qq.multiSelect ? ' (multi)' : ''}: ${qq.question}\n${qq.options.map((o, k) => `  ${k + 1}. ${o}`).join('\n')}`)
       const body = [p.summary, ...(p.cwd ? [`(cwd: ${p.cwd})`] : []), ...qs].join('\n')

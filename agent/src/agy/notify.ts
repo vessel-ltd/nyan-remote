@@ -20,6 +20,7 @@
 //     a "needs you" sent after the card had been declined on the PC). The newer look handles its own state.
 //     ⚠️ Read again before every send (a send inside the same look can be the slow one).
 //  7. A conversation that appears already answered rings "done" when the answer is newer than the previous look
+//     (7b: or when the same answer an `idle` look stood on is now `done` — a child's closing record became readable)
 //     (a first turn that started and ended between two looks / codex review); an old answer of a resumed
 //     conversation does not.
 //  9. ⚠️ No "done" when another agy wrote into the conversation during the turn (its visit mark / `agyOthersWrote`):
@@ -41,6 +42,11 @@ import { readTailRecords, turnEnd, type TurnEnd } from './pending.ts'
 export interface AgyNotifyDeps {
   /** The listed agy rows now */
   rows(): Promise<SessionSummary[]>
+  /**
+   * Rule 7b: whether this conversation's answer stands after children that reported and finished well
+   * (`agyChildrenSettled`). Absent ⇒ rule 7b never rings.
+   */
+  childrenSettled?: (sessionId: string) => boolean
   home: string
   /**
    * Build the payload (the one text builder) and send it. Returns how many devices got it.
@@ -126,7 +132,7 @@ function stateOfTurn(row: Pick<SessionSummary, 'lastActivity'>, end: TurnEnd | u
 export class AgyNotifier {
   readonly #deps: AgyNotifyDeps
   /** session → its status and turn at the last look */
-  #last: Map<string, { status: string; turn: number | undefined; card?: string; missingSince?: number }> | undefined
+  #last: Map<string, { status: string; turn: number | undefined; card?: string; idleAnswer?: number; missingSince?: number }> | undefined
   #sent = new Map<string, Sent>()
   /** Rule 4b: session → the push still owed for its current state */
   #owed = new Map<string, Owed>()
@@ -207,14 +213,34 @@ export class AgyNotifier {
         const e = ends.get(r.sessionId)
         const after = stateOfTurn(r, e)
         const card = cardOf(r)
-        return [r.sessionId, { status: r.status, turn: after ? e?.turn : (before?.get(r.sessionId)?.turn ?? e?.turn), ...(card !== undefined ? { card } : {}) }] as const
+        // ★ The answer an `idle` row stands on (rule 7b), only when it was held there at the end of a turn seen running
+        //   (or kept from such a look): an old turn's answer read `idle` at the start or after it was `done` is not
+        //   armed (agy review: it rang an old turn's "done")
+        const was = before?.get(r.sessionId)
+        const armed =
+          r.status === 'idle' &&
+          e?.answered === true &&
+          e.answeredAt !== undefined &&
+          before !== undefined &&
+          ((was !== undefined && ACTIVE.has(was.status)) ||
+            (was?.status === 'idle' && was.idleAnswer === e.answeredAt) ||
+            // ★ a new turn already over when first seen (its running looks fell between two looks / codex review)
+            (was !== undefined && was.turn !== undefined && e.turn !== undefined && e.turn !== was.turn && after) ||
+            // ★ a conversation's first turn seen already over (no row, or an `idle` row with no turn before): only one
+            //   whose prompt or answer came after the previous look (the start-up baseline stays quiet / codex · agy)
+            ((was === undefined || (was.status === 'idle' && was.turn === undefined)) &&
+              after &&
+              this.#lastAt !== undefined &&
+              ((e.turnAt !== undefined && e.turnAt >= this.#lastAt - 1000) || e.answeredAt >= this.#lastAt - 1000)))
+        const held = armed ? { idleAnswer: e.answeredAt! } : {}
+        return [r.sessionId, { status: r.status, turn: after ? e?.turn : before !== undefined ? before.get(r.sessionId)?.turn : e?.turn, ...(card !== undefined ? { card } : {}), ...held }] as const
       }),
     )
     // ★ A conversation missing from this look (a lock probe that failed, a file being rewritten) is carried over for a
     //   while instead of read as gone: otherwise its "working" was forgotten and the completion seen after it was not
     //   news, and owed pushes were dropped (codex review). Gone for `MISSING_KEEP_MS` ⇒ forgotten.
     const seenAt = (this.#deps.now ?? Date.now)()
-    const kept = new Map<string, { status: string; turn: number | undefined; card?: string; missingSince?: number }>(now)
+    const kept = new Map<string, { status: string; turn: number | undefined; card?: string; idleAnswer?: number; missingSince?: number }>(now)
     for (const [id, was] of before ?? []) {
       if (now.has(id)) continue
       const since = was.missingSince ?? seenAt
@@ -225,7 +251,7 @@ export class AgyNotifier {
     this.#lastAt = snap.at
     // Rule 3: the baseline tells only the cards waiting now
     const baseline = before === undefined
-    const prior = before ?? new Map<string, { status: string; turn: number | undefined; card?: string }>()
+    const prior = before ?? new Map<string, { status: string; turn: number | undefined; card?: string; idleAnswer?: number }>()
     const nowMs = (this.#deps.now ?? Date.now)()
     // a push owed for a state or turn that is over is dropped (codex review: an old turn's "done" was retried after the
     // next turn had been stopped)
@@ -300,6 +326,20 @@ export class AgyNotifier {
       ) {
         // Rule 7 (★ also from `idle`: a parent whose children outlived its answer is idle, and its next answer can
         //   come before a look sees it working / codex review)
+      } else if (
+        to === 'done' &&
+        from?.status === 'idle' &&
+        from.idleAnswer !== undefined &&
+        end.answered &&
+        end.answeredAt === from.idleAnswer &&
+        from.turn === end.turn &&
+        this.#deps.childrenSettled?.(row.sessionId) === true
+      ) {
+        // Rule 7b: the same answer, held as `idle` while a child's closing record was not readable yet (it reported and
+        //   finished well: `agyChildrenOutlived`), is now this turn's end (codex review: working → idle → done rang
+        //   nothing). ⚠️ Only when the children are confirmed to have reported and finished well now
+        //   (`childrenSettled`): any other change on the same answer (a failed child missing from the index) does not
+        //   ring. Rule 4 still keeps one "done" per turn.
       } else {
         continue
       }

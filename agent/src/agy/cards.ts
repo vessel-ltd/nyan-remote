@@ -36,6 +36,7 @@
 //     it shows the card. A newer last call is another agy's (one that shared the conversation, declined, and left).
 
 import { createHash } from 'node:crypto'
+import { statSync } from 'node:fs'
 import type { PermissionRequest, SessionSummary } from '../../../shared/types.ts'
 import { hasHidden } from '../../../shared/reveal.ts'
 import { t } from '../../../shared/i18n.ts'
@@ -48,7 +49,7 @@ import { callBeforeState, readTailRecords, turnEnd, type PendingCall } from './p
 import type { AgyCardFailure, AgyCardMark, AgyQuestionAnswer, AgyQuestionFailure, AgyQuestionMark } from './keys.ts'
 import { agyQuestionInteraction, parseAgyQuestion, questionTextsOf, skipSteps, type AgyAnswerPlan, type AgyQuestion, type AgyStep } from './questions.ts'
 import { childViewOf, dialogFits, inChildView, parseBanner, parseDialog, readAgyScreen, sameQuestionText, viewOwnerOf } from './screen.ts'
-import { AGY_QUESTION_TOOL, agyChildQuestions, agyPendingCall, agyQuestionAt, agyQuestionWaitAt } from './sessions.ts'
+import { AGY_QUESTION_TOOL, agyCardAt, agyChildQuestions, agyPendingCall, agyQuestionAt, agyQuestionWaitAt } from './sessions.ts'
 
 /** ★ The calls whose card was measured, as the tool and input the card helpers know. undefined = stays on the PC */
 export function agyCardTool(call: Pick<PendingCall, 'name' | 'args'>): { toolName: string; input: Record<string, string> } | undefined {
@@ -218,6 +219,8 @@ export function agyQuestionCard(row: SessionSummary, mark: AgyQuestionMark, q: A
   }
 }
 
+/** ★ The card's name the notifier uses (`cardOf` / `agyCardAt`: its first state write, the same across agy's rewrites) */
+const cardName = (conv: string, m: AgyCardMark): string => new Date(agyCardAt(m.pid, conv, { step: m.step, index: m.index, at: m.callAt }, m.stateMtimeMs)).toISOString()
 const markId = (m: AgyCardMark): string => `${m.pid}:${m.stateMtimeMs}:${m.step}:${m.index}:${m.callAt}`
 /** How many calls "on the phone" / "auto-tried" remember */
 const CALL_MEMORY_MAX = 1024
@@ -241,6 +244,8 @@ export class AgyCards {
   #onPhone = new Set<string>()
   /** The conversations the last look could not tell about */
   #lastUnsure = new Set<string>()
+  /** ★ The call each conversation's card is up for, as of the last look (rule 4c across a state rewrite) */
+  #upCall = new Map<string, string>()
   /** ★ conversation → the question card on the phone (docs/AGY.md §13), by its mark id */
   #qRaised = new Map<string, Raised>()
   /** conversation → the question answered from the phone (not raised again while it stays up; rule 4 as cards) */
@@ -320,7 +325,7 @@ export class AgyCards {
   }
 
   /**
-   * ★ Rule 5b: whether this card (its state write, ISO, as the notifier's `cardOf`) is being answered by auto-approve,
+   * ★ Rule 5b: whether this card (its first state write, ISO, as the notifier's `cardOf` / `cardName`) is being answered by auto-approve,
    * so its "needs you" is not rung.
    */
   autoAnswering(conversationId: string, card: string): boolean {
@@ -367,7 +372,26 @@ export class AgyCards {
         continue
       }
       if (!locks.includes(conv)) continue
-      const end = turnEnd((this.#deps.tail ?? readTailRecords)(transcriptPathOf(conv, deps.home)))
+      const mtimeOf = (): { mtimeMs: number; size: number } | undefined => {
+        try {
+          return statSync(transcriptPathOf(conv, deps.home))
+        } catch {
+          return undefined
+        }
+      }
+      const before = mtimeOf()
+      const records = (this.#deps.tail ?? readTailRecords)(transcriptPathOf(conv, deps.home))
+      // ⚠️ A transcript that cannot be read now (or is missing) while the state says a card is up: cannot tell, not "no
+      //    card" (codex review: the timeout's re-ring was lost on such a look)
+      if (records.length === 0) {
+        unsure.add(conv)
+        continue
+      }
+      const end = turnEnd(records)
+      // ★ The transcript's time and size, the same before and after the read (it did not move under it); else the card
+      //   is not named by this look (`agyCardAt` / codex review)
+      const after = mtimeOf()
+      const transcriptAt = before && after && before.mtimeMs === after.mtimeMs && before.size === after.size ? after.mtimeMs : undefined
       // ★ Rule 9: the call must be older than this agy's "card is up" state
       if (!end.pending || !callBeforeState(end.pending, f.mtimeMs)) continue
       // Rule 7: another agy shows it too, or wrote into it during this card ⇒ the card could be the other one's
@@ -380,6 +404,8 @@ export class AgyCards {
         shared.add(conv)
         continue
       }
+      // ★ The card's name, given here as the notifier would (`agyCardAt`: whichever of the two looks sees it first)
+      agyCardAt(pid, conv, end.pending, f.mtimeMs, transcriptAt)
       want.set(conv, {
         state: f.state,
         mark: { pid, stateMtimeMs: f.mtimeMs, step: end.pending.step, index: end.pending.index, callAt: end.pending.at! },
@@ -389,6 +415,9 @@ export class AgyCards {
     }
     for (const conv of shared) want.delete(conv)
     this.#lastUnsure = unsure
+    // ⚠️ A conversation this look could not tell about keeps its last known call (codex review: one unreadable look at
+    //    the timeout dropped the re-ring)
+    this.#upCall = new Map([...[...this.#upCall].filter(([c]) => unsure.has(c) && !want.has(c)), ...[...want].map(([c, w]) => [c, callId(w.mark)] as const)])
     let changed = false
     // Rule 3: cards no longer up
     for (const [conv, r] of this.#raised) {
@@ -443,7 +472,7 @@ export class AgyCards {
       if (!this.#onPhone.has(call) && !this.#autoTried.has(call) && mine(owner) && shouldAutoApprove(info, this.#deps.now().getTime())) {
         this.#autoTried.add(call)
         this.#answered.set(conv, id)
-        this.#auto.set(conv, { id, card: new Date(w.mark.stateMtimeMs).toISOString() })
+        this.#auto.set(conv, { id, card: cardName(conv, w.mark) })
         // ⚠️ Asked again right before the byte (an "off", the expiry or a new grant during the settle wait / codex review);
         //    and never once the call has gone to the phone meanwhile (a person may be denying it there / codex review)
         void this.#autoAnswer(
@@ -759,7 +788,7 @@ export class AgyCards {
       this.#onPhone.add(`${conv}:${callId(mark)}`)
       if (this.#answered.get(conv) === id) this.#answered.delete(conv)
       // `once`: it has not been on the phone; a "needs you" already sent for this card is enough (codex review: two)
-      this.#deps.reraised?.(conv, new Date(mark.stateMtimeMs).toISOString(), true)
+      this.#deps.reraised?.(conv, cardName(conv, mark), true)
       void this.sync()
     }
     if (!res.ok) {
@@ -814,7 +843,7 @@ export class AgyCards {
       // Rule 4: not typed ⇒ the card may come back on the next look (if it is still up)
       if (this.#answered.get(conv) === raised.id) this.#answered.delete(conv)
       // ★ Past the phone's wait it was told "taken" (`permissionAnswer`): "needs you" rings again (agy review)
-      if (Date.now() - started >= (this.#deps.deliveryWaitMs ?? AGY_DELIVERY_WAIT_MS)) this.#deps.reraised?.(conv, new Date(mark.stateMtimeMs).toISOString())
+      if (Date.now() - started >= (this.#deps.deliveryWaitMs ?? AGY_DELIVERY_WAIT_MS)) this.#deps.reraised?.(conv, cardName(conv, mark))
       void this.sync()
       return
     }
@@ -822,10 +851,17 @@ export class AgyCards {
     //   the byte). agy rewrites its state within ~50 ms of an answer, so the same card still up after
     //   `UNCONFIRMED_MS` did not get it: it comes back on the phone (codex review)
     setTimeout(() => {
-      if (this.#answered.get(conv) !== raised.id) return
+      if (this.#answered.get(conv) !== raised.id) {
+        // ★ The same call still up under a new mark (agy rewrote its state meanwhile: the card came back with a new key,
+        //   and its name stays the same, so the notifier would not ring it / codex review): "needs you" again
+        if (this.#upCall.get(conv) !== callId(mark)) return
+        this.#deps.log?.(`[agy] card ${behavior} conversation=${conv.slice(0, 8)} still up after the key (rewritten); shown again`)
+        this.#deps.reraised?.(conv, cardName(conv, mark))
+        return
+      }
       this.#answered.delete(conv)
       this.#deps.log?.(`[agy] card ${behavior} conversation=${conv.slice(0, 8)} still up after the key; shown again`)
-      this.#deps.reraised?.(conv, new Date(mark.stateMtimeMs).toISOString())
+      this.#deps.reraised?.(conv, cardName(conv, mark))
       void this.sync()
     }, this.#deps.unconfirmedMs ?? UNCONFIRMED_MS).unref?.()
   }

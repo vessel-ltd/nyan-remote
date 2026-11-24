@@ -81,6 +81,10 @@ test('candidates and pending print member text inside a data fence, with the add
   const p = formatPending([{ member: 'm1', ref: 'r0123456789', tool: 'Bash', summary: 'rm x', mayAnswer: true }])
   assert.match(p, /r0123456789/)
   assert.match(p, /<<<DATA-[0-9a-f]{12} m1[^\n]*\nrm x\nDATA-[0-9a-f]{12}>>>/)
+  assert.doesNotMatch(p, /subagent|サブエージェント/)
+  // ★ a subagent's card says so on its head line (outside the member's data)
+  const sub = formatPending([{ member: 'm1', ref: 'r0123456789', tool: 'AskUserQuestion', summary: 'q', mayAnswer: true, subagent: true }])
+  assert.match(sub.split('\n')[0], /r0123456789  AskUserQuestion (\(from a subagent\)|（サブエージェントから）)/)
 })
 
 for (const lang of ['en', 'ja']) test(`★ limits show each window with its reset time and how old the reading is (${lang} / 2026-11-19)`, (t) => {

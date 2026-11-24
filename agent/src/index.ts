@@ -6,7 +6,7 @@
 
 import { startAgyWatch } from './agy/watch.ts'
 import { endAgyGrantsOver } from './agy/grants.ts'
-import { AGY_PREFIX, agyDir, agyOthersWrote, agyOwnRowOf, agyOwnRows, conversationOf, defaultAgyDeps, transcriptPathOf, withLocksProbed } from './agy/sessions.ts'
+import { AGY_PREFIX, agyDir, agyChildrenSettledSeen, agyOthersWrote, agyOwnRowOf, agyOwnRows, conversationOf, defaultAgyDeps, transcriptPathOf, withLocksProbed } from './agy/sessions.ts'
 import { lastTurnStartCached, readTailRecords, turnEnd } from './agy/pending.ts'
 import { AgyCards } from './agy/cards.ts'
 import { homedir } from 'node:os'
@@ -176,6 +176,11 @@ async function main(): Promise<void> {
       return conv === undefined ? undefined : lastTurnStartCached(transcriptPathOf(conv))
     },
     // ⚠️ Locks probed without blocking (a Mac's `lsof`); a probe that fails ⇒ undefined (the push waits, `notify.ts`)
+    // ★ Rule 7b: "done" on an answer seen `idle` only when its children reported and finished well (`agyChildrenSettled`)
+    childrenSettled: (sessionId) => {
+      const conv = conversationOf(sessionId)
+      return conv !== undefined && agyChildrenSettledSeen(conv)
+    },
     othersWrote: async (sessionId, since) => {
       const conv = conversationOf(sessionId)
       if (conv === undefined) return true

@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import { AGY_CARD_KEYS, AGY_CLEAR_KEYS, clearAgy, compactAgy, agyTyped, answerAgyCard, answerAgyQuestion, type AgyQuestionMark, findAgyTarget, looksLikeAgyShortcut, readNow, sendGate, sendToAgy, stopAgy, stopGate, type AgyKeysDeps } from './keys.ts'
-import { agyOwnRowOf, agyOwnRows, agyRows, transcriptPathOf } from './sessions.ts'
+import { agyCardAt, agyChildrenSettledFor, agyChildrenSettledSeen, agyOwnRowOf, resetAgyCardNamesForTest, agyOwnRows, agyRows, transcriptPathOf } from './sessions.ts'
 import { readTailRecords } from './pending.ts'
 import { parseAgyQuestion } from './questions.ts'
 import { writeSequence } from '../claude/keys.ts'
@@ -67,6 +67,7 @@ interface Lab {
 }
 
 async function lab(t: { after(fn: () => void): void }, opts: { pane?: boolean; paste?: boolean; startedAt?: number } = {}): Promise<Lab> {
+  resetAgyCardNamesForTest()
   const root = mkdtempSync(join(tmpdir(), 'nyan-agy-keys-'))
   const prev = process.env.NYAN_REMOTE_STATE_DIR
   process.env.NYAN_REMOTE_STATE_DIR = root
@@ -194,6 +195,56 @@ test('★★★ a card that comes up between the body and Enter: Enter is not se
   assert.equal(res.reason, 'partial')
   await settle()
   assert.deepEqual(l.got, ['hello '])
+})
+
+test('★★ one card whose state agy writes twice keeps one name (it rang twice / measured 1.5.15); a new call is a new card', async (t) => {
+  const l = await lab(t)
+  const iso = (sec: number): string => new Date(sec * 1000).toISOString().replace(/\.\d{3}Z$/, 'Z')
+  const call = (step: number, at: number): string =>
+    JSON.stringify({ type: 'PLANNER_RESPONSE', step_index: step, created_at: iso(at), tool_calls: [{ name: 'run_command', args: { CommandLine: 'date' } }] }) + '\n'
+  appendFileSync(l.transcript, call(1, BASE - 5))
+  utimesSync(l.transcript, BASE - 5, BASE - 5)
+  l.setState({ agent_state: 'tool_use', tool_confirmation_pending: true }, BASE + 0.905)
+  const first = agyOwnRows('pc-a', l.deps)[0]?.lastActivity
+  assert.equal(first, new Date((BASE + 0.905) * 1000).toISOString())
+  // agy writes the same card's state again 0.3 s later: the same name (the notifier tells it once)
+  l.setState({ agent_state: 'tool_use', tool_confirmation_pending: true }, BASE + 1.199)
+  assert.equal(agyOwnRows('pc-a', l.deps)[0]?.lastActivity, first)
+  assert.equal(agyOwnRowOf('pc-a', l.deps, A)?.lastActivity, first)
+  // ⚠️ answered, its result written before agy rewrites its state: that write keeps its name (agy review: it went back
+  //    to its own time and rang the answered card)
+  const before = readFileSync(l.transcript, 'utf8')
+  appendFileSync(l.transcript, JSON.stringify({ type: 'GENERIC', step_index: 2, created_at: iso(BASE + 1), content: `Created At: ${iso(BASE - 5)}\nran` }) + '\n')
+  utimesSync(l.transcript, BASE + 1.3, BASE + 1.3)
+  assert.equal(agyOwnRows('pc-a', l.deps)[0]?.lastActivity, first)
+  writeFileSync(l.transcript, before)
+  utimesSync(l.transcript, BASE - 5, BASE - 5)
+  // ⚠️ two calls in one response: the first one's result moves the pending call to the second while the state still
+  //    shows the first card (a look then must not give the second card the first one's name / codex review)
+  appendFileSync(l.transcript, JSON.stringify({ type: 'PLANNER_RESPONSE', step_index: 2, created_at: iso(BASE + 2), tool_calls: [{ name: 'run_command', args: { CommandLine: 'a' } }, { name: 'run_command', args: { CommandLine: 'b' } }] }) + '\n')
+  utimesSync(l.transcript, BASE + 2, BASE + 2)
+  l.setState({ agent_state: 'tool_use', tool_confirmation_pending: true }, BASE + 2.5)
+  assert.equal(agyOwnRows('pc-a', l.deps)[0]?.lastActivity, new Date((BASE + 2.5) * 1000).toISOString())
+  appendFileSync(l.transcript, JSON.stringify({ type: 'GENERIC', step_index: 3, created_at: iso(BASE + 3), content: `Created At: ${iso(BASE + 2)}\nran a` }) + '\n')
+  utimesSync(l.transcript, BASE + 3, BASE + 3)
+  agyOwnRows('pc-a', l.deps)
+  l.setState({ agent_state: 'tool_use', tool_confirmation_pending: true }, BASE + 3.4)
+  assert.equal(agyOwnRows('pc-a', l.deps)[0]?.lastActivity, new Date((BASE + 3.4) * 1000).toISOString(), 'the second card is its own')
+  // ⚠️ the second write seen first, then the first write seen late (a slow look), then the second again: one name
+  //    throughout (codex review: the late look renamed it and it rang twice)
+  const late = { step: 98, index: 0, at: (BASE + 40) * 1000 }
+  assert.equal(agyCardAt(PID, A, late, (BASE + 41.3) * 1000, (BASE + 40) * 1000), (BASE + 41.3) * 1000)
+  assert.equal(agyCardAt(PID, A, late, (BASE + 41) * 1000, (BASE + 40) * 1000), (BASE + 41.3) * 1000)
+  assert.equal(agyCardAt(PID, A, late, (BASE + 41.3) * 1000, (BASE + 40) * 1000), (BASE + 41.3) * 1000)
+  // ⚠️ a state written in the same clock tick as the transcript is not tied to its call (cannot be ordered / codex review)
+  const tick = { step: 99, index: 0, at: (BASE + 50) * 1000 }
+  assert.equal(agyCardAt(PID, A, tick, (BASE + 51) * 1000, (BASE + 51) * 1000), (BASE + 51) * 1000)
+  assert.equal(agyCardAt(PID, A, tick, (BASE + 52) * 1000), (BASE + 52) * 1000, 'not named by that write')
+  // ★ the next card (another call): its own name
+  appendFileSync(l.transcript, JSON.stringify({ type: 'GENERIC', step_index: 4, created_at: iso(BASE + 3), content: 'ran b' }) + '\n' + call(5, BASE + 4))
+  utimesSync(l.transcript, BASE + 4, BASE + 4)
+  l.setState({ agent_state: 'tool_use', tool_confirmation_pending: true }, BASE + 5.5)
+  assert.equal(agyOwnRows('pc-a', l.deps)[0]?.lastActivity, new Date((BASE + 5.5) * 1000).toISOString())
 })
 
 test('★ a long text goes as one paste (only where the relay saw paste on)', async (t) => {
@@ -887,6 +938,264 @@ test('★ a child that failed later in the same second as the parent’s answer 
   // a child's message recorded after the answer (the parent has not answered it yet): not done
   appendFileSync(l.transcript, JSON.stringify({ type: 'SYSTEM_MESSAGE', step_index: 21, content: `x\n<SYSTEM_MESSAGE>\n[Message] timestamp=${new Date(BASE * 1000).toISOString()} sender=${K1} priority=MESSAGE_PRIORITY_HIGH content=failed\n</SYSTEM_MESSAGE>` }) + '\n')
   utimesSync(l.transcript, BASE + 1, BASE + 1)
+  assert.equal(agyOwnRows('pc-a', l.deps)[0]?.status, 'idle')
+})
+
+test('★★ a child that reported to the parent, then wrote its closing record after the parent’s answer: "done" (measured 2026-11-23)', async (t) => {
+  const l = await lab(t)
+  withChildren(l, [{ id: K1, prompt: 'ask', asking: false, finished: true }])
+  const iso = new Date(BASE * 1000).toISOString().replace(/\.\d{3}Z$/, 'Z')
+  const message = (sender: string, step: number): string =>
+    JSON.stringify({ type: 'SYSTEM_MESSAGE', step_index: step, content: `x\n<SYSTEM_MESSAGE>\n[Message] timestamp=${iso} sender=${sender} priority=MESSAGE_PRIORITY_HIGH content=The user chose: Blue\n</SYSTEM_MESSAGE>` }) + '\n'
+  const answer = JSON.stringify({ type: 'PLANNER_RESPONSE', step_index: 21, created_at: iso, content: 'You chose Blue.' }) + '\n'
+  // another launch in this turn (a sibling the parent started) and its result naming the child
+  const launch = (prompt: string, id: string): string =>
+    JSON.stringify({ type: 'PLANNER_RESPONSE', step_index: 18, created_at: iso, tool_calls: [{ name: 'invoke_subagent', args: { Prompt: prompt } }] }) +
+    '\n' +
+    JSON.stringify({ type: 'GENERIC', step_index: 19, created_at: iso, content: `Created At: ${iso}\nCreated the following subagent:\n{\n  "conversationId": "${id}"\n}` }) +
+    '\n'
+  // a child of this conversation that ran to its own answer
+  const finishedChild = (id: string, prompt: string): string => {
+    const path = transcriptPathOf(id, l.deps.home)
+    mkdirSync(join(path, '..'), { recursive: true })
+    writeFileSync(
+      path,
+      JSON.stringify({ type: 'SYSTEM_MESSAGE', step_index: 0, created_at: iso, content: `x\n<SYSTEM_MESSAGE>\n[Message] timestamp=${iso} sender=${A} priority=MESSAGE_PRIORITY_HIGH content=${prompt}\n</SYSTEM_MESSAGE>` }) +
+        '\n' +
+        JSON.stringify({ type: 'PLANNER_RESPONSE', step_index: 1, created_at: iso, content: 'Done.' }) +
+        '\n',
+    )
+    utimesSync(path, BASE - 1, BASE - 1)
+    return path
+  }
+  const NOFILE = '5d2e3f40-0000-4000-8000-00000000000b'
+  const raw = { nyanPid: PID, nyanBusyAt: BASE, input: { conversation_id: A, cwd: '/home/user/p', agent_state: 'idle', subagents: [{ name: 'self', role: 'ask', status: 'completed' }] } }
+  for (const f of [`pid-${PID}.json`, `session-${A}.json`]) {
+    writeFileSync(join(l.deps.dir, f), JSON.stringify(raw))
+    utimesSync(join(l.deps.dir, f), BASE + 2, BASE + 2)
+  }
+  // (distinct times per case: the transcript cache keys on size and time)
+  const parentAt = (sec: number): void => utimesSync(l.transcript, sec, sec)
+  const childAt = (sec: number): void => utimesSync(transcriptPathOf(K1, l.deps.home), sec, sec)
+  const base = readFileSync(l.transcript, 'utf8')
+  // ⚠️ another agent's message (not this child's): the child's later write still keeps it from "done"
+  writeFileSync(l.transcript, base + message(K2, 20) + answer)
+  parentAt(BASE + 0.11)
+  childAt(BASE + 0.84)
+  assert.equal(agyOwnRows('pc-a', l.deps)[0]?.status, 'idle')
+  assert.equal(agyChildrenSettledFor(A, l.deps), false)
+  // ★ the child's own report before the answer, the child's closing record 0.7 s after it: done
+  writeFileSync(l.transcript, base + message(K1, 20) + answer)
+  parentAt(BASE + 0.12)
+  childAt(BASE + 0.84)
+  assert.equal(agyOwnRows('pc-a', l.deps)[0]?.status, 'done')
+  // ★ and settled (the notifier's rule 7b may ring it)
+  assert.equal(agyChildrenSettledFor(A, l.deps), true)
+  // ⚠️ a child that has children of its own (a coordinator whose worker may fail later): not exempt (codex review)
+  const g = transcriptPathOf(K3, l.deps.home)
+  mkdirSync(join(g, '..'), { recursive: true })
+  writeFileSync(g, JSON.stringify({ type: 'SYSTEM_MESSAGE', step_index: 0, created_at: iso, content: `x\n<SYSTEM_MESSAGE>\n[Message] timestamp=${iso} sender=${K1} priority=MESSAGE_PRIORITY_HIGH content=work\n</SYSTEM_MESSAGE>` }) + '\n')
+  utimesSync(g, BASE - 1, BASE - 1)
+  await new Promise((r) => setTimeout(r, 5))
+  utimesSync(join(l.deps.home, '.gemini', 'antigravity-cli', 'brain'), BASE + 3, BASE + 3)
+  assert.equal(agyOwnRows('pc-a', l.deps)[0]?.status, 'idle')
+  rmSync(join(g, '..', '..', '..'), { recursive: true })
+  // ⚠️ …nor when ANOTHER child of the turn (one that closed before the answer) has a worker (codex review)
+  writeFileSync(l.transcript, base + launch('coordinate', K2) + message(K1, 20) + answer)
+  parentAt(BASE + 0.16)
+  for (const f of [`pid-${PID}.json`, `session-${A}.json`]) {
+    writeFileSync(join(l.deps.dir, f), JSON.stringify({ ...raw, input: { ...raw.input, subagents: [{ name: 'self', role: 'ask', status: 'completed' }, { name: 'self', role: 'coordinate', status: 'completed' }] } }))
+    utimesSync(join(l.deps.dir, f), BASE + 2, BASE + 2)
+  }
+  const k2 = transcriptPathOf(K2, l.deps.home)
+  mkdirSync(join(k2, '..'), { recursive: true })
+  writeFileSync(k2, JSON.stringify({ type: 'SYSTEM_MESSAGE', step_index: 0, created_at: iso, content: `x\n<SYSTEM_MESSAGE>\n[Message] timestamp=${iso} sender=${A} priority=MESSAGE_PRIORITY_HIGH content=coordinate\n</SYSTEM_MESSAGE>` }) + '\n')
+  utimesSync(k2, BASE - 1, BASE - 1)
+  // (another id: a conversation's first record never changes, and it is remembered)
+  const g2 = transcriptPathOf('4c1d2e3f-0000-4000-8000-00000000000a', l.deps.home)
+  mkdirSync(join(g2, '..'), { recursive: true })
+  writeFileSync(g2, JSON.stringify({ type: 'SYSTEM_MESSAGE', step_index: 0, created_at: iso, content: `x\n<SYSTEM_MESSAGE>\n[Message] timestamp=${iso} sender=${K2} priority=MESSAGE_PRIORITY_HIGH content=work\n</SYSTEM_MESSAGE>` }) + '\n')
+  utimesSync(g2, BASE - 1, BASE - 1)
+  utimesSync(join(l.deps.home, '.gemini', 'antigravity-cli', 'brain'), BASE + 5, BASE + 5)
+  assert.equal(agyOwnRows('pc-a', l.deps)[0]?.status, 'idle')
+  // ★ the same coordinator in an EARLIER turn (not launched in this one): this turn is still exempt
+  writeFileSync(l.transcript, base + message(K1, 20) + answer)
+  parentAt(BASE + 0.17)
+  assert.equal(agyOwnRows('pc-a', l.deps)[0]?.status, 'done')
+  rmSync(join(g2, '..', '..', '..'), { recursive: true })
+  rmSync(join(k2, '..', '..', '..'), { recursive: true })
+  for (const f of [`pid-${PID}.json`, `session-${A}.json`]) {
+    writeFileSync(join(l.deps.dir, f), JSON.stringify(raw))
+    utimesSync(join(l.deps.dir, f), BASE + 2, BASE + 2)
+  }
+  utimesSync(join(l.deps.home, '.gemini', 'antigravity-cli', 'brain'), BASE + 6, BASE + 6)
+  writeFileSync(l.transcript, base + message(K1, 20) + answer)
+  parentAt(BASE + 0.12)
+  assert.equal(agyOwnRows('pc-a', l.deps)[0]?.status, 'done')
+  // ⚠️ a child whose own record started a worker (the worker gone from the index): not exempt (codex review)
+  const k1 = transcriptPathOf(K1, l.deps.home)
+  const k1Was = readFileSync(k1, 'utf8')
+  const lines = k1Was.trimEnd().split('\n')
+  lines.splice(1, 0, JSON.stringify({ type: 'PLANNER_RESPONSE', step_index: 1, created_at: iso, tool_calls: [{ name: 'invoke_subagent', args: { Prompt: 'work' } }] }))
+  writeFileSync(k1, lines.join('\n') + '\n')
+  childAt(BASE + 0.86)
+  assert.equal(agyOwnRows('pc-a', l.deps)[0]?.status, 'idle')
+  writeFileSync(k1, k1Was)
+  childAt(BASE + 0.84)
+  assert.equal(agyOwnRows('pc-a', l.deps)[0]?.status, 'done')
+  // ⚠️ a child record that ends mid-line (an error being written, or cut by a failure: the tail read drops it): not exempt
+  appendFileSync(k1, '{"type":"ERROR_MESSAGE","step_index":9,"err')
+  childAt(BASE + 0.88)
+  assert.equal(agyOwnRows('pc-a', l.deps)[0]?.status, 'idle')
+  writeFileSync(k1, k1Was)
+  childAt(BASE + 0.84)
+  assert.equal(agyOwnRows('pc-a', l.deps)[0]?.status, 'done')
+  // ⚠️ a child record larger than the tail read (a launch could be out of it): not exempt (codex review / user decision)
+  const big = k1Was.trimEnd().split('\n')
+  big.splice(1, 0, JSON.stringify({ type: 'GENERIC', step_index: 1, created_at: iso, content: `Created At: ${iso}\n${'x'.repeat(2 * 1024 * 1024 + 10)}` }))
+  writeFileSync(k1, big.join('\n') + '\n')
+  childAt(BASE + 0.87)
+  assert.equal(agyOwnRows('pc-a', l.deps)[0]?.status, 'idle')
+  writeFileSync(k1, k1Was)
+  childAt(BASE + 0.84)
+  assert.equal(agyOwnRows('pc-a', l.deps)[0]?.status, 'done')
+  // ⚠️ a failed sibling of this turn (gone from the index; still in the parent's launches and the status line) beside
+  //    the child that reported: not settled, and not "done" either (codex review)
+  writeFileSync(l.transcript, base + launch('sibling', NOFILE) + message(K1, 20) + answer)
+  parentAt(BASE + 0.18)
+  for (const f of [`pid-${PID}.json`, `session-${A}.json`]) {
+    writeFileSync(join(l.deps.dir, f), JSON.stringify({ ...raw, input: { ...raw.input, subagents: [{ name: 'self', role: 'ask', status: 'completed' }, { name: 'self', role: 'sibling', status: 'failed' }] } }))
+    utimesSync(join(l.deps.dir, f), BASE + 2, BASE + 2)
+  }
+  assert.equal(agyChildrenSettledFor(A, l.deps), false)
+  assert.equal(agyOwnRows('pc-a', l.deps)[0]?.status, 'idle')
+  // ⚠️ a sibling of this turn that ran to its own answer but never reported (stopped before reporting): not exempt, not
+  //    settled (codex review); once it has reported too: done
+  const k6id = '7f405162-0000-4000-8000-00000000000d'
+  const k6 = finishedChild(k6id, 'quiet')
+  utimesSync(join(l.deps.home, '.gemini', 'antigravity-cli', 'brain'), BASE + 9, BASE + 9)
+  writeFileSync(l.transcript, base + launch('quiet', k6id) + message(K1, 20) + answer)
+  parentAt(BASE + 0.23)
+  assert.equal(agyOwnRows('pc-a', l.deps)[0]?.status, 'idle')
+  assert.equal(agyChildrenSettledFor(A, l.deps), false)
+  writeFileSync(l.transcript, base + launch('quiet', k6id) + message(k6id, 20) + message(K1, 20) + answer)
+  parentAt(BASE + 0.24)
+  assert.equal(agyOwnRows('pc-a', l.deps)[0]?.status, 'done')
+  rmSync(join(k6, '..', '..', '..'), { recursive: true })
+  utimesSync(join(l.deps.home, '.gemini', 'antigravity-cli', 'brain'), BASE + 10, BASE + 10)
+  // ⚠️ a system notice after the parent's answer (children stopped by a restart: `sender=system`): not done (codex review)
+  writeFileSync(l.transcript, base + message(K1, 20) + answer + JSON.stringify({ type: 'SYSTEM_MESSAGE', step_index: 22, content: `x\n<SYSTEM_MESSAGE>\n[Message] timestamp=${iso} sender=system priority=MESSAGE_PRIORITY_HIGH content=stopped\n</SYSTEM_MESSAGE>` }) + '\n')
+  parentAt(BASE + 0.25)
+  assert.equal(agyOwnRows('pc-a', l.deps)[0]?.status, 'idle')
+  // ⚠️ a launch whose result names no child (it may have failed to start): not exempt
+  writeFileSync(l.transcript, base + JSON.stringify({ type: 'PLANNER_RESPONSE', step_index: 18, created_at: iso, tool_calls: [{ name: 'invoke_subagent', args: { Prompt: 'x' } }] }) + '\n' + message(K1, 20) + answer)
+  parentAt(BASE + 0.22)
+  for (const f of [`pid-${PID}.json`, `session-${A}.json`]) {
+    writeFileSync(join(l.deps.dir, f), JSON.stringify(raw))
+    utimesSync(join(l.deps.dir, f), BASE + 2, BASE + 2)
+  }
+  assert.equal(agyOwnRows('pc-a', l.deps)[0]?.status, 'idle')
+  // ★ a child that failed in an EARLIER turn (not launched in this one): this turn is still done and settled (codex
+  //   review / user decision: the status line keeps earlier turns' children)
+  writeFileSync(l.transcript, base + message(K1, 20) + answer)
+  parentAt(BASE + 0.19)
+  assert.equal(agyChildrenSettledFor(A, l.deps), true)
+  assert.equal(agyOwnRows('pc-a', l.deps)[0]?.status, 'done')
+  writeFileSync(l.transcript, base + message(K1, 20) + answer)
+  parentAt(BASE + 0.12)
+  for (const f of [`pid-${PID}.json`, `session-${A}.json`]) {
+    writeFileSync(join(l.deps.dir, f), JSON.stringify(raw))
+    utimesSync(join(l.deps.dir, f), BASE + 2, BASE + 2)
+  }
+  // ★ the notifier's rows read it in the same lock-verified pass (no second probe at send time / codex review)
+  agyOwnRows('pc-a', l.deps)
+  assert.equal(agyChildrenSettledSeen(A), true)
+  agyOwnRows('pc-a', { ...l.deps, locksOf: () => [] })
+  assert.equal(agyChildrenSettledSeen(A), true, 'a look that does not list it keeps the last read')
+  // ⚠️ judged by the lock holder only (a stale file of an agy that moved on does not count / codex review)
+  assert.equal(agyChildrenSettledFor(A, { ...l.deps, locksOf: () => [] }), false)
+  assert.equal(agyChildrenSettledFor(A, l.deps), true)
+  // (the child wrote before the answer: done; settled too — every child says `completed`, so an `idle` held while the
+  //  children could not be listed may ring once readable / agy review)
+  childAt(BASE + 0.05)
+  assert.equal(agyOwnRows('pc-a', l.deps)[0]?.status, 'done')
+  assert.equal(agyChildrenSettledFor(A, l.deps), true)
+  // ⚠️ …but not with a failed or killed child of this turn (codex review: one gone from the index rang "done")
+  for (const f of [`pid-${PID}.json`, `session-${A}.json`]) {
+    writeFileSync(join(l.deps.dir, f), JSON.stringify({ ...raw, input: { ...raw.input, subagents: [{ name: 'self', role: 'ask', status: 'completed' }, { name: 'self', role: 'other', status: 'failed' }] } }))
+    utimesSync(join(l.deps.dir, f), BASE + 2, BASE + 2)
+  }
+  writeFileSync(l.transcript, base + launch('other', NOFILE) + message(K1, 20) + answer)
+  parentAt(BASE + 0.2)
+  assert.equal(agyChildrenSettledFor(A, l.deps), false)
+  // (that failure in an earlier turn: settled)
+  writeFileSync(l.transcript, base + message(K1, 20) + answer)
+  parentAt(BASE + 0.12)
+  assert.equal(agyChildrenSettledFor(A, l.deps), true)
+  // ⚠️ a child of an EARLIER turn reporting in this one (this turn launched another): not exempt
+  for (const f of [`pid-${PID}.json`, `session-${A}.json`]) {
+    writeFileSync(join(l.deps.dir, f), JSON.stringify({ ...raw, input: { ...raw.input, subagents: [{ name: 'self', role: 'ask', status: 'completed' }, { name: 'self', role: 'other', status: 'completed' }] } }))
+    utimesSync(join(l.deps.dir, f), BASE + 2, BASE + 2)
+  }
+  const k5 = finishedChild('6e3f4051-0000-4000-8000-00000000000c', 'other')
+  utimesSync(join(l.deps.home, '.gemini', 'antigravity-cli', 'brain'), BASE + 7, BASE + 7)
+  writeFileSync(l.transcript, base + JSON.stringify({ type: 'USER_INPUT', step_index: 17, created_at: iso, content: '<USER_REQUEST>\nnext\n</USER_REQUEST>' }) + '\n' + launch('other', '6e3f4051-0000-4000-8000-00000000000c') + message(K1, 20) + answer)
+  parentAt(BASE + 0.21)
+  childAt(BASE + 0.84)
+  assert.equal(agyOwnRows('pc-a', l.deps)[0]?.status, 'idle')
+  childAt(BASE + 0.05)
+  rmSync(join(k5, '..', '..', '..'), { recursive: true })
+  utimesSync(join(l.deps.home, '.gemini', 'antigravity-cli', 'brain'), BASE + 8, BASE + 8)
+  writeFileSync(l.transcript, base + message(K1, 20) + answer)
+  parentAt(BASE + 0.12)
+  for (const f of [`pid-${PID}.json`, `session-${A}.json`]) {
+    writeFileSync(join(l.deps.dir, f), JSON.stringify(raw))
+    utimesSync(join(l.deps.dir, f), BASE + 2, BASE + 2)
+  }
+  childAt(BASE + 0.84)
+  // ⚠️ a report in an earlier turn does not count (a new request came after it)
+  writeFileSync(l.transcript, base + message(K1, 20) + JSON.stringify({ type: 'USER_INPUT', step_index: 21, created_at: iso, content: '<USER_REQUEST>\nagain\n</USER_REQUEST>' }) + '\n' + answer)
+  parentAt(BASE + 0.14)
+  childAt(BASE + 0.84)
+  assert.equal(agyOwnRows('pc-a', l.deps)[0]?.status, 'idle')
+  writeFileSync(l.transcript, base + message(K1, 20) + answer)
+  parentAt(BASE + 0.13)
+  // ⚠️ the children cannot all be listed now (a conversation folder being created): the row is not flipped for it
+  //    (agy review: every finished parent turned "idle"), but rule 7b does not ring on it (codex review)
+  const fresh = join(l.deps.home, '.gemini', 'antigravity-cli', 'brain', '3f0c1d2e-0000-4000-8000-00000000000f')
+  mkdirSync(fresh, { recursive: true })
+  // (the child that wrote after the answer is not exempt then: as before this exemption / codex review)
+  assert.equal(agyOwnRows('pc-a', l.deps)[0]?.status, 'idle')
+  assert.equal(agyChildrenSettledFor(A, l.deps), false)
+  rmSync(fresh, { recursive: true })
+  await new Promise((r) => setTimeout(r, 5))
+  assert.equal(agyOwnRows('pc-a', l.deps)[0]?.status, 'done')
+  assert.equal(agyChildrenSettledFor(A, l.deps), true)
+  // ★ the status line says `killed` (an earlier run of the same prompt, or killed after its own answer): judged by the
+  //   child's record, which ran to its answer — done (codex review: a retry under the same prompt lost the fix)
+  for (const f of [`pid-${PID}.json`, `session-${A}.json`]) {
+    writeFileSync(join(l.deps.dir, f), JSON.stringify({ ...raw, input: { ...raw.input, subagents: [{ name: 'self', role: 'ask', status: 'killed' }, { name: 'self', role: 'ask', status: 'completed' }] } }))
+    utimesSync(join(l.deps.dir, f), BASE + 2, BASE + 2)
+  }
+  assert.equal(agyOwnRows('pc-a', l.deps)[0]?.status, 'done')
+  for (const f of [`pid-${PID}.json`, `session-${A}.json`]) {
+    writeFileSync(join(l.deps.dir, f), JSON.stringify(raw))
+    utimesSync(join(l.deps.dir, f), BASE + 2, BASE + 2)
+  }
+  assert.equal(agyOwnRows('pc-a', l.deps)[0]?.status, 'done')
+  // ⚠️ another agent's message after the child's own answer (a worker's failure it had not answered): not done
+  const p0 = transcriptPathOf(K1, l.deps.home)
+  const kid = readFileSync(p0, 'utf8')
+  appendFileSync(p0, message(K2, 4))
+  childAt(BASE + 0.85)
+  assert.equal(agyOwnRows('pc-a', l.deps)[0]?.status, 'idle')
+  writeFileSync(p0, kid)
+  // ⚠️ a child that failed after its report: not done
+  writeFileSync(l.transcript, base + message(K1, 20) + answer)
+  parentAt(BASE + 0.15)
+  const p = transcriptPathOf(K1, l.deps.home)
+  appendFileSync(p, JSON.stringify({ type: 'ERROR_MESSAGE', step_index: 4, created_at: iso, error: 'quota' }) + '\n')
+  childAt(BASE + 0.84)
   assert.equal(agyOwnRows('pc-a', l.deps)[0]?.status, 'idle')
 })
 

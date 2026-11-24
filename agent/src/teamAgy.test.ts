@@ -146,12 +146,15 @@ test('★★ an agy card raised again with a new key (a state rewrite) is announ
   assert.match(told[0]!, /m1 \(agy\)|m1（agy）/)
   // ★ a notice that did not get through is tried again on the next change (agy review)
   const failing = { tell: async () => false, unique: async () => true }
-  void waitForDecision({ ...card('agy:third#1'), origin: 'agy:other-call' }, () => {}, { toolInput: { command: 'date' }, requestedAt: Date.now(), agyPid: ME })
+  void waitForDecision({ ...card('agy:third#1'), origin: 'agy:other-call', subagent: {} }, () => {}, { toolInput: { command: 'date' }, requestedAt: Date.now(), agyPid: ME })
   agyCardsChanged(failing)
   await new Promise((res) => setTimeout(res, 30))
   agyCardsChanged(deps)
   await new Promise((res) => setTimeout(res, 30))
   assert.equal(told.length, 2)
+  // ★ a subagent's card says so (the phone's card does; the leader could not tell / 2026-11-23)
+  assert.doesNotMatch(told[0]!.split('\n')[0]!, /subagent|サブエージェント/)
+  assert.match(told[1]!.split('\n')[0]!, /from a subagent|サブエージェントから/)
   resetPending()
 })
 

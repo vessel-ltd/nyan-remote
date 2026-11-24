@@ -81,6 +81,11 @@ export function requestRef(key: string): string {
   return `r${createHash('sha256').update(key, 'utf8').digest('hex').slice(0, 10)}`
 }
 
+/** ★ Said when a card comes from the member's subagent (the phone's card says so too; the leader's notice did not) */
+export function fromSubagent(info: Pick<PermissionRequest, 'subagent'>): string {
+  return info.subagent ? t(' — サブエージェントから', ' — from a subagent') : ''
+}
+
 /**
  * ★ A card's ref. An agy card's is made from its origin, not its key (measured 2026-11-23: agy rewrote its state file
  *   right after the leader was told, the same call came back under a new key, and the ref in the notice no longer
@@ -418,8 +423,8 @@ export function announceToLeader(info: PermissionRequest): void {
     if (!(await memberUnique(found.member))) return
     const lines = [
       t(
-        `[nyan-team] ${found.member.name} が承認を待っています（${oneLineData(info.toolName)}）`,
-        `[nyan-team] ${found.member.name} is waiting for an approval (${oneLineData(info.toolName)})`,
+        `[nyan-team] ${found.member.name} が承認を待っています（${oneLineData(info.toolName)}）${fromSubagent(info)}`,
+        `[nyan-team] ${found.member.name} is waiting for an approval (${oneLineData(info.toolName)})${fromSubagent(info)}`,
       ),
       // ★ The whole input the leader may answer (already bounded by `cardText`; never cut again / r10 medium #1)
       asMemberData(found.member, cardText(info).text, Number.POSITIVE_INFINITY),
@@ -552,8 +557,8 @@ function cardsChangedFor(tool: 'codex' | 'agy', deps: AnnounceDeps): void {
           found.team,
           [
             t(
-              `[nyan-team] ${found.member.name}（${toolTag(found.member)}）が承認を待っています（${oneLineData(now.toolName)}）`,
-              `[nyan-team] ${found.member.name} (${toolTag(found.member)}) is waiting for an approval (${oneLineData(now.toolName)})`,
+              `[nyan-team] ${found.member.name}（${toolTag(found.member)}）が承認を待っています（${oneLineData(now.toolName)}）${fromSubagent(now)}`,
+              `[nyan-team] ${found.member.name} (${toolTag(found.member)}) is waiting for an approval (${oneLineData(now.toolName)})${fromSubagent(now)}`,
             ),
             asMemberData(found.member, cardText(now).text, Number.POSITIVE_INFINITY),
             howToAnswer(found.member, now),

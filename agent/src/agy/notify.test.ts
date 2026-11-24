@@ -5,7 +5,7 @@ import { AgyNotifier, QUIET_UNSURE_MAX } from './notify.ts'
 
 const A = '062a8f25-9451-42f3-ae93-34a208e99365'
 
-function rig(opts: { quiet?: (sessionId: string, card: string) => boolean | undefined | Promise<boolean | undefined> } = {}) {
+function rig(opts: { quiet?: (sessionId: string, card: string) => boolean | undefined | Promise<boolean | undefined>; settled?: () => boolean } = {}) {
   let status: SessionStatus | undefined = 'idle'
   let wrote = '2026-11-20T00:00:10Z'
   let records: Record<string, unknown>[] = []
@@ -28,6 +28,7 @@ function rig(opts: { quiet?: (sessionId: string, card: string) => boolean | unde
     tail: () => records,
     now: () => clock,
     ...(opts.quiet ? { quiet: opts.quiet } : {}),
+    ...(opts.settled ? { childrenSettled: opts.settled } : {}),
   })
   return {
     n,
@@ -934,6 +935,154 @@ test('★ a "needs you" is judged by its card, not the turn: a newer look readin
   // two looks at once: the first is judged against the newer one
   await Promise.all([n.look(), n.look()])
   assert.deepEqual(sent, ['要対応'])
+})
+
+test('★★ "idle" then "done" on the same answer (a child\'s closing record became readable) rings "done" once (codex review)', async () => {
+  let settled = true
+  const r = rig({ settled: () => settled })
+  r.set('working', asking(0))
+  await r.n.look()
+  r.tick(5_000)
+  const answered = [user(0), { step_index: 1, type: 'PLANNER_RESPONSE', content: 'You chose Blue.', created_at: new Date(1_000).toISOString() }]
+  r.set('idle', answered)
+  await r.n.look()
+  assert.equal(r.sent.length, 0)
+  r.tick(5_000)
+  r.set('done', answered)
+  await r.n.look()
+  assert.deepEqual(r.sent.map((f) => f.label), ['完了'])
+  // a flap back and forth on that answer does not ring it again
+  r.tick(5_000)
+  r.set('idle', answered)
+  await r.n.look()
+  r.tick(5_000)
+  r.set('done', answered)
+  await r.n.look()
+  assert.equal(r.sent.length, 1)
+  // ⚠️ the same flip while the children are not confirmed to have finished well (a failed child gone from the index):
+  //    not rung (codex review)
+  settled = false
+  const r3 = rig({ settled: () => settled })
+  r3.set('working', asking(0))
+  await r3.n.look()
+  r3.tick(5_000)
+  r3.set('idle', answered)
+  await r3.n.look()
+  r3.tick(5_000)
+  r3.set('done', answered)
+  await r3.n.look()
+  assert.equal(r3.sent.length, 0)
+  settled = true
+  // ⚠️ an old turn's answer read `idle` from the start (an agent restart), or `done → idle → done`, is not armed: the
+  //    flip of an old turn does not ring (agy review)
+  const r4 = rig({ settled: () => true })
+  // (the answer is well before the first look: rule 7 does not take it as new)
+  r4.tick(60_000)
+  r4.set('idle', answered)
+  await r4.n.look()
+  r4.tick(5_000)
+  r4.set('done', answered)
+  await r4.n.look()
+  r4.tick(5_000)
+  r4.set('idle', answered)
+  await r4.n.look()
+  r4.tick(5_000)
+  r4.set('done', answered)
+  await r4.n.look()
+  assert.equal(r4.sent.length, 0)
+  // ★ a whole new turn between two looks, first seen `idle` (a child's closing record pending), then `done`: rung
+  //   (codex review)
+  const r5 = rig({ settled: () => true })
+  r5.tick(60_000)
+  r5.set('done', answered)
+  await r5.n.look()
+  r5.tick(60_000)
+  const next = [...answered, user(2), { step_index: 3, type: 'PLANNER_RESPONSE', content: 'You chose Cat.', created_at: new Date(3_000).toISOString() }]
+  r5.set('idle', next, '2026-11-20T00:05:00Z')
+  await r5.n.look()
+  r5.tick(5_000)
+  r5.set('done', next)
+  await r5.n.look()
+  assert.deepEqual(r5.sent.map((f) => f.label), ['完了'])
+  // ★ a conversation's first turn, first seen already over (`idle`), then `done`: rung if its prompt came after the
+  //   previous look (codex review)
+  const r6 = rig({ settled: () => true })
+  r6.set(undefined)
+  await r6.n.look()
+  r6.tick(Date.parse('2026-11-20T00:00:30Z'))
+  r6.set('idle', answered, '2026-11-20T00:00:40Z')
+  await r6.n.look()
+  r6.tick(5_000)
+  r6.set('done', answered)
+  await r6.n.look()
+  assert.deepEqual(r6.sent.map((f) => f.label), ['完了'])
+  // ⚠️ …but not one whose prompt is older than the previous look (an old conversation appearing)
+  const r7 = rig({ settled: () => true })
+  r7.tick(Date.parse('2026-11-21T00:00:00Z'))
+  r7.set(undefined)
+  await r7.n.look()
+  r7.tick(5_000)
+  r7.set('idle', answered, '2026-11-20T00:00:40Z')
+  await r7.n.look()
+  r7.tick(5_000)
+  r7.set('done', answered)
+  await r7.n.look()
+  assert.equal(r7.sent.length, 0)
+  // ★ a `working` look whose transcript gave no turn (not written yet, or unreadable), then `idle`, then `done`: armed by
+  //   the working look (agy review)
+  const r8 = rig({ settled: () => true })
+  r8.tick(Date.parse('2026-11-22T00:00:00Z'))
+  r8.set('working', [])
+  await r8.n.look()
+  r8.tick(5_000)
+  r8.set('idle', answered, '2026-11-22T00:00:04Z')
+  await r8.n.look()
+  r8.tick(5_000)
+  r8.set('done', answered)
+  await r8.n.look()
+  assert.deepEqual(r8.sent.map((f) => f.label), ['完了'])
+  // ★ an `idle` row with no turn, then a look that sees the first prompt while the state is still the old one (not
+  //   this turn's yet): the turn is not taken as known, so its end seen `idle` then `done` rings (codex review)
+  const r9 = rig({ settled: () => true })
+  r9.tick(Date.parse('2026-11-19T23:59:50Z'))
+  r9.set('idle', [], '2026-11-19T23:59:00Z')
+  await r9.n.look()
+  // (…and the same when the conversation was not listed at all before: codex review)
+  const r10 = rig({ settled: () => true })
+  r10.tick(Date.parse('2026-11-19T23:59:50Z'))
+  r10.set(undefined)
+  await r10.n.look()
+  r10.tick(9_000)
+  r10.set('idle', [user(0)], '2026-11-19T23:59:00Z')
+  await r10.n.look()
+  r10.tick(60_000)
+  r10.set('idle', answered, '2026-11-20T00:00:40Z')
+  await r10.n.look()
+  r10.tick(5_000)
+  r10.set('done', answered)
+  await r10.n.look()
+  assert.deepEqual(r10.sent.map((f) => f.label), ['完了'])
+  r9.tick(9_000)
+  r9.set('idle', [user(0)], '2026-11-19T23:59:00Z')
+  await r9.n.look()
+  r9.tick(60_000)
+  r9.set('idle', answered, '2026-11-20T00:00:40Z')
+  await r9.n.look()
+  r9.tick(5_000)
+  r9.set('done', answered)
+  await r9.n.look()
+  assert.deepEqual(r9.sent.map((f) => f.label), ['完了'])
+  // ⚠️ another answer than the one the idle look stood on is not this rule's (rule 7 decides it by time)
+  const r2 = rig({ settled: () => true })
+  r2.set('working', asking(0))
+  await r2.n.look()
+  r2.tick(5_000)
+  r2.set('idle', answered)
+  await r2.n.look()
+  r2.tick(60_000)
+  r2.set('done', [user(0), { step_index: 3, type: 'PLANNER_RESPONSE', content: 'Old.', created_at: new Date(2_000).toISOString() }])
+  await r2.n.look()
+  assert.equal(r2.sent.length, 0)
 })
 
 test('★ "idle" (its children outlived its answer) to "done" rings "done" when the new answer is newer than the last look', async () => {

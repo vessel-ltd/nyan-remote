@@ -622,6 +622,7 @@ export async function teamPending(ctx: Ctx): Promise<unknown> {
       // ⚠️ Said, never dropped: what cannot be shown whole is the human's to answer; hidden characters are marked
       ...(shown.clipped || info.detailClipped ? { clipped: true } : {}),
       ...(info.hidden ? { hidden: true } : {}),
+      ...(info.subagent ? { subagent: true } : {}),
       ...(info.interaction?.kind === 'question'
         ? {
             questions: info.interaction.questions.map((q) => ({
