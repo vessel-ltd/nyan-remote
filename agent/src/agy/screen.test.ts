@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
-import { approvalChoicesShown, approvalShows, childViewOf, dialogFits, inChildView, inputBoxOf, inputRowOf, listAgy, listFocused, parseApproval, parseBanner, parseDialog, parseSubagentList, readAgyScreen, respondOffered, slashPicked, viewOwnerOf, sameQuestionText, showsQuestion } from './screen.ts'
+import { approvalChoicesShown, approvalShows, ownApprovalShows, rowsShowCommand, childViewOf, dialogFits, inChildView, inputBoxOf, inputRowOf, listAgy, listFocused, parseApproval, parseBanner, parseDialog, parseSubagentList, readAgyScreen, respondOffered, slashPicked, viewOwnerOf, sameQuestionText, showsQuestion } from './screen.ts'
 
 // ★ Screens as the relay rebuilt them from agy 1.5.13 (2026-11-21), trimmed
 const batch = [
@@ -359,4 +359,30 @@ test('★ a subagent approval as measured (1.5.16): its command, its two choices
   assert.equal(approvalChoicesShown(v16.childApprovalOpen.replace('2. No, deny', '2. Yes, always')), false)
   // the open dialog's footer is its own: the owner is read from the header
   assert.deepEqual(viewOwnerOf(v16.childApprovalOpen), { child: '1788a5a6-a988-4356-bcaf-5f50e974aa73' })
+})
+
+// ★ The parent's own command approval with a subagent running (agy 1.5.16, measured 2026-11-25), trimmed
+const parentOwn = "> Do not wait for the subagent. Run the shell command `echo parent-own` yourself with run_command now and tell me the output.\n\n● Ran (echo parent-own) (ctrl+o to expand)\n\n ┃ self needs approval for Bash\n ┃ ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\n ┃\n ┃ ● Bash(echo stuck-again)\n ┃\n ┃ ctrl+k approve\nCommand\n──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\n\nRequesting permission for:\n   echo parent-own\n\nRun this command?\n> 1. Yes, run command\n  2. Yes, and always allow in this conversation for commands that start with 'echo'\n  3. Yes, and always allow for commands that start with 'echo' (Persist to settings.json)\n  4. No, cancel\n\n  ↑/↓ Navigate · tab Amend · ctrl+g edit/expand command\nesc to cancel                                                                                      accept-edits · Gemini 4 Neon · high · 1 subagent(s)"
+
+test('★ the parent\'s own approval with a subagent running (1.5.16): its command, on the parent\'s view, under the child\'s banner', () => {
+  assert.equal(ownApprovalShows(parentOwn, 'echo parent-own'), true)
+  assert.equal(ownApprovalShows(parentOwn, 'echo stuck-again'), false, 'the banner\'s command is the child\'s')
+  assert.equal(ownApprovalShows(parentOwn.replace('> 1. Yes, run command', '> 1. Yes, approve'), 'echo parent-own'), false)
+  assert.equal(ownApprovalShows(parentOwn.replace(/esc to cancel/, 'esc back'), 'echo parent-own'), false)
+  assert.equal(ownApprovalShows(v16.childApprovalOpen, 'echo alpha-cmd'), false, 'a child\'s dialog is not the parent\'s')
+})
+
+test('★ a command on the screen: spaces inside a row count, a wrap may or may not be a space (codex review)', () => {
+  assert.equal(rowsShowCommand(['mv \'releasedraft\' staging/'], "mv 'release draft' staging/"), false)
+  assert.equal(rowsShowCommand(["mv 'release draft' staging/"], "mv 'release draft' staging/"), true)
+  assert.equal(rowsShowCommand(['echo alpha-', 'cmd'], 'echo alpha-cmd'), true, 'wrapped inside a word')
+  assert.equal(rowsShowCommand(['echo', 'alpha'], 'echo alpha'), true, 'wrapped at a space')
+  assert.equal(rowsShowCommand(['echo', 'alpha'], 'echoalpha'), true, '(either is allowed at a wrap)')
+  assert.equal(rowsShowCommand(['mv "release  draft" staging/'], 'mv "release draft" staging/'), false, 'every space counts')
+  assert.equal(rowsShowCommand(['mv "release  draft" staging/'], 'mv "release  draft" staging/'), true)
+  assert.equal(rowsShowCommand(['echo alpha', 'echo beta'], 'echo alpha\necho beta'), true, 'a command of two lines (codex review)')
+  assert.equal(rowsShowCommand(['rm -rf bu…'], 'rm -rf build'), true, 'cut short')
+  assert.equal(rowsShowCommand(['rm -rf bu…'], 'rm -rf /'), false)
+  assert.equal(rowsShowCommand(['a.c'], 'abc'), false, 'no pattern characters')
+  assert.equal(rowsShowCommand([], 'ls'), false)
 })

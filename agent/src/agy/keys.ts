@@ -52,7 +52,7 @@ import {
 } from '../claude/keys.ts'
 import { callBeforeState, readTailRecords, turnEnd, type PendingCall } from './pending.ts'
 import { parseAgyQuestion, questionTextsOf, type AgyAnswerPlan, type AgyQuestion, type AgyStep } from './questions.ts'
-import { approvalChoicesShown, approvalShows, childViewOf, dialogFits, inChildView, inputBoxOf, inputRowOf, listAgy, listFocused, noteUnlisted, parseApproval, previewAsks, parseBanner, parseSubagentList, respondOffered, slashPicked, viewOwnerOf, parseDialog, readAgyScreen, sameQuestionText, showsQuestion, type FooterHint, type ScreenDialog } from './screen.ts'
+import { approvalChoicesShown, approvalShows, ownApprovalShows, childViewOf, dialogFits, inChildView, inputBoxOf, inputRowOf, listAgy, listFocused, noteUnlisted, parseApproval, previewAsks, parseBanner, parseSubagentList, respondOffered, slashPicked, viewOwnerOf, parseDialog, readAgyScreen, sameQuestionText, showsQuestion, type FooterHint, type ScreenDialog } from './screen.ts'
 import {
   AGY_PREFIX,
   AGY_QUESTION_TOOL,
@@ -1008,21 +1008,29 @@ export function sameCardNow(
     shared: (conversationId: string, pid: number, since: number) => boolean | undefined
     tail?: (path: string) => Record<string, unknown>[]
   },
+  /**
+   * ★ Children running are allowed (agy 1.5.16 with the screen: the answer checks the parent's own dialog on it before
+   *   the key / `answerAgyCard`). Off ⇒ a child running refuses, as before.
+   */
+  withChildren = false,
+  /** ★ The slow probes too (the lock, another agy on it); off right before a key checked against the screen */
+  slow = true,
 ): boolean {
   // ⚠️ The slow checks first (`lsof` on a Mac can take a while), the file reads last: the state the key acts on is the
   //    one read right before it (codex review)
   // ★★ agy's own word that this process shows this conversation (`cards.ts` rule 8)
-  if (!checks.holdsLock(mark.pid, target.conversationId)) return false
+  if (slow && !checks.holdsLock(mark.pid, target.conversationId)) return false
   // ⚠️ Another agy on the same conversation (now, or during this card): the last call could be its (`cards.ts` rule 7)
   // (cannot tell counts as shared here: nothing is typed on a guess)
-  if (checks.shared(target.conversationId, mark.pid, mark.callAt) !== false) return false
+  if (slow && checks.shared(target.conversationId, mark.pid, mark.callAt) !== false) return false
   const p = turnEnd((checks.tail ?? readTailRecords)(target.transcript)).pending
   if (p === undefined || p.step !== mark.step || p.index !== mark.index || p.at !== mark.callAt) return false
   // ★ The state file last of all (the transcript read can take a moment / codex review)
   const f = readAgyPidFile(target.dir, mark.pid)
   if (!f || f.state.conversationId !== target.conversationId || !f.state.confirmationPending) return false
-  // ★ A child agent not finished: its question may be open on the PC and would take the key (docs/AGY.md §11)
-  if (f.state.subagentsActive) return false
+  // ★ A child agent not finished: its question may be open on the PC and would take the key (docs/AGY.md §11) — unless
+  //   the answer reads the screen (`withChildren`)
+  if (f.state.subagentsActive && !withChildren) return false
   if (f.mtimeMs !== mark.stateMtimeMs || f.mtimeMs < target.pane.startedAt) return false
   // ★ `cards.ts` rule 9: the call is not newer than this agy's "card is up" state
   return callBeforeState(p, f.mtimeMs)
@@ -1053,24 +1061,47 @@ export async function answerAgyCard(
     const pane = await agyPaneOf(mark.pid, deps.aliveProcStart)
     if (typeof pane === 'string') return { ok: false, reason: pane }
     const target = { conversationId: conv, pid: mark.pid, pane, dir: deps.dir, transcript: transcriptPathOf(conv, deps.home) }
+    // ★★ Subagents running (agy 1.5.16+ with the screen): the key only once the parent's own dialog is seen open on the
+    //    parent's view for this very command (`ownApprovalShows` / docs/AGY.md §19): a child's question or approval
+    //    that could take the key is then not what is open. ⚠️ Any other agy: refused while children run, as before
+    const first = readAgyPidFile(target.dir, mark.pid)
+    const withChildren = first?.state.subagentsActive === true && pane.screen && listAgy(first.state.version)
+    const commandNow = (): string | undefined => {
+      const p = turnEnd(tail(target.transcript)).pending
+      const c = p?.name === 'run_command' ? p.args['CommandLine'] : undefined
+      return typeof c === 'string' && c !== '' ? c : undefined
+    }
     // ⚠️ The slow probes (a Mac's `lsof`) made without blocking the agent, just before each check (agy review)
-    if (!sameCardNow(target, mark, await probedChecks(deps, tail, mark.pid))) return { ok: false, reason: 'changed' }
+    if (!sameCardNow(target, mark, await probedChecks(deps, tail, mark.pid), withChildren)) return { ok: false, reason: 'changed' }
     await new Promise((r) => setTimeout(r, deps.answerSettleMs ?? AGY_ANSWER_SETTLE_MS))
     // ★ The PC left on a subagent's view: back to the parent's first (there `1` is dropped and ESC only goes back —
     //   the card would be neither allowed nor declined / agy review)
-    if (pane.screen) {
+    // ⚠️ Not with children running: the key goes only to the parent's own dialog seen on the parent's view below — an
+    //    ESC taking the PC back first could land on a child's question opened meanwhile (codex review)
+    if (pane.screen && !withChildren) {
       const before = await probedChecks(deps, tail, mark.pid)
       // ⚠️ `stillWanted` (slow on a Mac) first, the card last (codex review, as before the key below)
-      const left = await leaveChildView({ ...target, stateFile: '' }, deps, () => (stillWanted === undefined || stillWanted()) && sameCardNow(target, mark, before))
+      const left = await leaveChildView({ ...target, stateFile: '' }, deps, () => (stillWanted === undefined || stillWanted()) && sameCardNow(target, mark, before, withChildren))
       if (left !== 'ok') return { ok: false, reason: 'changed' }
     }
     const checks = await probedChecks(deps, tail, mark.pid)
+    if (withChildren) {
+      // ★ Every slow check before the screen is read, only the file reads between it and the key (codex review: a
+      //   process probe after the screen check left a moment for a child's dialog to open under the key)
+      if ((stillWanted !== undefined && !stillWanted()) || !sameCardNow(target, mark, checks, true)) return { ok: false, reason: 'changed' }
+      const command = commandNow()
+      const shown = command === undefined ? undefined : await (deps.readScreen ?? ((p: string) => readAgyScreen(p)))(pane.socketPath)
+      if (command === undefined || shown === undefined || !ownApprovalShows(shown, command)) return { ok: false, reason: 'changed' }
+      const res = await writeControl(pane.socketPath, AGY_CARD_KEYS[behavior], { beforeWrite: () => !sameCardNow(target, mark, checks, true, false) })
+      if (res.ok) return { ok: true }
+      return { ok: false, reason: res.reason === 'pending-approval' ? 'changed' : 'unreachable' }
+    }
     const res = await writeControl(pane.socketPath, AGY_CARD_KEYS[behavior], {
       // ⚠️ The slow lock probes are done above (`checks`). `stillWanted` first — a team's guard probes processes (`ps` on
       //    a Mac) — and the card itself last, right before the byte (codex review: a card answered on the PC during
       //    those probes got the team's queued key)
       // ★ …and once more after it: still wanted when the card check (its own process probes) ends (codex review)
-      beforeWrite: () => (stillWanted !== undefined && !stillWanted()) || !sameCardNow(target, mark, checks) || (stillWanted !== undefined && !stillWanted()),
+      beforeWrite: () => (stillWanted !== undefined && !stillWanted()) || !sameCardNow(target, mark, checks, withChildren) || (stillWanted !== undefined && !stillWanted()),
     })
     if (res.ok) return { ok: true }
     return { ok: false, reason: res.reason === 'pending-approval' ? 'changed' : 'unreachable' }

@@ -3369,3 +3369,31 @@ test('★ subagent approval: a view the walk opened and left, opened again by th
   assert.deepEqual([fake.view, fake.childId], ['child', K2])
   assert.deepEqual(fake.keys, ['\x1b[B', '\r', '\x1b', '\x1b[B'], 'no ESC of cleanup into their view')
 })
+
+test('★★ a parent\'s own card with a child running (1.5.16): typed only once its dialog is seen open for this command', async (t) => {
+  const rule = '─'.repeat(40)
+  const dialog = (command: string): string =>
+    [' ┃ self needs approval for Bash', ' ┃', ' ┃ ● Bash(echo child)', ' ┃ ctrl+k approve', 'Command', rule, 'Requesting permission for:', `   ${command}`, 'Run this command?', '> 1. Yes, run command', '  4. No, cancel', 'esc to cancel                                        accept-edits · Gemini 4 Neon · high · 1 subagent(s)'].join('\n')
+  const childView = '  main › self\n  ● running · Gemini 4 Neon (High) · 9s · 3 steps\n  ID: 15bc1e2a-6a62-4f86-9bf9-dd03e99f6627\n  ↑/↓ scroll · shift+k kill · esc back'
+  for (const [version, shown, want] of [
+    ['1.5.16', dialog('make'), '1'],
+    // ⚠️ the PC on a child's view: nothing pressed (not even an ESC to go back / codex review)
+    ['1.5.16', childView, ''],
+    ['1.5.16', dialog('make clean'), ''],
+    ['1.5.15', dialog('make'), ''],
+  ] as const) {
+    const l = await lab(t)
+    // (the viewed child asks nothing: an ESC to go back would be allowed there — never sent with children running)
+    idleChild(l, K1)
+    appendFileSync(l.transcript, JSON.stringify({ step_index: 1, type: 'PLANNER_RESPONSE', created_at: new Date((BASE - 60) * 1000).toISOString(), tool_calls: [{ name: 'run_command', args: { CommandLine: 'make' } }] }) + '\n')
+    utimesSync(l.transcript, BASE - 50, BASE - 50)
+    l.setState({ agent_state: 'tool_use', tool_confirmation_pending: true, version, subagents: [{ name: 'self', status: 'running' }] })
+    const pane = join(l.root, 'panes', `${PID}.json`)
+    writeFileSync(pane, JSON.stringify({ ...JSON.parse(readFileSync(pane, 'utf8')), screen: true }))
+    const mark = { pid: PID, stateMtimeMs: BASE * 1000, step: 1, index: 0, callAt: (BASE - 60) * 1000 }
+    const res = await answerAgyCard(A, mark, 'allow', { ...l.deps, answerSettleMs: 0, readScreen: async () => shown })
+    assert.deepEqual(res, want === '1' ? { ok: true } : { ok: false, reason: 'changed' }, `${version} ${shown.includes('make clean') ? 'other command' : ''}`)
+    await settle()
+    assert.equal(l.got.join(''), want)
+  }
+})

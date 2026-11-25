@@ -48,7 +48,7 @@ import { agyLocksOf, agyPaneOf, withLocksProbed, agyPidFiles, agyRow, agyShared,
 import { callBeforeState, readTailRecords, turnEnd, type PendingCall } from './pending.ts'
 import type { AgyCardFailure, AgyCardMark, AgyChildApprovalMark, AgyQuestionAnswer, AgyQuestionFailure, AgyQuestionMark } from './keys.ts'
 import { agyQuestionInteraction, parseAgyQuestion, questionTextsOf, skipSteps, type AgyAnswerPlan, type AgyQuestion, type AgyStep } from './questions.ts'
-import { agyUnlisted, childViewOf, dialogFits, inChildView, inputBoxOf, listAgy, parseApproval, previewAsks, respondOffered, parseBanner, parseDialog, parseSubagentList, readAgyScreen, sameQuestionText, viewOwnerOf } from './screen.ts'
+import { agyUnlisted, ownApprovalShows, childViewOf, dialogFits, inChildView, inputBoxOf, listAgy, parseApproval, previewAsks, respondOffered, parseBanner, parseDialog, parseSubagentList, readAgyScreen, sameQuestionText, viewOwnerOf } from './screen.ts'
 import { AGY_QUESTION_TOOL, agyBlockedReadAt, agyBlockedWaits, agyCardAt, agyChildQuestions, agyPendingCall, agyQuestionAt, agyQuestionWaitAt } from './sessions.ts'
 
 /** ★ The calls whose card was measured, as the tool and input the card helpers know. undefined = stays on the PC */
@@ -389,7 +389,7 @@ export class AgyCards {
     // ⚠️ Locks probed all at once without blocking (a Mac's `lsof` / `withLocksProbed`)
     const deps = await withLocksProbed(this.#deps.agy())
     void sweepAgyPidFiles(deps)
-    const want = new Map<string, { state: AgyState; mark: AgyCardMark; call: PendingCall; relayAt: number }>()
+    const want = new Map<string, { state: AgyState; mark: AgyCardMark; call: PendingCall; relayAt: number; children?: true }>()
     const shared = new Set<string>()
     const unsure = new Set<string>()
     // ★ Each agy's own state file (a second agy on the conversation can neither take the card over nor hide it)
@@ -397,9 +397,12 @@ export class AgyCards {
       if (!deps.isAgy(pid)) continue
       const f = readAgyPidFile(deps.dir, pid)
       if (!f?.state.confirmationPending) continue
-      // ★ A child agent not finished: no card on the phone and no auto-answer (its question may be open on the PC and
-      //   would take the `1` or the ESC / docs/AGY.md §11). The card stays on the PC and rings as any waiting row.
-      if (f.state.subagentsActive) continue
+      // ★ A child agent not finished: its question may be open on the PC and would take the `1` or the ESC (docs/AGY.md
+      //   §11) ⇒ no card — except on agy 1.5.16+ with the screen, where the parent's own dialog is read open on the
+      //   parent's view for this command (`ownApprovalShows`), here and again right before the key (`answerAgyCard`).
+      //   ⚠️ Never auto-answered then (the phone or a team's leader only). The card stays on the PC otherwise.
+      const children = f.state.subagentsActive
+      if (children && !listAgy(f.state.version)) continue
       const conv = f.state.conversationId
       // Rule 1: only an agy whose relay checks out (the pane's process is this agy)
       const pane = await agyPaneOf(pid, deps.aliveProcStart ?? aliveProcStartSync)
@@ -410,6 +413,7 @@ export class AgyCards {
         continue
       }
       if (typeof pane === 'string' || f.mtimeMs < pane.startedAt) continue
+      if (children && !pane.screen) continue
       // ★★ agy's own word that this process shows this conversation (rule 8)
       const locksOf = deps.locksOf ?? ((p: number) => agyLocksOf(p, deps.home))
       const locks = locksOf(pid)
@@ -442,6 +446,17 @@ export class AgyCards {
       const transcriptAt = before && after && before.mtimeMs === after.mtimeMs && before.size === after.size ? after.mtimeMs : undefined
       // ★ Rule 9: the call must be older than this agy's "card is up" state
       if (!end.pending || !callBeforeState(end.pending, f.mtimeMs)) continue
+      if (children) {
+        const command = end.pending.name === 'run_command' ? end.pending.args['CommandLine'] : undefined
+        if (typeof command !== 'string' || command === '') continue
+        const shown = await (this.#deps.readScreen ?? readAgyScreen)(pane.socketPath)
+        // (a screen that cannot be read now: cannot tell — a card up stays as it is / agy review)
+        if (shown === undefined) {
+          unsure.add(conv)
+          continue
+        }
+        if (!ownApprovalShows(shown, command)) continue
+      }
       // Rule 7: another agy shows it too, or wrote into it during this card ⇒ the card could be the other one's
       const sharedNow = want.has(conv) || agyShared(deps.dir, conv, pid, deps.isAgy, locksOf, end.pending.at!)
       if (sharedNow === undefined) {
@@ -459,6 +474,7 @@ export class AgyCards {
         mark: { pid, stateMtimeMs: f.mtimeMs, step: end.pending.step, index: end.pending.index, callAt: end.pending.at! },
         call: end.pending,
         relayAt: pane.startedAt,
+        ...(children ? { children: true as const } : {}),
       })
     }
     for (const conv of shared) want.delete(conv)
@@ -517,7 +533,7 @@ export class AgyCards {
       // ⚠️ Once per call: a call still up after its try (a status rewrite such as a resize gives it a new mark) is the
       //    phone's, never typed at again (codex review: a byte the relay dropped, then a resize, typed `1` twice)
       const call = `${conv}:${callId(w.mark)}`
-      if (!this.#onPhone.has(call) && !this.#autoTried.has(call) && mine(owner) && shouldAutoApprove(info, this.#deps.now().getTime())) {
+      if (!w.children && !this.#onPhone.has(call) && !this.#autoTried.has(call) && mine(owner) && shouldAutoApprove(info, this.#deps.now().getTime())) {
         this.#autoTried.add(call)
         this.#answered.set(conv, id)
         this.#auto.set(conv, { id, card: cardName(conv, w.mark) })
@@ -1130,6 +1146,18 @@ export class AgyCards {
     settle(res)
     // ⚠️ One line, no command text (the card and the PC's screen are the only traces of it)
     this.#deps.log?.(`[agy] card ${behavior} conversation=${conv.slice(0, 8)} ${res.ok ? 'typed' : `not typed (${res.reason})`}`)
+    // ★ Answered with children running: a subagent's wait still up from before (an approval, a question) rings again
+    //   once this card is gone — opening the alert for this card dismissed it, and the older wait's name does not ring
+    //   by itself (codex · agy review)
+    if (res.ok) {
+      setTimeout(() => {
+        const deps = this.#deps.agy()
+        const f = readAgyPidFile(deps.dir, mark.pid)
+        if (!f || f.state.confirmationPending || !f.state.subagentsActive) return
+        const at = agyQuestionWaitAt(f.state, f.mtimeMs, deps.home)
+        if (at !== undefined && at < started) this.#deps.reraised?.(conv, new Date(at).toISOString())
+      }, this.#deps.unconfirmedMs ?? UNCONFIRMED_MS).unref?.()
+    }
     if (!res.ok) {
       // Rule 4: not typed ⇒ the card may come back on the next look (if it is still up)
       if (this.#answered.get(conv) === raised.id) this.#answered.delete(conv)

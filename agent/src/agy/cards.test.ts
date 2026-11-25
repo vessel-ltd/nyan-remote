@@ -547,6 +547,59 @@ test('★★ a child agent running: no card on the phone and no auto-answer (its
   assert.equal(l.answers.length, 1)
 })
 
+test('★★ agy 1.5.16 with the screen: the parent\'s own card with a child running comes to the phone when its dialog is seen open; never auto-answered', async (t) => {
+  const l = lab(t)
+  await autoOn(t)
+  const rule = '─'.repeat(40)
+  const dialog = (command: string): string =>
+    [' ┃ self needs approval for Bash', ' ┃', ' ┃ ● Bash(echo child)', ' ┃ ctrl+k approve', 'Command', rule, 'Requesting permission for:', `   ${command}`, 'Run this command?', '> 1. Yes, run command', '  2. Yes, and always allow in this conversation', '  4. No, cancel', '  ↑/↓ Navigate · tab Amend', 'esc to cancel                                        accept-edits · Gemini 4 Neon · high · 1 subagent(s)'].join('\n')
+  let shown = dialog('ls')
+  const root = join(l.deps.agy().dir, '..')
+  const pane = join(root, 'panes', `${PID}.json`)
+  writeFileSync(pane, JSON.stringify({ ...JSON.parse(readFileSync(pane, 'utf8')), screen: true }))
+  const deps: AgyCardDeps = { ...l.deps, unconfirmedMs: 10_000, readScreen: async () => shown }
+  l.setState({ subagents: [{ name: 'self', status: 'running' }], version: '1.5.16' })
+  resetPending()
+  const cards = new AgyCards(deps)
+  await cards.sync()
+  await settle()
+  assert.deepEqual(agyCards().map((c) => c.summary), ['ls'], 'on the phone')
+  assert.equal(l.answers.length, 0, 'not auto-answered while a child runs')
+  // the screen shows another command's dialog (a child's banner only, the parent's for something else): no card
+  shown = dialog('rm -rf build')
+  resetPending()
+  await new AgyCards(deps).sync()
+  assert.equal(agyCards().length, 0)
+  // ⚠️ an older agy (no screen check there): none, as before
+  shown = dialog('ls')
+  l.setState({ subagents: [{ name: 'self', status: 'running' }], version: '1.5.15' })
+  resetPending()
+  await new AgyCards(deps).sync()
+  assert.equal(agyCards().length, 0)
+  // ★ a screen that cannot be read for a moment keeps the card up (agy review)
+  l.setState({ subagents: [{ name: 'self', status: 'running' }], version: '1.5.16' })
+  resetPending()
+  let unreadable = false
+  const rung: string[] = []
+  const c2 = new AgyCards({ ...deps, readScreen: async () => (unreadable ? undefined : shown), unconfirmedMs: 40, reraised: (conv, card) => rung.push(card) })
+  await c2.sync()
+  assert.equal(agyCards().length, 1)
+  unreadable = true
+  await c2.sync()
+  assert.equal(agyCards().length, 1, 'kept')
+  unreadable = false
+  // ★ answered, and a subagent's approval waiting from before: rung again once the card is gone (codex · agy review)
+  resetAgyBlockedForTest()
+  noteAgyBlocked(A, PID, 1, (BASE - 30) * 1000)
+  t.after(() => resetAgyBlockedForTest())
+  answer(agyCards()[0]!.key, 'allow')
+  await settle()
+  l.setState({ subagents: [{ name: 'self', status: 'running' }], version: '1.5.16', tool_confirmation_pending: false, agent_state: 'idle' }, BASE + 1)
+  await new Promise((r) => setTimeout(r, 100))
+  // (the card's own 4c check also rings here: no look ran since the key in this test)
+  assert.ok(rung.includes(new Date((BASE - 30) * 1000).toISOString()), rung.join(','))
+})
+
 test('★★ auto-approve: a key that does not land sends that card to the phone (and rings it); it is not typed again', async (t) => {
   const l = lab(t)
   await autoOn(t)

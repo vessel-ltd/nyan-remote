@@ -558,12 +558,44 @@ export function parseApproval(screen: string): ApprovalShown | undefined {
 export function approvalShows(screen: string, command: string): boolean {
   const a = parseApproval(screen)
   if (!a || a.tool !== 'Bash' || a.details.length === 0) return false
-  const squash = (x: string): string => x.replace(/\s+/g, '')
-  const shown = squash(a.details.join(''))
-  const want = squash(command)
-  if (want === '' || shown === '') return false
-  if (shown === want) return true
-  return shown.endsWith('…') && shown.length > 1 && want.startsWith(shown.slice(0, -1))
+  return rowsShowCommand(a.details, command)
+}
+
+/**
+ * ★ Rows show this command: each row's spaces exactly as they are, a row boundary any whitespace or none (agy wraps
+ *   at spaces, or inside a long word; a command of several lines breaks there too); or its start when the last row is cut short ("…"). ⚠️ Spaces inside a row
+ *   count (codex review: compared without any, `release draft` matched `releasedraft`; runs collapsed, it matched
+ *   `release  draft`).
+ */
+export function rowsShowCommand(rows: readonly string[], command: string): boolean {
+  // (only the ends trimmed: spaces inside a row count, every one of them / codex review: "release  draft")
+  const parts = rows.map((x) => x.trim()).filter((r) => r !== '')
+  const want = command.trim()
+  if (parts.length === 0 || want === '') return false
+  const esc = (x: string): string => x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const last = parts[parts.length - 1]!
+  const cut = last.endsWith('…') && last.length > 1
+  const body = [...parts.slice(0, -1), cut ? last.slice(0, -1) : last].map(esc).join('\\s*')
+  return new RegExp(cut ? `^${body}` : `^${body}$`).test(want)
+}
+
+/**
+ * ★★ The parent's own command approval open on the parent's view (agy 1.5.16, measured 2026-11-25 with a subagent
+ *   running: "Command / Requesting permission for: / <command> / Run this command? / > 1. Yes, run command / … /
+ *   4. No, cancel", footer "esc to cancel"), showing this command (compared as `approvalShows`). The child's banner may
+ *   be drawn above it. Where `1` approves this very command, and ESC cancels it.
+ */
+export function ownApprovalShows(screen: string, command: string): boolean {
+  if (inChildView(screen) || viewOwnerOf(screen) !== 'parent') return false
+  const rows = screen.split('\n').map((l) => l.trim())
+  const at = rows.lastIndexOf('Requesting permission for:')
+  if (at < 0) return false
+  const q = rows.findIndex((l, i) => i > at && l === 'Run this command?')
+  if (q < 0) return false
+  if (!/^(?:>\s)?1\. Yes, run command$/.test(rows[q + 1] ?? '')) return false
+  const last = rows.filter((l) => l !== '').slice(-2)
+  if (!last.some((l) => /^esc to cancel(?:\s|$)/.test(l))) return false
+  return rowsShowCommand(rows.slice(at + 1, q), command)
 }
 
 /** ★ The approval dialog is open with exactly the two measured choices: 1 approves, 2 denies (agy 1.5.16) */
