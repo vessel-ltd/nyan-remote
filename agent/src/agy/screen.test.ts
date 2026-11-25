@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
-import { childViewOf, dialogFits, inChildView, inputBoxOf, inputRowOf, parseBanner, parseDialog, readAgyScreen, slashPicked, viewOwnerOf, sameQuestionText, showsQuestion } from './screen.ts'
+import { childViewOf, dialogFits, inChildView, inputBoxOf, inputRowOf, listAgy, listFocused, parseApproval, parseBanner, parseDialog, parseSubagentList, readAgyScreen, respondOffered, slashPicked, viewOwnerOf, sameQuestionText, showsQuestion } from './screen.ts'
 
 // ★ Screens as the relay rebuilt them from agy 1.5.13 (2026-11-21), trimmed
 const batch = [
@@ -243,4 +243,104 @@ test('★ the slash command list shows /compact picked with "enter Select" (meas
   assert.equal(slashPicked(shown.replace('> /compact  Compact', '> /compare  Compact'), '/compact', 'Compact the conversation'), false)
   assert.equal(slashPicked(shown.replace('enter Select', 'enter Run'), '/compact', 'Compact the conversation'), false)
   assert.equal(slashPicked(shown.replace('Compact the conversation now', 'Clear everything'), '/compact', 'Compact the conversation'), false)
+})
+
+// ★ Screens of agy 1.5.16 as tmux showed them (2026-11-25 / docs/AGY.md §19.2), trimmed
+const v16 = {
+  "parentList": " ┃ ● Bash(echo alpha-cmd)\n ┃\n ┃ ctrl+k approve · alt+j manage\n────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\n>\n────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\n> ● Agent(self: Beta Command Runner) · Gemini 4 Neon  Blocked · Bash · 37s\n  ● Agent(self: Alpha Command Runner) · Gemini 4 Neon  Blocked · Bash · 39s\n────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\n? for shortcuts                                                      accept-edits · Gemini 4 Neon · high · 2 subagent(s)",
+  "childApproval": "  main › self\n  ● running · Gemini 4 Neon (High) · 47s · 3 steps\n  ID: 1788a5a6-a988-4356-bcaf-5f50e974aa73\n  ────────────────────────────────────────────────────────────\n  Tools\n    Bash\n  ────────────────────────────────────────────────────────────\n  ⚠ Approval Required\n    Bash\n      echo alpha-cmd\n  ────────────────────────────────────────────────────────────\n  Trajectory — self (3 steps)\n  ▸ Thought for 4s, 96 tokens\n    Calling the command executor with the specified command to fulfill the task requirements. The focus is solely o...\n  ● Bash(echo alpha-cmd) (ctrl+o to expand)\n  ↑/↓ scroll · pgup/pgdown page · ctrl+end bottom · ctrl+home top · ctrl+o expand · a respond · shift+k kill · esc back\n                                                                     accept-edits · Gemini 4 Neon · high · 2 subagent(s)",
+  "childApprovalOpen": "  main › self\n  ● running · Gemini 4 Neon (High) · 59s · 3 steps\n  ID: 1788a5a6-a988-4356-bcaf-5f50e974aa73\n    Bash\n  ────────────────────────────────────────────────────────────\n  ⚠ Approval Required\n    > Bash\n      echo alpha-cmd\n      > 1. Yes, approve\n        2. No, deny\n  ────────────────────────────────────────────────────────────\n  Trajectory — self (3 steps)\n  ▸ Thought for 4s, 96 tokens\n    Calling the command executor with the specified command to fulfill the task requirements. The focus is solely o...\n  ● Bash(echo alpha-cmd) (ctrl+o to expand)\n  ↑/↓ navigate · / select · enter confirm · esc cancel\n                                                                     accept-edits · Gemini 4 Neon · high · 2 subagent(s)",
+  "childQuestion": "  main › self\n  ● running · Gemini 4 Neon (High) · 11s · 3 steps\n  ID: dd2a582b-f573-4dc7-9e26-c839fa3fe8dd\n  ────────────────────────────────────────────────────────────\n  Tools\n    No tools used yet\n  ────────────────────────────────────────────────────────────\n  ⚠ Approval Required\n    AskQuestion\n      ? Pick a sea\n  ────────────────────────────────────────────────────────────\n  Trajectory — self (3 steps)\n  ? Pick a sea\n  ↑/↓ scroll · pgup/pgdown page · ctrl+end bottom · ctrl+home top · ctrl+o expand · a respond · shift+k kill · esc back\n                                                                     accept-edits · Gemini 4 Neon · high · 2 subagent(s)",
+  "childQuestionOpen": "  main › self\n  ● running · Gemini 4 Neon (High) · 13s · 3 steps\n  ID: 7929e674-cd04-4705-85e8-7188c29a56f5\n  Trajectory — self (3 steps)\n  ▸ Thought for 4s, 168 tokens\n    I'm thinking through how to approach this.\n  ? Pick a color\nQuestion\n────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\nQuestion 1/1: Pick a color\n> 1. red\n  2. blue\n  3. Write-in...\n  ↑/↓ Navigate · enter Select · esc Skip\n                                                                     accept-edits · Gemini 4 Neon · high · 2 subagent(s)"
+}
+
+test('★★ agy 1.5.16: the parent\'s subagent list — names, what each waits on, the focus (docs/AGY.md §19.2)', () => {
+  const rows = parseSubagentList(v16.parentList)!
+  assert.deepEqual(rows, [
+    { focused: true, name: 'self: Beta Command Runner', state: 'Blocked · Bash', blockedOn: 'Bash' },
+    { focused: false, name: 'self: Alpha Command Runner', state: 'Blocked · Bash', blockedOn: 'Bash' },
+  ])
+  // a running one: no `blockedOn`
+  const running = v16.parentList.replace('Blocked · Bash · 39s', 'Echo alpha-cmd · 1m6s')
+  assert.deepEqual(parseSubagentList(running)![1], { focused: false, name: 'self: Alpha Command Runner', state: 'Echo alpha-cmd' })
+  // no list (a child's view, or nothing running)
+  assert.equal(parseSubagentList(v16.childApproval), undefined)
+  assert.equal(viewOwnerOf(v16.parentList), 'parent')
+  // ⚠️ the list's focused row is not the input box (an empty box above it), also with one subagent (between two rules)
+  assert.equal(inputRowOf(v16.parentList), '')
+  assert.deepEqual(inputBoxOf(v16.parentList), [''])
+  const one = v16.parentList.replace(/\n  ● Agent\(self: Alpha[^\n]*/, '')
+  assert.equal(parseSubagentList(one)!.length, 1)
+  assert.equal(inputRowOf(one), '')
+  assert.deepEqual(inputBoxOf(one), [''])
+})
+
+test('★★ agy 1.5.16: a subagent\'s view opened from the list — whose, what it waits for, and whether its dialog is open', () => {
+  assert.deepEqual(viewOwnerOf(v16.childApproval), { child: '1788a5a6-a988-4356-bcaf-5f50e974aa73' })
+  // closed: "a respond" offered, no choices
+  assert.equal(respondOffered(v16.childApproval), true)
+  assert.deepEqual(parseApproval(v16.childApproval), { tool: 'Bash', details: ['echo alpha-cmd'] })
+  // open: its choices, the cursor; "a respond" no longer offered
+  assert.equal(respondOffered(v16.childApprovalOpen), false)
+  assert.deepEqual(parseApproval(v16.childApprovalOpen), {
+    tool: 'Bash',
+    details: ['echo alpha-cmd'],
+    choices: [
+      { n: 1, label: 'Yes, approve', cursor: true },
+      { n: 2, label: 'No, deny', cursor: false },
+    ],
+  })
+  // a question: the block names AskQuestion and the question; its dialog is the question dialog
+  assert.equal(respondOffered(v16.childQuestion), true)
+  assert.deepEqual(parseApproval(v16.childQuestion), { tool: 'AskQuestion', details: ['? Pick a sea'] })
+  assert.equal(respondOffered(v16.childQuestionOpen), false)
+  assert.equal(parseDialog(v16.childQuestionOpen)?.question, 'Pick a color')
+  // ⚠️ the parent's view offers nothing to respond to
+  assert.equal(respondOffered(v16.parentList), false)
+})
+
+test('★★ agy 1.5.16: the list is read only right under the input box, and the version that has it', () => {
+  // ⚠️ a matching line of output above (a log, this very file) is not a row (codex · agy review)
+  const stray = '  ● Agent(self: Old Runner) · Gemini 4 Neon  Blocked · Bash · 5s'
+  assert.equal(parseSubagentList(`${stray}\n${'─'.repeat(40)}\n>\n${'─'.repeat(40)}\n? for shortcuts`), undefined)
+  assert.equal(parseSubagentList(`${stray}\n${v16.parentList}`)!.length, 2)
+  // (a row framed by rules in the output, with no input box right above it)
+  const rule = '─'.repeat(40)
+  assert.equal(parseSubagentList(`${rule}\n  a table\n${rule}\n${stray}\n${rule}\n  more output\n? for shortcuts`), undefined)
+  // a block with anything but rows in it is not the list
+  assert.equal(parseSubagentList(v16.parentList.replace('  ● Agent(self: Alpha', '  output line\n  ● Agent(self: Alpha')), undefined)
+  // ★ 1.5.16 and later have it; ⚠️ a version that cannot be read is taken as one that has it (never ctrl+k on a guess)
+  assert.equal(listAgy('1.5.16'), true)
+  assert.equal(listAgy('1.6.0'), true)
+  assert.equal(listAgy('2.0.1'), true)
+  assert.equal(listAgy('1.5.15'), false)
+  assert.equal(listAgy('1.5.13'), false)
+  assert.equal(listAgy(undefined), true)
+})
+
+test('★ agy 1.5.16: a focused list row wrapped or cut short is not a draft in the box, and says the list has the focus', () => {
+  const rule = '─'.repeat(40)
+  const wrapped = [rule, '>', rule, '> ● Agent(self: Worker) · Gemini 4 Neon', '  Blocked · AskQuestion · 15s', rule, '? for shortcuts'].join('\n')
+  assert.equal(inputRowOf(wrapped), '')
+  assert.deepEqual(inputBoxOf(wrapped), [''])
+  assert.equal(listFocused(wrapped), true)
+  // (cut short on one row, between the rules)
+  const cut = [rule, '>', rule, '> ● Agent(self: Worker) · Gemi…', rule, '? for shortcuts'].join('\n')
+  assert.equal(inputRowOf(cut), '')
+  assert.equal(listFocused(cut), true)
+  assert.equal(listFocused(v16.parentList), true)
+  assert.equal(listFocused(v16.parentList.replace('> ● Agent(self: Beta', '  ● Agent(self: Beta')), false)
+})
+
+test('★ agy 1.5.16: numbered rows are choices only in an open dialog — in a closed preview they are the question\'s text', () => {
+  const closed = v16.childQuestion.replace('      ? Pick a sea', '      ? Roll out with\n      1. canary or 2. all at once?')
+  assert.deepEqual(parseApproval(closed), { tool: 'AskQuestion', details: ['? Roll out with', '1. canary or 2. all at once?'] })
+  assert.equal(parseApproval(v16.childApprovalOpen)!.choices!.length, 2)
+})
+
+test('★ a draft that itself starts "● Agent(" is a draft (1.5.13: no list under the box), not the list (codex review)', () => {
+  const rule = '─'.repeat(40)
+  const draft = [rule, '> ● Agent(self: Reviewer) is stuck', rule, '? for shortcuts'].join('\n')
+  assert.equal(inputRowOf(draft), '● Agent(self: Reviewer) is stuck')
+  assert.equal(listFocused(draft), false)
 })

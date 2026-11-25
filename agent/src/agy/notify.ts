@@ -119,6 +119,13 @@ export const QUIET_UNSURE_MAX = 3
  * ★ A question (`ask_question`) is named by the transcript write that posed it instead (`agyOwnRows` /
  *   `agyQuestionAt`): a background subagent's progress rewrites the state file while it stays up.
  */
+/** The card named `a` began after the one named `b` (names are ISO times); unreadable ⇒ yes (rings as before) */
+function laterCard(a: string, b: string | undefined): boolean {
+  const ta = Date.parse(a)
+  const tb = b === undefined ? NaN : Date.parse(b)
+  return !(Number.isFinite(ta) && Number.isFinite(tb)) || ta > tb
+}
+
 function cardOf(row: Pick<SessionSummary, 'status' | 'lastActivity'>): string | undefined {
   return row.status === 'waiting' ? row.lastActivity : undefined
 }
@@ -294,7 +301,12 @@ export class AgyNotifier {
       const newTurn = from !== undefined && from.turn !== undefined && end.turn !== undefined && end.turn !== from.turn && stateAfterTurn
       const cardKey = cardOf(row)
       // ★ Another card while it still waits (the `working` between two cards was not seen / codex review)
-      const newCard = to === 'waiting' && from?.status === 'waiting' && cardKey !== undefined && cardKey !== from.card
+      //   ⚠️ A name going back is an older wait still up after a newer one ended: not new when a "needs you" reached the
+      //      phone since it began (codex · agy review: a subagent's approval left behind an answered question rang
+      //      again). ⚠️ One that never reached it is (codex · agy review: a failed push for both left the older silent)
+      const lastSent = this.#sent.get(row.sessionId)?.card
+      const covered = cardKey !== undefined && lastSent !== undefined && !laterCard(cardKey, lastSent)
+      const newCard = to === 'waiting' && from?.status === 'waiting' && cardKey !== undefined && cardKey !== from.card && (laterCard(cardKey, from.card) || !covered)
       // ★ For "needs you" the card alone decides (a second agy's prompt can make the same card look like a new turn's /
       //   codex review); other states go by turn
       const fresh = from === undefined || from.status !== to || (to === 'waiting' ? newCard : newTurn)

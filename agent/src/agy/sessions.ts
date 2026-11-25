@@ -17,7 +17,9 @@ import { open, readdir, stat, unlink } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, join } from 'node:path'
 import type { SessionStatus, SessionSummary, TitleSource, ToolUsage, UsageWindow } from '../../../shared/types.ts'
+import { AGY_CHILD_APPROVAL } from '../../../shared/types.ts'
 import type { PaneRecord } from '../claude/keys.ts'
+import { listAgy } from './screen.ts'
 import { aliveProcStartSync, sameProcStart } from '../claude/sessionIndex.ts'
 import { readJsonFile, stateDir } from '../state.ts'
 import { TAIL_BYTES, callBeforeState, readTailRecords, turnEnd, type PendingCall } from './pending.ts'
@@ -430,7 +432,8 @@ export function agyRow(s: AgyState, ctx: AgyRowContext): SessionSummary {
     ...title,
     status,
     // ★ A question: the words a Codex question uses (the phone tells it apart from an approval)
-    ...(status === 'waiting' ? { waitingFor: s.confirmationPending ? 'permission prompt' : 'input needed' } : {}),
+    // ★ A subagent's approval on the PC (`agyBlockedAt`) says so: the phone has no card for it
+    ...(status === 'waiting' ? { waitingFor: s.confirmationPending ? 'permission prompt' : agyBlockedAt(s) !== undefined ? AGY_CHILD_APPROVAL : 'input needed' } : {}),
     live: true,
     ...(ctx.sendRoute ? { sendRoute: ctx.sendRoute } : {}),
     ...(s.mode ? { permissionMode: s.mode } : {}),
@@ -1312,7 +1315,7 @@ export interface AgyChildQuestion {
  * ⚠️ Only while the parent has running children; anything unreadable ⇒ not counted, and `complete` is false.
  */
 export function agyChildQuestions(
-  state: Pick<AgyState, 'activeSubagentRoles'>,
+  state: Pick<AgyState, 'activeSubagentRoles'> & { version?: string },
   conversationId: string,
   home: string = homedir(),
   tail: (path: string) => Record<string, unknown>[] = readTailRecords,
@@ -1326,6 +1329,24 @@ export function agyChildQuestions(
   let complete = !index.unreadable
   let known = !index.unreadable
   const children = (index.byParent.get(parent) ?? []).filter((c) => c.id !== parent)
+  // ★ agy 1.5.16 lists the grandchildren too in the parent's `subagents`, flat like its screen list (measured
+  //   2026-11-25: a grandchild's question read as "unknown" and was never carded) ⇒ a running prompt no direct child
+  //   is looked for at any depth. ⚠️ Only on 1.5.16+ (codex · agy review: on an older agy a deeper match let the blind
+  //   ctrl+k path answer a grandchild's — or a killed one's — question; 1.5.16+ never presses ctrl+k, and opens a child
+  //   from the list only by its id)
+  const deeper: { id: string; prompt: string }[] = []
+  if (listAgy(state.version)) {
+    const visited = new Set<string>([parent, ...children.map((c) => c.id)])
+    const stack = children.map((c) => c.id)
+    while (stack.length > 0) {
+      for (const c of index.byParent.get(stack.pop()!) ?? []) {
+        if (visited.has(c.id)) continue
+        visited.add(c.id)
+        deeper.push(c)
+        stack.push(c.id)
+      }
+    }
+  }
   const running = new Map<string, number>()
   for (const r of roles.map(promptDigest)) running.set(r, (running.get(r) ?? 0) + 1)
   // ★ Every child of a running prompt counts (which of several with the same prompt still runs cannot be told: the
@@ -1334,7 +1355,11 @@ export function agyChildQuestions(
   //   Matched one-to-one (and so answerable from the phone) only when exactly one child has the prompt.
   const live: { id: string; prompt: string; matched: boolean }[] = []
   for (const [prompt, n] of running) {
-    const same = children.filter((c) => c.prompt === prompt)
+    // ★ On 1.5.16+ every descendant with the prompt (a finished child with it must not hide a grandchild that runs
+    //   with it / agy review). ✅ Accepted: a killed descendant's leftover with the same prompt as a running one may
+    //   get a card the answer cannot reach — the answer is refused, and once the list was walked it is not carded
+    //   again (`agyUnlisted`): never a wrong answer, never silence (codex review)
+    const same = [...children, ...deeper].filter((c) => c.prompt === prompt)
     // ★ Only runs with a call pending can be the one ctrl+k opens: earlier runs of the same prompt that are over —
     //   finished or failed — do not make it ambiguous (codex review: a rerun's question stayed off the phone)
     const open = same.filter((c) => pendingOf(transcriptPathOf(c.id, home), tail) !== null)
@@ -1389,8 +1414,22 @@ export function agyChildQuestions(
 /**
  * ★ When this conversation started waiting for the person's answer to a question (its own, else a running child's),
  * or undefined. The notifier's identity of the wait (`agyOwnRows`), the row's "needs you" (docs/AGY.md §11, §13).
+ * ★ Also a subagent's approval seen on the PC's list (`agyBlockedAt` / docs/AGY.md §19, case 8): the phone cannot
+ *   answer it, but it rings and the leader is told, instead of a silent "working".
  */
 export function agyQuestionWaitAt(
+  s: AgyState,
+  stateMtimeMs: number,
+  home: string = homedir(),
+  tail: (path: string) => Record<string, unknown>[] = readTailRecords,
+): number | undefined {
+  const asked = agyAskedAt(s, stateMtimeMs, home, tail)
+  const blocked = agyBlockedAt(s)
+  return asked === undefined ? blocked : blocked === undefined ? asked : Math.max(asked, blocked)
+}
+
+/** The questions alone (its own, its running children's): the newest one's time, or undefined. Not the approvals */
+function agyAskedAt(
   s: AgyState,
   stateMtimeMs: number,
   home: string = homedir(),
@@ -1401,6 +1440,62 @@ export function agyQuestionWaitAt(
   const kids = agyChildQuestions(s, s.conversationId, home, tail).asking
   const all = [...(own === undefined ? [] : [own]), ...kids.map((k) => k.askedAt)]
   return all.length === 0 ? undefined : Math.max(...all)
+}
+
+/**
+ * ★★ Subagents waiting on an approval (agy 1.5.16+: "Blocked · Bash" on the parent's list / docs/AGY.md §19, case 8).
+ *   Not in any record (the child's transcript does not show the wait): only the PC's screen, read by `blocked.ts`.
+ *   conversation → the agy that showed it, and since when (the wait's name for the notifier: a new one rings again).
+ */
+/** One child waiting: its start, and a number of its own (a leader's notice goes by it) */
+interface BlockedKid {
+  since: number
+  id: number
+}
+const blockedKids = new Map<string, { pid: number; kids: BlockedKid[] }>()
+let blockedSerial = 0
+
+/** The subagents of this agy waiting on an approval, each with its own start. ⚠️ Only while its children still run */
+export function agyBlockedWaits(s: Pick<AgyState, 'conversationId' | 'pid' | 'subagentsActive'>): readonly BlockedKid[] {
+  const b = blockedKids.get(s.conversationId)
+  return b !== undefined && b.pid === s.pid && s.subagentsActive ? b.kids : []
+}
+
+/** Since when the newest of them waits (the wait's name for the notifier: a new one rings), or undefined */
+export function agyBlockedAt(s: Pick<AgyState, 'conversationId' | 'pid' | 'subagentsActive'>): number | undefined {
+  const kids = agyBlockedWaits(s)
+  return kids.length === 0 ? undefined : Math.max(...kids.map((k) => k.since))
+}
+
+/**
+ * What the screen showed for this agy's list: how many children wait on an approval (0 = none).
+ * ★ By their number only, not their names: a name is cut short at another terminal width, and matching cut names went
+ *   wrong in turn after turn (codex · agy review, rounds 5–7). One more than before is a new wait (rung, told to a
+ *   leader by its own number) — also while an older one still waits. One fewer keeps the newer starts: a leader may hear
+ *   of the remaining one again, never not at all.
+ *   ✅ Accepted: one approved at the PC and another blocked within one look (5 s) is not rung (the person is at the PC).
+ * Returns whether it changed.
+ */
+export function noteAgyBlocked(conversationId: string, pid: number, count: number, now: number): boolean {
+  const b = blockedKids.get(conversationId)
+  if (count <= 0) return blockedKids.delete(conversationId)
+  const had = b !== undefined && b.pid === pid ? [...b.kids].sort((x, y) => x.since - y.since || x.id - y.id) : []
+  if (had.length === count && b !== undefined && b.pid === pid) return false
+  const kids = had.slice(Math.max(0, had.length - count))
+  while (kids.length < count) kids.push({ since: now, id: ++blockedSerial })
+  blockedKids.set(conversationId, { pid, kids })
+  return true
+}
+
+/** Forget the conversations not in `keep` (their children ended, or their agy is gone). Returns whether any went */
+export function forgetAgyBlockedExcept(keep: ReadonlySet<string>): boolean {
+  let changed = false
+  for (const id of [...blockedKids.keys()]) if (!keep.has(id)) changed = blockedKids.delete(id) || changed
+  return changed
+}
+
+export function resetAgyBlockedForTest(): void {
+  blockedKids.clear()
 }
 
 /**

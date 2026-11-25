@@ -21,7 +21,9 @@ export async function agyStatuses(dir: string, home?: string): Promise<Map<strin
     const asking = agyQuestionWaitAt(f.state, f.mtimeMs, home) !== undefined
     // ★ A card and a question both read `waiting`: told apart (an approval followed by a question, the `working` in
     //   between not seen, left the thread saying "approval" / codex review)
-    out.set(f.state.conversationId, `${f.state.pid}:${agyStatus(f.state, asking, agyChildrenOutlived(f.state, home))}${asking ? ':question' : ''}`)
+    // ★ And its own card beside a wait (a subagent's approval, then the parent's card: the same `waiting:question`, the
+    //   phone kept the old reason until its next poll / codex review)
+    out.set(f.state.conversationId, `${f.state.pid}:${agyStatus(f.state, asking, agyChildrenOutlived(f.state, home))}${asking ? ':question' : ''}${f.state.confirmationPending ? ':card' : ''}`)
   }
   return out
 }

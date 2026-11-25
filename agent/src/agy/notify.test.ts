@@ -1100,3 +1100,41 @@ test('★ "idle" (its children outlived its answer) to "done" rings "done" when 
   await r.n.look()
   assert.deepEqual(r.sent.map((f) => f.label), ['完了'])
 })
+
+test('★ an older wait left up after a newer one ends does not ring again (codex · agy review: a subagent approval behind an answered question)', async () => {
+  const r = rig()
+  r.set('working', asking(0))
+  await r.n.look()
+  // a subagent blocks on a command
+  r.set('waiting', asking(0), '2026-11-20T00:00:20Z')
+  await r.n.look()
+  // a sibling asks a question (newer)
+  r.set('waiting', asking(0), '2026-11-20T00:00:30Z')
+  await r.n.look()
+  assert.equal(r.sent.length, 2)
+  // the question answered from the phone: the approval's older name is back
+  r.set('waiting', asking(0), '2026-11-20T00:00:20Z')
+  await r.n.look()
+  assert.equal(r.sent.length, 2, 'not rung again for the approval')
+  // a new wait later still rings
+  r.set('waiting', asking(0), '2026-11-20T00:00:40Z')
+  await r.n.look()
+  assert.equal(r.sent.length, 3)
+})
+
+test('★ …but an older wait that never reached the phone still rings when the newer one ends (codex · agy review)', async () => {
+  const r = rig()
+  r.set('working', asking(0))
+  await r.n.look()
+  r.fail(true)
+  r.set('waiting', asking(0), '2026-11-20T00:00:20Z')
+  await r.n.look()
+  r.set('waiting', asking(0), '2026-11-20T00:00:30Z')
+  await r.n.look()
+  assert.equal(r.sent.length, 0)
+  // the newer one answered at the PC, the push works again: the older one rings
+  r.fail(false)
+  r.set('waiting', asking(0), '2026-11-20T00:00:20Z')
+  await r.n.look()
+  assert.equal(r.sent.length, 1)
+})

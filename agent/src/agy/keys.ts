@@ -52,7 +52,7 @@ import {
 } from '../claude/keys.ts'
 import { callBeforeState, readTailRecords, turnEnd, type PendingCall } from './pending.ts'
 import { parseAgyQuestion, questionTextsOf, type AgyAnswerPlan, type AgyQuestion, type AgyStep } from './questions.ts'
-import { childViewOf, dialogFits, inChildView, inputBoxOf, inputRowOf, parseBanner, slashPicked, viewOwnerOf, parseDialog, readAgyScreen, sameQuestionText, showsQuestion, type FooterHint, type ScreenDialog } from './screen.ts'
+import { childViewOf, dialogFits, inChildView, inputBoxOf, inputRowOf, listAgy, listFocused, noteUnlisted, parseApproval, previewAsks, parseBanner, parseSubagentList, respondOffered, slashPicked, viewOwnerOf, parseDialog, readAgyScreen, sameQuestionText, showsQuestion, type FooterHint, type ScreenDialog } from './screen.ts'
 import {
   AGY_PREFIX,
   AGY_QUESTION_TOOL,
@@ -892,6 +892,8 @@ export async function clearAgy(conversationId: string, deps: AgyKeysDeps = defau
       if (s === undefined || s.trim() === '') return undefined
       // ⚠️ Only the parent's own view with nothing open over it (a key in a dialog is that dialog's key)
       if (viewOwnerOf(s) !== 'parent' || inChildView(s) || parseDialog(s) !== undefined) return 'off'
+      // ⚠️ agy 1.5.16: the subagent list has the focus (a key there is the list's / codex · agy review)
+      if (listFocused(s)) return 'off'
       return inputBoxOf(s) ?? 'off'
     }
     const empty = (b: string[]): boolean => b.length === 1 && b[0] === ''
@@ -1218,6 +1220,8 @@ export async function answerAgyQuestion(
     await new Promise((r) => setTimeout(r, deps.answerSettleMs ?? AGY_ANSWER_SETTLE_MS))
     if (stillWanted && !stillWanted()) return { ok: false, reason: 'changed' }
     if (answer.kind !== 'steps') return answerOnScreen({ ...target, stateFile: '' }, pane, mark, answer, checks, deps, tail, stillWanted)
+    // ⚠️⚠️ A blind relay opens a subagent's question with ctrl+k: never on agy 1.5.16+ (it approves a command there)
+    if (mark.child !== undefined && listAgy(readAgyPidFile(target.dir, mark.pid)?.state.version)) return { ok: false, reason: 'changed' }
     const stepMs = deps.questionStepMs ?? AGY_QUESTION_STEP_MS
     const openMs = deps.childOpenMs ?? AGY_CHILD_OPEN_MS
     // ⚠️ `stillWanted` (slow on a Mac) first, the question last
@@ -1281,7 +1285,7 @@ export type AgyQuestionAnswer =
   | { kind: 'skip'; question: AgyQuestion }
 
 /** Keys the screen-driven answer types (agy 1.5.13 defaults, measured 2026-11-21) */
-export const SCREEN_KEYS = { down: '\x1b[B', up: '\x1b[A', left: '\x1b[D', right: '\x1b[C', space: ' ', enter: '\r', esc: '\x1b', open: '\x0b' } as const
+export const SCREEN_KEYS = { down: '\x1b[B', up: '\x1b[A', left: '\x1b[D', right: '\x1b[C', space: ' ', enter: '\r', esc: '\x1b', open: '\x0b', respond: 'a' } as const
 /** How long a screen change is waited for after a key */
 /** ★ The write-in field shows about 4 rows (measured, agy 1.5.13 / 1.5.14): with 3 or more filled it may have scrolled */
 const FIELD_FULL_ROWS = 3
@@ -1371,6 +1375,26 @@ async function answerOnScreen(
     const ok = await line.write(bytes, () => unwanted() || !sameQuestionNow(target, mark, now, slow) || unwanted())
     if (!ok) throw new Stop(typed > 0 ? 'partial' : 'changed')
     typed++
+  }
+  /**
+   * ★ A key that moves between views (the list, a subagent's view): not part of the answer (a stop here is `changed`).
+   *   ⚠️ The slow probes first, then the screen read again and checked by `on`, then the key (codex · agy review: the
+   *   screen read before a probe of seconds let the PC change it under the key)
+   */
+  const nav = async (bytes: string, on: (s: string) => boolean, slow = false): Promise<void> => {
+    // ★ Every slow check (the lock, another agy on it — `ps` on a Mac) before the screen is read; only the quick ones
+    //   between the screen and the key (codex review: the sharing probe ran after the screen and let a draft start)
+    const now = slow ? await probedChecks(deps, tail, mark.pid) : checks
+    if (!sameQuestionNow(target, mark, now, slow)) throw new Stop(typed > 0 ? 'partial' : 'changed')
+    if (!on(await screen())) throw new Stop(typed > 0 ? 'partial' : 'changed')
+    // ⚠️ Between the screen and the key only this agy's own state file (the children's scan above can take a while /
+    //    codex review: a sibling's question opened during it took the ESC)
+    const ok = await line.write(bytes, () => {
+      if (unwanted()) return true
+      const f = readAgyPidFile(target.dir, mark.pid)
+      return !f || f.state.conversationId !== target.conversationId || f.state.agentState !== 'idle' || f.state.confirmationPending
+    })
+    if (!ok) throw new Stop(typed > 0 ? 'partial' : 'changed')
   }
   const screen = async (): Promise<string> => {
     const s = await look(pane.socketPath)
@@ -1478,14 +1502,101 @@ async function answerOnScreen(
     need(field, 'enter Submit', 'enter Submit All')
     await press(SCREEN_KEYS.enter, last)
   }
+  /**
+   * ★★ agy 1.5.16 (docs/AGY.md §19.2): the subagent's view opened from the parent's list, told by its id, its question
+   *    opened with `a`. Each other view opened on the way is left with `esc back` (its dialog is closed there: opening a
+   *    view from the list never opens its dialog — measured). ⚠️ ctrl+k is not used (on an approval it approves).
+   *    Returns the screen with this question's dialog open.
+   */
+  const openFromList = async (start: string): Promise<string> => {
+    const child = mark.child!.toLowerCase()
+    const listAt = (s: string): ReturnType<typeof parseSubagentList> => (!inChildView(s) && viewOwnerOf(s) === 'parent' && parseDialog(s) === undefined ? parseSubagentList(s) : undefined)
+    // ⚠️ Nothing typed in the PC's box (the arrows would move in a draft instead)
+    const emptyBox = (s: string): boolean => {
+      const box = inputBoxOf(s)
+      return box !== undefined && box.every((l) => l.trim() === '')
+    }
+    let rows = listAt(start)
+    if (!rows || !emptyBox(start)) throw new Stop('changed')
+    if (!rows.some((r) => r.focused)) {
+      await nav(SCREEN_KEYS.down, (s) => listAt(s) !== undefined && emptyBox(s) && !listAt(s)!.some((r) => r.focused), true)
+      rows = await until((s) => (listAt(s)?.some((r) => r.focused) ? listAt(s) : undefined))
+    }
+    // from the top, one row at a time (each seen focused before the next key)
+    let at = rows.findIndex((r) => r.focused)
+    while (at > 0) {
+      const from = at
+      await nav(SCREEN_KEYS.up, (s) => listAt(s)?.[from]?.focused === true)
+      const want = at - 1
+      rows = await until((s) => (listAt(s)?.[want]?.focused ? listAt(s) : undefined))
+      at = want
+    }
+    // ★ Missing from the list only after a walk of a list that stayed the same, each row a different subagent (codex
+    //   review: a row added meanwhile shifted the walk, one was opened twice and a live one was taken for missing)
+    const startRows = rows.map((r) => r.name).join('\n')
+    let moved = false
+    const seen = new Set<string>()
+    for (let i = 0; i < rows.length; i++) {
+      if (i > 0) {
+        await nav(SCREEN_KEYS.down, (s) => listAt(s)?.[i - 1]?.focused === true)
+        await until((s) => (listAt(s)?.[i]?.focused ? true : undefined))
+      }
+      await nav(SCREEN_KEYS.enter, (s) => {
+        const now = listAt(s)
+        if (now !== undefined && now.map((r) => r.name).join('\n') !== startRows) moved = true
+        return now?.[i]?.focused === true
+      })
+      const opened = await until((s) => (inChildView(s) && typeof viewOwnerOf(s) === 'object' ? s : undefined))
+      seen.add(childViewOf(opened) ?? '')
+      if (childViewOf(opened) === child) {
+        // ★ Its question waits there, closed, and is this one (a long one wraps over several rows: joined)
+        const fits = (s: string): boolean => childViewOf(s) === child && respondOffered(s) && previewAsks(s, items[0]!.question)
+        await until((s) => (fits(s) ? true : undefined))
+        await nav(SCREEN_KEYS.respond, fits, true)
+        return await until((s) => (batchAt(s) !== undefined ? s : undefined))
+      }
+      // another subagent's view: back to the list (⚠️ only with nothing open there — ESC on an open question skips it;
+      // its footer must say "esc back")
+      const closed = (s: string): boolean => inChildView(s) && childViewOf(s) === childViewOf(opened) && parseDialog(s) === undefined && parseApproval(s)?.choices === undefined
+      await nav(SCREEN_KEYS.esc, closed)
+      await until((s) => (listAt(s)?.[i]?.focused ? true : undefined))
+    }
+    // ★ Every row opened and this one is not there (a killed one's leftover question): its card is not raised again
+    //   while that call stays (codex review: it came back after every failed answer)
+    const endRows = (listAt(await screen()) ?? []).map((r) => r.name).join('\n')
+    if (!moved && endRows === startRows && seen.size === rows.length && !seen.has('')) noteUnlisted(mark)
+    throw new Stop('changed')
+  }
   try {
     // ★ No other question asked now has the same text (the screen tells questions apart by their text): checked here,
     //   at the answer, not only when the card was raised (codex review: a sibling asked the same question meanwhile)
     const others = otherQuestions(target, mark, deps, tail)
-    if (others === undefined || others.some((o) => items.some((x) => sameQuestionText(o, x.question)))) throw new Stop('changed')
-    otherTexts = others
-    // ★ A subagent's question: opened from the parent's banner with ctrl+k, unless its dialog is open already
+    if (others === undefined) throw new Stop('changed')
+    // ★ A subagent's question: opened from the parent's banner with ctrl+k, unless its dialog is open already — or, on
+    //   agy 1.5.16, from the parent's subagent list by its id (`openFromList`)
     let first = await screen()
+    // ★★ The list (agy 1.5.16): the dialog is told by its owner's id, so a sibling asking the same text does not stop it
+    //    (§19.1 case 4) — a subagent's question only; the parent's own and the banner's are told by their text as before
+    const byList = (s: string): boolean => mark.child !== undefined && parseSubagentList(s) !== undefined
+    /** Told on the parent's view (below): the list there, or the old way by text */
+    const byText = (): void => {
+      if (others.some((o) => items.some((x) => sameQuestionText(o, x.question)))) throw new Stop('changed')
+      otherTexts = others
+    }
+    // (a dialog already open, or the parent's view now: decided here; a subagent's view: once back on the parent's)
+    // ★ agy 1.5.16: this child's own dialog already open — told by its owner's id (`dialogOf`), not by text (codex review:
+    //   a sibling asking the same text made it PC-only)
+    const ownersDialog = mark.child !== undefined && batchAt(first) !== undefined && listAgy(readAgyPidFile(target.dir, mark.pid)?.state.version)
+    if ((!inChildView(first) || batchAt(first) !== undefined) && !ownersDialog) {
+      if (!byList(first)) byText()
+    }
+    // ★ agy 1.5.16: the PC already on this subagent's view, its question closed: opened right there with `a`
+    if (mark.child !== undefined && batchAt(first) === undefined && childViewOf(first) === mark.child.toLowerCase() && respondOffered(first) && previewAsks(first, items[0]!.question)) {
+      // (its preview shows this very question, checked again right before `a` / codex review)
+      const here = (s: string): boolean => childViewOf(s) === mark.child!.toLowerCase() && respondOffered(s) && previewAsks(s, items[0]!.question)
+      await nav(SCREEN_KEYS.respond, here, true)
+      first = await until((s) => (batchAt(s) !== undefined ? s : undefined))
+    }
     if (batchAt(first) === undefined && inChildView(first) && parseDialog(first) === undefined) {
       // ★★ The PC is on a subagent's view (an earlier answer left it there, or someone opened it) with nothing open in
       //    it: ESC there only goes back to the parent's view (its footer says "esc back"; it stops nothing — measured),
@@ -1496,6 +1607,9 @@ async function answerOnScreen(
       //    approval meanwhile, and ESC would skip or decline it (codex / agy review). The viewed child must not be
       //    asking either (its question queued, not yet drawn).
       const now = await probedChecks(deps, tail, mark.pid)
+      // ★ Every slow check (sharing, the children's scan — `ps` on a Mac) before the screen is read again; only quick
+      //   file checks between it and the ESC (codex review: another child's question opened during them took it)
+      if (!sameQuestionNow(target, mark, now, true)) throw new Stop('changed')
       const again = await screen()
       const viewed = childViewOf(again)
       if (!inChildView(again) || parseDialog(again) !== undefined || viewed === undefined) throw new Stop('changed')
@@ -1503,13 +1617,24 @@ async function answerOnScreen(
       // ⚠️ Any call pending there (a question, a command whose approval is about to be drawn — ESC would decline it), or
       //    none readable: not left (codex / agy review). A long command there keeps the sibling's answer waiting.
       const asking = (): boolean => agyPendingCall(viewedT, tail) !== null
-      const ok = await line.write(SCREEN_KEYS.esc, () => unwanted() || !sameQuestionNow(target, mark, now, true) || asking())
+      const ok = await line.write(SCREEN_KEYS.esc, () => {
+        if (unwanted() || asking()) return true
+        // (the parent's own question: its own transcript and state, read quickly; a subagent's: the parent idle)
+        if (mark.child === undefined) return !sameQuestionNow(target, mark, now, false)
+        const f = readAgyPidFile(target.dir, mark.pid)
+        return !f || f.state.conversationId !== target.conversationId || f.state.agentState !== 'idle' || f.state.confirmationPending
+      })
       if (!ok) throw new Stop('changed')
       typed++
       // (the parent's view: its banner for a subagent's question, the dialog for its own)
-      first = await until((s) => (!inChildView(s) && viewOwnerOf(s) === 'parent' && (mark.child !== undefined ? parseBanner(s) : batchAt(s)) !== undefined ? s : undefined))
+      first = await until((s) => (!inChildView(s) && viewOwnerOf(s) === 'parent' && (mark.child !== undefined ? (parseBanner(s) ?? parseSubagentList(s)) : batchAt(s)) !== undefined ? s : undefined))
     }
+    const listed = byList(first)
+    if (inChildView(first) === false && batchAt(first) === undefined && !listed && otherTexts !== others) byText()
+    if (mark.child !== undefined && batchAt(first) === undefined && listed) first = await openFromList(first)
     if (mark.child !== undefined && batchAt(first) === undefined) {
+      // ⚠️⚠️ agy 1.5.16+: never the banner's ctrl+k (it approves a subagent's command at once / codex · agy review)
+      if (listAgy(readAgyPidFile(target.dir, mark.pid)?.state.version)) throw new Stop('changed')
       const banner = parseBanner(first)
       if (banner === undefined || inChildView(first) || !sameQuestionText(banner, items[0]!.question) || otherTexts.some((o) => sameQuestionText(banner, o))) throw new Stop('changed')
       await press(SCREEN_KEYS.open, true)
@@ -1606,6 +1731,20 @@ async function answerOnScreen(
       }
       // ★ Left on the child's view (the parent was busy): the next answer to a subagent's question goes back first
       if (!back) return { ok: true, left: true }
+      // ★ agy 1.5.16: back on the parent's view the list keeps the focus ⇒ ESC gives it back to the input box (only
+      //   while the list has it, on the parent's view with nothing open, the parent idle — ESC there is the list's)
+      if (listed) {
+        // (agy redraws the parent's view after the ESC: waited for / agy review)
+        const s = await until((x) => (!inChildView(x) && viewOwnerOf(x) === 'parent' ? x : undefined)).catch(() => undefined)
+        if (s !== undefined && parseDialog(s) === undefined && listFocused(s)) {
+          await line.write(SCREEN_KEYS.esc, () => {
+            const f = readAgyPidFile(target.dir, mark.pid)
+            if (!f || f.state.conversationId !== target.conversationId || f.state.agentState !== 'idle' || f.state.confirmationPending) return true
+            // (a new prompt typed on the PC meanwhile: its turn is not stopped by it)
+            return parentAt === undefined || statSync(target.transcript, { throwIfNoEntry: false })?.mtimeMs !== parentAt
+          })
+        }
+      }
     }
     return { ok: true }
   } catch (err) {

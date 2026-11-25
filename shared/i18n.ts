@@ -93,6 +93,7 @@ export const NOTIFY_PHRASES_EN: readonly (readonly [string, string])[] = [
   ['背景で実行中', 'Running in background'],
   ['⚠ 異常終了', '⚠ Failed'],
   ['自動承認 終了', 'Auto-approve ended'],
+  ['PC でサブエージェントの承認', 'subagent approval on the PC'],
   ['承認プロンプト', 'permission prompt'],
   ['sandbox の許可', 'sandbox permission'],
   ['worker の要求', 'worker request'],

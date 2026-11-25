@@ -9,6 +9,7 @@ import { agyCardAt, agyChildrenSettledFor, agyChildrenSettledSeen, agyOwnRowOf, 
 import { readTailRecords } from './pending.ts'
 import { parseAgyQuestion } from './questions.ts'
 import { writeSequence } from '../claude/keys.ts'
+import { agyUnlisted, resetAgyUnlistedForTest } from './screen.ts'
 
 const A = '062a8f25-9451-42f3-ae93-34a208e99365'
 const PID = 4242
@@ -81,7 +82,7 @@ async function lab(t: { after(fn: () => void): void }, opts: { pane?: boolean; p
   utimesSync(transcript, BASE - 100, BASE - 100)
   const stateFile = join(dir, `session-${A}.json`)
   const setState = (over: Record<string, unknown>, mtimeSec = BASE): void => {
-    const body = JSON.stringify({ nyanPid: PID, nyanBusyAt: 0, input: { conversation_id: A, cwd: '/home/user/p', agent_state: 'idle', ...over } })
+    const body = JSON.stringify({ nyanPid: PID, nyanBusyAt: 0, input: { conversation_id: A, cwd: '/home/user/p', agent_state: 'idle', version: '1.5.14', ...over } })
     // ★ the relay hook writes both: the conversation's file and this agy's own (`pid-<pid>.json`)
     for (const f of [stateFile, join(dir, `pid-${PID}.json`)]) {
       writeFileSync(f, body)
@@ -1284,6 +1285,63 @@ test('★ a grandchild’s question (a child’s own child) rings for the root, 
   assert.deepEqual(await answerAgyQuestion(A, mark, { kind: 'steps', steps: [{ key: '2' }] }, l.deps), { ok: false, reason: 'changed' })
 })
 
+test('★★ agy 1.5.16 lists the grandchild in the parent\'s subagents too: its question is known and matched (measured 2026-11-25)', async (t) => {
+  const l = await lab(t)
+  withChildren(l, [{ id: K1, prompt: 'coordinate', asking: false, thinking: true }])
+  const iso = (sec: number): string => new Date(sec * 1000).toISOString().replace(/\.\d{3}Z$/, 'Z')
+  const g = transcriptPathOf(K3, l.deps.home)
+  mkdirSync(join(g, '..'), { recursive: true })
+  writeFileSync(
+    g,
+    [
+      { type: 'SYSTEM_MESSAGE', step_index: 0, content: `x\n<SYSTEM_MESSAGE>\n[Message] timestamp=${iso(BASE - 30)} sender=${K1} priority=MESSAGE_PRIORITY_HIGH content=ask fruit\n</SYSTEM_MESSAGE>` },
+      { type: 'PLANNER_RESPONSE', step_index: 1, created_at: iso(BASE - 30), tool_calls: [{ name: 'ask_question', args: { questions: [{ question: 'G?', options: ['a', 'b'] }] } }] },
+    ]
+      .map((r) => JSON.stringify(r))
+      .join('\n') + '\n',
+  )
+  const { agyChildQuestions } = await import('./sessions.ts')
+  // as 1.5.16 writes it: the child and the grandchild, flat
+  const q = agyChildQuestions({ activeSubagentRoles: ['coordinate', 'ask fruit'], version: '1.5.16' }, A, l.deps.home)
+  assert.equal(q.known, true)
+  assert.deepEqual(q.asking.map((a) => [a.child, a.ambiguous]), [[K3, false]])
+  // as an older agy writes it: the direct child only (the grandchild nested, as before)
+  const old = agyChildQuestions({ activeSubagentRoles: ['coordinate'], version: '1.5.15' }, A, l.deps.home)
+  assert.equal(old.known, true)
+  assert.deepEqual(old.asking.map((a) => [a.child, a.ambiguous]), [[K3, true]])
+  // ⚠️ an older agy is never matched deeper (its blind ctrl+k path reads `ambiguous` / codex · agy review)
+  assert.equal(agyChildQuestions({ activeSubagentRoles: ['coordinate', 'ask fruit'], version: '1.5.15' }, A, l.deps.home).known, false)
+})
+
+test('★ 1.5.16: a deeper one with a running prompt counts too — a killed leftover makes it ambiguous, never silent (codex · agy review)', async (t) => {
+  const l = await lab(t)
+  // K1 asks (direct, prompt "ask fruit"); K3 under K2 is a killed leftover with the same prompt, its question pending
+  withChildren(l, [
+    { id: K1, prompt: 'ask fruit', asking: true },
+    { id: K2, prompt: 'coordinate', asking: false, finished: true, running: false },
+  ])
+  const iso = (sec: number): string => new Date(sec * 1000).toISOString().replace(/\.\d{3}Z$/, 'Z')
+  const g = transcriptPathOf(K3, l.deps.home)
+  mkdirSync(join(g, '..'), { recursive: true })
+  writeFileSync(
+    g,
+    [
+      { type: 'SYSTEM_MESSAGE', step_index: 0, content: `x\n<SYSTEM_MESSAGE>\n[Message] timestamp=${iso(BASE - 300)} sender=${K2} priority=MESSAGE_PRIORITY_HIGH content=ask fruit\n</SYSTEM_MESSAGE>` },
+      { type: 'PLANNER_RESPONSE', step_index: 1, created_at: iso(BASE - 300), tool_calls: [{ name: 'ask_question', args: { questions: [{ question: 'Old?', options: ['a', 'b'] }] } }] },
+    ]
+      .map((r) => JSON.stringify(r))
+      .join('\n') + '\n',
+  )
+  const { agyChildQuestions } = await import('./sessions.ts')
+  const q = agyChildQuestions({ activeSubagentRoles: ['ask fruit'], version: '1.5.16' }, A, l.deps.home)
+  assert.equal(q.known, true)
+  assert.deepEqual(q.asking.map((a) => [a.child, a.ambiguous]).sort(), [[K1, true], [K3, true]].sort())
+  // ★ a finished direct child with the prompt does not hide a grandchild that runs with it (agy review)
+  appendFileSync(transcriptPathOf(K1, l.deps.home), JSON.stringify({ type: 'GENERIC', step_index: 2, content: 'A1: a' }) + '\n' + JSON.stringify({ type: 'PLANNER_RESPONSE', step_index: 3, content: 'Reported back.' }) + '\n')
+  const after = agyChildQuestions({ activeSubagentRoles: ['ask fruit'], version: '1.5.16' }, A, l.deps.home)
+  assert.deepEqual(after.asking.map((a) => [a.child, a.ambiguous]), [[K3, false]])
+})
+
 test('★ the back ESC is not sent once the parent’s transcript moved (a new prompt typed on the PC, the status line not yet "working")', async (t) => {
   const l = await lab(t)
   const { askedAt } = withChildren(l, [{ id: K1, prompt: 'ask', asking: true }])
@@ -1371,8 +1429,34 @@ class FakeDialog {
   askingChild = K1
   /** Where the open dialog is drawn: the parent's own question on its view, a subagent's on that child's */
   dialogView: 'parent' | 'child' = 'parent'
+  /**
+   * ★ agy 1.5.16's subagent list under the parent's input box (docs/AGY.md §19.2): set ⇒ drawn, and the keys below act
+   *   as measured. `waits`: what each one's view shows waiting (its own question is the asking child's).
+   */
+  list?: { id: string; name: string; waits?: 'question' | 'approval' }[]
+  /** The list's focused row; -1 = the input box */
+  focus = -1
+  /** Something typed in the PC's input box */
+  draft = ''
   press(bytes: string): void {
     this.keys.push(bytes)
+    if (this.list !== undefined && !this.open) {
+      if (this.view === 'parent') {
+        if (bytes === '\x1b[B') this.focus = Math.min(this.list.length - 1, this.focus + 1)
+        else if (bytes === '\x1b[A') this.focus = Math.max(-1, this.focus - 1)
+        else if (bytes === '\r' && this.focus >= 0) {
+          this.view = 'child'
+          this.childId = this.list[this.focus]!.id
+        } else if (bytes === '\x1b' && this.focus >= 0) this.focus = -1
+        return
+      }
+      if (bytes === '\x1b') this.view = 'parent'
+      else if (bytes === 'a' && this.childId === this.askingChild) {
+        this.open = true
+        this.dialogView = 'child'
+      } else if (bytes === 'a') this.openedOther = true
+      return
+    }
     // (the dialog is on the other view: only ESC, going back from a subagent's view)
     if (this.open && !this.done && this.view !== this.dialogView) {
       if (bytes === '\x1b' && this.view === 'child') this.view = 'parent'
@@ -1391,6 +1475,7 @@ class FakeDialog {
     }
     if (this.done) {
       if (bytes === '\x1b' && this.view === 'child') this.view = 'parent'
+      else if (bytes === '\x1b' && this.list !== undefined && this.focus >= 0) this.focus = -1
       return
     }
     const n = this.q.options.length
@@ -1438,8 +1523,29 @@ class FakeDialog {
         break
     }
   }
+  /** `a` pressed on another subagent's view (its dialog would have opened) */
+  openedOther = false
+  /** What the asking child's view shows it asks (its question by default) */
+  shownQuestion?: string
   screen(): string {
     const lines: string[] = []
+    if (this.list !== undefined && (!this.open || this.done) && this.view === 'parent') {
+      const rule = '─'.repeat(60)
+      if (this.banner !== undefined && !this.open) lines.push(' ┃ self has a question', ' ┃', ` ┃ ? ${this.banner}`, ' ┃', ' ┃ ctrl+k answer · alt+j manage')
+      lines.push(rule, this.draft ? `> ${this.draft}` : '>', rule)
+      this.list.forEach((r, i) => lines.push(`${this.focus === i ? '> ' : '  '}● Agent(self: ${r.name}) · Gemini 4 Neon  ${r.waits === 'question' ? 'Blocked · AskQuestion' : r.waits === 'approval' ? 'Blocked · Bash' : 'Thinking'} · 9s`))
+      lines.push(rule, '? for shortcuts                                accept-edits · Gemini 4 Neon · high')
+      return lines.join('\n')
+    }
+    if (this.list !== undefined && (!this.open || this.done) && this.view === 'child') {
+      const row = this.list.find((r) => r.id === this.childId)
+      const waits = this.done && this.childId === this.askingChild ? undefined : row?.waits
+      lines.push('  main › self', '  ● running · Gemini 4 Neon (High) · 9s · 3 steps', `  ID: ${this.childId}`, '  ' + '─'.repeat(20))
+      if (waits === 'question') lines.push('  ⚠ Approval Required', '    AskQuestion', `      ? ${this.childId === this.askingChild ? (this.shownQuestion ?? this.q.question) : 'Something else?'}`, '  ' + '─'.repeat(20))
+      if (waits === 'approval') lines.push('  ⚠ Approval Required', '    Bash', '      make', '  ' + '─'.repeat(20))
+      lines.push(`  ↑/↓ scroll · pgup/pgdown page · ctrl+end bottom · ctrl+home top · ctrl+o expand${waits ? ' · a respond' : ''} · shift+k kill · esc back`, '                                Gemini 4 Neon · high · 2 subagent(s)')
+      return lines.join('\n')
+    }
     if (!this.open || this.done || this.view !== this.dialogView) {
       // ★ as agy 1.5.13 draws a subagent's view at 80 columns (its id under the header, the footer wrapped)
       if (this.view === 'child') lines.push('  main › self', '  ● running · Gemini 4 Neon (High) · 9s · 3 steps', `  ID: ${this.childId}`, '', '  ? asked', '  ↑/↓ scroll · pgup/pgdown page · ctrl+end bottom · ctrl+home top', '  ctrl+o expand · shift+k kill · esc back', '                                Gemini 4 Neon · high · 1 subagent(s)')
@@ -2734,3 +2840,241 @@ test('★ clear: the screen is read again before each further round (a subagent�
   assert.deepEqual(k.written, [AGY_CLEAR_KEYS.bottom, AGY_CLEAR_KEYS.row.repeat(3)])
 })
 
+
+// ★★ agy 1.5.16 (docs/AGY.md §19.2): a subagent's question opened from the parent's list by its id, never with ctrl+k
+test('★★ list (1.5.16): the asking subagent is found in the list by its id, its question opened with `a` and answered', async (t) => {
+  const qs = [{ question: 'Which hill?', options: ['east', 'west'], multi: false }]
+  const { l, fake, mark, question } = await screenLab(t, qs, true)
+  l.deps.screenSettleMs = 150
+  idleChild(l, K2)
+  // another subagent waits for an approval above it in the list; the asking one is K1
+  fake.list = [
+    { id: K2, name: 'Runner', waits: 'approval' },
+    { id: K1, name: 'Asker', waits: 'question' },
+  ]
+  const kid = transcriptPathOf(K1, l.deps.home)
+  const recorded = setTimeout(() => appendFileSync(kid, JSON.stringify({ type: 'GENERIC', step_index: 2, content: 'A1: west' }) + '\n'), 50)
+  assert.deepEqual(await answerAgyQuestion(A, mark, { kind: 'plan', question, plan: plan({ indexes: [1] }) }, l.deps), { ok: true })
+  clearTimeout(recorded)
+  assert.deepEqual(fake.answers, ['west'])
+  // down into the list, K2's view opened and left, down, K1's view, `a`, the answer, back
+  // (the last ESC gives the list's focus back to the input box)
+  assert.deepEqual(fake.keys, ['\x1b[B', '\r', '\x1b', '\x1b[B', '\r', 'a', '2', '\x1b', '\x1b'])
+  assert.equal(fake.focus, -1)
+  assert.equal(fake.keys.includes('\x0b'), false, 'never ctrl+k (on an approval it approves)')
+  assert.equal(fake.openedOther, false)
+})
+
+test('★★ list (1.5.16): a sibling asking the same text does not stop it (told by the id); the focus left mid-list starts from the top', async (t) => {
+  const qs = [{ question: 'Which hill?', options: ['east', 'west'], multi: false }]
+  const { l, fake, mark, question } = await screenLab(t, qs, true)
+  l.deps.screenSettleMs = 150
+  // a second child asks the very same question (§19.1 case 4)
+  const iso = (sec: number): string => new Date(sec * 1000).toISOString().replace(/\.\d{3}Z$/, 'Z')
+  const twin = transcriptPathOf(K3, l.deps.home)
+  mkdirSync(join(twin, '..'), { recursive: true })
+  writeFileSync(
+    twin,
+    [
+      { type: 'SYSTEM_MESSAGE', step_index: 0, created_at: iso(BASE - 40), content: `x\n<SYSTEM_MESSAGE>\n[Message] timestamp=${iso(BASE - 40)} sender=${A} priority=MESSAGE_PRIORITY_HIGH content=ask\n</SYSTEM_MESSAGE>` },
+      { type: 'PLANNER_RESPONSE', step_index: 1, created_at: iso(BASE - 35), tool_calls: [{ name: 'ask_question', args: { questions: [{ question: 'Which hill?', options: ['east', 'west'], is_multi_select: false }] } }] },
+    ]
+      .map((r) => JSON.stringify(r))
+      .join('\n') + '\n',
+  )
+  fake.list = [
+    { id: K3, name: 'Asker', waits: 'question' },
+    { id: K1, name: 'Asker', waits: 'question' },
+  ]
+  fake.focus = 1
+  const kid = transcriptPathOf(K1, l.deps.home)
+  const recorded = setTimeout(() => appendFileSync(kid, JSON.stringify({ type: 'GENERIC', step_index: 2, content: 'A1: east' }) + '\n'), 50)
+  assert.deepEqual(await answerAgyQuestion(A, mark, { kind: 'plan', question, plan: plan({ indexes: [0] }) }, l.deps), { ok: true })
+  clearTimeout(recorded)
+  assert.deepEqual(fake.answers, ['east'])
+  assert.deepEqual(fake.keys, ['\x1b[A', '\r', '\x1b', '\x1b[B', '\r', 'a', '1', '\x1b', '\x1b'])
+  assert.equal(fake.focus, -1)
+  assert.equal(fake.openedOther, false)
+})
+
+test('★★ list (1.5.16): a draft in the PC\'s box, or the asking subagent not in the list: nothing opened', async (t) => {
+  const qs = [{ question: 'Which hill?', options: ['east', 'west'], multi: false }]
+  const { l, fake, mark, question } = await screenLab(t, qs, true)
+  l.deps.screenSettleMs = 150
+  idleChild(l, K2)
+  fake.list = [
+    { id: K2, name: 'Runner', waits: 'approval' },
+    { id: K1, name: 'Asker', waits: 'question' },
+  ]
+  fake.draft = 'half typed'
+  assert.deepEqual(await answerAgyQuestion(A, mark, { kind: 'plan', question, plan: plan({ indexes: [1] }) }, l.deps), { ok: false, reason: 'changed' })
+  assert.deepEqual(fake.keys, [])
+  fake.draft = ''
+  fake.list = [{ id: K2, name: 'Runner', waits: 'approval' }]
+  assert.equal(agyUnlisted(mark), false)
+  assert.deepEqual(await answerAgyQuestion(A, mark, { kind: 'plan', question, plan: plan({ indexes: [1] }) }, l.deps), { ok: false, reason: 'changed' })
+  assert.deepEqual(fake.keys, ['\x1b[B', '\r', '\x1b'])
+  // ★ the whole list walked without it: remembered (its card is not raised again / codex review)
+  assert.equal(agyUnlisted(mark), true)
+  resetAgyUnlistedForTest()
+  // ⚠️ the list changing during the walk (a row added): not remembered (codex review)
+  fake.keys = []
+  fake.view = 'parent'
+  fake.focus = -1
+  const press = fake.press.bind(fake)
+  fake.press = (bytes: string) => {
+    press(bytes)
+    if (bytes === '\r' && fake.list!.length === 1) fake.list = [{ id: K3, name: 'Newer', waits: 'approval' }, ...fake.list!]
+  }
+  assert.deepEqual(await answerAgyQuestion(A, mark, { kind: 'plan', question, plan: plan({ indexes: [1] }) }, l.deps), { ok: false, reason: 'changed' })
+  assert.equal(agyUnlisted(mark), false)
+  fake.press = press
+  fake.list = [{ id: K2, name: 'Runner', waits: 'approval' }]
+  assert.equal(fake.openedOther, false)
+  assert.deepEqual(fake.answers, [''])
+  // ⚠️ the PC types into its box right after the answer looked (before the first key): the key is not sent
+  fake.keys = []
+  fake.view = 'parent'
+  fake.focus = -1
+  fake.list = [{ id: K1, name: 'Asker', waits: 'question' }]
+  const draw = fake.screen.bind(fake)
+  let reads = 0
+  l.deps.readScreen = async () => {
+    if (++reads === 2) fake.draft = 'typed meanwhile'
+    return draw()
+  }
+  assert.deepEqual(await answerAgyQuestion(A, mark, { kind: 'plan', question, plan: plan({ indexes: [1] }) }, l.deps), { ok: false, reason: 'changed' })
+  assert.deepEqual(fake.keys, [])
+  fake.draft = ''
+  l.deps.readScreen = async () => draw()
+  // ⚠️ its view shows another question now (asked again meanwhile): `a` not pressed
+  fake.keys = []
+  fake.view = 'parent'
+  fake.focus = -1
+  fake.list = [{ id: K1, name: 'Asker', waits: 'question' }]
+  fake.shownQuestion = 'Which lake?'
+  assert.deepEqual(await answerAgyQuestion(A, mark, { kind: 'plan', question, plan: plan({ indexes: [1] }) }, l.deps), { ok: false, reason: 'changed' })
+  assert.equal(fake.keys.includes('a'), false)
+})
+
+test('★★ list (1.5.16): never ctrl+k on agy 1.5.16+ — the banner without a readable list, or a blind relay', async (t) => {
+  const qs = [{ question: 'Which hill?', options: ['east', 'west'], multi: false }]
+  const { l, fake, mark, question } = await screenLab(t, qs, true)
+  l.deps.screenSettleMs = 150
+  for (const f of [l.stateFile, join(l.deps.dir, `pid-${PID}.json`)]) {
+    const raw = JSON.parse(readFileSync(f, 'utf8'))
+    const at = statSync(f).mtimeMs / 1000
+    writeFileSync(f, JSON.stringify({ ...raw, input: { ...raw.input, version: '1.5.16' } }))
+    utimesSync(f, at, at)
+  }
+  // the banner is up, the list is not readable (a narrow terminal wrapped it): nothing pressed
+  assert.deepEqual(await answerAgyQuestion(A, mark, { kind: 'plan', question, plan: plan({ indexes: [1] }) }, l.deps), { ok: false, reason: 'changed' })
+  assert.equal(fake.keys.includes('\x0b'), false)
+  // a blind relay's fixed keys for a subagent's question start with ctrl+k: refused
+  const blind = { ...mark, screen: undefined }
+  delete (blind as { screen?: true }).screen
+  assert.deepEqual(await answerAgyQuestion(A, blind, { kind: 'steps', steps: [{ key: '2' }] }, l.deps), { ok: false, reason: 'changed' })
+  assert.equal(fake.keys.includes('\x0b'), false)
+})
+
+test('★ list (1.5.16): a question whose own text has a "? " row is still matched (a ternary / codex review)', async (t) => {
+  const qs = [{ question: 'Keep a ? b : c as is?', options: ['yes', 'no'], multi: false }]
+  const { l, fake, mark, question } = await screenLab(t, qs, true)
+  l.deps.screenSettleMs = 150
+  fake.list = [{ id: K1, name: 'Asker', waits: 'question' }]
+  // the view shows it wrapped right before "? b"
+  fake.shownQuestion = 'Keep a\n      ? b : c as is?'
+  const kid = transcriptPathOf(K1, l.deps.home)
+  const recorded = setTimeout(() => appendFileSync(kid, JSON.stringify({ type: 'GENERIC', step_index: 2, content: 'A1: yes' }) + '\n'), 50)
+  assert.deepEqual(await answerAgyQuestion(A, mark, { kind: 'plan', question, plan: plan({ indexes: [0] }) }, l.deps), { ok: true })
+  clearTimeout(recorded)
+  assert.deepEqual(fake.answers, ['yes'])
+})
+
+test('★ list (1.5.16): the PC left on the asking subagent\'s view with its question closed: `a` right there (codex review)', async (t) => {
+  const qs = [{ question: 'Which hill?', options: ['east', 'west'], multi: false }]
+  const { l, fake, mark, question } = await screenLab(t, qs, true)
+  l.deps.screenSettleMs = 150
+  fake.list = [{ id: K1, name: 'Asker', waits: 'question' }]
+  fake.view = 'child'
+  fake.childId = K1
+  const kid = transcriptPathOf(K1, l.deps.home)
+  const recorded = setTimeout(() => appendFileSync(kid, JSON.stringify({ type: 'GENERIC', step_index: 2, content: 'A1: west' }) + '\n'), 50)
+  assert.deepEqual(await answerAgyQuestion(A, mark, { kind: 'plan', question, plan: plan({ indexes: [1] }) }, l.deps), { ok: true })
+  clearTimeout(recorded)
+  assert.deepEqual(fake.answers, ['west'])
+  assert.deepEqual(fake.keys, ['a', '2', '\x1b'])
+})
+
+test('★ list (1.5.16): a list that changes during the walk and comes back is not taken for "missing" (codex review)', async (t) => {
+  const qs = [{ question: 'Which hill?', options: ['east', 'west'], multi: false }]
+  const { l, fake, mark, question } = await screenLab(t, qs, true)
+  l.deps.screenSettleMs = 150
+  const K4 = '4d4d4d4d-1111-4222-8333-444444444444'
+  const K5 = '5e5e5e5e-1111-4222-8333-444444444444'
+  const K6 = '6f6f6f6f-1111-4222-8333-444444444444'
+  fake.list = [
+    { id: K2, name: 'Runner', waits: 'approval' },
+    { id: K4, name: 'Other', waits: 'approval' },
+  ]
+  let enters = 0
+  const press = fake.press.bind(fake)
+  fake.press = (bytes: string) => {
+    press(bytes)
+    if (bytes !== '\r') return
+    enters++
+    // two rows appear above while the first is open, and are gone again while the second is
+    if (enters === 1) fake.list = [{ id: K5, name: 'Temp', waits: 'approval' }, { id: K6, name: 'Temp2', waits: 'approval' }, ...fake.list!]
+    else if (enters === 2) fake.list = fake.list!.filter((r) => r.id !== K5 && r.id !== K6)
+  }
+  assert.deepEqual(await answerAgyQuestion(A, mark, { kind: 'plan', question, plan: plan({ indexes: [1] }) }, l.deps), { ok: false, reason: 'changed' })
+  assert.equal(agyUnlisted(mark), false)
+  resetAgyUnlistedForTest()
+})
+
+test('★ list (1.5.16): the direct `a` only when the preview shows this question (codex review)', async (t) => {
+  const qs = [{ question: 'Which hill?', options: ['east', 'west'], multi: false }]
+  const { l, fake, mark, question } = await screenLab(t, qs, true)
+  l.deps.screenSettleMs = 150
+  fake.list = [{ id: K1, name: 'Asker', waits: 'question' }]
+  fake.view = 'child'
+  fake.childId = K1
+  fake.shownQuestion = 'Which lake?'
+  const r = await answerAgyQuestion(A, mark, { kind: 'plan', question, plan: plan({ indexes: [1] }) }, l.deps)
+  assert.equal(r.ok, false)
+  assert.equal(fake.keys.includes('a'), false)
+})
+
+test('★ list (1.5.16): this child\'s own dialog already open, a sibling asking the same text: answered (told by its id / codex review)', async (t) => {
+  const qs = [{ question: 'Which hill?', options: ['east', 'west'], multi: false }]
+  const { l, fake, mark, question } = await screenLab(t, qs, true)
+  l.deps.screenSettleMs = 150
+  for (const f of [l.stateFile, join(l.deps.dir, `pid-${PID}.json`)]) {
+    const raw = JSON.parse(readFileSync(f, 'utf8'))
+    const at = statSync(f).mtimeMs / 1000
+    writeFileSync(f, JSON.stringify({ ...raw, input: { ...raw.input, version: '1.5.16' } }))
+    utimesSync(f, at, at)
+  }
+  const iso = (sec: number): string => new Date(sec * 1000).toISOString().replace(/\.\d{3}Z$/, 'Z')
+  const twin = transcriptPathOf(K3, l.deps.home)
+  mkdirSync(join(twin, '..'), { recursive: true })
+  writeFileSync(
+    twin,
+    [
+      { type: 'SYSTEM_MESSAGE', step_index: 0, created_at: iso(BASE - 40), content: `x\n<SYSTEM_MESSAGE>\n[Message] timestamp=${iso(BASE - 40)} sender=${A} priority=MESSAGE_PRIORITY_HIGH content=ask\n</SYSTEM_MESSAGE>` },
+      { type: 'PLANNER_RESPONSE', step_index: 1, created_at: iso(BASE - 35), tool_calls: [{ name: 'ask_question', args: { questions: [{ question: 'Which hill?', options: ['east', 'west'], is_multi_select: false }] } }] },
+    ]
+      .map((r) => JSON.stringify(r))
+      .join('\n') + '\n',
+  )
+  // the PC has K1's dialog open on its view
+  fake.open = true
+  fake.view = 'child'
+  fake.dialogView = 'child'
+  fake.childId = K1
+  const kid = transcriptPathOf(K1, l.deps.home)
+  const recorded = setTimeout(() => appendFileSync(kid, JSON.stringify({ type: 'GENERIC', step_index: 2, content: 'A1: west' }) + '\n'), 50)
+  assert.deepEqual(await answerAgyQuestion(A, mark, { kind: 'plan', question, plan: plan({ indexes: [1] }) }, l.deps), { ok: true })
+  clearTimeout(recorded)
+  assert.deepEqual(fake.answers, ['west'])
+})

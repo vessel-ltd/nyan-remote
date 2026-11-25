@@ -18,7 +18,7 @@ import { broadcast } from './events.ts'
 import { createHash, randomBytes } from 'node:crypto'
 import { firstSeenAt, isQuiet, onRequestOver, originOf, pendingWithMeta, setFirstSeenPin } from './permission.ts'
 import { codexRowsNow } from './codex/run.ts'
-import { agyChildrenSettled, agyDir, agyLocksOfAsync, agyQuestionWaitAt, agyVisitedSince, conversationOf, defaultAgyDeps, readAgyPidFile, transcriptPathOf, type AgyFile } from './agy/sessions.ts'
+import { AGY_QUESTION_TOOL, agyChildQuestions, agyChildrenSettled, agyDir, agyBlockedWaits, agyLocksOfAsync, agyQuestionWaitAt, agyVisitedSince, conversationOf, defaultAgyDeps, readAgyPidFile, transcriptPathOf, type AgyFile } from './agy/sessions.ts'
 import { defaultAgyKeysDeps, findAgyTarget } from './agy/keys.ts'
 import { lastTurnStart, readTailRecords, TAIL_BYTES, turnEnd } from './agy/pending.ts'
 import {
@@ -899,6 +899,12 @@ export interface AgyNetDeps {
   waiting(sessionId: string): boolean
   /** The agy waits for the person's answer to a question (its own, or a running child's) */
   asking(f: AgyFile): boolean
+  /** When that question wait began (`agyQuestionWaitAt`), or undefined */
+  questionWaitAt(f: AgyFile): number | undefined
+  /** The calls asking now (its own question, its subagents'), each by conversation and call; undefined = unreadable */
+  questionCalls(f: AgyFile): string[] | undefined
+  /** ★ The subagents waiting on an approval seen on the PC's list, each with its start (`agyBlockedWaits` / docs/AGY.md §19, case 8) */
+  blockedWaits(f: AgyFile): readonly { since: number; id: number }[]
   /** Another agy than `pid` wrote into the conversation since `since` (`agyVisitedSince`) */
   othersWrote(conv: string, pid: number, since: number): boolean
   /** Its children all reported and finished well (`agyChildrenSettled`) */
@@ -929,6 +935,18 @@ const agyNetDeps: AgyNetDeps = {
   tell: tellLeader,
   waiting: (id) => pendingWithMeta().some((p) => p.info.sessionId === id),
   asking: (f) => agyQuestionWaitAt(f.state, f.mtimeMs, defaultAgyDeps().home) !== undefined,
+  questionWaitAt: (f) => agyQuestionWaitAt(f.state, f.mtimeMs, defaultAgyDeps().home),
+  questionCalls: (f) => {
+    const home = defaultAgyDeps().home
+    const own = turnEnd(readTailRecords(transcriptPathOf(f.state.conversationId, home))).pending
+    // (what was read, also when some child could not be: its calls name the wait the same way / agy review)
+    const kids = agyChildQuestions(f.state, f.state.conversationId, home)
+    return [
+      ...(own && own.name === AGY_QUESTION_TOOL ? [`${f.state.conversationId}:${own.step}:${own.index}:${own.at ?? ''}`] : []),
+      ...kids.asking.map((k) => `${k.child}:${k.call.step}:${k.call.index}:${k.call.at ?? ''}`),
+    ]
+  },
+  blockedWaits: (f) => agyBlockedWaits(f.state),
   othersWrote: (conv, pid, since) => agyVisitedSince(agyDir(), conv, pid, since),
   childrenSettled: (f) => !f.state.hadSubagents || agyChildrenSettled(f.state, defaultAgyDeps().home),
 }
@@ -1160,6 +1178,166 @@ export async function agyTeamSafetyNet(deps: AgyNetDeps = agyNetDeps): Promise<v
     // the next look tries again
   } finally {
     netRunning = false
+  }
+}
+
+/**
+ * ★★ A member waiting for an answer that only the PC can give (docs/TEAM.md §9.3): agy asks a question or waits for an
+ *    approval (its own, a subagent's, a deeper one's) and no card for it is in the agent — the phone and the leader
+ *    cannot answer it (which of several dialogs ctrl+k would open is not known, an older relay …). The phone rings
+ *    "needs you" as before; the leader, who would otherwise take the member for busy, is told once per wait.
+ */
+/** The waits the leader was told of (newest few per member): one told stays told while it lasts (codex review) */
+const pcTold = new WeakMap<TeamMember, string[]>()
+/** How long a wait with no card must last before the leader is told (a card being raised takes a look or two) */
+export const AGY_PC_WAIT_MS = 20_000
+
+/**
+ * The member's waits now, each by its call (its own question or approval, each subagent's question), or undefined (not
+ * waiting, a card for it is up, or unreadable). ★ Per call, so one answered of two told does not make the other new
+ * (codex review); a question and an approval both counted (agy review: the approval was hidden behind the question)
+ */
+function pcWaitIds(m: TeamMember, deps: AgyNetDeps): string[] | undefined {
+  const f = agyStateNow(m)
+  const conv = conversationOf(m.sessionId)
+  if (f === undefined || conv === undefined) return undefined
+  // ★ An approval past the tail is one wait while it lasts: forgotten once it is over (codex · agy review: a later one
+  //   was never told)
+  if (!f.state.confirmationPending) {
+    forgetTold(m, 'a@unread')
+    lastApproval.delete(m)
+  }
+  // ⚠️ A card in the agent (the leader's or the human's) is answerable from here: not this
+  if (deps.waiting(m.sessionId)) return undefined
+  const ids: string[] = []
+  const askedAt = deps.questionWaitAt(f)
+  // ★ Each subagent's approval on its own id, beside the questions (codex · agy review: a question already told hid it;
+  //   one id for all restarted the first one's time whenever another came)
+  const blocked = deps.blockedWaits(f)
+  // (by its own number)
+  for (const k of blocked) ids.push(`b@${k.since}#${k.id}`)
+  const newest = blocked.length === 0 ? undefined : Math.max(...blocked.map((k) => k.since))
+  if (askedAt !== undefined) {
+    // ★ By the calls asking (its own, its subagents'): a system record appended to a child's transcript moves the time,
+    //   not the call (codex review: the same wait was told again). The time when the calls cannot be read.
+    // (⚠️ Not the approval's own time again: `questionWaitAt` includes it)
+    const calls = deps.questionCalls(f)
+    if (calls !== undefined && calls.length > 0) ids.push(...calls.map((c) => `q@${c}`))
+    else if (askedAt !== newest) ids.push(`q@${askedAt}`)
+  }
+  if (f.state.confirmationPending) {
+    // ★ Its own approval by the call (a terminal resize rewrites the state file, not the call / codex review)
+    const end = turnEnd(deps.tail(transcriptPathOf(conv, defaultAgyDeps().home)))
+    const p = end.pending
+    // ⚠️ The transcript says the turn ended answered: a stale "approval" flag in the state file, not a wait (codex review)
+    if (p === undefined && end.answered) {
+      // (that approval is over: a next one is new / codex review)
+      forgetTold(m, 'a@unread')
+      lastApproval.delete(m)
+      return ids.length === 0 ? undefined : ids
+    }
+    // ★ Unreadable now but read earlier in this same approval: that one (codex review: told again as "unread")
+    if (p === undefined) ids.push(lastApproval.get(m) ?? 'a@unread')
+    else {
+      const id = `a@${p.step}:${p.index}:${p.at ?? ''}`
+      lastApproval.set(m, id)
+      // ★ The same approval read at last (it was told unread): carried over, not new (codex review)
+      const told = pcTold.get(m)
+      if (told?.includes('a@unread')) pcTold.set(m, [...told.filter((x) => x !== 'a@unread'), id])
+      ids.push(id)
+    }
+  }
+  return ids.length === 0 ? undefined : ids
+}
+
+/** The approval read last while `confirmationPending` lasts (an unreadable look keeps its name) */
+const lastApproval = new WeakMap<TeamMember, string>()
+
+function forgetTold(m: TeamMember, id: string): void {
+  const told = pcTold.get(m)
+  if (told?.includes(id)) pcTold.set(m, told.filter((x) => x !== id))
+}
+
+/** ★ Since when each wait not told yet has been seen with no card (codex review: one timer for the set restarted when another came) */
+const pcSeen = new WeakMap<TeamMember, Map<string, number>>()
+
+/** The waits due to be told now (seen cardless long enough, not told yet), sorted; undefined = none */
+function pcDue(m: TeamMember, deps: AgyNetDeps, now: number): string[] | undefined {
+  const ids = pcWaitIds(m, deps)
+  const seen = pcSeen.get(m) ?? new Map<string, number>()
+  if (ids === undefined) {
+    pcSeen.delete(m)
+    return undefined
+  }
+  const told = pcTold.get(m) ?? []
+  const fresh = ids.filter((x) => !told.includes(x))
+  // (each one's own time: kept while it lasts, forgotten when it goes)
+  for (const k of [...seen.keys()]) if (!fresh.includes(k)) seen.delete(k)
+  for (const k of fresh) if (!seen.has(k)) seen.set(k, now)
+  pcSeen.set(m, seen)
+  const due = fresh.filter((k) => now - seen.get(k)! >= AGY_PC_WAIT_MS).sort()
+  return due.length === 0 ? undefined : due
+}
+
+let pcRunning = false
+
+/**
+ * ★ One round of the PC-wait notices (each agy look, `index.ts`) — apart from the safety net, so a slow probe here does
+ *   not hold the net's reports back (codex review). Never throws.
+ */
+export async function agyTeamPcWaits(deps: AgyNetDeps = agyNetDeps): Promise<void> {
+  if (pcRunning) return
+  pcRunning = true
+  try {
+    for (const team of allTeamsNow()) for (const m of [...team.members]) if (m.tool === 'agy' && m.pid !== undefined) await pcWaitNotice(team, m, deps)
+  } catch {
+    // the next look tries again
+  } finally {
+    pcRunning = false
+  }
+}
+
+async function pcWaitNotice(team: Team, m: TeamMember, deps: AgyNetDeps): Promise<void> {
+  try {
+    const due = pcDue(m, deps, deps.now())
+    if (due === undefined) return
+    if (!leaderLive(team, teamDeps()) || !leaderSessionNow(team) || !liveMember(m)) return
+    const conv = conversationOf(m.sessionId)!
+    if (!(await deps.locks(m.pid!))?.includes(conv)) return
+    // ⚠️ Right before the write too: still this member, the same waits still waiting with no card (codex review)
+    const still = (): boolean => {
+      if (membershipOf(m.sessionId)?.member !== m || !liveMember(m)) return false
+      const now = pcWaitIds(m, deps)
+      return now !== undefined && due.every((k) => now.includes(k)) && !due.some((k) => pcTold.get(m)?.includes(k))
+    }
+    if (!still()) return
+    const told = await deps.tell(
+      team,
+      t(
+        `[nyan-team] ${m.name}（agy）は、PC でしか答えられない質問か承認で止まっています（サブエージェントのものなど。ここからもスマホからも選べません）。ユーザーに PC で答えてもらう必要があります。nyan team read ${m.name} で様子を見られます`,
+        `[nyan-team] ${m.name} (agy) is stopped at a question or approval only the PC can answer (a subagent's, for example; neither you nor the phone can pick it). The user needs to answer it on the PC. See nyan team read ${m.name}.`,
+      ),
+      still,
+    )
+    if (told) {
+      // (the cap drops waits that are over first: one still up must not be told again / codex review)
+      const now = pcWaitIds(m, deps)
+      let list = [...(pcTold.get(m) ?? []), ...due]
+      // (a card up now hides the waits: nothing known to be over, nothing dropped / codex review)
+      while (now !== undefined && list.length > 32) {
+        const k = list.findIndex((x) => !now.includes(x))
+        if (k < 0) break
+        list = [...list.slice(0, k), ...list.slice(k + 1)]
+      }
+      pcTold.set(m, list)
+      console.log(`[team] told the leader team=${team.id} ${m.name} waits for the PC`)
+    } else {
+      // ★ Tried again after another while
+      const seen = pcSeen.get(m)
+      for (const k of due) seen?.set(k, deps.now())
+    }
+  } catch {
+    // the next look tries again
   }
 }
 

@@ -1062,6 +1062,9 @@ export function notificationText(f: NotifyFields): { title: string; body: string
  * ⚠️ The wording lives here **so notifications (agent side) and the UI never disagree**
  *    (same reason as `statusLabel` / CLAUDE.md).
  */
+/** ★ agy: the `waitingFor` of a row waiting on a subagent's approval the phone cannot answer (docs/AGY.md §19, case 8) */
+export const AGY_CHILD_APPROVAL = 'subagent approval on the PC'
+
 export function waitingReason(waitingFor: string | undefined): string | null {
   if (!waitingFor) return null
   const t = waitingFor.trim()
@@ -1079,6 +1082,9 @@ export function waitingReason(waitingFor: string | undefined): string | null {
       return 'worker の要求'
     case 'goal proposal':
       return '目標の提案'
+    // ★ agy: a subagent waits on an approval the phone cannot answer (`agent/src/agy/blocked.ts` / docs/AGY.md §19)
+    case AGY_CHILD_APPROVAL:
+      return 'PC でサブエージェントの承認'
     default:
       return t
   }

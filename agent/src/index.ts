@@ -11,6 +11,7 @@ import { lastTurnStartCached, readTailRecords, turnEnd } from './agy/pending.ts'
 import { AgyCards } from './agy/cards.ts'
 import { homedir } from 'node:os'
 import { aliveProcStartSync } from './claude/sessionIndex.ts'
+import { scanAgyBlocked } from './agy/blocked.ts'
 import { AgyNotifier } from './agy/notify.ts'
 import { answerAgyCard, answerAgyQuestion } from './agy/keys.ts'
 
@@ -28,7 +29,7 @@ import { seedHookState } from './claude/hookState.ts'
 import { startSessionWatch } from './claude/sessionWatch.ts'
 import { uploads } from './uploads.ts'
 import { CODEX_FOLLOW_TICK_MS, codexFollowTick, codexLastWords, codexRowsNow, startCodex } from './codex/run.ts'
-import { agyCardsChanged, agyMemberDone, agyTeamSafetyNet, agyPhoneFallback, codexCardsChanged, codexMemberState, codexRowStatus, codexSnapshot, sessionEnded } from './teamHooks.ts'
+import { agyCardsChanged, agyMemberDone, agyTeamSafetyNet, agyTeamPcWaits, agyPhoneFallback, codexCardsChanged, codexMemberState, codexRowStatus, codexSnapshot, sessionEnded } from './teamHooks.ts'
 import { startTeamSocket } from './teamSocket.ts'
 import { codexPayload } from './codex/notify.ts'
 import { sendToAll } from './push.ts'
@@ -217,11 +218,20 @@ async function main(): Promise<void> {
   const agyLook = (): void => {
     // ★ Then the team safety net (a member's turn the leader was not told about / docs/TEAM.md §9.2)
     // ★ One card look for both (agy review: two `fresh()` calls ran every look twice)
-    const cards = agyCards.fresh()
+    // ★ With the subagents waiting on an approval only the PC can answer (`agy/blocked.ts` / docs/AGY.md §19, case 8):
+    //   read before the notifier and the leaders' notices look, so they see it the same look
+    const cards = Promise.all([
+      agyCards.fresh(),
+      scanAgyBlocked().then((changed) => {
+        if (changed) broadcast({ type: 'sessions-changed', at: new Date().toISOString() })
+      }),
+    ])
     void cards.then(() => agyNotifier.look())
     // ★ Then the team safety net — not behind the notifier's queue (codex review: a stalled phone push held it, and a
     //   member's stop was never told)
     void cards.then(() => agyTeamSafetyNet())
+    // ★ And the leaders' "waits for the PC" notices (docs/TEAM.md §9.3), apart from the net
+    void cards.then(() => agyTeamPcWaits())
     void endAgyAutoApproveGone().catch(() => undefined)
   }
   // ★ An agy grant whose agy no longer shows the conversation (it exited, moved on, or this agent restarted and forgot

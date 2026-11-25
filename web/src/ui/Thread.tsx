@@ -18,7 +18,7 @@ import type { Transport } from '../transport/index.ts'
 import { renderMarkdown } from './markdown.tsx'
 import { Composer } from './Composer.tsx'
 import { followAction } from './follow.ts'
-import { alreadyInTranscript, sendLimitBytes, type InflightMessage } from '../../../shared/types.ts'
+import { AGY_CHILD_APPROVAL, alreadyInTranscript, sendLimitBytes, type InflightMessage } from '../../../shared/types.ts'
 import { ctxText, formatTokens, modelText } from './tokens.ts'
 import { prepareFile, uploadFile } from './attach.ts'
 import { beginSend, consumeAfterReload, finishSend, noteArrivals, RELOAD_SLACK_MS, type PendingSend } from './pending.ts'
@@ -1155,6 +1155,13 @@ export function Thread({
                   {t('。PCで答えてください。', '. Please answer on the PC.')}
                 </>
               )
+            ) : session?.waitingFor === AGY_CHILD_APPROVAL ? (
+              /* ★ A subagent waits on an approval (seen on the PC's list / docs/AGY.md §19, case 8): no card for it yet */
+              <>
+                {t('PCの画面で、サブエージェントが承認を待っています。', 'A subagent is waiting for an approval on the PC screen. ')}
+                <strong>{t('サブエージェントの承認は、まだスマホからは答えられません', 'A subagent’s approval can’t be answered from the phone yet')}</strong>
+                {t('。PCで答えてください。', '. Please answer on the PC.')}
+              </>
             ) : session?.agyShared ? (
               <>
                 {t('PCの画面で承認を待っています。', 'The PC screen is waiting for an approval. ')}

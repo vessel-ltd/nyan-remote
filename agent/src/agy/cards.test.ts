@@ -12,6 +12,7 @@ import { AgyCards, agyCard, agyCardTool, agyDelivery, agyDeliveryMessage, agyQue
 import type { AgyCardMark } from './keys.ts'
 import { agyCardAt, agyOwnRows, resetAgyCardNamesForTest, transcriptPathOf } from './sessions.ts'
 import { readTailRecords } from './pending.ts'
+import { noteUnlisted, resetAgyUnlistedForTest } from './screen.ts'
 
 const A = '062a8f25-9451-42f3-ae93-34a208e99365'
 const PID = 4242
@@ -97,7 +98,7 @@ function lab(t: { after(fn: () => void): void }, opts: { pane?: boolean } = {}):
   writeFileSync(transcript, JSON.stringify({ step_index: 1, type: 'PLANNER_RESPONSE', created_at: new Date((BASE - 60) * 1000).toISOString(), tool_calls: [{ name: 'run_command', args: { CommandLine: 'ls' } }] }) + '\n', { flag: 'a' })
   const stateFile = join(dir, `session-${A}.json`)
   const setState = (over: Record<string, unknown>, mtimeSec = BASE): void => {
-    const body = JSON.stringify({ nyanPid: PID, nyanBusyAt: BASE, input: { conversation_id: A, cwd: '/home/user/p', agent_state: 'tool_use', tool_confirmation_pending: true, ...over } })
+    const body = JSON.stringify({ nyanPid: PID, nyanBusyAt: BASE, input: { conversation_id: A, cwd: '/home/user/p', agent_state: 'tool_use', tool_confirmation_pending: true, version: '1.5.14', ...over } })
     for (const f of [stateFile, join(dir, `pid-${PID}.json`)]) {
       writeFileSync(f, body)
       utimesSync(f, mtimeSec, mtimeSec)
@@ -1478,4 +1479,126 @@ test('★ an agy question\'s origin is its call too (another question at the sam
   assert.equal(agyQuestionCard(row, { ...mark, askedAt: mark.askedAt + 1 }, q('Deploy now?'), at).origin, a.origin)
   assert.notEqual(agyQuestionCard(row, mark, q('Delete the branch?'), at).origin, a.origin)
   assert.notEqual(agyQuestionCard(row, { ...mark, callAt: mark.callAt + 5000 }, q('Deploy now?'), at).origin, a.origin)
+})
+
+test('★★ list (agy 1.5.16): the oldest asking subagent comes to the phone — a grandchild, or one of two asking the same (docs/AGY.md §19)', async (t) => {
+  const l = questionLab(t)
+  const iso = (sec: number): string => new Date(sec * 1000).toISOString().replace(/\.\d{3}Z$/, 'Z')
+  const K1 = '15bc1e2a-6a62-4f86-9bf9-dd03e99f6627'
+  const K2 = '70039de1-d758-4556-afa8-5d36b9625540'
+  const G = '2b7c1e44-0d6e-4a55-9a1d-6c0f4b2f7a11'
+  const kid = (id: string, parent: string, n: number, calls: Record<string, unknown>[], at: number): void => {
+    const p = transcriptPathOf(id, l.deps.agy().home)
+    mkdirSync(join(p, '..'), { recursive: true })
+    writeFileSync(
+      p,
+      [
+        { type: 'SYSTEM_MESSAGE', step_index: 0, created_at: iso(BASE - 35), content: `x\n\n<SYSTEM_MESSAGE>\n[Message] timestamp=${iso(BASE - 35)} sender=${parent} priority=MESSAGE_PRIORITY_HIGH content=p${n}\n</SYSTEM_MESSAGE>` },
+        { type: 'PLANNER_RESPONSE', step_index: 1, created_at: iso(BASE - 35), tool_calls: calls },
+      ]
+        .map((r) => JSON.stringify(r))
+        .join('\n') + '\n',
+    )
+    utimesSync(p, at, at)
+  }
+  const ask = (question: string): Record<string, unknown> => ({ name: 'ask_question', args: { questions: [{ question, options: ['a', 'b'] }] } })
+  // K1 coordinates (its own subagent G asks); K2 asks the same question G asks, later
+  kid(K1, A, 0, [{ name: 'invoke_subagent', args: { Prompt: 'g' } }], BASE - 25)
+  kid(G, K1, 9, [ask('Which planet?')], BASE - 20)
+  kid(K2, A, 1, [ask('Which moon?')], BASE - 18)
+  writeFileSync(l.transcript, JSON.stringify({ type: 'USER_INPUT', step_index: 0, content: '<USER_REQUEST>\ngo\n</USER_REQUEST>' }) + '\n')
+  utimesSync(l.transcript, BASE - 30, BASE - 30)
+  l.setState({ tool_confirmation_pending: false, agent_state: 'idle', subagents: [{ name: 'self', role: 'p0', status: 'running' }, { name: 'self', role: 'p1', status: 'running' }] }, BASE)
+  const rule = '─'.repeat(40)
+  const list = [' ┃ self has a question', ' ┃', ' ┃ ? Which planet?', ' ┃ ctrl+k answer · alt+j manage', rule, '>', rule,
+    '  ● Agent(self: Coordinator) · Gemini 4 Neon  Delegating · 20s',
+    '  ● Agent(self: Planet Asker) · Gemini 4 Neon  Blocked · AskQuestion · 15s',
+    '  ● Agent(self: Planet Asker 2) · Gemini 4 Neon  Blocked · AskQuestion · 12s', rule, '? for shortcuts'].join('\n')
+  const bannerOnly = list.split('\n').filter((x) => !x.includes('● Agent')).join('\n')
+  // ★ the list: the oldest asking one — the grandchild's — is the card (the answer finds it in the list by its id)
+  resetPending()
+  await new AgyCards(withScreen(l, () => list)).sync()
+  assert.deepEqual(agyCards().map((c) => [c.summary, c.subagent]), [['Which planet?', {}]])
+  // ★ two asking the very same text (§19.1 case 4): still a card (the id tells them apart), where the banner gave none
+  kid(K2, A, 1, [ask('Which planet?')], BASE - 18)
+  resetPending()
+  await new AgyCards(withScreen(l, () => bannerOnly)).sync()
+  assert.equal(agyCards().length, 0)
+  resetPending()
+  await new AgyCards(withScreen(l, () => list)).sync()
+  assert.deepEqual(agyCards().map((c) => c.summary), ['Which planet?'])
+  // ⚠️ fewer rows asking than calls asking (a killed one's leftover question is not in the list): no card (codex · agy review)
+  resetPending()
+  await new AgyCards(withScreen(l, () => list.replace('Planet Asker 2) · Gemini 4 Neon  Blocked · AskQuestion', 'Planet Asker 2) · Gemini 4 Neon  Thinking'))).sync()
+  assert.equal(agyCards().length, 0)
+  // ⚠️ a listed one asks what the phone does not take, a killed one's leftover is not listed: counted over all calls
+  //    (codex · agy review: the counts matched and the leftover's card came back after every failed answer)
+  kid(K2, A, 1, [{ name: 'ask_question', args: { questions: [{ question: 'Twin?', options: ['x', 'x'] }] } }], BASE - 18)
+  resetPending()
+  await new AgyCards(withScreen(l, () => list.replace('Planet Asker) · Gemini 4 Neon  Blocked · AskQuestion', 'Planet Asker) · Gemini 4 Neon  Thinking'))).sync()
+  assert.equal(agyCards().length, 0)
+  kid(K2, A, 1, [ask('Which planet?')], BASE - 18)
+  // ★ a call the list was walked for whole without finding it: not raised again; the next one is (codex review)
+  const callOf = (id: string): { step: number; index: number; callAt: number } => ({ step: 1, index: 0, callAt: (BASE - 35) * 1000 })
+  noteUnlisted({ pid: PID, child: G, ...callOf(G) })
+  kid(K2, A, 1, [ask('Which moon?')], BASE - 18)
+  resetPending()
+  await new AgyCards(withScreen(l, () => list.replace('Planet Asker) · Gemini 4 Neon  Blocked · AskQuestion', 'Planet Asker) · Gemini 4 Neon  Thinking'))).sync()
+  assert.deepEqual(agyCards().map((c) => c.summary), ['Which moon?'], "K2's, with G's left out")
+  resetAgyUnlistedForTest()
+  kid(K2, A, 1, [ask('Which planet?')], BASE - 18)
+  // ⚠️ something typed in the PC's box (the answer could not go into the list): no card
+  resetPending()
+  await new AgyCards(withScreen(l, () => list.replace('\n>\n', '\n> half typed\n'))).sync()
+  assert.equal(agyCards().length, 0)
+  // ★ two asking the same text, the PC opened one's dialog: told by its owner (codex review)
+  kid(K2, A, 1, [ask('Which planet?')], BASE - 18)
+  const openOfK2 = ['  main › self', '  ● running · Gemini 4 Neon (High) · 9s · 3 steps', `  ID: ${K2}`, 'Question', '────', 'Question 1/1: Which planet?', '', '> 1. a', '  2. b', '  3. Write-in...', '', '  ↑/↓ Navigate · enter Select · esc Skip'].join('\n')
+  l.setState({ tool_confirmation_pending: false, agent_state: 'idle', version: '1.5.16', subagents: [{ name: 'self', role: 'p0', status: 'running' }, { name: 'self', role: 'p1', status: 'running' }] }, BASE)
+  resetPending()
+  await new AgyCards(withScreen(l, () => openOfK2)).sync()
+  assert.deepEqual(agyCards().map((c) => c.summary), ['Which planet?'])
+  l.setState({ tool_confirmation_pending: false, agent_state: 'idle', subagents: [{ name: 'self', role: 'p0', status: 'running' }, { name: 'self', role: 'p1', status: 'running' }] }, BASE)
+  resetPending()
+  await new AgyCards(withScreen(l, () => openOfK2)).sync()
+  assert.equal(agyCards().length, 0, 'before 1.5.16: ambiguous by text, as before')
+  // ★ two asking in the same tick: one of them by id, not none (codex review)
+  kid(K2, A, 1, [ask('Which moon?')], BASE - 20)
+  resetPending()
+  await new AgyCards(withScreen(l, () => list)).sync()
+  assert.equal(agyCards().length, 1)
+  // ⚠️⚠️ agy 1.5.16+ with the banner only (the list not readable): no card from the banner (ctrl+k approves there)
+  kid(K2, A, 1, [ask('Which moon?')], BASE - 18)
+  l.setState({ tool_confirmation_pending: false, agent_state: 'idle', version: '1.5.16', subagents: [{ name: 'self', role: 'p0', status: 'running' }, { name: 'self', role: 'p1', status: 'running' }] }, BASE)
+  resetPending()
+  await new AgyCards(withScreen(l, () => bannerOnly)).sync()
+  assert.equal(agyCards().length, 0)
+  // ★ agy 1.5.16+ with the PC on a finished subagent's view (left there after an answer): the card still comes — the
+  //   answer goes back to the parent's view first (codex review round 5: not offering it stranded the PC there)
+  const X = '3c9d2e55-1f7f-4b66-8b2e-7d1a5c3b8e22'
+  const px = transcriptPathOf(X, l.deps.agy().home)
+  mkdirSync(join(px, '..'), { recursive: true })
+  writeFileSync(px, [{ type: 'SYSTEM_MESSAGE', step_index: 0, content: 'x' }, { type: 'PLANNER_RESPONSE', step_index: 1, content: 'Reported back.' }].map((r) => JSON.stringify(r)).join('\n') + '\n')
+  const viewOfX = ['  main › self', '  ● done · Gemini 4 Neon (High) · 9s · 3 steps', `  ID: ${X}`, '', '  ↑/↓ scroll · pgup/pgdown page · ctrl+end bottom · ctrl+home top', '  ctrl+o expand · shift+k kill · esc back'].join('\n')
+  resetPending()
+  await new AgyCards(withScreen(l, () => viewOfX)).sync()
+  assert.equal(agyCards().length, 1)
+  // ★ … also when two ask the same text (1.5.16: told by id in the list / codex review)
+  kid(K2, A, 1, [ask('Which planet?')], BASE - 18)
+  resetPending()
+  await new AgyCards(withScreen(l, () => viewOfX)).sync()
+  assert.equal(agyCards().length, 1)
+  kid(K2, A, 1, [ask('Which moon?')], BASE - 18)
+  // ★ the PC left on an asking subagent's view, its question closed ("a respond"): that one (codex review)
+  l.setState({ tool_confirmation_pending: false, agent_state: 'idle', version: '1.5.16', subagents: [{ name: 'self', role: 'p0', status: 'running' }, { name: 'self', role: 'p1', status: 'running' }] }, BASE)
+  const viewOfK2 = ['  main › self', '  ● running · Gemini 4 Neon (High) · 9s · 3 steps', `  ID: ${K2}`, '  ⚠ Approval Required', '    AskQuestion', '      ? Which moon?', '', '  ↑/↓ scroll · pgup/pgdown page · ctrl+end bottom · ctrl+home top · ctrl+o expand · a respond · shift+k kill · esc back'].join('\n')
+  resetPending()
+  await new AgyCards(withScreen(l, () => viewOfK2)).sync()
+  assert.deepEqual(agyCards().map((c) => c.summary), ['Which moon?'])
+  l.setState({ tool_confirmation_pending: false, agent_state: 'idle', subagents: [{ name: 'self', role: 'p0', status: 'running' }, { name: 'self', role: 'p1', status: 'running' }] }, BASE)
+  // (before 1.5.16 too, as before)
+  l.setState({ tool_confirmation_pending: false, agent_state: 'idle', subagents: [{ name: 'self', role: 'p0', status: 'running' }, { name: 'self', role: 'p1', status: 'running' }] }, BASE)
+  resetPending()
+  await new AgyCards(withScreen(l, () => viewOfX)).sync()
+  assert.equal(agyCards().length, 1)
 })

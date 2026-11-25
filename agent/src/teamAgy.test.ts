@@ -9,7 +9,7 @@ import { aliveProcStartFreshSync } from './claude/sessionIndex.ts'
 import { createTeam, resetTeamsForTest } from './team.ts'
 import { untilNextSecondMs } from './routes/team.ts'
 import { answer, resetPending, waitForDecision } from './permission.ts'
-import { agyCardsChanged, codexCardsChanged, agyInstructionSent, agyLastWords, agyPhoneFallback, agyPhoneMayRing, agyMemberDone, agyStateNow, agyTeamSafetyNet, resetAgyReportedForTest, AGY_NET_GRACE_MS, AGY_NET_NOT_STARTED_MS, leaderMay, memberIdentity, cardRef, soleProcessSync, type AgyDoneDeps, type AgyNetDeps } from './teamHooks.ts'
+import { agyCardsChanged, codexCardsChanged, agyInstructionSent, agyLastWords, agyPhoneFallback, agyPhoneMayRing, agyMemberDone, agyStateNow, agyTeamSafetyNet, agyTeamPcWaits, resetAgyReportedForTest, AGY_NET_GRACE_MS, AGY_PC_WAIT_MS, AGY_NET_NOT_STARTED_MS, leaderMay, memberIdentity, cardRef, soleProcessSync, type AgyDoneDeps, type AgyNetDeps } from './teamHooks.ts'
 
 const root = mkdtempSync(join(tmpdir(), 'nr-team-agy-'))
 const prevState = process.env['NYAN_REMOTE_STATE_DIR']
@@ -361,6 +361,9 @@ function rigDeps(rig: ReturnType<typeof netRig>['rig']): AgyNetDeps {
     tell: async (_t, text, guard) => (rig.tellOk && (guard?.() ?? true) ? (rig.told.push(text), true) : false),
     waiting: () => rig.waiting,
     asking: () => false,
+    questionWaitAt: () => rig.questionAt,
+    questionCalls: () => rig.questionCalls,
+    blockedWaits: () => rig.blocked,
     othersWrote: () => rig.others,
     childrenSettled: () => rig.settled,
   }
@@ -380,6 +383,12 @@ function netRig(records: Record<string, unknown>[], clock: number) {
     tellOk: true,
     locks: [CONV],
     told: [] as string[],
+    /** When the member's question wait began (undefined = none) */
+    questionAt: undefined as number | undefined,
+    /** The calls asking (undefined = unreadable: the time names the wait) */
+    questionCalls: undefined as string[] | undefined,
+    /** The subagents waiting on an approval on the PC, each with its start */
+    blocked: [] as { since: number; id: number }[],
     /** Runs while the lock is probed (the PC acting meanwhile) */
     onLocks: undefined as (() => void) | undefined,
   }
@@ -1761,4 +1770,298 @@ test('★ safety net round 24: a failed lock probe hands the completion\'s own t
     2,
   )
   assert.deepEqual(got, { turn: 3, at: A })
+})
+
+test('★★ the leader is told once when a member waits for an answer only the PC can give (docs/TEAM.md §9.3)', async () => {
+  const r = createTeam(LEADER, [member], undefined)
+  assert.ok(r.ok)
+  const T = Date.now() - 60_000
+  const { rig, deps } = netRig([userInput(3, T), call(4)], T + 10_000)
+  stateAt(T + 1000)
+  // a subagent's question with no card in the agent
+  rig.questionAt = T + 2000
+  await agyTeamPcWaits(deps)
+  rig.clock += AGY_PC_WAIT_MS - 1
+  await agyTeamPcWaits(deps)
+  assert.equal(rig.told.length, 0, 'not yet')
+  rig.clock += 1
+  await agyTeamPcWaits(deps)
+  assert.equal(rig.told.length, 1)
+  assert.match(rig.told[0]!, /only the PC can answer|PC でしか答えられない/)
+  assert.doesNotMatch(rig.told[0]!, /was notified|知らせました/, 'not claimed (the phone may not have been reached)')
+  rig.clock += AGY_PC_WAIT_MS * 3
+  await agyTeamPcWaits(deps)
+  assert.equal(rig.told.length, 1, 'once per wait')
+  // ★ a new wait is told again
+  rig.questionAt = T + 50_000
+  await agyTeamPcWaits(deps)
+  rig.clock += AGY_PC_WAIT_MS
+  await agyTeamPcWaits(deps)
+  assert.equal(rig.told.length, 2)
+  // ⚠️ a card for it in the agent (the leader's or the human's): not this
+  rig.questionAt = T + 90_000
+  rig.waiting = true
+  await agyTeamPcWaits(deps)
+  rig.clock += AGY_PC_WAIT_MS * 2
+  await agyTeamPcWaits(deps)
+  assert.equal(rig.told.length, 2)
+  // … and once that card is gone (withdrawn), the time starts again from then
+  rig.waiting = false
+  await agyTeamPcWaits(deps)
+  rig.clock += AGY_PC_WAIT_MS - 1
+  await agyTeamPcWaits(deps)
+  assert.equal(rig.told.length, 2, 'timed from when the card went')
+  rig.clock += 1
+  await agyTeamPcWaits(deps)
+  assert.equal(rig.told.length, 3)
+  rig.told.pop()
+  // ⚠️ its own approval with no card yet, and the leader not reached: tried again after another while
+  rig.questionAt = undefined
+  stateAt(T + 95_000, { tool_confirmation_pending: true })
+  rig.tellOk = false
+  await agyTeamPcWaits(deps)
+  rig.clock += AGY_PC_WAIT_MS
+  await agyTeamPcWaits(deps)
+  rig.tellOk = true
+  rig.clock += 1
+  await agyTeamPcWaits(deps)
+  assert.equal(rig.told.length, 2)
+  rig.clock += AGY_PC_WAIT_MS
+  await agyTeamPcWaits(deps)
+  assert.equal(rig.told.length, 3)
+  // ⚠️ the recorded agy no longer holds the conversation: not told
+  rig.questionAt = T + 120_000
+  stateAt(T + 1000)
+  rig.locks = [OTHER]
+  await agyTeamPcWaits(deps)
+  rig.clock += AGY_PC_WAIT_MS * 2
+  await agyTeamPcWaits(deps)
+  assert.equal(rig.told.length, 3)
+})
+
+test('★ PC-wait notice: a subagent\'s approval on the PC is told on its own, also behind a question already told (case 8)', async () => {
+  const r = createTeam(LEADER, [member], undefined)
+  assert.ok(r.ok)
+  const T = Date.now() - 60_000
+  const { rig, deps } = netRig([userInput(3, T), call(4)], T + 10_000)
+  stateAt(T + 1000)
+  // a child's question with no card, told
+  rig.questionAt = T + 2000
+  rig.questionCalls = ['kid-a:5:0:1']
+  await agyTeamPcWaits(deps)
+  rig.clock += AGY_PC_WAIT_MS
+  await agyTeamPcWaits(deps)
+  assert.equal(rig.told.length, 1)
+  // another child blocks on a command (the wait time moves to it; the question's call stays)
+  rig.blocked = [{ since: T + 40_000, id: 1 }]
+  rig.questionAt = T + 40_000
+  await agyTeamPcWaits(deps)
+  rig.clock += AGY_PC_WAIT_MS
+  await agyTeamPcWaits(deps)
+  assert.equal(rig.told.length, 2, 'the approval is a wait of its own')
+  rig.clock += AGY_PC_WAIT_MS * 3
+  await agyTeamPcWaits(deps)
+  assert.equal(rig.told.length, 2, 'once')
+  // the question answered: the approval alone, its time also the wait time — not told again under another name
+  rig.questionCalls = []
+  await agyTeamPcWaits(deps)
+  rig.clock += AGY_PC_WAIT_MS * 2
+  await agyTeamPcWaits(deps)
+  assert.equal(rig.told.length, 2)
+  // ★ beta answered; gamma blocks, then delta 15 s later: gamma's time is not restarted by delta (codex review)
+  rig.blocked = [{ since: T + 200_000, id: 2 }]
+  rig.questionAt = T + 200_000
+  await agyTeamPcWaits(deps)
+  rig.clock += 15_000
+  rig.blocked = [...rig.blocked, { since: T + 215_000, id: 3 }]
+  rig.questionAt = T + 215_000
+  await agyTeamPcWaits(deps)
+  rig.clock += AGY_PC_WAIT_MS - 15_000
+  await agyTeamPcWaits(deps)
+  assert.equal(rig.told.length, 3, 'gamma told at its own 20 s')
+  rig.clock += 15_000
+  await agyTeamPcWaits(deps)
+  assert.equal(rig.told.length, 4, 'delta at its own')
+})
+
+test('★ PC-wait notice: one wait told once — across state rewrites, overlapping questions, a passing card; and not when answered meanwhile', async () => {
+  const r = createTeam(LEADER, [member], undefined)
+  assert.ok(r.ok)
+  const T = Date.now() - 60_000
+  const { rig, deps } = netRig([userInput(3, T), call(4)], T + 10_000)
+  const twice = async (): Promise<void> => {
+    await agyTeamPcWaits(deps)
+    rig.clock += AGY_PC_WAIT_MS
+    await agyTeamPcWaits(deps)
+  }
+  // ★ its own approval: the state file rewritten (a resize) is the same wait (codex review)
+  stateAt(T + 1000, { tool_confirmation_pending: true })
+  await twice()
+  assert.equal(rig.told.length, 1)
+  stateAt(T + 5000, { tool_confirmation_pending: true })
+  await twice()
+  assert.equal(rig.told.length, 1, 'same call')
+  // ★ question A told; B over it; B answered: A is not told again (codex review)
+  stateAt(T + 6000)
+  rig.questionAt = T + 7000
+  await twice()
+  assert.equal(rig.told.length, 2)
+  rig.questionAt = T + 8000
+  await twice()
+  assert.equal(rig.told.length, 3)
+  rig.questionAt = T + 7000
+  await twice()
+  assert.equal(rig.told.length, 3, 'A was told')
+  // ★ a card that comes and goes does not make A new
+  rig.waiting = true
+  await twice()
+  rig.waiting = false
+  await twice()
+  assert.equal(rig.told.length, 3)
+  // ⚠️ answered while the leader's inbox is reached: not written (codex review)
+  rig.questionAt = T + 9000
+  await agyTeamPcWaits(deps)
+  rig.clock += AGY_PC_WAIT_MS
+  rig.onLocks = () => (rig.questionAt = undefined)
+  await agyTeamPcWaits(deps)
+  assert.equal(rig.told.length, 3)
+})
+
+test('★ PC-wait notice: a question wait named by its calls (a system record moving the time is the same wait); an approval past the tail is told too', async () => {
+  const r = createTeam(LEADER, [member], undefined)
+  assert.ok(r.ok)
+  const T = Date.now() - 60_000
+  const { rig, deps } = netRig([userInput(3, T), call(4)], T + 10_000)
+  const twice = async (): Promise<void> => {
+    await agyTeamPcWaits(deps)
+    rig.clock += AGY_PC_WAIT_MS
+    await agyTeamPcWaits(deps)
+  }
+  stateAt(T + 1000)
+  rig.questionAt = T + 2000
+  rig.questionCalls = ['k1:1:0:5']
+  await twice()
+  assert.equal(rig.told.length, 1)
+  // a system record appended to the child's transcript: the time moves, the call does not (codex review)
+  rig.questionAt = T + 3000
+  await twice()
+  assert.equal(rig.told.length, 1)
+  // another call asking: a new wait
+  rig.questionCalls = ['k1:1:0:5', 'k2:1:0:7']
+  await twice()
+  assert.equal(rig.told.length, 2)
+  // ★ its own approval whose call is past the tail: told once (codex review: none was)
+  rig.questionAt = undefined
+  rig.records = [{ type: 'GENERIC', step_index: 9, content: 'big' }]
+  stateAt(T + 9000, { tool_confirmation_pending: true })
+  await twice()
+  assert.equal(rig.told.length, 3)
+  await twice()
+  assert.equal(rig.told.length, 3)
+})
+
+test('★ PC-wait notice: per call — one of two told answered is not new; an unreadable approval told, over, then another: told again', async () => {
+  const r = createTeam(LEADER, [member], undefined)
+  assert.ok(r.ok)
+  const T = Date.now() - 60_000
+  const { rig, deps } = netRig([userInput(3, T), call(4)], T + 10_000)
+  const twice = async (): Promise<void> => {
+    await agyTeamPcWaits(deps)
+    rig.clock += AGY_PC_WAIT_MS
+    await agyTeamPcWaits(deps)
+  }
+  stateAt(T + 1000)
+  rig.questionAt = T + 2000
+  rig.questionCalls = ['a:1:0:5', 'b:1:0:7']
+  await twice()
+  assert.equal(rig.told.length, 1)
+  // A answered: B alone is not a new wait (codex review)
+  rig.questionCalls = ['b:1:0:7']
+  await twice()
+  assert.equal(rig.told.length, 1)
+  // ★ an approval past the tail, told; over; a later one past the tail is told too (codex · agy review)
+  rig.questionAt = undefined
+  rig.questionCalls = undefined
+  rig.records = [{ type: 'GENERIC', step_index: 9, content: 'big' }]
+  stateAt(T + 9000, { tool_confirmation_pending: true })
+  await twice()
+  assert.equal(rig.told.length, 2)
+  stateAt(T + 9500)
+  await agyTeamPcWaits(deps)
+  stateAt(T + 9800, { tool_confirmation_pending: true })
+  await twice()
+  assert.equal(rig.told.length, 3)
+})
+
+test('★ PC-wait notice: each wait timed on its own; a question and an approval both counted; an unread approval read at last is the same', async () => {
+  const r = createTeam(LEADER, [member], undefined)
+  assert.ok(r.ok)
+  const T = Date.now() - 60_000
+  const { rig, deps } = netRig([userInput(3, T), call(4)], T + 10_000)
+  stateAt(T + 1000)
+  rig.questionAt = T + 2000
+  rig.questionCalls = ['a:1:0:5']
+  await agyTeamPcWaits(deps)
+  rig.clock += 15_000
+  // B comes at 15 s: A is still told at 20 s (codex review: one timer restarted)
+  rig.questionCalls = ['a:1:0:5', 'b:1:0:7']
+  await agyTeamPcWaits(deps)
+  rig.clock += 5_000
+  await agyTeamPcWaits(deps)
+  assert.equal(rig.told.length, 1, 'A at 20 s')
+  rig.clock += 15_000
+  await agyTeamPcWaits(deps)
+  assert.equal(rig.told.length, 2, 'B at its own 20 s')
+  // ★ an approval of its own beside the question, no card: told too (agy review: it was hidden behind the question)
+  rig.records = [userInput(3, T), call(4)]
+  stateAt(T + 3000, { tool_confirmation_pending: true })
+  await agyTeamPcWaits(deps)
+  rig.clock += AGY_PC_WAIT_MS
+  await agyTeamPcWaits(deps)
+  assert.equal(rig.told.length, 3)
+  // ★ an approval told unread, then read (the same one): not told again (codex review)
+  rig.questionAt = undefined
+  rig.questionCalls = undefined
+  stateAt(T + 4000)
+  await agyTeamPcWaits(deps)
+  rig.records = [{ type: 'GENERIC', step_index: 9, content: 'big' }]
+  stateAt(T + 5000, { tool_confirmation_pending: true })
+  await agyTeamPcWaits(deps)
+  rig.clock += AGY_PC_WAIT_MS
+  await agyTeamPcWaits(deps)
+  assert.equal(rig.told.length, 4)
+  rig.records = [userInput(10, T + 4500), call(11)]
+  await agyTeamPcWaits(deps)
+  rig.clock += AGY_PC_WAIT_MS * 2
+  await agyTeamPcWaits(deps)
+  assert.equal(rig.told.length, 4)
+})
+
+test('★ PC-wait notice: an approval told while readable, then pushed past the tail: the same one, not told again (codex review)', async () => {
+  const r = createTeam(LEADER, [member], undefined)
+  assert.ok(r.ok)
+  const T = Date.now() - 60_000
+  const { rig, deps } = netRig([userInput(3, T), call(4)], T + 10_000)
+  stateAt(T + 1000, { tool_confirmation_pending: true })
+  await agyTeamPcWaits(deps)
+  rig.clock += AGY_PC_WAIT_MS
+  await agyTeamPcWaits(deps)
+  assert.equal(rig.told.length, 1)
+  rig.records = [{ type: 'GENERIC', step_index: 9, content: 'big' }]
+  await agyTeamPcWaits(deps)
+  rig.clock += AGY_PC_WAIT_MS * 2
+  await agyTeamPcWaits(deps)
+  assert.equal(rig.told.length, 1)
+})
+
+test('★ PC-wait notice: a stale approval flag after the turn ended answered is not a wait (codex review)', async () => {
+  const r = createTeam(LEADER, [member], undefined)
+  assert.ok(r.ok)
+  const T = Date.now() - 60_000
+  const { rig, deps } = netRig([userInput(3, T), said(4, 'done')], T + 10_000)
+  stateAt(T + 1000, { tool_confirmation_pending: true })
+  await agyTeamPcWaits(deps)
+  rig.clock += AGY_PC_WAIT_MS * 2
+  await agyTeamPcWaits(deps)
+  assert.equal(rig.told.length, 0)
 })

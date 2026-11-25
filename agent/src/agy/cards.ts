@@ -48,7 +48,7 @@ import { agyLocksOf, agyPaneOf, withLocksProbed, agyPidFiles, agyRow, agyShared,
 import { callBeforeState, readTailRecords, turnEnd, type PendingCall } from './pending.ts'
 import type { AgyCardFailure, AgyCardMark, AgyQuestionAnswer, AgyQuestionFailure, AgyQuestionMark } from './keys.ts'
 import { agyQuestionInteraction, parseAgyQuestion, questionTextsOf, skipSteps, type AgyAnswerPlan, type AgyQuestion, type AgyStep } from './questions.ts'
-import { childViewOf, dialogFits, inChildView, parseBanner, parseDialog, readAgyScreen, sameQuestionText, viewOwnerOf } from './screen.ts'
+import { agyUnlisted, childViewOf, dialogFits, inChildView, inputBoxOf, listAgy, parseApproval, previewAsks, respondOffered, parseBanner, parseDialog, parseSubagentList, readAgyScreen, sameQuestionText, viewOwnerOf } from './screen.ts'
 import { AGY_QUESTION_TOOL, agyCardAt, agyChildQuestions, agyPendingCall, agyQuestionAt, agyQuestionWaitAt } from './sessions.ts'
 
 /** ★ The calls whose card was measured, as the tool and input the card helpers know. undefined = stays on the PC */
@@ -544,7 +544,7 @@ export class AgyCards {
         // ★ With the screen (docs/AGY.md §14): the question the PC shows — its open dialog, else a subagent's banner
         // ⚠️ A running child whose call could not be read may ask the same text: no card (codex / agy review)
         if (found && !found.known) continue
-        const seen = await this.#onScreen(pane.socketPath, ownAt !== undefined ? turnEnd(tail(path)).pending : undefined, ownAt, found?.asking ?? [])
+        const seen = await this.#onScreen(pane.socketPath, ownAt !== undefined ? turnEnd(tail(path)).pending : undefined, ownAt, found?.asking ?? [], listAgy(f.state.version), pid)
         if (seen === 'unsure') {
           unsure.add(conv)
           continue
@@ -553,7 +553,8 @@ export class AgyCards {
       } else if (ownAt !== undefined && !f.state.subagentsActive) {
         // its own question (no child running: a child's question could be the one open on the PC)
         pick = { call: turnEnd(tail(path)).pending!, askedAt: ownAt }
-      } else if (ownAt === undefined && f.state.agentState === 'idle' && found?.complete && found.asking.length === 1 && !found.asking[0]!.ambiguous) {
+      } else if (ownAt === undefined && !listAgy(f.state.version) && f.state.agentState === 'idle' && found?.complete && found.asking.length === 1 && !found.asking[0]!.ambiguous) {
+        // (a blind relay opens it with ctrl+k — ⚠️ never on agy 1.5.16+, where ctrl+k approves a subagent's command)
         // the question of its only asking child (ctrl+k opens the one the banner shows; every running child seen)
         const k = found.asking[0]!
         pick = { call: k.call, askedAt: k.askedAt, child: k.child }
@@ -621,6 +622,10 @@ export class AgyCards {
     ownCall: PendingCall | undefined,
     ownAt: number | undefined,
     kids: readonly { child: string; call: PendingCall; askedAt: number }[],
+    /** ★ agy 1.5.16+ (`listAgy`): a subagent's question only through the list, never the banner (ctrl+k approves there) */
+    listOnly = false,
+    /** The agy's pid (the calls found missing from its list / `agyUnlisted`) */
+    pid = -1,
   ): Promise<{ call: PendingCall; askedAt: number; child?: string } | undefined | 'unsure'> {
     const screen = await (this.#deps.readScreen ?? readAgyScreen)(socketPath)
     if (screen === undefined) return 'unsure'
@@ -646,14 +651,19 @@ export class AgyCards {
       if (q) all.push({ call: k.call, askedAt: k.askedAt, child: k.child, q })
     }
     const one = <T>(xs: T[]): T | undefined => (xs.length === 1 ? xs[0] : undefined)
+    const gone = (c: { child?: string; call: PendingCall }): boolean => agyUnlisted({ pid, child: c.child, step: c.call.step, index: c.call.index, callAt: c.call.at ?? -1 })
     const d = parseDialog(screen)
     if (d) {
       // ★★ The dialog's owner from the screen (a child's id in the header / the parent's view), and the dialog as the
       //    answer will check it (options, write-in row, ticks)
       const owner = viewOwnerOf(screen)
       if (owner === undefined) return undefined
-      const hit = one(all.filter((c) => c.q.items.length === d.of && c.q.items[d.k - 1] !== undefined && dialogFits(d, c.q.items[d.k - 1]!)))
-      if (!hit || !alone(hit.call, d.question, hit.q)) return undefined
+      // ★ agy 1.5.16: a subagent's dialog is told by its owner first (its id in the header): a sibling's same text does
+      //   not make it ambiguous (codex review)
+      const byOwner = listOnly && typeof owner === 'object'
+      const fitting = all.filter((c) => c.q.items.length === d.of && c.q.items[d.k - 1] !== undefined && dialogFits(d, c.q.items[d.k - 1]!) && (!byOwner || c.child?.toLowerCase() === owner.child))
+      const hit = one(fitting)
+      if (!hit || (!byOwner && !alone(hit.call, d.question, hit.q))) return undefined
       if (owner === 'parent' ? hit.child !== undefined : hit.child?.toLowerCase() !== owner.child) return undefined
       return hit && { call: hit.call, askedAt: hit.askedAt, ...(hit.child !== undefined ? { child: hit.child } : {}) }
     }
@@ -664,16 +674,53 @@ export class AgyCards {
       // ⚠️ Only when the answer could go back (`answerOnScreen`): the viewed child named by its header, nothing pending
       //    there (agy / codex review: a card the answer always refused came back after each try)
       const viewed = childViewOf(screen)
-      if (viewed === undefined || agyPendingCall(transcriptPathOf(viewed, this.#deps.agy().home), this.#deps.tail ?? readTailRecords) !== null) return undefined
+      if (viewed === undefined) return undefined
+      // ★ agy 1.5.16: the PC left on an asking subagent's view, its question closed ("a respond"): that question, opened
+      //   right there with `a` by the answer (codex review: no card, the wait stranded on the PC)
+      if (listOnly) {
+        const here = all.find((c) => c.child?.toLowerCase() === viewed)
+        const a = parseApproval(screen)
+        // (its preview shows this very question: the answer checks the same before `a` / codex review)
+        if (here && respondOffered(screen) && a?.tool === 'AskQuestion' && previewAsks(screen, here.q.items[0]!.question) && !gone(here)) return { call: here.call, askedAt: here.askedAt, child: here.child! }
+      }
+      if (agyPendingCall(transcriptPathOf(viewed, this.#deps.agy().home), this.#deps.tail ?? readTailRecords) !== null) return undefined
+      // (agy 1.5.16+: the answer goes back to the parent's view and opens it from the list; ✅ accepted: a list it then
+      //  cannot read — a narrow terminal — refuses, and the card comes back. Not offering it left the PC stranded on a
+      //  subagent's view after an answer / codex review)
       // ★ The parent's own question (its dialog is drawn on the parent's view, where the answer goes first / agy review)
       const own = all.find((c) => c.child === undefined)
       if (own) return alone(own.call, own.q.items[0]!.question, own.q) ? { call: own.call, askedAt: own.askedAt } : undefined
-      const kids = all.filter((c) => c.child !== undefined).sort((a, b) => a.askedAt - b.askedAt)
+      // ★ agy 1.5.16: the answer goes back and opens it from the list by its id — the list's rules (the oldest, ties by
+      //   id, no text check / codex review: two asking the same stayed off while the PC showed a finished child)
+      const kids = all.filter((c) => c.child !== undefined && !(listOnly && gone(c))).sort((a, b) => a.askedAt - b.askedAt || (listOnly ? (a.child! < b.child! ? -1 : 1) : 0))
       const oldest = kids[0]
-      if (!oldest || (kids[1] !== undefined && kids[1].askedAt === oldest.askedAt)) return undefined
+      if (!oldest) return undefined
+      if (listOnly) return { call: oldest.call, askedAt: oldest.askedAt, child: oldest.child! }
+      if (kids[1] !== undefined && kids[1].askedAt === oldest.askedAt) return undefined
       if (!alone(oldest.call, oldest.q.items[0]!.question, oldest.q)) return undefined
       return { call: oldest.call, askedAt: oldest.askedAt, child: oldest.child! }
     }
+    // ★★ agy 1.5.16: the parent's view lists its subagents (children and deeper / docs/AGY.md §19.2). The answer opens
+    //    the very child from that list by its id and checks the question there before a key (`answerOnScreen`), so
+    //    which one ctrl+k would open does not matter: the card is the oldest asking subagent's question, whatever its
+    //    depth or a sibling's text (§19.1 cases 1–4)
+    const rows = viewOwnerOf(screen) === 'parent' ? parseSubagentList(screen) : undefined
+    if (rows !== undefined) {
+      // (a call the list was walked for whole without finding it is left out: its card would never be answered / codex)
+      // (ties broken by the child's id: two asking in the same tick both stayed off / codex review — the answer checks the id)
+      const parsed = all.filter((c) => c.child !== undefined && !gone(c)).sort((a, b) => a.askedAt - b.askedAt || (a.child! < b.child! ? -1 : 1))
+      // ⚠️ Only when every asking one is in the list (as many rows blocked on a question as calls asking — all of them,
+      //    also ones the phone does not take): a killed one's leftover question is not, and its card could never be
+      //    answered (codex · agy review)
+      const listed = rows.filter((r) => r.blockedOn === 'AskQuestion').length
+      // ⚠️ And the answer can go into the list: nothing typed in the PC's box (codex · agy review: a card the answer always
+      //    refused came back after each try)
+      const box = inputBoxOf(screen)
+      if (parsed.length === 0 || listed !== kids.filter((k) => !gone(k)).length || box === undefined || box.some((l) => l.trim() !== '')) return undefined
+      const oldest = parsed[0]!
+      return { call: oldest.call, askedAt: oldest.askedAt, child: oldest.child! }
+    }
+    if (listOnly) return undefined
     const banner = parseBanner(screen)
     if (banner === undefined) return undefined
     const hit = one(all.filter((c) => c.child !== undefined && sameQuestionText(banner, c.q.items[0]!.question)))
@@ -700,6 +747,8 @@ export class AgyCards {
   #stillWaitingName(mark: AgyQuestionMark, before: number): string | undefined {
     const deps = this.#deps.agy()
     const f = readAgyPidFile(deps.dir, mark.pid)
+    // ★ Also a subagent's approval still up (docs/AGY.md §19, case 8): opening the alert dismissed it too. It rings once
+    //   here; the notifier does not ring the older name coming back (`notify.ts` `laterCard` / agy review)
     const at = f ? agyQuestionWaitAt(f.state, f.mtimeMs, deps.home) : undefined
     return at === undefined || at >= before ? undefined : new Date(at).toISOString()
   }

@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
-import { transcriptPathOf } from './sessions.ts'
+import { noteAgyBlocked, resetAgyBlockedForTest, transcriptPathOf } from './sessions.ts'
 import { agyStatuses, startAgyWatch } from './watch.ts'
 
 const A = '062a8f25-9451-42f3-ae93-34a208e99365'
@@ -73,6 +73,17 @@ test('★ watch: a card and a question are different states (an approval then a 
   writeFileSync(f, file('tool_use'))
   utimesSync(f, sec + 6, sec + 6)
   const question = (await agyStatuses(dir, root)).get(A)
-  assert.equal(card, '4242:waiting')
+  assert.equal(card, '4242:waiting:card')
   assert.equal(question, '4242:waiting:question')
+  // ★ a subagent's approval up, then the parent's own card beside it: a change too (codex review)
+  resetAgyBlockedForTest()
+  t.after(() => resetAgyBlockedForTest())
+  noteAgyBlocked(A, 4242, 1, Date.now())
+  const kid = (pending: boolean): string => JSON.stringify({ nyanPid: 4242, nyanBusyAt: 1, input: { conversation_id: A, cwd: '/home/user/w', agent_state: 'idle', tool_confirmation_pending: pending, subagents: [{ status: 'running', role: 'x' }] } })
+  writeFileSync(f, kid(false))
+  const blocked = (await agyStatuses(dir, root)).get(A)
+  writeFileSync(f, kid(true))
+  const both = (await agyStatuses(dir, root)).get(A)
+  assert.equal(blocked, '4242:waiting:question')
+  assert.notEqual(both, blocked)
 })

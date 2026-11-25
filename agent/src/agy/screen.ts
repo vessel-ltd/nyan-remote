@@ -338,6 +338,9 @@ const RULE = /^─{8,}$/
 export function inputRowOf(screen: string): string | undefined {
   const rows = screen.split('\n').map((l) => l.replace(/\s+$/, ''))
   for (let i = rows.length - 2; i >= 1; i--) {
+    // ⚠️ Not the subagent list's focused row ("> ● Agent(…)", agy 1.5.16 — also between two rules / docs/AGY.md §19.2),
+    //    also one wrapped or cut short (agy review)
+    if (inSubagentList(rows, i)) continue
     const m = /^>(?: (.*))?$/.exec(rows[i]!)
     if (m && RULE.test(rows[i - 1]!.trim()) && RULE.test(rows[i + 1]!.trim())) return (m[1] ?? '').trim()
   }
@@ -353,6 +356,7 @@ export function inputRowOf(screen: string): string | undefined {
 export function inputBoxOf(screen: string): string[] | undefined {
   const rows = screen.split('\n').map((l) => l.replace(/\s+$/, ''))
   for (let i = rows.length - 2; i >= 1; i--) {
+    if (inSubagentList(rows, i)) continue
     const m = /^>(?: (.*))?$/.exec(rows[i]!)
     // ⚠️ The rules as drawn (flush left): a draft's own "────" line is indented, never one of them (codex review)
     if (!m || !RULE.test(rows[i - 1]!)) continue
@@ -375,4 +379,214 @@ export function slashPicked(screen: string, command: string, about: string): boo
   const at = rows.findIndex((l) => l.startsWith(`> ${command}  `) && l.slice(command.length + 2).trim().startsWith(about))
   if (at < 0) return false
   return rows.slice(at + 1, at + 4).some((l) => /(?:^|·\s)enter Select(?:\s·|$)/.test(l.trim()))
+}
+
+/**
+ * ★ A subagent in the parent's list (agy 1.5.16 / docs/AGY.md §19.2): every running subagent, children and deeper,
+ *   flat, under the input box — `> ● Agent(self: <name>) · <model>  <state> · <time>`. `focused`: the list has the
+ *   keyboard's focus on it (the down arrow from an empty input box moves it there).
+ */
+export interface SubagentRow {
+  focused: boolean
+  /** What agy names it (the part inside "Agent(…)"): not unique, and not its id */
+  name: string
+  /** What it does: "Blocked · Bash", "Blocked · AskQuestion", a running step's words … */
+  state: string
+  /** The tool it waits on when blocked ("Bash", "AskQuestion", …) */
+  blockedOn?: string
+}
+
+const SUBAGENT_ROW = /^(>\s)?\s*● Agent\((.+?)\) · .+?\s{2,}(.+?) · \S+$/
+/** The list's focused row, whole or wrapped/cut short */
+const LIST_FOCUS = /^>\s*● Agent\(/
+
+/** ★ agy 1.5.16: the subagent list has the keyboard's focus (a key goes to the list, not the input box) */
+export function listFocused(screen: string): boolean {
+  const rows = screen.split('\n').map((l) => l.replace(/\s+$/, ''))
+  return rows.some((l, i) => LIST_FOCUS.test(l) && inSubagentList(rows, i))
+}
+
+/**
+ * ★ Row `i` is the subagent list's focused row (whole, wrapped or cut short): a "> ● Agent(" row under a rule that closes
+ *   the input box ("────" / "> …" / "────"), with only list rows between. ⚠️ By its place, not its text alone: a draft in
+ *   the box may itself start "● Agent(" (codex review: on 1.5.13 such a draft was taken for the list)
+ */
+function inSubagentList(rows: readonly string[], i: number): boolean {
+  if (!LIST_FOCUS.test(rows[i]!)) return false
+  let r = i - 1
+  while (r >= 0 && !RULE.test(rows[r]!)) {
+    if (!SUBAGENT_ROW.test(rows[r]!) && !/^ {2}\S/.test(rows[r]!)) return false
+    r--
+  }
+  if (r < 1) return false
+  let q = r - 1
+  while (q >= 0 && !RULE.test(rows[q]!)) q--
+  return q >= 0 && q < r - 1 && /^>(?: |$)/.test(rows[q + 1] ?? '')
+}
+
+/**
+ * ★ The parent view's subagent list, top to bottom; undefined = none shown (no subagent running, or another view, or a
+ *   list that cannot be read whole). ⚠️ Only the block between two flush-left rules right under the input box, made of
+ *   list rows only (codex · agy review: a matching line of output elsewhere on the screen was read as a row)
+ */
+export function parseSubagentList(screen: string): SubagentRow[] | undefined {
+  const lines = screen.split('\n').map((l) => l.trimEnd())
+  const rules = lines.map((l, i) => (RULE.test(l) ? i : -1)).filter((i) => i >= 0)
+  for (let r = rules.length - 1; r >= 2; r--) {
+    const top = rules[r - 1]!
+    const end = rules[r]!
+    if (end - top < 2) continue
+    const block = lines.slice(top + 1, end)
+    if (!block.every((l) => SUBAGENT_ROW.test(l))) continue
+    // the input box right above: "────" / "> …" (or ">") / … / "────"
+    const above = rules[r - 2]!
+    if (!/^>(?: |$)/.test(lines[above + 1] ?? '')) continue
+    return block.map((l) => {
+      const m = SUBAGENT_ROW.exec(l)!
+      const state = m[3]!.trim()
+      const b = /^Blocked · (\S+)$/.exec(state)
+      return { focused: m[1] !== undefined, name: m[2]!, state, ...(b ? { blockedOn: b[1]! } : {}) }
+    })
+  }
+  return undefined
+}
+
+/** A list entry's first row (the focused one starts "> ") */
+const LIST_ENTRY = /^(?:>\s)?\s*● Agent\(/
+
+/**
+ * ★ The parent's subagent list read for what each entry waits on, also with wrapped rows (a long name or step folds onto
+ *   the next row, indented): each entry's rows joined. For telling only (`blocked.ts`), never for picking a row to open
+ *   (that is `parseSubagentList`, whole rows only). undefined = no list right under the input box (another view, a menu
+ *   or dialog in its place, or a row that is neither an entry nor its continuation). `cut`: a row cut short (what it
+ *   waits on cannot be told).
+ */
+export function readSubagentEntries(screen: string): { name: string; blockedOn?: string; cut?: true }[] | undefined {
+  const lines = screen.split('\n').map((l) => l.trimEnd())
+  const rules = lines.map((l, i) => (RULE.test(l) ? i : -1)).filter((i) => i >= 0)
+  for (let r = rules.length - 1; r >= 2; r--) {
+    const top = rules[r - 1]!
+    const end = rules[r]!
+    if (end - top < 2) continue
+    const block = lines.slice(top + 1, end)
+    if (!LIST_ENTRY.test(block[0]!)) continue
+    // the input box right above: "────" / "> …" (or ">") / … / "────"
+    if (!/^>(?: |$)/.test(lines[rules[r - 2]! + 1] ?? '')) continue
+    const entries: string[] = []
+    for (const l of block) {
+      if (LIST_ENTRY.test(l)) entries.push(l)
+      // (a wrapped row's rest: kept apart by a gap, as agy sets the state apart from the model)
+      else if (/^\s+\S/.test(l) && entries.length > 0) entries[entries.length - 1] += `  ${l.trim()}`
+      else return undefined
+    }
+    return entries.map((e) => {
+      const t = e.replace(/\s+/g, ' ').trim()
+      // ★ The state comes after a gap of two spaces ("<model>  Blocked · Bash · 37s"), at the row's end (before its time,
+      //   or cut short): not words inside a running step (codex review: "Searching for Blocked · Bash · 6s" read as a wait)
+      const gapped = e.trim().replace(/ {2,}/g, '\t').replace(/ +/g, ' ')
+      const b = /\tBlocked[\t ]·[\t ](\S+?)(?:[\t ]·[\t ]\S+)?$/.exec(gapped)
+      // (the name is for reading only: waits are counted, not named / `sessions.ts` `noteAgyBlocked`)
+      const name = /● Agent\((.+?)\) · /.exec(t)?.[1] ?? t
+      // ★ Read whole only when it ends in its time (" · 37s", " · 1m6s"): a row cut short anywhere ("· Gemi…", "Blo…",
+      //   "Blocked · …") cannot say what it waits on (codex · agy review, rounds 8–9: each cut was read as running)
+      const whole = / · \d+[hms](?:\d+[ms])*$/.test(t)
+      return { name, ...(whole && b ? { blockedOn: b[1]! } : {}), ...(whole ? {} : { cut: true as const }) }
+    })
+  }
+  return undefined
+}
+
+/** ★ agy 1.5.16 or later (its subagent list, and ctrl+k approving a subagent's command at once): never ctrl+k there */
+export function listAgy(version: string | undefined): boolean {
+  const m = /^(\d+)\.(\d+)\.(\d+)/.exec(version ?? '')
+  if (!m) return true
+  const [a, b, c] = [Number(m[1]), Number(m[2]), Number(m[3])]
+  return a > 1 || (a === 1 && (b > 5 || (b === 5 && c >= 16)))
+}
+
+/**
+ * ★ A subagent's view offers to open its pending question or approval ("a respond" in its footer): it waits, and no
+ *   dialog is open over it (agy 1.5.16: opening the view from the list leaves the dialog closed / docs/AGY.md §19.2)
+ */
+export function respondOffered(screen: string): boolean {
+  if (!inChildView(screen)) return false
+  const rows = screen.split('\n').map((l) => l.trim()).filter((l) => l !== '')
+  const last = rows.slice(-3).join(' · ')
+  return /(?:^|·\s)a respond\s·/.test(last)
+}
+
+/**
+ * ★ What a subagent's view says it waits for ("⚠ Approval Required", then the tool, then its details), with the
+ *   approval's choices when that dialog is open ("> 1. Yes, approve" / "2. No, deny", footer "esc cancel").
+ *   undefined = no such block on the screen.
+ */
+export interface ApprovalShown {
+  tool: string
+  /** The detail rows under the tool (a command, a question "? …"), trimmed */
+  details: string[]
+  /** The open dialog's choices, or undefined when it is closed */
+  choices?: { n: number; label: string; cursor: boolean }[]
+}
+
+export function parseApproval(screen: string): ApprovalShown | undefined {
+  const lines = screen.split('\n')
+  const at = lines.findIndex((l) => /^\s*⚠ Approval Required\s*$/.test(l))
+  if (at < 0) return undefined
+  const tool = /^\s*(?:>\s)?(\S.*?)\s*$/.exec(lines[at + 1] ?? '')
+  if (!tool || /^─/.test(tool[1]!)) return undefined
+  const details: string[] = []
+  const choices: { n: number; label: string; cursor: boolean }[] = []
+  const rows = screen.split('\n').map((l) => l.trim()).filter((l) => l !== '')
+  // ★ Numbered rows are the dialog's choices only while it is open (its footer "esc cancel"); in a closed preview they
+  //   are the question's own wrapped text ("… 1. canary or 2. all at once?" / codex review)
+  const open = rows.slice(-3).some((l) => /(?:^|·\s)esc cancel$/.test(l))
+  for (let i = at + 2; i < lines.length && i <= at + 40; i++) {
+    const l = lines[i]!.trim()
+    if (l === '' || /^─{8,}/.test(l)) break
+    const c = open ? /^(>\s)?(\d+)\.\s+(.+)$/.exec(l) : null
+    if (c) choices.push({ n: Number(c[2]), label: c[3]!.trim(), cursor: c[1] !== undefined })
+    else if (choices.length === 0) details.push(l)
+    else break
+  }
+  return { tool: tool[1]!, details, ...(open && choices.length > 0 ? { choices } : {}) }
+}
+
+/** A subagent's question call (`AgyQuestionMark`'s fields) */
+type UnlistedMark = { pid: number; child?: string; step: number; index: number; callAt: number }
+
+/**
+ * ★ Subagent questions the list was walked for whole without finding them (agy 1.5.16 / docs/AGY.md §19.3): their cards
+ *   are not raised again (`cards.ts`) while that very call stays. Bounded, oldest out.
+ */
+const unlisted = new Set<string>()
+const unlistedId = (m: UnlistedMark): string => `${m.pid}:${m.child ?? ''}:${m.step}:${m.index}:${m.callAt}`
+export function noteUnlisted(m: UnlistedMark): void {
+  unlisted.add(unlistedId(m))
+  while (unlisted.size > 256) unlisted.delete(unlisted.values().next().value as string)
+}
+/** Whether this subagent's call was found missing from the list (`openFromList`) */
+export function agyUnlisted(m: UnlistedMark): boolean {
+  return unlisted.has(unlistedId(m))
+}
+/** Tests only */
+export function resetAgyUnlistedForTest(): void {
+  unlisted.clear()
+}
+
+
+/**
+ * ★ A closed question preview on a subagent's view ("⚠ Approval Required" / "AskQuestion" / "? …") asks this question:
+ *   its first "? " row and the rows after it (up to the next "? " row, or all of them — a "? " can be in the question's
+ *   own text), or the first row alone (cut short). Shared by the card and the answer (codex review: they differed).
+ */
+export function previewAsks(screen: string, question: string): boolean {
+  const a = parseApproval(screen)
+  if (!a || a.tool !== 'AskQuestion' || a.choices !== undefined) return false
+  const k = a.details.findIndex((d) => /^\?\s/.test(d))
+  if (k < 0) return false
+  const head = a.details[k]!.replace(/^\?\s+/, '')
+  const next = a.details.findIndex((d, j) => j > k && /^\?\s/.test(d))
+  const upTo = [head, ...a.details.slice(k + 1, next < 0 ? undefined : next)].join(' ')
+  const rest = [head, ...a.details.slice(k + 1)].join(' ')
+  return [upTo, rest, head].some((x) => sameQuestionText(x, question))
 }
