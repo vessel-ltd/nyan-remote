@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
-import { childViewOf, dialogFits, inChildView, inputBoxOf, inputRowOf, listAgy, listFocused, parseApproval, parseBanner, parseDialog, parseSubagentList, readAgyScreen, respondOffered, slashPicked, viewOwnerOf, sameQuestionText, showsQuestion } from './screen.ts'
+import { approvalChoicesShown, approvalShows, childViewOf, dialogFits, inChildView, inputBoxOf, inputRowOf, listAgy, listFocused, parseApproval, parseBanner, parseDialog, parseSubagentList, readAgyScreen, respondOffered, slashPicked, viewOwnerOf, sameQuestionText, showsQuestion } from './screen.ts'
 
 // ★ Screens as the relay rebuilt them from agy 1.5.13 (2026-11-21), trimmed
 const batch = [
@@ -343,4 +343,20 @@ test('★ a draft that itself starts "● Agent(" is a draft (1.5.13: no list un
   const draft = [rule, '> ● Agent(self: Reviewer) is stuck', rule, '? for shortcuts'].join('\n')
   assert.equal(inputRowOf(draft), '● Agent(self: Reviewer) is stuck')
   assert.equal(listFocused(draft), false)
+})
+
+test('★ a subagent approval as measured (1.5.16): its command, its two choices, its owner by the header (docs/AGY.md §19, case 8)', () => {
+  assert.equal(approvalShows(v16.childApproval, 'echo alpha-cmd'), true)
+  assert.equal(approvalShows(v16.childApprovalOpen, 'echo alpha-cmd'), true)
+  assert.equal(approvalShows(v16.childApproval, 'echo beta-cmd'), false)
+  assert.equal(approvalShows(v16.childQuestion, 'echo alpha-cmd'), false, 'a question is not an approval')
+  // wrapped over rows (compared without spaces), or cut short
+  assert.equal(approvalShows(v16.childApproval.replace('      echo alpha-cmd', '      echo alpha-\n      cmd'), 'echo alpha-cmd'), true)
+  assert.equal(approvalShows(v16.childApproval.replace('      echo alpha-cmd', '      echo al…'), 'echo alpha-cmd'), true)
+  assert.equal(approvalShows(v16.childApproval.replace('      echo alpha-cmd', '      echo al…'), 'rm -rf /'), false)
+  assert.equal(approvalChoicesShown(v16.childApprovalOpen), true)
+  assert.equal(approvalChoicesShown(v16.childApproval), false, 'closed: no choices')
+  assert.equal(approvalChoicesShown(v16.childApprovalOpen.replace('2. No, deny', '2. Yes, always')), false)
+  // the open dialog's footer is its own: the owner is read from the header
+  assert.deepEqual(viewOwnerOf(v16.childApprovalOpen), { child: '1788a5a6-a988-4356-bcaf-5f50e974aa73' })
 })

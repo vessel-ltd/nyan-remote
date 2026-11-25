@@ -1157,11 +1157,23 @@ export function Thread({
               )
             ) : session?.waitingFor === AGY_CHILD_APPROVAL ? (
               /* ★ A subagent waits on an approval (seen on the PC's list / docs/AGY.md §19, case 8): no card for it yet */
-              <>
-                {t('PCの画面で、サブエージェントが承認を待っています。', 'A subagent is waiting for an approval on the PC screen. ')}
-                <strong>{t('サブエージェントの承認は、まだスマホからは答えられません', 'A subagent’s approval can’t be answered from the phone yet')}</strong>
-                {t('。PCで答えてください。', '. Please answer on the PC.')}
-              </>
+              agentFeatures?.includes('agy-child-approve') ? (
+                /* ★ Cards come for a command when the PC shows the parent's list (docs/AGY.md §19): say which stay on the PC */
+                <>
+                  {t('PCの画面で、サブエージェントが承認を待っています。', 'A subagent is waiting for an approval on the PC screen. ')}
+                  <strong>{t('この承認はスマホに出ていません', 'This approval is not on the phone')}</strong>
+                  {t(
+                    '（PC の画面がサブエージェントの一覧ではなく別の画面を出しているとき・コマンド以外の承認・画面の読めない agy では PC で答えます）。PCで答えてください。',
+                    ' (it is answered on the PC while the PC shows another screen than the subagent list, for an approval of something other than a command, or for an agy whose screen cannot be read). Please answer on the PC.',
+                  )}
+                </>
+              ) : (
+                <>
+                  {t('PCの画面で、サブエージェントが承認を待っています。', 'A subagent is waiting for an approval on the PC screen. ')}
+                  <strong>{t('サブエージェントの承認は、まだスマホからは答えられません', 'A subagent’s approval can’t be answered from the phone yet')}</strong>
+                  {t('。PCで答えてください。', '. Please answer on the PC.')}
+                </>
+              )
             ) : session?.agyShared ? (
               <>
                 {t('PCの画面で承認を待っています。', 'The PC screen is waiting for an approval. ')}

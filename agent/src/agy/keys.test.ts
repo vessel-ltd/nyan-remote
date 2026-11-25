@@ -4,7 +4,7 @@ import { createServer, type Server } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
-import { AGY_CARD_KEYS, AGY_CLEAR_KEYS, clearAgy, compactAgy, agyTyped, answerAgyCard, answerAgyQuestion, type AgyQuestionMark, findAgyTarget, looksLikeAgyShortcut, readNow, sendGate, sendToAgy, stopAgy, stopGate, type AgyKeysDeps } from './keys.ts'
+import { AGY_CARD_KEYS, AGY_CLEAR_KEYS, clearAgy, compactAgy, agyTyped, answerAgyCard, answerAgyChildApproval, answerAgyQuestion, type AgyChildApprovalMark, type AgyQuestionMark, findAgyTarget, looksLikeAgyShortcut, readNow, sendGate, sendToAgy, stopAgy, stopGate, type AgyKeysDeps } from './keys.ts'
 import { agyCardAt, agyChildrenSettledFor, agyChildrenSettledSeen, agyOwnRowOf, resetAgyCardNamesForTest, agyOwnRows, agyRows, transcriptPathOf } from './sessions.ts'
 import { readTailRecords } from './pending.ts'
 import { parseAgyQuestion } from './questions.ts'
@@ -3077,4 +3077,295 @@ test('★ list (1.5.16): this child\'s own dialog already open, a sibling asking
   assert.deepEqual(await answerAgyQuestion(A, mark, { kind: 'plan', question, plan: plan({ indexes: [1] }) }, l.deps), { ok: true })
   clearTimeout(recorded)
   assert.deepEqual(fake.answers, ['west'])
+})
+
+// ★★ agy 1.5.16: a subagent's command approval answered from the phone (docs/AGY.md §19, case 8)
+/** The parent's list and the subagents' views as agy 1.5.16 draws them, for approvals (measured 2026-11-25) */
+class FakeApprovals {
+  view: 'parent' | 'child' = 'parent'
+  focus = -1
+  childId = ''
+  /** the open approval dialog (in `childId`'s view) */
+  open = false
+  keys: string[] = []
+  decided = new Map<string, string>()
+  /** the choices the open dialog shows */
+  choices = ['1. Yes, approve', '2. No, deny']
+  /** a digit agy does not act on (dropped on the way) */
+  dropDigits = false
+  /** run when a digit decides (the child reporting to the parent, say) */
+  onDecide?: () => void
+  /** run when a subagent's view is opened from the list */
+  onOpen?: (id: string) => void
+  readonly list: { id: string; name: string; command?: string }[]
+  constructor(list: { id: string; name: string; command?: string }[]) {
+    this.list = list
+  }
+  press(bytes: string): void {
+    this.keys.push(bytes)
+    if (this.view === 'parent') {
+      if (bytes === '\x1b[B') this.focus = Math.min(this.list.length - 1, this.focus + 1)
+      else if (bytes === '\x1b[A') this.focus = Math.max(-1, this.focus - 1)
+      else if (bytes === '\r' && this.focus >= 0) {
+        this.view = 'child'
+        this.childId = this.list[this.focus]!.id
+        this.onOpen?.(this.childId)
+      } else if (bytes === '\x1b' && this.focus >= 0) this.focus = -1
+      return
+    }
+    const row = this.list.find((r) => r.id === this.childId)!
+    if (this.open) {
+      if ((bytes === '1' || bytes === '2') && this.dropDigits) return
+      if (bytes === '1' || bytes === '2') {
+        this.onDecide?.()
+        this.decided.set(row.id, bytes)
+        row.command = undefined
+        this.open = false
+      } else if (bytes === '\x1b') this.open = false
+      return
+    }
+    if (bytes === '\x1b') this.view = 'parent'
+    else if (bytes === 'a' && row.command !== undefined) this.open = true
+  }
+  screen(): string {
+    const rule = '─'.repeat(60)
+    if (this.view === 'parent') {
+      const lines = [rule, '>', rule]
+      this.list.forEach((r, i) => lines.push(`${this.focus === i ? '> ' : '  '}● Agent(self: ${r.name}) · Gemini 4 Neon  ${r.command !== undefined ? 'Blocked · Bash' : 'Thinking'} · 9s`))
+      lines.push(rule, '? for shortcuts                                accept-edits · Gemini 4 Neon · high')
+      return lines.join('\n')
+    }
+    const row = this.list.find((r) => r.id === this.childId)!
+    const lines = ['  main › self', '  ● running · Gemini 4 Neon (High) · 9s · 3 steps', `  ID: ${this.childId}`, '  ' + '─'.repeat(20)]
+    if (row.command !== undefined) {
+      lines.push('  ⚠ Approval Required', this.open ? '    > Bash' : '    Bash', `      ${row.command}`)
+      if (this.open) this.choices.forEach((c, i) => lines.push(`      ${i === 0 ? '> ' : '  '}${c}`))
+      lines.push('  ' + '─'.repeat(20))
+    }
+    lines.push(
+      this.open ? '  ↑/↓ navigate · / select · enter confirm · esc cancel' : `  ↑/↓ scroll · pgup/pgdown page · ctrl+end bottom · ctrl+home top · ctrl+o expand${row.command !== undefined ? ' · a respond' : ''} · shift+k kill · esc back`,
+      '                                Gemini 4 Neon · high · 2 subagent(s)',
+    )
+    return lines.join('\n')
+  }
+}
+
+async function approvalLab(t: { after(fn: () => void): void }, list: { id: string; name: string; command?: string }[]) {
+  const l = await lab(t)
+  const { askedAt } = withChildren(l, [
+    { id: K1, prompt: 'run', asking: false, command: true },
+    { id: K2, prompt: 'think', asking: false, thinking: true },
+  ])
+  l.setState({ agent_state: 'idle', version: '1.5.16', subagents: [{ name: 'self', role: 'run', status: 'running' }, { name: 'self', role: 'think', status: 'running' }] }, BASE)
+  const fake = new FakeApprovals(list)
+  l.deps.answerSettleMs = 0
+  l.deps.screenSettleMs = 150
+  l.deps.readScreen = async () => fake.screen()
+  l.deps.openKeyLine = async () => ({
+    write: async (bytes, refuse) => {
+      if (refuse?.()) return false
+      fake.press(bytes)
+      return true
+    },
+    close: () => undefined,
+  })
+  const pane = join(l.root, 'panes', `${PID}.json`)
+  writeFileSync(pane, JSON.stringify({ ...JSON.parse(readFileSync(pane, 'utf8')), screen: true }))
+  const mark: AgyChildApprovalMark = { pid: PID, child: K1, askedAt: askedAt.get(K1)!, step: 1, index: 0, callAt: (BASE - 35) * 1000, command: 'ls' }
+  return { l, fake, mark }
+}
+
+test('★★ subagent approval (1.5.16): opened from the list by its id, its command and choices checked, `1` approves', async (t) => {
+  const { l, fake, mark } = await approvalLab(t, [
+    { id: K2, name: 'Thinker' },
+    { id: K1, name: 'Runner', command: 'ls' },
+  ])
+  assert.deepEqual(await answerAgyChildApproval(A, mark, 'allow', l.deps), { ok: true })
+  assert.equal(fake.decided.get(K1), '1')
+  // down, K2's view opened and left, down, K1's view, `a`, `1`, back, the list's focus back to the box
+  assert.deepEqual(fake.keys, ['\x1b[B', '\r', '\x1b', '\x1b[B', '\r', 'a', '1', '\x1b', '\x1b'])
+  assert.equal(fake.view, 'parent')
+  assert.equal(fake.focus, -1)
+  assert.equal(fake.keys.includes('\x0b'), false, 'never ctrl+k (it approves at once on 1.5.16)')
+})
+
+test('★ subagent approval: `2` denies; the PC already on its view answers there', async (t) => {
+  const { l, fake, mark } = await approvalLab(t, [{ id: K1, name: 'Runner', command: 'ls' }])
+  fake.view = 'child'
+  fake.childId = K1
+  assert.deepEqual(await answerAgyChildApproval(A, mark, 'deny', l.deps), { ok: true })
+  assert.equal(fake.decided.get(K1), '2')
+  assert.deepEqual(fake.keys, ['a', '2', '\x1b'])
+})
+
+test('★ subagent approval: nothing decided when the screen shows another command, other choices, or the parent is not idle', async (t) => {
+  {
+    const { l, fake, mark } = await approvalLab(t, [{ id: K1, name: 'Runner', command: 'rm -rf build' }])
+    assert.deepEqual(await answerAgyChildApproval(A, mark, 'allow', l.deps), { ok: false, reason: 'changed' })
+    assert.equal(fake.decided.size, 0)
+    assert.equal(fake.keys.includes('a'), false, 'not even opened')
+  }
+  {
+    const { l, fake, mark } = await approvalLab(t, [{ id: K1, name: 'Runner', command: 'ls' }])
+    fake.choices = ['1. Yes, approve', '2. Yes, and always', '3. No, deny']
+    assert.deepEqual(await answerAgyChildApproval(A, mark, 'deny', l.deps), { ok: false, reason: 'changed' })
+    assert.equal(fake.decided.size, 0, 'no digit on unmeasured choices')
+    assert.equal(fake.open, false, 'its dialog closed again (ESC cancels, deciding nothing)')
+    assert.equal(fake.view, 'parent')
+  }
+  {
+    const { l, fake, mark } = await approvalLab(t, [{ id: K1, name: 'Runner', command: 'ls' }])
+    l.setState({ agent_state: 'tool_use', version: '1.5.16', subagents: [{ name: 'self', role: 'run', status: 'running' }] }, BASE)
+    assert.deepEqual(await answerAgyChildApproval(A, mark, 'allow', l.deps), { ok: false, reason: 'changed' })
+    assert.equal(fake.keys.length, 0)
+  }
+  {
+    // ⚠️ an older agy (no list there, and ctrl+k does not approve): never
+    const { l, fake, mark } = await approvalLab(t, [{ id: K1, name: 'Runner', command: 'ls' }])
+    l.setState({ agent_state: 'idle', version: '1.5.15', subagents: [{ name: 'self', role: 'run', status: 'running' }] }, BASE)
+    assert.deepEqual(await answerAgyChildApproval(A, mark, 'allow', l.deps), { ok: false, reason: 'changed' })
+    assert.equal(fake.keys.length, 0)
+  }
+})
+
+test('★ subagent approval: a call no longer the card\'s (answered on the PC, its transcript written) is not answered', async (t) => {
+  const { l, fake, mark } = await approvalLab(t, [{ id: K1, name: 'Runner', command: 'ls' }])
+  appendFileSync(transcriptPathOf(K1, l.deps.home), JSON.stringify({ type: 'GENERIC', step_index: 2, content: 'done' }) + '\n')
+  assert.deepEqual(await answerAgyChildApproval(A, mark, 'allow', l.deps), { ok: false, reason: 'changed' })
+  assert.equal(fake.keys.length, 0)
+})
+
+test('★ subagent approval: its dialog already open on the PC, but the parent working or the child\'s record rewritten: no digit', async (t) => {
+  {
+    const { l, fake, mark } = await approvalLab(t, [{ id: K1, name: 'Runner', command: 'ls' }])
+    fake.view = 'child'
+    fake.childId = K1
+    fake.open = true
+    l.setState({ agent_state: 'tool_use', version: '1.5.16', subagents: [{ name: 'self', role: 'run', status: 'running' }] }, BASE)
+    assert.deepEqual(await answerAgyChildApproval(A, mark, 'allow', l.deps), { ok: false, reason: 'changed' })
+    assert.equal(fake.decided.size, 0)
+  }
+  {
+    const { l, fake, mark } = await approvalLab(t, [{ id: K1, name: 'Runner', command: 'ls' }])
+    fake.view = 'child'
+    fake.childId = K1
+    fake.open = true
+    // (written since the card: the same call may no longer be the one waiting)
+    const kid = transcriptPathOf(K1, l.deps.home)
+    utimesSync(kid, BASE - 5, BASE - 5)
+    assert.deepEqual(await answerAgyChildApproval(A, mark, 'allow', l.deps), { ok: false, reason: 'changed' })
+    assert.equal(fake.decided.size, 0)
+  }
+})
+
+test('★ subagent approval: a digit that did not take is not "answered"; a child reporting meanwhile does not keep the PC on its view (codex · agy review)', async (t) => {
+  {
+    const { l, fake, mark } = await approvalLab(t, [{ id: K1, name: 'Runner', command: 'ls' }])
+    fake.dropDigits = true
+    assert.deepEqual(await answerAgyChildApproval(A, mark, 'allow', l.deps), { ok: false, reason: 'unreachable' })
+    assert.equal(fake.decided.size, 0)
+    // ★ what it opened is closed again (ESC cancels the dialog, `esc back` leaves the view): the list shows again
+    assert.equal(fake.open, false)
+    assert.equal(fake.view, 'parent')
+  }
+  {
+    const { l, fake, mark } = await approvalLab(t, [
+      { id: K2, name: 'Thinker' },
+      { id: K1, name: 'Runner', command: 'ls' },
+    ])
+    // the child's report lands in the parent's transcript as the command is approved
+    fake.onDecide = () => appendFileSync(l.transcript, JSON.stringify({ type: 'SYSTEM_MESSAGE', step_index: 20, content: 'x' }) + '\n')
+    assert.deepEqual(await answerAgyChildApproval(A, mark, 'allow', l.deps), { ok: true })
+    assert.equal(fake.view, 'parent', 'back on the parent\'s view, where the siblings\' approvals show')
+  }
+})
+
+test('★ subagent approval: a stop mid-way closes what it opened — a team\'s access ending at the dialog, a walk stopped on another view (codex · agy review)', async (t) => {
+  {
+    const { l, fake, mark } = await approvalLab(t, [{ id: K1, name: 'Runner', command: 'ls' }])
+    let wanted = true
+    // the access ends once the dialog is open
+    const read = l.deps.readScreen!
+    l.deps.readScreen = async (p) => {
+      if (fake.open) wanted = false
+      return read(p)
+    }
+    assert.deepEqual(await answerAgyChildApproval(A, mark, 'allow', l.deps, undefined, () => wanted), { ok: false, reason: 'changed' })
+    assert.equal(fake.decided.size, 0)
+    assert.equal(fake.open, false, 'its dialog cancelled')
+    assert.equal(fake.view, 'parent')
+  }
+  {
+    const { l, fake, mark } = await approvalLab(t, [
+      { id: K2, name: 'Thinker' },
+      { id: K1, name: 'Runner', command: 'ls' },
+    ])
+    // the parent wakes while the walk is on K2's view (a sibling reported)
+    fake.onOpen = (id) => {
+      if (id === K2) l.setState({ agent_state: 'tool_use', version: '1.5.16', subagents: [{ name: 'self', role: 'run', status: 'running' }] }, BASE)
+    }
+    assert.deepEqual(await answerAgyChildApproval(A, mark, 'allow', l.deps), { ok: false, reason: 'changed' })
+    assert.equal(fake.view, 'parent', 'not left on K2\'s view')
+    assert.equal(fake.decided.size, 0)
+  }
+})
+
+test('★ subagent approval: a failed screen read is read again (the PC goes back after the decision); a view the PC opened is not closed (codex · agy review)', async (t) => {
+  {
+    const { l, fake, mark } = await approvalLab(t, [
+      { id: K2, name: 'Thinker' },
+      { id: K1, name: 'Runner', command: 'ls' },
+    ])
+    // one failed read right after the decision
+    const read = l.deps.readScreen!
+    let dropped = false
+    l.deps.readScreen = async (p) => {
+      if (fake.decided.size > 0 && !dropped) {
+        dropped = true
+        return undefined
+      }
+      return read(p)
+    }
+    assert.deepEqual(await answerAgyChildApproval(A, mark, 'allow', l.deps), { ok: true })
+    assert.equal(dropped, true)
+    assert.equal(fake.view, 'parent')
+  }
+  {
+    const { l, fake, mark } = await approvalLab(t, [
+      { id: K2, name: 'Thinker' },
+      { id: K1, name: 'Runner', command: 'ls' },
+      { id: K3, name: 'Other' },
+    ])
+    // the PC person opens K3's view as the walk starts
+    const read = l.deps.readScreen!
+    l.deps.readScreen = async (p) => {
+      if (fake.keys.length === 1 && fake.view === 'parent') {
+        fake.view = 'child'
+        fake.childId = K3
+      }
+      return read(p)
+    }
+    assert.deepEqual(await answerAgyChildApproval(A, mark, 'allow', l.deps), { ok: false, reason: 'changed' })
+    assert.deepEqual([fake.view, fake.childId], ['child', K3], 'their view left as it is')
+    assert.equal(fake.keys.includes('\x1b'), false)
+  }
+})
+
+test('★ subagent approval: a view the walk opened and left, opened again by the PC person, is not closed (codex review)', async (t) => {
+  const { l, fake, mark } = await approvalLab(t, [
+    { id: K2, name: 'Thinker' },
+    { id: K1, name: 'Runner', command: 'ls' },
+  ])
+  const read = l.deps.readScreen!
+  l.deps.readScreen = async (p) => {
+    // after the walk left K2 and moved down, the PC person opens K2 again
+    if (fake.keys.length === 4 && fake.view === 'parent') {
+      fake.view = 'child'
+      fake.childId = K2
+    }
+    return read(p)
+  }
+  assert.deepEqual(await answerAgyChildApproval(A, mark, 'allow', l.deps), { ok: false, reason: 'changed' })
+  assert.deepEqual([fake.view, fake.childId], ['child', K2])
+  assert.deepEqual(fake.keys, ['\x1b[B', '\r', '\x1b', '\x1b[B'], 'no ESC of cleanup into their view')
 })

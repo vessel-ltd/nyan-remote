@@ -188,7 +188,9 @@ export function Permissions({
       //      not the agent's). No `at` (an older agent) ⇒ nothing is closed
       const tookEffect = res.at ? Date.parse(res.at) : NaN
       // ⚠️ Not after skipping a question: the turn goes on, and the next question's "needs you" can come right after
-      if (item.tool === 'agy' && !agyQuestion && behavior === 'deny' && item.sessionId && Number.isFinite(tookEffect)) {
+      // ⚠️ Nor after denying a subagent's command: only that child is told, the turn and its siblings go on (codex · agy
+      //    review: a sibling's waiting alert was closed)
+      if (item.tool === 'agy' && !agyQuestion && !item.subagent && behavior === 'deny' && item.sessionId && Number.isFinite(tookEffect)) {
         // ★ Again a few times: a push already on its way can be shown after this (codex review)
         const sessionId = item.sessionId
         for (const ms of [0, 3000, 10_000, 30_000]) {

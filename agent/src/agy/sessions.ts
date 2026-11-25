@@ -247,6 +247,13 @@ function messageSender(r: Record<string, unknown>): string | undefined {
   return /\[Message\] timestamp=\S+ sender=([0-9a-fA-F-]{36})/.exec(r['content'])?.[1]?.toLowerCase()
 }
 
+/** A `run_command` call's command line and folder (strings only), else nothing */
+function commandArgs(call: PendingCall): Record<string, unknown> {
+  if (call.name !== 'run_command') return {}
+  const { CommandLine, Cwd } = call.args
+  return { ...(typeof CommandLine === 'string' ? { CommandLine } : {}), ...(typeof Cwd === 'string' ? { Cwd } : {}) }
+}
+
 /** The transcript's pending call (any tool) and its time; null = none; undefined = cannot be read. Cached by size + time */
 function pendingOf(transcript: string, tail: (path: string) => Record<string, unknown>[]): { call: PendingCall; mtimeMs: number; size: number } | null | undefined {
   let st: { size: number; mtimeMs: number }
@@ -262,8 +269,9 @@ function pendingOf(transcript: string, tail: (path: string) => Record<string, un
     // ⚠️ A read that gave nothing from a file that has bytes failed (e.g. out of file descriptors): not remembered,
     //    or the question would stay unseen while the file stays unchanged (codex review)
     if (records.length === 0) return undefined
-    // ⚠️ Compact: a call's arguments are kept only for a question (a written file's content stays out of memory)
-    const pending = end.pending && end.pending.name !== AGY_QUESTION_TOOL ? { ...end.pending, args: {} } : end.pending
+    // ⚠️ Compact: a call's arguments are kept only for a question (a written file's content stays out of memory) — and a
+    //    command's own line and folder (a subagent's approval card shows it / docs/AGY.md §19, case 8)
+    const pending = end.pending && end.pending.name !== AGY_QUESTION_TOOL ? { ...end.pending, args: commandArgs(end.pending) } : end.pending
     // ★ For `agyChildrenOutlived`: whether the answer is the very last record (then the file's time is the answer's, to
     //   the millisecond), and whether another agent's message (a child's "[Message] … sender=…") came after it
     //   ★ and which agents' messages came before it in the same turn (`heard`: a child that reported, then wrote its own
@@ -1295,6 +1303,11 @@ export interface AgyChildQuestions {
    *   agy review)
    */
   known: boolean
+  /**
+   * ★ The other calls pending in the running children (and theirs): a command running, or waiting for its approval —
+   *   which of the two cannot be told from a transcript (docs/AGY.md §19.2). `askedAt` is the call's transcript write.
+   */
+  calls: AgyChildQuestion[]
 }
 
 export interface AgyChildQuestion {
@@ -1321,11 +1334,11 @@ export function agyChildQuestions(
   tail: (path: string) => Record<string, unknown>[] = readTailRecords,
 ): AgyChildQuestions {
   const roles = state.activeSubagentRoles
-  if (!roles) return { asking: [], complete: false, known: false }
-  if (roles.length === 0) return { asking: [], complete: true, known: true }
+  if (!roles) return { asking: [], complete: false, known: false, calls: [] }
+  if (roles.length === 0) return { asking: [], complete: true, known: true, calls: [] }
   const parent = conversationId.toLowerCase()
   const index = childrenIndex(home)
-  if (!index) return { asking: [], complete: false, known: false }
+  if (!index) return { asking: [], complete: false, known: false, calls: [] }
   let complete = !index.unreadable
   let known = !index.unreadable
   const children = (index.byParent.get(parent) ?? []).filter((c) => c.id !== parent)
@@ -1389,26 +1402,26 @@ export function agyChildQuestions(
   }
   for (const c of live) walk(c.id)
   const asking: AgyChildQuestion[] = []
-  const busy: string[] = []
+  const busy: AgyChildQuestion[] = []
   for (const id of nested) {
     const p = pendingOf(transcriptPathOf(id, home), tail)
     if (p === undefined) complete = known = false
     if (!p) continue
     if (p.call.name === AGY_QUESTION_TOOL) asking.push({ child: id, call: p.call, askedAt: p.mtimeMs, ambiguous: true })
-    else busy.push(id)
+    else busy.push({ child: id, call: p.call, askedAt: p.mtimeMs, ambiguous: true })
   }
   for (const c of live) {
     const p = pendingOf(transcriptPathOf(c.id, home), tail)
     if (p === undefined) complete = known = false
     if (!p) continue
     if (p.call.name === AGY_QUESTION_TOOL) asking.push({ child: c.id, call: p.call, askedAt: p.mtimeMs, ambiguous: !c.matched })
-    else busy.push(c.id)
+    else busy.push({ child: c.id, call: p.call, askedAt: p.mtimeMs, ambiguous: !c.matched })
   }
   // ⚠️ Another running child with a call of its own pending (running, or waiting for its approval): agy queues the
   //    children's questions and approvals for ctrl+k, and its approval may be the one opened — the answer's digit would
   //    approve its command (codex review) ⇒ no child is answered from the phone
   if (busy.length > 0) complete = false
-  return { asking, complete, known }
+  return { asking, complete, known, calls: busy }
 }
 
 /**
@@ -1454,6 +1467,13 @@ interface BlockedKid {
 }
 const blockedKids = new Map<string, { pid: number; kids: BlockedKid[] }>()
 let blockedSerial = 0
+/** conversation → when its list was last read whole (`noteAgyBlocked`), epoch ms */
+const blockedReadAt = new Map<string, number>()
+
+/** When this conversation's list was last read whole (a look after an answer is told apart by it), or undefined */
+export function agyBlockedReadAt(conversationId: string): number | undefined {
+  return blockedReadAt.get(conversationId)
+}
 
 /** The subagents of this agy waiting on an approval, each with its own start. ⚠️ Only while its children still run */
 export function agyBlockedWaits(s: Pick<AgyState, 'conversationId' | 'pid' | 'subagentsActive'>): readonly BlockedKid[] {
@@ -1477,6 +1497,7 @@ export function agyBlockedAt(s: Pick<AgyState, 'conversationId' | 'pid' | 'subag
  * Returns whether it changed.
  */
 export function noteAgyBlocked(conversationId: string, pid: number, count: number, now: number): boolean {
+  blockedReadAt.set(conversationId, now)
   const b = blockedKids.get(conversationId)
   if (count <= 0) return blockedKids.delete(conversationId)
   const had = b !== undefined && b.pid === pid ? [...b.kids].sort((x, y) => x.since - y.since || x.id - y.id) : []
@@ -1491,11 +1512,13 @@ export function noteAgyBlocked(conversationId: string, pid: number, count: numbe
 export function forgetAgyBlockedExcept(keep: ReadonlySet<string>): boolean {
   let changed = false
   for (const id of [...blockedKids.keys()]) if (!keep.has(id)) changed = blockedKids.delete(id) || changed
+  for (const id of [...blockedReadAt.keys()]) if (!keep.has(id)) blockedReadAt.delete(id)
   return changed
 }
 
 export function resetAgyBlockedForTest(): void {
   blockedKids.clear()
+  blockedReadAt.clear()
 }
 
 /**

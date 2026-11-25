@@ -165,8 +165,8 @@ test('★★ a subagent waiting on a command: the row needs you (it rings), says
   assert.equal(rows[0]!.status, 'waiting')
   assert.equal(rows[0]!.waitingFor, AGY_CHILD_APPROVAL)
   assert.equal(rows[0]!.lastActivity, new Date(at).toISOString())
-  assert.equal(waitingReason(AGY_CHILD_APPROVAL), 'PC でサブエージェントの承認')
-  assert.equal(localizeNotificationBody('要対応（PC でサブエージェントの承認）', 'en'), 'Needs you (subagent approval on the PC)')
+  assert.equal(waitingReason(AGY_CHILD_APPROVAL), 'サブエージェントの承認')
+  assert.equal(localizeNotificationBody('要対応（サブエージェントの承認）', 'en'), 'Needs you (subagent approval)')
   // the same wait on the next look: no change, same name
   assert.equal(await scan(r), false)
   assert.equal(agyBlockedAt(state(r)), at)

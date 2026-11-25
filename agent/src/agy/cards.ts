@@ -46,10 +46,10 @@ import { agyGrantOwner, type AgyGrantOwner } from './grants.ts'
 import { aliveProcStartSync } from '../claude/sessionIndex.ts'
 import { agyLocksOf, agyPaneOf, withLocksProbed, agyPidFiles, agyRow, agyShared, readAgyPidFile, sweepAgyPidFiles, transcriptPathOf, type AgyDeps, type AgyState } from './sessions.ts'
 import { callBeforeState, readTailRecords, turnEnd, type PendingCall } from './pending.ts'
-import type { AgyCardFailure, AgyCardMark, AgyQuestionAnswer, AgyQuestionFailure, AgyQuestionMark } from './keys.ts'
+import type { AgyCardFailure, AgyCardMark, AgyChildApprovalMark, AgyQuestionAnswer, AgyQuestionFailure, AgyQuestionMark } from './keys.ts'
 import { agyQuestionInteraction, parseAgyQuestion, questionTextsOf, skipSteps, type AgyAnswerPlan, type AgyQuestion, type AgyStep } from './questions.ts'
 import { agyUnlisted, childViewOf, dialogFits, inChildView, inputBoxOf, listAgy, parseApproval, previewAsks, respondOffered, parseBanner, parseDialog, parseSubagentList, readAgyScreen, sameQuestionText, viewOwnerOf } from './screen.ts'
-import { AGY_QUESTION_TOOL, agyCardAt, agyChildQuestions, agyPendingCall, agyQuestionAt, agyQuestionWaitAt } from './sessions.ts'
+import { AGY_QUESTION_TOOL, agyBlockedReadAt, agyBlockedWaits, agyCardAt, agyChildQuestions, agyPendingCall, agyQuestionAt, agyQuestionWaitAt } from './sessions.ts'
 
 /** ★ The calls whose card was measured, as the tool and input the card helpers know. undefined = stays on the PC */
 export function agyCardTool(call: Pick<PendingCall, 'name' | 'args'>): { toolName: string; input: Record<string, string> } | undefined {
@@ -134,10 +134,22 @@ export interface AgyCardDeps {
     /** ★ The answer's own `Decision.stillValid` (a team's leader: still this team) */
     stillWanted?: () => boolean,
   ): Promise<{ ok: true; left?: true } | { ok: false; reason: AgyQuestionFailure }>
+  /**
+   * ★ Types the phone's answer to a subagent's command approval (agy 1.5.16+ / docs/AGY.md §19, case 8 /
+   *   `keys.ts` `answerAgyChildApproval`). Absent ⇒ no such cards (they ring and stay on the PC).
+   */
+  answerChildApproval?(
+    conversationId: string,
+    mark: AgyChildApprovalMark,
+    behavior: 'allow' | 'deny',
+    stillWanted?: () => boolean,
+  ): Promise<{ ok: true } | { ok: false; reason: AgyCardFailure }>
   /** ★ Reads an agy's screen through its relay (`readAgyScreen`; replaced in tests) */
   readScreen?: (socketPath: string) => Promise<string | undefined>
   /** Rule 4c (tests shorten it) */
   unconfirmedMs?: number
+  /** (tests) `CA_ANSWERED_MS` */
+  childAnsweredMs?: number
   /**
    * Rule 4c: a card shown again after its key did not land (the notifier owes a fresh "needs you").
    * @param card the card's state write (ISO time of the agy's own state file, as the notifier's `cardOf`)
@@ -147,6 +159,9 @@ export interface AgyCardDeps {
   deliveryWaitMs?: number
 }
 
+
+/** How long an answered subagent approval still blocked on the list is not raised again (agy redraws, the key lands) */
+export const CA_ANSWERED_MS = 30_000
 
 /** Rule 4c: how long the same card may stay up after its key was written before it is shown again */
 export const UNCONFIRMED_MS = 3000
@@ -219,6 +234,26 @@ export function agyQuestionCard(row: SessionSummary, mark: AgyQuestionMark, q: A
   }
 }
 
+/**
+ * ★★ A subagent's command approval as an approval card (agy 1.5.16+ / docs/AGY.md §19, case 8): a Bash card marked as a
+ *   subagent's. ⚠️ Never answered by auto-approve (only a person or a team's leader).
+ */
+export function agyChildApprovalCard(row: SessionSummary, mark: AgyChildApprovalMark, call: PendingCall, at: string): PermissionRequest | undefined {
+  const base = agyCard(row, { pid: mark.pid, stateMtimeMs: mark.askedAt, step: mark.step, index: mark.index, callAt: mark.callAt }, call, at)
+  if (!base || base.toolName !== 'Bash') return undefined
+  const id = createHash('sha256').update(['agy-child-approval', row.sessionId, mark.pid, mark.child, mark.askedAt, mark.step, mark.index].join('\0'), 'utf8').digest('hex').slice(0, 24)
+  return {
+    ...base,
+    key: withGeneration(`agy:${id}`),
+    // ⚠️ Bound to the call itself (its child, time and command), as a card's
+    origin: `agy:${createHash('sha256').update(['agy-child-approval', row.sessionId, mark.pid, mark.child, mark.step, mark.index, mark.callAt, mark.command].join('\0'), 'utf8').digest('hex').slice(0, 24)}`,
+    subagent: {},
+  }
+}
+
+const caMarkId = (m: AgyChildApprovalMark): string => `ca:${m.pid}:${m.child}:${m.askedAt}:${m.step}:${m.index}:${m.callAt}`
+const caCallId = (conv: string, m: AgyChildApprovalMark): string => `${conv}:${m.pid}:${m.child}:${m.step}:${m.index}:${m.callAt}`
+
 /** ★ The card's name the notifier uses (`cardOf` / `agyCardAt`: its first state write, the same across agy's rewrites) */
 const cardName = (conv: string, m: AgyCardMark): string => new Date(agyCardAt(m.pid, conv, { step: m.step, index: m.index, at: m.callAt }, m.stateMtimeMs)).toISOString()
 const markId = (m: AgyCardMark): string => `${m.pid}:${m.stateMtimeMs}:${m.step}:${m.index}:${m.callAt}`
@@ -262,6 +297,19 @@ export class AgyCards {
    *   sibling's short call hid it for a look, the answered memory was dropped, and a second card was raised mid-answer)
    */
   #qTyping = new Set<string>()
+  /** ★ conversation → the subagent approval card on the phone (docs/AGY.md §19, case 8), by its mark id */
+  #caRaised = new Map<string, Raised & { mark: AgyChildApprovalMark }>()
+  /**
+   * conversation → the subagent approval answered from the phone (not raised again while the list still shows it).
+   * ⚠️ For a while only (`CA_ANSWERED_MS`): one still blocked after that comes back, whatever the looks between could
+   *    read (codex review: a list hidden past the confirmation's tries kept it off for good)
+   */
+  #caAnswered = new Map<string, string>()
+  #caAnsweredAt = new Map<string, number>()
+  /** ★ Subagent approval calls whose answer is being typed now: never raised again meanwhile (as `#qTyping` / agy review) */
+  #caTyping = new Set<string>()
+  /** conversation → how many children the list showed blocked on an approval, and at which look */
+  #caBlocked = new Map<string, { look: number; blocked: number }>()
   /** The calls auto-approve has tried once (rule 5b: never a second time; the phone's after that). Bounded */
   #autoTried = new Set<string>()
   #run: Promise<void> | undefined
@@ -492,6 +540,7 @@ export class AgyCards {
       void this.#wait(conv, raised, info, w.mark, agyCardTool(w.call)?.input)
     }
     if (await this.#lookQuestions(deps, unsure)) changed = true
+    if (await this.#lookChildApprovals(deps)) changed = true
     if (changed) this.#deps.changed()
   }
 
@@ -819,6 +868,199 @@ export class AgyCards {
     } finally {
       // ★ Only now (after `#qLeft` got it above, in the same run): no look can raise it in between
       this.#qTyping.delete(callKey)
+      settle(undefined)
+      if (deliveries.get(info.key) === mine) deliveries.delete(info.key)
+    }
+  }
+
+  /**
+   * ★★ Subagents' command approvals (agy 1.5.16+ / docs/AGY.md §19, case 8), raised as approval cards. A child's
+   *   transcript shows its call pending whether the command runs or waits for its approval; the parent's list tells the
+   *   two apart only by count ⇒ a card only when the list, read on the parent's view, shows as many children blocked on
+   *   an approval as there are calls pending (then every one of them waits). The oldest command is raised; one per
+   *   conversation. ⚠️ Never auto-approved. Returns whether the set of cards changed.
+   */
+  async #lookChildApprovals(deps: AgyDeps): Promise<boolean> {
+    if (!this.#deps.answerChildApproval) return false
+    const tail = this.#deps.tail ?? readTailRecords
+    const locksOf = deps.locksOf ?? ((p: number) => agyLocksOf(p, deps.home))
+    const want = new Map<string, { state: AgyState; mark: AgyChildApprovalMark; call: PendingCall }>()
+    /** conversations whose list could not be read now (the PC on another view): a card up stays while its call does */
+    const unread = new Set<string>()
+    const shared = new Set<string>()
+    for (const pid of agyPidFiles(deps.dir)) {
+      if (!deps.isAgy(pid)) continue
+      const f = readAgyPidFile(deps.dir, pid)
+      if (!f) continue
+      const st = f.state
+      const conv = st.conversationId
+      // (the parent idle with nothing of its own up, children running, an agy with the list)
+      if (st.confirmationPending || !st.subagentsActive || st.agentState !== 'idle' || !listAgy(st.version)) continue
+      const found = agyChildQuestions(st, conv, deps.home, tail)
+      if (!found.known) continue
+      const calls = found.calls.filter((c) => c.call.at !== undefined && !agyUnlisted({ pid, child: c.child, step: c.call.step, index: c.call.index, callAt: c.call.at }))
+      if (calls.length === 0) continue
+      const pane = await agyPaneOf(pid, deps.aliveProcStart ?? aliveProcStartSync)
+      if (pane === 'broken' || pane === 'unverified') {
+        unread.add(conv)
+        continue
+      }
+      if (typeof pane === 'string' || !pane.screen || f.mtimeMs < pane.startedAt) continue
+      const locks = locksOf(pid)
+      if (locks === undefined) {
+        unread.add(conv)
+        continue
+      }
+      if (!locks.includes(conv)) continue
+      const oldest = Math.min(...calls.map((c) => c.call.at!))
+      const sharedNow = want.has(conv) || agyShared(deps.dir, conv, pid, deps.isAgy, locksOf, oldest)
+      if (sharedNow === undefined) {
+        unread.add(conv)
+        continue
+      }
+      if (sharedNow) {
+        shared.add(conv)
+        continue
+      }
+      const screen = await (this.#deps.readScreen ?? readAgyScreen)(pane.socketPath)
+      const rows = screen !== undefined && !inChildView(screen) && viewOwnerOf(screen) === 'parent' && parseDialog(screen) === undefined ? parseSubagentList(screen) : undefined
+      if (rows === undefined) {
+        unread.add(conv)
+        continue
+      }
+      // ★ Every pending call waits for its approval only when the counts match (fail-closed: no card otherwise)
+      const blocked = rows.filter((r) => r.blockedOn !== undefined && r.blockedOn !== 'AskQuestion').length
+      this.#caBlocked.set(conv, { look: this.#begun, blocked })
+      if (blocked !== calls.length) continue
+      // ⚠️ Something typed in the PC's box: the answer cannot go into the list (it would loop, answered "changed" each
+      //    time, and hide the leader's PC-wait notice / agy review) ⇒ no card, as for questions
+      const box = inputBoxOf(screen!)
+      if (box === undefined || box.some((x) => x.trim() !== '')) continue
+      const pick = [...calls].sort((a, b) => a.askedAt - b.askedAt || (a.child < b.child ? -1 : a.child > b.child ? 1 : 0))[0]!
+      const command = pick.call.name === 'run_command' ? pick.call.args['CommandLine'] : undefined
+      if (typeof command !== 'string' || command === '') continue
+      want.set(conv, {
+        state: st,
+        mark: { pid, child: pick.child, askedAt: pick.askedAt, step: pick.call.step, index: pick.call.index, callAt: pick.call.at!, command },
+        call: pick.call,
+      })
+    }
+    for (const conv of shared) want.delete(conv)
+    /** a card whose list could not be read now: kept while the child's call is still the one (its transcript unwritten) */
+    const stillPending = (m: AgyChildApprovalMark): boolean => {
+      const p = agyPendingCall(transcriptPathOf(m.child, deps.home), tail)
+      return !!p && p.mtimeMs === m.askedAt && p.call.step === m.step && p.call.index === m.index && p.call.at === m.callAt
+    }
+    let changed = false
+    for (const [conv, r] of this.#caRaised) {
+      const w = want.get(conv)
+      if (w && caMarkId(w.mark) === r.id) continue
+      if (!w && unread.has(conv) && stillPending(r.mark)) continue
+      this.#caRaised.delete(conv)
+      r.withdraw?.()
+      changed = true
+    }
+    for (const [conv, id] of this.#caAnswered) {
+      const w = want.get(conv)
+      if (!w && unread.has(conv)) continue
+      if (!w || caMarkId(w.mark) !== id) this.#caAnswered.delete(conv)
+    }
+    for (const [conv, w] of want) {
+      const id = caMarkId(w.mark)
+      if (this.#caRaised.has(conv) || this.#caTyping.has(caCallId(conv, w.mark))) continue
+      if (this.#caAnswered.get(conv) === id) {
+        if (Date.now() - (this.#caAnsweredAt.get(conv) ?? 0) < (this.#deps.childAnsweredMs ?? CA_ANSWERED_MS)) continue
+        this.#caAnswered.delete(conv)
+      }
+      const row = agyRow(w.state, { machine: this.#deps.machine, transcriptBytes: 0, lastActivity: new Date(w.mark.askedAt).toISOString(), sendRoute: 'keys', asking: true, outlived: false })
+      const info = agyChildApprovalCard(row, w.mark, w.call, this.#deps.now().toISOString())
+      if (!info) continue
+      const raised = { id, mark: w.mark }
+      this.#caRaised.set(conv, raised)
+      changed = true
+      void this.#waitChildApproval(conv, raised, info, w.mark, agyCardTool(w.call)?.input)
+    }
+    return changed
+  }
+
+  /** The name the notifier gives this conversation's wait now (`agyQuestionWaitAt`), else `fallback` */
+  #waitNameOfConv(pid: number, fallback: number): string {
+    const deps = this.#deps.agy()
+    const f = readAgyPidFile(deps.dir, pid)
+    const at = f ? agyQuestionWaitAt(f.state, f.mtimeMs, deps.home) : undefined
+    return new Date(at ?? fallback).toISOString()
+  }
+
+  async #waitChildApproval(conv: string, raised: Raised, info: PermissionRequest, mark: AgyChildApprovalMark, toolInput?: Record<string, string>): Promise<void> {
+    let settle!: (d: AgyDelivery | undefined) => void
+    const mine = new Promise<AgyDelivery | undefined>((r) => (settle = r))
+    deliveries.set(info.key, mine)
+    try {
+      const decision = await waitForDecision(info, (withdraw) => (raised.withdraw = withdraw), { ...(toolInput ? { toolInput } : {}), requestedAt: mark.callAt, agyPid: mark.pid })
+      if (!decision) return
+      if (this.#caRaised.get(conv) === raised) this.#caRaised.delete(conv)
+      this.#caAnswered.set(conv, raised.id)
+      this.#caAnsweredAt.set(conv, Date.now())
+      this.#deps.changed()
+      const behavior = decision.behavior === 'allow' ? 'allow' : 'deny'
+      const started = Date.now()
+      const typing = caCallId(conv, mark)
+      this.#caTyping.add(typing)
+      const res: AgyDelivery = await this.#deps.answerChildApproval!(conv, mark, behavior, decision.stillValid)
+        .catch(() => ({ ok: false as const, reason: 'unreachable' as const }))
+        .finally(() => this.#caTyping.delete(typing))
+      settle(res)
+      // ⚠️ One line, no command text
+      this.#deps.log?.(`[agy] subagent card ${behavior} conversation=${conv.slice(0, 8)} ${res.ok ? 'typed' : `not typed (${res.reason})`}`)
+      if (res.ok) {
+        const answeredAt = Date.now()
+        const answeredLook = this.#begun
+        // ★ After a moment, with a look made since whose list was read: the same call still blocked there ⇒ the key did
+        //   not take, it comes back (rule 4c, as a card's)
+        //   ⚠️ Looked again (bounded) until a list is read: one unreadable look must not keep it off for good (codex review)
+        const unconfirmed = this.#deps.unconfirmedMs ?? UNCONFIRMED_MS
+        const giveUp = answeredAt + unconfirmed * 5
+        const confirm = (): void => {
+          void this.fresh().then(() => {
+            const seen = this.#caBlocked.get(conv)
+            if (seen === undefined || seen.look <= answeredLook) {
+              if (Date.now() < giveUp && this.#caAnswered.get(conv) === raised.id) setTimeout(confirm, Math.max(20, unconfirmed / 3)).unref?.()
+              return
+            }
+            if (this.#caAnswered.get(conv) === raised.id) {
+              this.#caAnswered.delete(conv)
+              this.#deps.log?.(`[agy] subagent card ${behavior} conversation=${conv.slice(0, 8)} still up after the key; shown again`)
+              this.#deps.reraised?.(conv, this.#waitNameOfConv(mark.pid, mark.askedAt))
+              void this.sync()
+            }
+          })
+        }
+        setTimeout(confirm, unconfirmed).unref?.()
+        // ★ Another wait still up (a sibling's approval, a child's question) once the list was read since the answer —
+        //   by `blocked.ts`, which reads it whatever the parent does and through wrapped rows ⇒ "needs you" rings again:
+        //   opening the alert for this one dismissed it (codex · agy review). Asked for a while, then given up.
+        const again = (): void => {
+          const readAt = agyBlockedReadAt(conv)
+          if (readAt === undefined || readAt <= answeredAt) {
+            if (Date.now() < giveUp) setTimeout(again, Math.max(20, unconfirmed / 3)).unref?.()
+            return
+          }
+          const deps = this.#deps.agy()
+          const f = readAgyPidFile(deps.dir, mark.pid)
+          if (!f) return
+          const asking = agyChildQuestions(f.state, conv, deps.home, this.#deps.tail ?? readTailRecords).asking.length > 0
+          if (agyBlockedWaits(f.state).length > 0 || asking) this.#deps.reraised?.(conv, this.#waitNameOfConv(mark.pid, mark.askedAt))
+        }
+        setTimeout(again, unconfirmed).unref?.()
+      }
+      if (!res.ok) {
+        // not typed ⇒ it may come back on the next look (if the list still shows it)
+        if (this.#caAnswered.get(conv) === raised.id) this.#caAnswered.delete(conv)
+        // ★ Past the phone's wait it was told "taken": "needs you" rings again (as a card's)
+        if (Date.now() - started >= (this.#deps.deliveryWaitMs ?? AGY_DELIVERY_WAIT_MS)) this.#deps.reraised?.(conv, this.#waitNameOfConv(mark.pid, mark.askedAt))
+        void this.sync()
+      }
+    } finally {
       settle(undefined)
       if (deliveries.get(info.key) === mine) deliveries.delete(info.key)
     }

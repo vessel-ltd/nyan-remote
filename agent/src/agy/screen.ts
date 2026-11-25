@@ -551,6 +551,27 @@ export function parseApproval(screen: string): ApprovalShown | undefined {
   return { tool: tool[1]!, details, ...(open && choices.length > 0 ? { choices } : {}) }
 }
 
+/**
+ * ★ The approval shown is this command's (docs/AGY.md §19, case 8): a Bash approval whose shown command is the card's,
+ *   compared without whitespace (agy wraps a long one over rows), or its start when cut short ("…").
+ */
+export function approvalShows(screen: string, command: string): boolean {
+  const a = parseApproval(screen)
+  if (!a || a.tool !== 'Bash' || a.details.length === 0) return false
+  const squash = (x: string): string => x.replace(/\s+/g, '')
+  const shown = squash(a.details.join(''))
+  const want = squash(command)
+  if (want === '' || shown === '') return false
+  if (shown === want) return true
+  return shown.endsWith('…') && shown.length > 1 && want.startsWith(shown.slice(0, -1))
+}
+
+/** ★ The approval dialog is open with exactly the two measured choices: 1 approves, 2 denies (agy 1.5.16) */
+export function approvalChoicesShown(screen: string): boolean {
+  const c = parseApproval(screen)?.choices
+  return c !== undefined && c.length === 2 && c[0]!.n === 1 && c[0]!.label === 'Yes, approve' && c[1]!.n === 2 && c[1]!.label === 'No, deny'
+}
+
 /** A subagent's question call (`AgyQuestionMark`'s fields) */
 type UnlistedMark = { pid: number; child?: string; step: number; index: number; callAt: number }
 

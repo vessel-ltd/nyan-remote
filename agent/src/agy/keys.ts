@@ -52,7 +52,7 @@ import {
 } from '../claude/keys.ts'
 import { callBeforeState, readTailRecords, turnEnd, type PendingCall } from './pending.ts'
 import { parseAgyQuestion, questionTextsOf, type AgyAnswerPlan, type AgyQuestion, type AgyStep } from './questions.ts'
-import { childViewOf, dialogFits, inChildView, inputBoxOf, inputRowOf, listAgy, listFocused, noteUnlisted, parseApproval, previewAsks, parseBanner, parseSubagentList, respondOffered, slashPicked, viewOwnerOf, parseDialog, readAgyScreen, sameQuestionText, showsQuestion, type FooterHint, type ScreenDialog } from './screen.ts'
+import { approvalChoicesShown, approvalShows, childViewOf, dialogFits, inChildView, inputBoxOf, inputRowOf, listAgy, listFocused, noteUnlisted, parseApproval, previewAsks, parseBanner, parseSubagentList, respondOffered, slashPicked, viewOwnerOf, parseDialog, readAgyScreen, sameQuestionText, showsQuestion, type FooterHint, type ScreenDialog } from './screen.ts'
 import {
   AGY_PREFIX,
   AGY_QUESTION_TOOL,
@@ -1322,6 +1322,295 @@ function notePieces(note: string): string[] {
 export const SCREEN_SETTLE_MS = 2000
 const SCREEN_POLL_MS = 30
 
+/**
+ * ★★ A subagent's command approval the phone answers (agy 1.5.16+ / docs/AGY.md §19, case 8). Not in any record as
+ *   such (the child's transcript shows the call pending, as for a command running): raised when the parent's list shows
+ *   as many children blocked on an approval as there are calls pending (`cards.ts`).
+ */
+export interface AgyChildApprovalMark {
+  pid: number
+  /** The subagent's conversation id */
+  child: string
+  /** The child transcript's write that holds the call (nothing writes it while the call waits) */
+  askedAt: number
+  step: number
+  index: number
+  callAt: number
+  /** The command the card shows (the approval on the screen must show it) */
+  command: string
+}
+
+/** ★ Whether this subagent's approval is still the one up: the parent idle, its child's call the same. ⚠️ Synchronous */
+export function sameChildApprovalNow(
+  target: Pick<AgyTarget, 'conversationId' | 'pid' | 'pane' | 'dir' | 'transcript'>,
+  mark: AgyChildApprovalMark,
+  checks: Parameters<typeof sameQuestionNow>[2],
+  slow = true,
+): boolean {
+  // the slow checks first, the file reads last (as `sameCardNow`)
+  if (slow && !checks.holdsLock(mark.pid, target.conversationId)) return false
+  if (slow && checks.shared(target.conversationId, mark.pid, mark.callAt) !== false) return false
+  const f = readAgyPidFile(target.dir, mark.pid)
+  if (!f || f.state.conversationId !== target.conversationId || f.state.confirmationPending || f.state.agentState !== 'idle' || !f.state.subagentsActive) return false
+  if (f.mtimeMs < target.pane.startedAt || !listAgy(f.state.version)) return false
+  const home = homeOf(target.transcript, target.conversationId)
+  if (home === undefined) return false
+  const p = agyPendingCall(transcriptPathOf(mark.child, home), checks.tail ?? readTailRecords)
+  if (!p || p.mtimeMs !== mark.askedAt) return false
+  return p.call.name === 'run_command' && p.call.step === mark.step && p.call.index === mark.index && p.call.at === mark.callAt && p.call.args['CommandLine'] === mark.command
+}
+
+/**
+ * ★★ Answer a subagent's command approval from the phone (agy 1.5.16+): the child opened from the parent's list by its
+ *    id, its approval checked to show this command, opened with `a`, its two choices checked, then `1` (approve) or `2`
+ *    (deny). ⚠️ Never ctrl+k (it approves at once on 1.5.16). ⚠️ Only through a relay that shows the screen.
+ */
+export async function answerAgyChildApproval(
+  conversationId: string,
+  mark: AgyChildApprovalMark,
+  behavior: 'allow' | 'deny',
+  deps: AgyKeysDeps = defaultAgyKeysDeps(),
+  tail: (path: string) => Record<string, unknown>[] = readTailRecords,
+  /** ★ Asked before each key (a team's leader: still this team) */
+  stillWanted?: () => boolean,
+): Promise<{ ok: true } | { ok: false; reason: AgyCardFailure }> {
+  const conv = conversationId.toLowerCase()
+  return whileAnswering(keyOf(conv), () => serializeBySession(keyOf(conv), async () => {
+    if (!deps.isAgy(mark.pid)) return { ok: false, reason: 'not-open' }
+    const pane = await agyPaneOf(mark.pid, deps.aliveProcStart)
+    if (typeof pane === 'string') return { ok: false, reason: pane }
+    if (!pane.screen) return { ok: false, reason: 'changed' }
+    const target = { conversationId: conv, pid: mark.pid, pane, dir: deps.dir, transcript: transcriptPathOf(conv, deps.home), stateFile: '' }
+    if (!sameChildApprovalNow(target, mark, await probedChecks(deps, tail, mark.pid))) return { ok: false, reason: 'changed' }
+    // ★ An answer on the PC just before lands in this wait (as a card's)
+    await new Promise((r) => setTimeout(r, deps.answerSettleMs ?? AGY_ANSWER_SETTLE_MS))
+    if (stillWanted && !stillWanted()) return { ok: false, reason: 'changed' }
+    return approveOnScreen(target, pane, mark, behavior, deps, tail, stillWanted)
+  }))
+}
+
+async function approveOnScreen(
+  target: AgyTarget,
+  pane: AgyPane,
+  mark: AgyChildApprovalMark,
+  behavior: 'allow' | 'deny',
+  deps: AgyKeysDeps,
+  tail: (path: string) => Record<string, unknown>[],
+  stillWanted?: () => boolean,
+): Promise<{ ok: true } | { ok: false; reason: AgyCardFailure }> {
+  const unwanted = (): boolean => stillWanted !== undefined && !stillWanted()
+  const settle = deps.screenSettleMs ?? SCREEN_SETTLE_MS
+  const look = deps.readScreen ?? ((p: string) => readAgyScreen(p))
+  const line = await (deps.openKeyLine ?? openKeyLine)(pane.socketPath)
+  if (!line) return { ok: false, reason: 'unreachable' }
+  const child = mark.child.toLowerCase()
+  /** this agy's own state between a screen read and its key: the parent still idle with nothing of its own up */
+  const parentMoved = (): boolean => {
+    const f = readAgyPidFile(target.dir, mark.pid)
+    return !f || f.state.conversationId !== target.conversationId || f.state.agentState !== 'idle' || f.state.confirmationPending
+  }
+  const screen = async (): Promise<string> => {
+    const s = await look(pane.socketPath)
+    if (s === undefined) throw new Stop('changed')
+    return s
+  }
+  // ★ A screen read that fails is read again until the wait ends (codex · agy review: one failed read gave up at once)
+  const until = async <T>(want: (s: string) => T | undefined): Promise<T> => {
+    const end = Date.now() + settle
+    for (;;) {
+      const s = await look(pane.socketPath)
+      const got = s === undefined ? undefined : want(s)
+      if (got !== undefined) return got
+      if (Date.now() >= end) throw new Stop('changed')
+      await new Promise((r) => setTimeout(r, SCREEN_POLL_MS))
+    }
+  }
+
+  // ★ As `answerOnScreen`'s: every slow check before the screen is read, only this agy's own file between it and the key
+  const quick = await probedChecks(deps, tail, mark.pid)
+  const nav = async (bytes: string, on: (s: string) => boolean, slow = false): Promise<void> => {
+    const now = slow ? await probedChecks(deps, tail, mark.pid) : quick
+    if (!sameChildApprovalNow(target, mark, now, slow)) throw new Stop('changed')
+    if (!on(await screen())) throw new Stop('changed')
+    if (!(await line.write(bytes, () => unwanted() || parentMoved()))) throw new Stop('changed')
+  }
+  /** this child's view, its approval shown closed and of this command */
+  const closedHere = (s: string): boolean => childViewOf(s) === child && respondOffered(s) && parseApproval(s)?.choices === undefined && approvalShows(s, mark.command)
+  /**
+   * this child's view, its approval open with the two measured choices, of this command (⚠️ told by the header's id: the
+   * open dialog's footer is the dialog's, not the view's)
+   */
+  const openHere = (s: string): boolean => {
+    const owner = viewOwnerOf(s)
+    return typeof owner === 'object' && owner.child === child && approvalChoicesShown(s) && approvalShows(s, mark.command)
+  }
+  const parentAt = statSync(target.transcript, { throwIfNoEntry: false })?.mtimeMs
+  let listed = false
+  let opened = false
+  let decided = false
+  /** the subagents' views this try opened from the list (only those are left again / codex review) */
+  const entered = new Set<string>()
+  /**
+   * ★ A try that stopped: what it opened is closed again — the approval dialog with ESC (on it ESC cancels, deciding
+   *   nothing — measured), the child's view with `esc back` when it was opened from the list — so the PC shows the
+   *   parent's list again, where the card can come back (codex · agy review: left on the child's open dialog, the list
+   *   could not be read and the wait went silent). Each only on the screen read right before it.
+   */
+  //   ⚠️ Not held back by `stillWanted` (a team's access that ended): closing what this try opened decides nothing for
+  //      anyone (codex · agy review: left on the open dialog, the card could not come back for the person). A walk
+  //      stopped on another subagent's view on the way is left too (agy review).
+  const restore = async (): Promise<void> => {
+    try {
+      let s = await until((x) => x)
+      const owner = viewOwnerOf(s)
+      if (opened && typeof owner === 'object' && owner.child === child && parseApproval(s)?.choices !== undefined) {
+        if (!(await line.write(SCREEN_KEYS.esc))) return
+        s = await until((x) => (childViewOf(x) === child && parseApproval(x)?.choices === undefined ? x : undefined))
+      }
+      const viewed = childViewOf(s)
+      if (listed && viewed !== undefined && entered.has(viewed) && parseDialog(s) === undefined && parseApproval(s)?.choices === undefined) await line.write(SCREEN_KEYS.esc)
+    } catch {
+      // left as it is
+    }
+  }
+  try {
+    let first = await screen()
+    if (!openHere(first)) {
+      if (!closedHere(first)) {
+        // ★ Only from the parent's view (its list); another subagent's view or anything open is left to the PC
+        if (inChildView(first) || viewOwnerOf(first) !== 'parent' || parseSubagentList(first) === undefined) throw new Stop('changed')
+        listed = true
+        await openChildFromList({ screen, until, nav }, first, child, closedHere, () => noteUnlisted(mark), entered)
+      }
+      await nav(SCREEN_KEYS.respond, closedHere, true)
+      opened = true
+      first = await until((s) => (openHere(s) ? s : undefined))
+    }
+    // ★ The decision: the screen read again right before it, every check, then the one digit
+    const now = await probedChecks(deps, tail, mark.pid)
+    if (!sameChildApprovalNow(target, mark, now, true) || !openHere(await screen())) throw new Stop('changed')
+    const digit = behavior === 'allow' ? '1' : '2'
+    if (!(await line.write(digit, () => unwanted() || !sameChildApprovalNow(target, mark, now, false)))) throw new Stop('changed')
+    // the dialog closes (the command runs, or the child is told it was denied) — ⚠️ else the digit did not land: not
+    //   answered (codex · agy review: told "answered", the card never came back)
+    const closed = await until((s) => (childViewOf(s) === child && parseApproval(s)?.choices === undefined ? true : undefined)).catch(() => false)
+    if (closed !== true) {
+      await restore()
+      return { ok: false, reason: 'unreachable' }
+    }
+    decided = true
+    // ★ Back to the parent's view: a child's view opens no dialog by itself (measured), so ESC there only goes back —
+    //   read right before it (codex review: guarded by the parent's transcript too, a child's report kept the PC on the
+    //   child's view, where its siblings' approvals cannot be seen). ✅ Accepted: the PC going back itself in the
+    //   moment between that read and the key (the ESC then reaches the parent's view)
+    // (read again for a while: one failed read must not leave the PC on the child's view / codex review)
+    const s = await until((x) => (childViewOf(x) === child && parseDialog(x) === undefined && parseApproval(x)?.choices === undefined ? x : undefined)).catch(() => undefined)
+    if (s !== undefined) {
+      // (not held back by `stillWanted`: the decision is made; going back decides nothing)
+      const back = await line.write(SCREEN_KEYS.esc)
+      if (back && listed) {
+        // ★ As after a question: back on the parent's view the list keeps the focus ⇒ ESC gives it back to the box
+        const p = await until((x) => (!inChildView(x) && viewOwnerOf(x) === 'parent' ? x : undefined)).catch(() => undefined)
+        if (p !== undefined && parseDialog(p) === undefined && listFocused(p)) {
+          await line.write(SCREEN_KEYS.esc, () => parentMoved() || parentAt === undefined || statSync(target.transcript, { throwIfNoEntry: false })?.mtimeMs !== parentAt)
+        }
+      }
+    }
+    return { ok: true }
+  } catch {
+    // (the digit out: answered, whatever came after it)
+    if (decided) return { ok: true }
+    await restore()
+    return { ok: false, reason: 'changed' }
+  } finally {
+    line.close()
+  }
+}
+
+/** The screen steps a list walk needs (`answerOnScreen` and `approveOnScreen` give their own guards) */
+interface ScreenOps {
+  screen(): Promise<string>
+  until<T>(want: (s: string) => T | undefined): Promise<T>
+  /** a key that moves between views, only while `on` holds on the screen read right before it */
+  nav(bytes: string, on: (s: string) => boolean, slow?: boolean): Promise<void>
+}
+
+/**
+ * ★★ agy 1.5.16 (docs/AGY.md §19.2): a subagent's view opened from the parent's list, told by its id (the header).
+ *    Each other view opened on the way is left with `esc back` (its dialog is closed there: opening a view from the list
+ *    never opens its dialog — measured). ⚠️ ctrl+k is not used (on an approval it approves).
+ *    Returns once `fits` holds on this child's view (its wait shown closed); throws `Stop('changed')` otherwise, calling
+ *    `missing` after a whole walk of a list that stayed the same found no such child.
+ */
+async function openChildFromList(
+  ops: ScreenOps,
+  start: string,
+  child: string,
+  fits: (s: string) => boolean,
+  missing: () => void,
+  /** each view this walk opened (its id) is added, as it is seen opened */
+  entered?: Set<string>,
+): Promise<void> {
+  const { screen, until, nav } = ops
+  const listAt = (s: string): ReturnType<typeof parseSubagentList> => (!inChildView(s) && viewOwnerOf(s) === 'parent' && parseDialog(s) === undefined ? parseSubagentList(s) : undefined)
+  // ⚠️ Nothing typed in the PC's box (the arrows would move in a draft instead)
+  const emptyBox = (s: string): boolean => {
+    const box = inputBoxOf(s)
+    return box !== undefined && box.every((l) => l.trim() === '')
+  }
+  let rows = listAt(start)
+  if (!rows || !emptyBox(start)) throw new Stop('changed')
+  if (!rows.some((r) => r.focused)) {
+    await nav(SCREEN_KEYS.down, (s) => listAt(s) !== undefined && emptyBox(s) && !listAt(s)!.some((r) => r.focused), true)
+    rows = await until((s) => (listAt(s)?.some((r) => r.focused) ? listAt(s) : undefined))
+  }
+  // from the top, one row at a time (each seen focused before the next key)
+  let at = rows.findIndex((r) => r.focused)
+  while (at > 0) {
+    const from = at
+    await nav(SCREEN_KEYS.up, (s) => listAt(s)?.[from]?.focused === true)
+    const want = at - 1
+    rows = await until((s) => (listAt(s)?.[want]?.focused ? listAt(s) : undefined))
+    at = want
+  }
+  // ★ Missing from the list only after a walk of a list that stayed the same, each row a different subagent (codex
+  //   review: a row added meanwhile shifted the walk, one was opened twice and a live one was taken for missing)
+  const startRows = rows.map((r) => r.name).join('\n')
+  let moved = false
+  const seen = new Set<string>()
+  for (let i = 0; i < rows.length; i++) {
+    if (i > 0) {
+      await nav(SCREEN_KEYS.down, (s) => listAt(s)?.[i - 1]?.focused === true)
+      await until((s) => (listAt(s)?.[i]?.focused ? true : undefined))
+    }
+    await nav(SCREEN_KEYS.enter, (s) => {
+      const now = listAt(s)
+      if (now !== undefined && now.map((r) => r.name).join('\n') !== startRows) moved = true
+      return now?.[i]?.focused === true
+    })
+    const opened = await until((s) => (inChildView(s) && typeof viewOwnerOf(s) === 'object' ? s : undefined))
+    seen.add(childViewOf(opened) ?? '')
+    const id = childViewOf(opened)
+    if (id !== undefined) entered?.add(id)
+    if (childViewOf(opened) === child) {
+      await until((s) => (fits(s) ? true : undefined))
+      return
+    }
+    // another subagent's view: back to the list (⚠️ only with nothing open there — ESC on an open question skips it;
+    // its footer must say "esc back")
+    const closed = (s: string): boolean => inChildView(s) && childViewOf(s) === childViewOf(opened) && parseDialog(s) === undefined && parseApproval(s)?.choices === undefined
+    await nav(SCREEN_KEYS.esc, closed)
+    // (left again: no longer this walk's — the PC person may open it next / codex review)
+    if (id !== undefined) entered?.delete(id)
+    await until((s) => (listAt(s)?.[i]?.focused ? true : undefined))
+  }
+  // ★ Every row opened and this one is not there (a killed one's leftover): its card is not raised again while that call
+  //   stays (codex review: it came back after every failed answer)
+  const endRows = (listAt(await screen()) ?? []).map((r) => r.name).join('\n')
+  if (!moved && endRows === startRows && seen.size === rows.length && !seen.has('')) missing()
+  throw new Stop('changed')
+}
+
 class Stop extends Error {
   readonly reason: 'changed' | 'partial'
   constructor(reason: 'changed' | 'partial') {
@@ -1503,69 +1792,16 @@ async function answerOnScreen(
     await press(SCREEN_KEYS.enter, last)
   }
   /**
-   * ★★ agy 1.5.16 (docs/AGY.md §19.2): the subagent's view opened from the parent's list, told by its id, its question
-   *    opened with `a`. Each other view opened on the way is left with `esc back` (its dialog is closed there: opening a
-   *    view from the list never opens its dialog — measured). ⚠️ ctrl+k is not used (on an approval it approves).
-   *    Returns the screen with this question's dialog open.
+   * ★★ agy 1.5.16 (docs/AGY.md §19.2): this subagent's view opened from the parent's list (`openChildFromList`), its
+   *    question opened with `a`. Returns the screen with this question's dialog open.
    */
   const openFromList = async (start: string): Promise<string> => {
     const child = mark.child!.toLowerCase()
-    const listAt = (s: string): ReturnType<typeof parseSubagentList> => (!inChildView(s) && viewOwnerOf(s) === 'parent' && parseDialog(s) === undefined ? parseSubagentList(s) : undefined)
-    // ⚠️ Nothing typed in the PC's box (the arrows would move in a draft instead)
-    const emptyBox = (s: string): boolean => {
-      const box = inputBoxOf(s)
-      return box !== undefined && box.every((l) => l.trim() === '')
-    }
-    let rows = listAt(start)
-    if (!rows || !emptyBox(start)) throw new Stop('changed')
-    if (!rows.some((r) => r.focused)) {
-      await nav(SCREEN_KEYS.down, (s) => listAt(s) !== undefined && emptyBox(s) && !listAt(s)!.some((r) => r.focused), true)
-      rows = await until((s) => (listAt(s)?.some((r) => r.focused) ? listAt(s) : undefined))
-    }
-    // from the top, one row at a time (each seen focused before the next key)
-    let at = rows.findIndex((r) => r.focused)
-    while (at > 0) {
-      const from = at
-      await nav(SCREEN_KEYS.up, (s) => listAt(s)?.[from]?.focused === true)
-      const want = at - 1
-      rows = await until((s) => (listAt(s)?.[want]?.focused ? listAt(s) : undefined))
-      at = want
-    }
-    // ★ Missing from the list only after a walk of a list that stayed the same, each row a different subagent (codex
-    //   review: a row added meanwhile shifted the walk, one was opened twice and a live one was taken for missing)
-    const startRows = rows.map((r) => r.name).join('\n')
-    let moved = false
-    const seen = new Set<string>()
-    for (let i = 0; i < rows.length; i++) {
-      if (i > 0) {
-        await nav(SCREEN_KEYS.down, (s) => listAt(s)?.[i - 1]?.focused === true)
-        await until((s) => (listAt(s)?.[i]?.focused ? true : undefined))
-      }
-      await nav(SCREEN_KEYS.enter, (s) => {
-        const now = listAt(s)
-        if (now !== undefined && now.map((r) => r.name).join('\n') !== startRows) moved = true
-        return now?.[i]?.focused === true
-      })
-      const opened = await until((s) => (inChildView(s) && typeof viewOwnerOf(s) === 'object' ? s : undefined))
-      seen.add(childViewOf(opened) ?? '')
-      if (childViewOf(opened) === child) {
-        // ★ Its question waits there, closed, and is this one (a long one wraps over several rows: joined)
-        const fits = (s: string): boolean => childViewOf(s) === child && respondOffered(s) && previewAsks(s, items[0]!.question)
-        await until((s) => (fits(s) ? true : undefined))
-        await nav(SCREEN_KEYS.respond, fits, true)
-        return await until((s) => (batchAt(s) !== undefined ? s : undefined))
-      }
-      // another subagent's view: back to the list (⚠️ only with nothing open there — ESC on an open question skips it;
-      // its footer must say "esc back")
-      const closed = (s: string): boolean => inChildView(s) && childViewOf(s) === childViewOf(opened) && parseDialog(s) === undefined && parseApproval(s)?.choices === undefined
-      await nav(SCREEN_KEYS.esc, closed)
-      await until((s) => (listAt(s)?.[i]?.focused ? true : undefined))
-    }
-    // ★ Every row opened and this one is not there (a killed one's leftover question): its card is not raised again
-    //   while that call stays (codex review: it came back after every failed answer)
-    const endRows = (listAt(await screen()) ?? []).map((r) => r.name).join('\n')
-    if (!moved && endRows === startRows && seen.size === rows.length && !seen.has('')) noteUnlisted(mark)
-    throw new Stop('changed')
+    // ★ Its question waits there, closed, and is this one (a long one wraps over several rows: joined)
+    const fits = (s: string): boolean => childViewOf(s) === child && respondOffered(s) && previewAsks(s, items[0]!.question)
+    await openChildFromList({ screen, until, nav }, start, child, fits, () => noteUnlisted(mark))
+    await nav(SCREEN_KEYS.respond, fits, true)
+    return await until((s) => (batchAt(s) !== undefined ? s : undefined))
   }
   try {
     // ★ No other question asked now has the same text (the screen tells questions apart by their text): checked here,

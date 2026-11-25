@@ -10,7 +10,7 @@ import { resetAgyGrantOwners, setAgyGrantOwner } from './grants.ts'
 import { answerPermission } from '../routes/permission.ts'
 import { AgyCards, agyCard, agyCardTool, agyDelivery, agyDeliveryMessage, agyQuestionCard, type AgyCardDeps } from './cards.ts'
 import type { AgyCardMark } from './keys.ts'
-import { agyCardAt, agyOwnRows, resetAgyCardNamesForTest, transcriptPathOf } from './sessions.ts'
+import { agyCardAt, agyOwnRows, noteAgyBlocked, resetAgyBlockedForTest, resetAgyCardNamesForTest, transcriptPathOf } from './sessions.ts'
 import { readTailRecords } from './pending.ts'
 import { noteUnlisted, resetAgyUnlistedForTest } from './screen.ts'
 
@@ -1601,4 +1601,157 @@ test('★★ list (agy 1.5.16): the oldest asking subagent comes to the phone �
   resetPending()
   await new AgyCards(withScreen(l, () => viewOfX)).sync()
   assert.equal(agyCards().length, 1)
+})
+
+// ★★ agy 1.5.16: a subagent's command approval as a card (docs/AGY.md §19, case 8)
+test('★★ subagent approval (agy 1.5.16): a card when the list shows every pending call blocked; answered by its own path, never auto-approved', async (t) => {
+  const l = questionLab(t)
+  const iso = (sec: number): string => new Date(sec * 1000).toISOString().replace(/\.\d{3}Z$/, 'Z')
+  const K1 = '15bc1e2a-6a62-4f86-9bf9-dd03e99f6627'
+  const K2 = '70039de1-d758-4556-afa8-5d36b9625540'
+  const kid = (id: string, n: number, calls: Record<string, unknown>[] | undefined, at: number): void => {
+    const p = transcriptPathOf(id, l.deps.agy().home)
+    mkdirSync(join(p, '..'), { recursive: true })
+    const recs: Record<string, unknown>[] = [{ type: 'SYSTEM_MESSAGE', step_index: 0, created_at: iso(BASE - 35), content: `x\n\n<SYSTEM_MESSAGE>\n[Message] timestamp=${iso(BASE - 35)} sender=${A} priority=MESSAGE_PRIORITY_HIGH content=p${n}\n</SYSTEM_MESSAGE>` }]
+    if (calls) recs.push({ type: 'PLANNER_RESPONSE', step_index: 1, created_at: iso(BASE - 35), tool_calls: calls })
+    writeFileSync(p, recs.map((r) => JSON.stringify(r)).join('\n') + '\n')
+    utimesSync(p, at, at)
+  }
+  kid(K1, 0, [{ name: 'run_command', args: { CommandLine: 'make test' } }], BASE - 20)
+  kid(K2, 1, undefined, BASE - 18)
+  writeFileSync(l.transcript, JSON.stringify({ type: 'USER_INPUT', step_index: 0, content: '<USER_REQUEST>\ngo\n</USER_REQUEST>' }) + '\n')
+  utimesSync(l.transcript, BASE - 30, BASE - 30)
+  const state = (version: string): void => l.setState({ tool_confirmation_pending: false, agent_state: 'idle', version, subagents: [{ name: 'self', role: 'p0', status: 'running' }, { name: 'self', role: 'p1', status: 'running' }] }, BASE)
+  state('1.5.16')
+  const rule = '─'.repeat(40)
+  const list = (k1: string): string => [rule, '>', rule, `  ● Agent(self: Runner) · Gemini 4 Neon  ${k1} · 20s`, '  ● Agent(self: Thinker) · Gemini 4 Neon  Thinking · 18s', rule, '? for shortcuts'].join('\n')
+  let shown = list('Blocked · Bash')
+  const answered: { conv: string; mark: unknown; behavior: string }[] = []
+  // ★ auto-approve on for the conversation: never applied to a subagent's approval
+  await autoOn(t)
+  const deps: AgyCardDeps = { ...withScreen(l, () => shown), answerChildApproval: async (conv, mark, behavior) => (answered.push({ conv, mark, behavior }), { ok: true }) }
+  resetPending()
+  const cards = new AgyCards(deps)
+  await cards.sync()
+  const c = agyCards()
+  assert.deepEqual(c.map((x) => [x.toolName, x.summary, x.subagent]), [['Bash', 'make test', {}]])
+  assert.equal(answered.length, 0, 'not auto-approved')
+  // the phone denies: answered through the subagent path, with the child and the command
+  assert.equal(answer(c[0]!.key, 'deny'), true)
+  await settle()
+  assert.equal(answered.length, 1)
+  assert.equal(answered[0]!.behavior, 'deny')
+  assert.deepEqual([(answered[0]!.mark as { child: string }).child, (answered[0]!.mark as { command: string }).command], [K1, 'make test'])
+  // still blocked on the list right after (agy redraws): not raised again for the same call
+  await cards.sync()
+  assert.equal(agyCards().length, 0)
+  // ⚠️ the list shows it running (approved on the PC): the count no longer matches ⇒ no card
+  resetPending()
+  shown = list('Echo make · 3s')
+  const c2 = new AgyCards(deps)
+  await c2.sync()
+  assert.equal(agyCards().length, 0)
+  // ⚠️ an older agy (no list, ctrl+k does not approve there): no card
+  shown = list('Blocked · Bash')
+  state('1.5.15')
+  resetPending()
+  await new AgyCards(deps).sync()
+  assert.equal(agyCards().length, 0)
+  // ★ a card up stays while the PC shows another view (the list unread) and its call is still the one; it goes once
+  //   the list shows it no longer blocked
+  state('1.5.16')
+  resetPending()
+  const c3 = new AgyCards(deps)
+  await c3.sync()
+  assert.equal(agyCards().length, 1)
+  shown = '  main › self\n  ID: 70039de1-d758-4556-afa8-5d36b9625540\n  ↑/↓ scroll · shift+k kill · esc back'
+  await c3.sync()
+  assert.equal(agyCards().length, 1, 'kept while unread')
+  shown = list('Echo make · 3s')
+  await c3.sync()
+  assert.equal(agyCards().length, 0, 'withdrawn')
+  // ⚠️ something typed in the PC's box: no card (the answer could not go into the list / agy review)
+  shown = list('Blocked · Bash').replace('\n>\n', '\n> half typed\n')
+  resetPending()
+  await new AgyCards(deps).sync()
+  assert.equal(agyCards().length, 0)
+  // ★ answered, but the list still shows it blocked after a moment (the key did not take): shown again and rung;
+  //   answered with a sibling still blocked: rung again (codex · agy review)
+  const rung: string[] = []
+  shown = list('Blocked · Bash')
+  resetPending()
+  const c4 = new AgyCards({ ...deps, unconfirmedMs: 40, reraised: (conv, card) => rung.push(`${conv}@${card}`) })
+  await c4.sync()
+  assert.equal(agyCards().length, 1)
+  answer(agyCards()[0]!.key, 'allow')
+  await new Promise((r) => setTimeout(r, 150))
+  assert.equal(rung.length, 1, 'still up: rung')
+  assert.equal(agyCards().length, 1, 'and shown again')
+  rung.length = 0
+  // this time the list shows it running after the key, with the sibling blocked too (two pending, two blocked)
+  kid(K2, 1, [{ name: 'run_command', args: { CommandLine: 'make lint' } }], BASE - 15)
+  shown = list('Blocked · Bash').replace('Thinking', 'Blocked · Bash')
+  await c4.sync()
+  const first = agyCards()[0]!
+  assert.equal(first.summary, 'make test')
+  shown = list('Echo make · 3s').replace('Thinking', 'Blocked · Bash')
+  answer(first.key, 'allow')
+  // (the blocked reader reads the list after the answer: one still blocked — `blocked.ts`)
+  setTimeout(() => noteAgyBlocked(A, PID, 1, Date.now()), 70)
+  await new Promise((r) => setTimeout(r, 300))
+  assert.equal(rung.length, 1, 'the sibling still waits: rung again')
+  // none left once the list is read after the answer: not rung
+  rung.length = 0
+  resetAgyBlockedForTest()
+  shown = list('Blocked · Bash')
+  kid(K2, 1, undefined, BASE - 15)
+  resetPending()
+  const c5 = new AgyCards({ ...deps, unconfirmedMs: 40, reraised: (conv, card) => rung.push(`${conv}@${card}`) })
+  await c5.sync()
+  shown = list('Echo make · 3s')
+  answer(agyCards()[0]!.key, 'allow')
+  setTimeout(() => noteAgyBlocked(A, PID, 0, Date.now()), 70)
+  await new Promise((r) => setTimeout(r, 300))
+  assert.equal(rung.length, 0)
+  resetAgyBlockedForTest()
+  // ★ while its answer is being typed, a sibling's quick call makes a look miss it: not raised a second time (agy review)
+  resetPending()
+  shown = list('Blocked · Bash')
+  let release!: () => void
+  const typing = new Promise<void>((r) => (release = r))
+  const c6 = new AgyCards({ ...deps, answerChildApproval: async () => (await typing, { ok: true }) })
+  await c6.sync()
+  answer(agyCards()[0]!.key, 'allow')
+  await settle()
+  kid(K2, 1, [{ name: 'read_file', args: { Path: '/x' } }], BASE - 15)
+  await c6.sync()
+  kid(K2, 1, undefined, BASE - 15)
+  await c6.sync()
+  assert.equal(agyCards().length, 0, 'not raised again mid-answer')
+  release()
+  await settle()
+  // ★ the key did not take and the first look after it could not read the list: looked again until it can (codex review)
+  const rung2: string[] = []
+  resetPending()
+  shown = list('Blocked · Bash')
+  const c7 = new AgyCards({ ...deps, unconfirmedMs: 40, reraised: (conv, card) => rung2.push(`${conv}@${card}`) })
+  await c7.sync()
+  answer(agyCards()[0]!.key, 'allow')
+  await settle()
+  shown = '  main › self\n  ID: 70039de1-d758-4556-afa8-5d36b9625540\n  ↑/↓ scroll · shift+k kill · esc back'
+  setTimeout(() => (shown = list('Blocked · Bash')), 90)
+  await new Promise((r) => setTimeout(r, 300))
+  assert.equal(agyCards().length, 1, 'shown again once the list could be read')
+  assert.ok(rung2.length >= 1)
+  // ★ answered, still blocked on the list past the hold (whatever the confirmation could read): comes back (codex review)
+  resetPending()
+  const c8 = new AgyCards({ ...deps, unconfirmedMs: 10_000, childAnsweredMs: 60 })
+  await c8.sync()
+  answer(agyCards()[0]!.key, 'allow')
+  await settle()
+  await c8.sync()
+  assert.equal(agyCards().length, 0, 'held right after the answer')
+  await new Promise((r) => setTimeout(r, 80))
+  await c8.sync()
+  assert.equal(agyCards().length, 1, 'back after the hold')
 })

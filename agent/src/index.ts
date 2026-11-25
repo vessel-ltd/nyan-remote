@@ -13,7 +13,7 @@ import { homedir } from 'node:os'
 import { aliveProcStartSync } from './claude/sessionIndex.ts'
 import { scanAgyBlocked } from './agy/blocked.ts'
 import { AgyNotifier } from './agy/notify.ts'
-import { answerAgyCard, answerAgyQuestion } from './agy/keys.ts'
+import { answerAgyCard, answerAgyQuestion, answerAgyChildApproval } from './agy/keys.ts'
 
 /** ★ How often agy cards and notifications are looked at besides the watcher (a missed file event) */
 const AGY_LOOK_MS = 5000
@@ -145,6 +145,8 @@ async function main(): Promise<void> {
     answer: (conv, mark, behavior, stillWanted) => answerAgyCard(conv, mark, behavior, undefined, undefined, stillWanted),
     // ★ Questions answered from the phone (docs/AGY.md §13)
     answerQuestion: (conv, mark, answer, stillWanted) => answerAgyQuestion(conv, mark, answer, undefined, undefined, stillWanted),
+    // ★ Subagents' command approvals answered from the phone (agy 1.5.16+ / docs/AGY.md §19, case 8)
+    answerChildApproval: (conv, mark, behavior, stillWanted) => answerAgyChildApproval(conv, mark, behavior, undefined, undefined, stillWanted),
     changed: () => {
       broadcast({ type: 'permissions-changed', machine: machineName(), at: new Date().toISOString() })
       // ★ Teams: each new agy card the leader may answer is announced to it once (`teamHooks.ts` / docs/TEAM.md §9)
