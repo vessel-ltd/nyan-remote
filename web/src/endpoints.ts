@@ -79,6 +79,12 @@ export function upsertEndpoint(
     relay?: { url: string; agentPublicKey: string }
     /** ★ The route registration went through (⚠️ falls back to `local` if absent) */
     kind?: 'local' | 'relay'
+    /**
+     * ★★★ The agent at `url` said it has `relay`'s key, asked just now (review PWA-1 / 2026-11-25) — a fact about the URL
+     *   and the key, judged here against the list as it is now. Without it an existing row's agent key is never
+     *   changed (nor a key put on a row that had none): nothing is saved.
+     */
+    urlHasKey?: boolean
   },
 ): AgentEndpoint[] | undefined {
   const id = e.url || (e.relay ? `relay:${e.relay.agentPublicKey}` : '')
@@ -98,6 +104,9 @@ export function upsertEndpoint(
   //   ⚠️ **`label` isn't overwritten** (don't clobber a name the user gave).
   //   ⚠️ `undefined` if nothing changes (= don't save again).
   const cur = list[at]!
+  // ★★★ PWA-1: a known machine's row is never handed to another key on the word of a QR alone (the caller checks it
+  //   first / `keyClash` in `ui/pairRun.ts`; this is the last line)
+  if (e.relay && cur.relay?.agentPublicKey !== e.relay.agentPublicKey && e.urlHasKey !== true) return undefined
   const { relay: _learned, ...withoutRelay } = cur
   const next: AgentEndpoint = { ...(dropRelay ? withoutRelay : cur), ...(e.relay ? { relay: e.relay } : {}), ...route }
   const same =
@@ -292,6 +301,25 @@ export function shouldOfferSelf(
  */
 export function shouldOfferManualUrl(probe: { readonly ok: boolean } | undefined): boolean {
   return probe?.ok === true
+}
+
+/**
+ * ★★ The list as saved right now, or undefined when nothing readable is saved (2026-11-25 / review PWA-1, codex): a save
+ *   that adds or changes a machine is judged against it, not against this tab's copy — another tab may have paired a
+ *   machine meanwhile, and a stale copy saved over it let a QR's key take that machine's URL without any check.
+ */
+export function savedEndpointsNow(): AgentEndpoint[] | undefined {
+  try {
+    const raw = localStorage.getItem(KEY)
+    if (!raw) return undefined
+    const parsed = JSON.parse(raw) as unknown
+    // ⚠️ An empty list saved is a list (every machine removed in another tab), not "nothing saved" (codex review: the
+    //    stale tab wrote the removed rows back)
+    if (Array.isArray(parsed) && parsed.length === 0) return []
+    return sanitize(parsed)
+  } catch {
+    return undefined
+  }
 }
 
 export function loadEndpoints(): AgentEndpoint[] {

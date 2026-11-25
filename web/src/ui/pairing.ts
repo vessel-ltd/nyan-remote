@@ -101,6 +101,11 @@ export type PairOutcome =
    *   ⇒ Instead **show how to fix it on screen** (otherwise it ends at "cannot connect").
    */
   | { kind: 'relay-only'; machine: string; reason: string }
+  /**
+   * ★★ The QR names (by its `u`) a machine already in the list, with another key, that could not be confirmed to be
+   *   that machine's (2026-11-25 / review PWA-1): nothing is sent or saved. Its row keeps its key.
+   */
+  | { kind: 'key-changed'; machine: string }
   | {
       kind: 'done'
       deviceId: string
@@ -182,6 +187,16 @@ export function pairText(o: PairOutcome): string {
           'If that still fails: ① update the agent (git pull → restart) ' +
           '② set "relayUrl" to "" in config.json and show the QR again. ' +
           '⚠️ This QR carries a relay entry point, so **for safety it will not register over local**',
+      )
+    case 'key-changed':
+      // ⚠️ Not "it is an attack": a PC whose key was made again reads the same (the fix is the user's to choose)
+      return t(
+        `この QR の鍵は、登録済みの「${o.machine}」の鍵と違います。何も登録・保存していません。` +
+          'PC で鍵を作り直したのなら、接続先から古い行を消してから読み直してください。' +
+          '心当たりがなければ、その QR は使わないでください（自分の PC が出した QR だけを読む）',
+        `This QR's key is not the key registered for "${o.machine}". Nothing was registered or saved. ` +
+          "If the PC's key was made again, remove the old row from Connections, then scan again. " +
+          'If you did not expect this, do not use that QR (scan only QRs your own PC shows)',
       )
     case 'done':
       // ★★ Fixed on 2026-09-23 (a real device showed 「既に登録しました」 = unnatural Japanese).

@@ -17,7 +17,7 @@ import { test } from 'node:test'
 import {
   mergeAdded,
   upsertEndpoint, endpointRoute, hasRoute, loadEndpoints, mergeRoute,
-  saveEndpoints, selfCandidate, shouldOfferManualUrl, shouldOfferSelf, storedEndpoints,
+  saveEndpoints, savedEndpointsNow, selfCandidate, shouldOfferManualUrl, shouldOfferSelf, storedEndpoints,
   type AgentEndpoint
 } from './endpoints.ts'
 import { staleTwins } from './endpoints.ts'
@@ -140,11 +140,14 @@ test('★★ also applies the verified material and route to an existing endpoin
   //    ★ Conditions: a local row is in the list, that local is unreachable (CORS / outage) so
   //      `healths` is `undefined`, the QR has `u` and `r`, and registration via relay succeeded.
   const before = [{ id: 'https://pc-b.example.ts.net', url: 'https://pc-b.example.ts.net', label: 'わたしの名前' }]
+  // ★★★ PWA-1 (2026-11-25): only once the key was confirmed for this machine (`keyClash` in `ui/pairRun.ts`)
+  assert.equal(upsertEndpoint(before, { url: 'https://pc-b.example.ts.net', label: 'PC-B', relay: R1, kind: 'relay' }), undefined, '⚠️⚠️ a key from a QR alone put on a known row')
   const after = upsertEndpoint(before, {
     url: 'https://pc-b.example.ts.net',
     label: 'PC-B',
     relay: R1,
     kind: 'relay',
+    urlHasKey: true,
   })
   assert.ok(after, '⚠️⚠️ not applied to the existing endpoint')
   assert.equal(after.length, 1, '⚠️ rows increased (double registration)')
@@ -328,4 +331,43 @@ test('★★ saved rows carry the route this version uses in `kind` (an older ca
     { id: 'c', url: '', label: 'C', relay },
   ])
   assert.deepEqual(got.map((e) => e.kind), ['relay', 'local', 'relay'], '⚠️⚠️ an old shell would route these differently')
+})
+
+test('★★★ PWA-1: a known machine\'s row is never handed to another key on the word of a QR alone (review 2026-11-22)', () => {
+  const R2 = { url: 'wss://relay.example', agentPublicKey: 'ATTACKER-KEY' }
+  const before = upsertEndpoint([], { url: 'https://pc-b.example.ts.net', label: 'PC-B', relay: R1, kind: 'relay', urlHasKey: true })!
+  // the same URL with another key: nothing changes
+  assert.equal(upsertEndpoint(before, { url: 'https://pc-b.example.ts.net', label: 'PC-B', relay: R2, kind: 'relay' }), undefined)
+  // the same key (a route change of the same machine): applied as before
+  assert.ok(upsertEndpoint(before, { url: 'https://pc-b.example.ts.net', label: 'PC-B', relay: R1, kind: 'local' }))
+  // confirmed (the machine itself said so): applied
+  assert.deepEqual(upsertEndpoint(before, { url: 'https://pc-b.example.ts.net', label: 'PC-B', relay: R2, kind: 'relay', urlHasKey: true })![0]!.relay, R2)
+})
+
+test('★★ PWA-1: a save is judged against the list as saved now (another tab may have paired the machine meanwhile)', () => {
+  const store = new Map<string, string>()
+  const g = globalThis as { localStorage?: unknown }
+  const had = g.localStorage
+  g.localStorage = { getItem: (k: string) => store.get(k) ?? null, setItem: (k: string, v: string) => void store.set(k, v), removeItem: (k: string) => void store.delete(k) }
+  try {
+    assert.equal(savedEndpointsNow(), undefined, 'nothing saved yet')
+    // every machine removed in another tab: an empty list, not "nothing saved" (codex review)
+    store.set('tmux-agent.endpoints.v1', '[]')
+    assert.deepEqual(savedEndpointsNow(), [])
+    // another tab paired PC-B (its key)
+    const other = upsertEndpoint([], { url: 'https://pc-b.example.ts.net', label: 'PC-B', relay: R1, kind: 'relay', urlHasKey: true })!
+    saveEndpoints(other)
+    // this tab's stale copy has no PC-B; a QR naming its URL with another key is judged against what is saved
+    const R2 = { url: 'wss://relay.example', agentPublicKey: 'ATTACKER-KEY' }
+    const stale: AgentEndpoint[] = []
+    assert.equal(upsertEndpoint(savedEndpointsNow() ?? stale, { url: 'https://pc-b.example.ts.net', label: 'pc-b', relay: R2, kind: 'relay' }), undefined)
+  } finally {
+    g.localStorage = had
+  }
+})
+
+test('★★ PWA-1: the screen saves a paired machine against the list as saved now (main.tsx wiring)', async () => {
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync(new URL('./main.tsx', import.meta.url), 'utf8')
+  assert.match(src, /upsertEndpoint\(savedEndpointsNow\(\) \?\? prev, e\)/, '⚠️ addEndpoint must judge against the saved list, not this tab\'s copy')
 })

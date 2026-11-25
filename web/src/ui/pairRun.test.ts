@@ -160,7 +160,7 @@ test('★★ even for a party **already** in endpoints, use relay when `r` is pr
   assert.equal(r.state.closed, 1)
   // ★ Existing endpoints also get the verified inputs and route (medium #3)
   assert.deepEqual(added, [
-    { url: '', label: 'pc-b', relay: { url: RELAY, agentPublicKey: KEY_B }, kind: 'relay' },
+    { url: '', label: 'pc-b', relay: { url: RELAY, agentPublicKey: KEY_B }, kind: 'relay', urlHasKey: false },
   ])
 })
 
@@ -562,7 +562,7 @@ test('★★ an agent not in endpoints is added from the QR\'s `u` and registere
   assert.equal(d.sent.length, 1, 'sends only to that one machine')
   // ⚠️ Added only after registration succeeds (⑪)
   // ★ Saved with the route it was registered on (local)
-  assert.deepEqual(d.added, [{ url: AGENT_URL, label: 'PC-B', kind: 'local' }])
+  assert.deepEqual(d.added, [{ url: AGENT_URL, label: 'PC-B', kind: 'local', urlHasKey: true }])
 })
 
 test('★★ a QR with both `u` and `r` but no `connectRelay` sends to `u` neither (round 9, high #1)', async () => {
@@ -707,7 +707,7 @@ test('★★ registration works via relay even when not in endpoints (⑰ comple
   // ★ Added to endpoints only after registration succeeds (⚠️ `url` is empty = reachable only via relay)
   // ★ Save **the route registration succeeded on** as-is (⚠️ no guessing / codex round 8, medium #2)
   assert.deepEqual(added, [
-    { url: '', label: 'pc-b', relay: { url: RELAY, agentPublicKey: KEY_B }, kind: 'relay' },
+    { url: '', label: 'pc-b', relay: { url: RELAY, agentPublicKey: KEY_B }, kind: 'relay', urlHasKey: false },
   ])
   // ★ Returns the registered party (to find old endpoints of the same machine whose key was regenerated / `staleTwins` / 2026-09-24)
   assert.deepEqual(out.kind === 'done' ? out.paired : undefined, { relayUrl: RELAY, agentPublicKey: KEY_B })
@@ -793,7 +793,7 @@ test('★★ without relay in the QR, the `u` path as before (⑳ do not kill lo
   assert.equal(out.kind, 'done')
   assert.equal(r.state.opened, 0, '⚠️ went to relay without relay inputs')
   assert.equal(viaU.sent.length, 1, '★ must send via the `u` path')
-  assert.deepEqual(added, [{ url: 'https://pc-b.example.ts.net', label: 'pc-b', kind: 'local' }])
+  assert.deepEqual(added, [{ url: 'https://pc-b.example.ts.net', label: 'pc-b', kind: 'local', urlHasKey: true }])
 })
 
 test('★★ with both relay and `u`, use relay (⚠️ the stronger first / codex high #1)', async () => {
@@ -1026,7 +1026,7 @@ test('★★ a QR without relay for an endpoint still routed via relay goes thro
   assert.equal(out.kind, 'done')
   assert.deepEqual(oldRelay.sent, [], '⚠️⚠️ sent through the relay the agent turned off')
   assert.equal(viaU.sent.length, 1)
-  assert.deepEqual(added, [{ url: 'https://pc-b.example.ts.net', label: 'pc-b', kind: 'local' }])
+  assert.deepEqual(added, [{ url: 'https://pc-b.example.ts.net', label: 'pc-b', kind: 'local', urlHasKey: true }])
   // ★ A local endpoint is used directly, as before
   const local = stub('local')
   const out2 = await runPairing(url, {
@@ -1038,4 +1038,78 @@ test('★★ a QR without relay for an endpoint still routed via relay goes thro
   })
   assert.equal(out2.kind, 'done')
   assert.equal(local.sent.length, 1)
+})
+
+// ★★★ Review PWA-1 (2026-11-22 / fixed 2026-11-25): a QR naming a known machine's URL with another key
+test('★★★ PWA-1: a QR naming a known machine (its `u`) with another key sends nothing and saves nothing — unless that URL itself says so', async () => {
+  const PC = 'https://pc-b.example.ts.net'
+  const known = (ep: Record<string, unknown>) => ({ ...stub('LOCAL').t, endpoint: { id: PC, url: PC, label: 'わたしの PC-B', ...ep } as never })
+  const attack = buildPairUrl({ agentPublicKey: KEY_A, token: TOKEN, machine: 'pc-b', relayUrl: RELAY, agentUrl: PC })
+  const asked: string[] = []
+  const connectSaying = (key: string | undefined) => (url: string) => {
+    asked.push(url)
+    return { transport: stub('U').t, health: async () => (key === undefined ? undefined : { agentPublicKey: key, machine: 'pc-b' }) }
+  }
+  for (const [why, ep, says] of [
+    ['its relay key is another, the URL unreachable', { relay: { url: RELAY, agentPublicKey: KEY_B }, kind: 'relay' }, undefined],
+    ['a Tailscale row, the URL unreachable', {}, undefined],
+    ['the URL says another key', {}, KEY_B],
+  ] as const) {
+    const r = relayStub()
+    const added: unknown[] = []
+    asked.length = 0
+    const out = await runPairing(attack, {
+      transports: [known(ep)],
+      // ⚠️ a remembered answer (even one saying the QR's key) is not what decides: the URL is asked now
+      healths: [{ agentPublicKey: KEY_A, machine: 'pc-b' }],
+      identity,
+      ua: 'Android',
+      addEndpoint: (e) => void added.push(e),
+      connectRelay: r.connectRelay,
+      connect: connectSaying(says),
+    })
+    assert.deepEqual(out, { kind: 'key-changed', machine: 'わたしの PC-B' }, why)
+    assert.deepEqual(asked, [PC], `${why}: the URL itself was asked`)
+    assert.equal(r.state.opened, 0, `${why}: nothing sent (the relay line not even opened)`)
+    assert.deepEqual(added, [], `${why}: nothing saved`)
+  }
+  // ★ the machine at that URL says it has the QR's key: a real re-pairing goes on, saved as confirmed
+  const r = relayStub()
+  const added: { urlHasKey?: boolean }[] = []
+  const ok = await runPairing(buildPairUrl({ agentPublicKey: KEY_A, token: TOKEN, machine: 'pc-b', relayUrl: RELAY, agentUrl: PC }), {
+    transports: [known({})],
+    healths: [undefined],
+    identity,
+    ua: 'Android',
+    addEndpoint: (e) => void added.push(e),
+    connectRelay: r.connectRelay,
+    connect: connectSaying(KEY_A),
+  })
+  assert.equal(ok.kind, 'done')
+  assert.equal(added[0]?.urlHasKey, true)
+  // ★ the same key as the known row: nothing to confirm (offline re-pairing works)
+  const same = await runPairing(buildPairUrl({ agentPublicKey: KEY_B, token: TOKEN, machine: 'pc-b', relayUrl: RELAY, agentUrl: PC }), {
+    transports: [known({ relay: { url: RELAY, agentPublicKey: KEY_B }, kind: 'relay' })],
+    healths: [undefined],
+    identity,
+    ua: 'Android',
+    addEndpoint: () => undefined,
+    connectRelay: relayStub().connectRelay,
+  })
+  assert.equal(same.kind, 'done')
+  assert.match(pairText({ kind: 'key-changed', machine: 'PC-B' }), /PC-B/)
+  // ★ a stale tab: the machine is looked up in the list as saved now, not this tab's transports (codex review)
+  const r2 = relayStub()
+  const stale = await runPairing(attack, {
+    transports: [],
+    endpointsNow: () => [{ id: PC, url: PC, label: 'わたしの PC-B' }],
+    healths: [],
+    identity,
+    ua: 'Android',
+    addEndpoint: () => undefined,
+    connectRelay: r2.connectRelay,
+    connect: connectSaying(undefined),
+  })
+  assert.deepEqual(stale, { kind: 'key-changed', machine: 'わたしの PC-B' })
+  assert.equal(r2.state.opened, 0)
 })

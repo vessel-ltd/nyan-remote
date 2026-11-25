@@ -17,6 +17,7 @@ import {
 import {
   upsertEndpoint,
   loadEndpoints,
+  savedEndpointsNow,
   rememberRelay as rememberRelayAt,
   saveEndpoints,
   selfCandidate,
@@ -201,10 +202,14 @@ function App() {
       relay?: { url: string; agentPublicKey: string }
       /** ★ The route registration went through (⚠️ no guessing / codex round 8, medium #2) */
       kind?: 'local' | 'relay'
+      /** ★★ The key was confirmed for this machine (PWA-1) */
+      urlHasKey?: boolean
     }) => {
       setEndpoints((prev) => {
         // ★★ The decision is in `endpoints.ts` (⚠️ `.tsx` has no behavioral tests / codex round 8, medium #2)
-        const next = upsertEndpoint(prev, e)
+        // ★★ Against the list as saved now, not this tab's copy (PWA-1 / codex review: a stale tab saved over a machine
+        //    another tab had just paired, and a QR's key took its URL unchecked)
+        const next = upsertEndpoint(savedEndpointsNow() ?? prev, e)
         if (!next) return prev
         saveEndpoints(next)
         return next

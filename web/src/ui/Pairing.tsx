@@ -4,6 +4,7 @@ import { idbKeyStore, loadIdentity, resetIdentity, type Identity } from '../iden
 import { hhmm } from '../time.ts'
 import { t } from '../../../shared/i18n.ts'
 import { connectForPairing, connectForRelayPairing, type Transport } from '../transport/index.ts'
+import { savedEndpointsNow } from '../endpoints.ts'
 import { pairAbility, pairText, verifyHandshake, verifyText } from './pairing.ts'
 import {
   cameraEnv,
@@ -28,6 +29,8 @@ type AddEndpoint = (e: {
   relay?: { url: string; agentPublicKey: string }
   /** ★ The route registration succeeded on (⚠️ no guessing / codex round 8, medium #2) */
   kind?: 'local' | 'relay'
+  /** ★★ The key was confirmed for this machine (PWA-1) */
+  urlHasKey?: boolean
 }) => void
 
 /**
@@ -86,6 +89,8 @@ export function usePairing({
 
   const deps = {
     transports,
+    // ★ PWA-1: a known machine is looked up in the list as saved now (another tab may have paired it)
+    endpointsNow: () => savedEndpointsNow(),
     healths: healths ?? [],
     identity,
     ua: navigator.userAgent,

@@ -43,6 +43,8 @@ export type HealthLike = PairCandidate & { features?: readonly AgentFeature[] }
 
 export interface PairDeps {
   readonly transports: readonly PairTransport[]
+  /** ★ The connections as saved right now (another tab may have changed them / PWA-1); absent ⇒ `transports`' */
+  readonly endpointsNow?: () => readonly AgentEndpoint[] | undefined
   /** ⚠️ **Same order** as `transports` (`undefined` = endpoint that could not be reached) */
   readonly healths: readonly (HealthLike | undefined)[]
   readonly identity: Identity | undefined
@@ -77,6 +79,8 @@ export interface PairDeps {
      * ⇒ **Save the route that was confirmed** (do not fall back to `endpointRoute`'s default `local`).
      */
     kind?: 'local' | 'relay'
+    /** ★★ The agent at `url` said it has `relay`'s key, asked just now (PWA-1 / `upsertEndpoint` changes a known row's key only then) */
+    urlHasKey?: boolean
   }) => void
   /**
    * ★★ **Pair via relay** (③ stage 7 / ARCHITECTURE §14.1.4).
@@ -133,12 +137,39 @@ async function sendPairing(
  * ⚠️ Added to endpoints **only after registration succeeds** (do not leave a refusing party in the list).
  * ⚠️ `u` (the local entry point) is remembered too if present (so local can be used at home).
  */
+/**
+ * ★★★ **Review PWA-1 (2026-11-25)**: the handshake over relay proves only "the holder of the QR's key is behind that
+ *   relay" — the QR's `u` (a machine's URL) is proved by nobody. A QR naming the URL of a machine already in the list
+ *   with **another key** would have taken that row over silently (same name, the key swapped: from then on what is
+ *   typed for it goes to the QR's agent). Returns that row (its URL matches, its key differs), else undefined.
+ * ⚠️ By the list only — never by the healths' positions (codex · agy review: a row removed shifted them, and another
+ *    machine's answer "confirmed" the key). The confirmation is asked of the URL itself (`pairViaRelay`).
+ */
+export function keyClash(deps: Pick<PairDeps, 'transports' | 'endpointsNow'>, payload: { agentPublicKey: string; agentUrl?: string }): AgentEndpoint | undefined {
+  const u = payload.agentUrl
+  if (u === undefined || u === '') return undefined
+  // (the list as saved now when the screen can tell — another tab may have added the machine / codex review)
+  const list = deps.endpointsNow?.() ?? deps.transports.map((tr) => tr.endpoint)
+  const ep = list.find((e) => e !== undefined && (e.url === u || e.id === u))
+  return ep !== undefined && ep.relay?.agentPublicKey !== payload.agentPublicKey ? ep : undefined
+}
+
 async function pairViaRelay(
   payload: { agentPublicKey: string; token: string; machine: string; relayUrl: string; agentUrl?: string },
   connectRelay: NonNullable<PairDeps['connectRelay']>,
   deps: PairDeps,
   identity: { publicKey: string },
 ): Promise<PairOutcome> {
+  // ★★★ Before anything goes out (PWA-1): a known machine's row is handed to another key only when the machine at that
+  //   URL says it has it — asked of the URL itself now (Tailscale's certificate), not of anything remembered. A fact
+  //   about the URL and the key, so the save can rely on it whatever the list became meanwhile (`urlHasKey`).
+  let urlHasKey = false
+  const clash = keyClash(deps, payload)
+  if (clash !== undefined) {
+    const h = payload.agentUrl !== undefined && deps.connect ? await deps.connect(payload.agentUrl).health().catch(() => undefined) : undefined
+    if (h?.agentPublicKey !== payload.agentPublicKey) return { kind: 'key-changed', machine: clash.label || clash.url }
+    urlHasKey = true
+  }
   const relay = { url: payload.relayUrl, agentPublicKey: payload.agentPublicKey }
   const { transport, close } = connectRelay(relay)
   try {
@@ -152,6 +183,8 @@ async function pairViaRelay(
       // ★★ **Registered via relay**. ⚠️⚠️ Without writing this, local wins when `u` is present,
       //   and with auto-allow removed **an unreachable endpoint** stays in the list (codex round 8, medium #2).
       kind: 'relay',
+      // ★ The machine at `u` said it has this key (above), else a known row is not changed (`upsertEndpoint`)
+      urlHasKey,
     })
     return {
       kind: 'done',
@@ -215,6 +248,8 @@ async function pairViaQr(
         : { relay: { url: payload.relayUrl, agentPublicKey: payload.agentPublicKey } }),
       // ★★ Registered over local (`connect(url)`) ⇒ save that route (an existing relay endpoint switches back / codex)
       kind: 'local',
+      // ★ The machine at that URL said it has this key (`/health` over that very URL, above)
+      urlHasKey: true,
     })
     return {
       kind: 'done',
