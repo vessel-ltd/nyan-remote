@@ -52,7 +52,10 @@ import { Confirm } from './Confirm.tsx'
  *      ⇒ the wrapper does not depend on the parent's layout.
  * ★ `bidi` (choice labels) marks direction controls only and keeps the natural direction (Hebrew labels stay readable).
  */
-function Revealed({ text, scope = 'all' }: { text: string; scope?: RevealScope }): VNode {
+function Revealed({ text, scope = 'all', lines = false }: { text: string; scope?: RevealScope; lines?: boolean }): VNode {
+  // ★ `lines`: each line a block of its own with a hanging indent (`.permline`), so a wrapped part never starts at the
+  //   margin (codex review: a long old line wrapped just before it, and its tail read like the real "── new ──" heading)
+  if (lines) return <>{text.split('\n').map((line, i) => <div key={i} class="permline"><Revealed text={line} scope={scope} /></div>)}</>
   const parts = reveal(text, scope).map((part, i) =>
     part.kind === 'text' ? part.text : <span key={i} class="hiddenchar">{part.label}</span>,
   )
@@ -236,7 +239,7 @@ export function Permissions({
                     </button>
                     {open[p.key] ? (
                       <>
-                        <div class="permfull mono"><Revealed text={p.detail} /></div>
+                        <div class="permfull mono"><Revealed text={p.detail} lines /></div>
                       </>
                     ) : null}
                   </>

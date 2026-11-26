@@ -906,3 +906,13 @@ test('★★★ registered tunnels are not closed (the flip side of ⑮; ordinar
   const second = await ask(w, { id: 2, method: 'GET', path: '/health' })
   assert.equal(second.ok, true)
 })
+
+test('★★ a response too large for one frame answers that request with 413; the tunnel stays (review E2E-8 / codex review)', async (t) => {
+  await boot(t)
+  const router = new Router().get('/big', async () => ({ text: 'x'.repeat(400 * 1024) })).get('/small', async () => ({ ok: true }))
+  const w = await wire(t, router)
+  assert.deepEqual(await ask(w, { id: 1, method: 'GET', path: '/big' }), { ok: true }, 'not fatal')
+  assert.deepEqual(await ask(w, { id: 2, method: 'GET', path: '/small' }), { ok: true })
+  const out = await drain(w)
+  assert.deepEqual(out.responses.map((r) => [r.id, r.status]), [[1, 413], [2, 200]])
+})

@@ -16,6 +16,7 @@ import { ensureFollowWatch } from '../claude/follow.ts'
 import { attach } from '../events.ts'
 import { t } from '../../../shared/i18n.ts'
 import { codexHistoryWanted, codexLog, codexRows } from '../codex/run.ts'
+import { READ_BUDGET_MS } from '../codex/log.ts'
 import { agyRows, conversationOf, transcriptPathOf } from '../agy/sessions.ts'
 import { agyEntries } from '../agy/log.ts'
 
@@ -242,10 +243,12 @@ export async function sessionLog(ctx: Ctx): Promise<LogPage> {
   //   ⚠️ `undefined` = no Codex line lists this id ⇒ fall through to the Claude side as before.
   const codexSince = intOrNull(ctx.url.searchParams.get('since'))
   const codexLimit = clampInt(ctx.url.searchParams.get('limit'), DEFAULT_LIMIT, 1, MAX_LIMIT)
+  // ★ One read budget for the whole request (`fitPage` asks again with smaller pages: each used to get its own / codex review)
+  const until = Date.now() + READ_BUDGET_MS
   const codex =
     codexSince !== null
-      ? await codexLog(sessionId, { before, since: codexSince, limit: codexLimit })
-      : await fitPage(codexLimit, (n) => codexLog(sessionId, { before, since: null, limit: n }))
+      ? await codexLog(sessionId, { before, since: codexSince, limit: codexLimit, until })
+      : await fitPage(codexLimit, (n) => codexLog(sessionId, { before, since: null, limit: n, until }))
   if (codex) return codex
   const found = await findTranscript(dirs, sessionId)
   if (!found) {

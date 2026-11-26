@@ -299,6 +299,16 @@ export function startCodexDaemonLine(opts: DaemonOptions): CodexDaemonLine {
    * ⚠️ Requests replayed to this connection are never answered (it has no `onServerRequest`).
    */
   const withSideRpc = async <T>(work: (rpc: Rpc) => Promise<T | undefined>): Promise<T | undefined> => {
+    // ★★ Only to the daemon the line is on (codex review: a daemon restarted between the line's check and this dial
+    //   was initialized by this connection before the TUI — rule 2's settling skipped, `nyan-remote` taken for the
+    //   originator). Checked before the dial and again before `initialize`.
+    const sameDaemon = async (): Promise<boolean> => {
+      const key = lineKey
+      if (key === undefined || !liveRpc) return false
+      const look = await deps.look(home.socketPath)
+      return look.type === 'present' && look.key === key && lineKey === key
+    }
+    if (!(await sameDaemon())) return undefined
     let side: Rpc | undefined
     const early: string[] = []
     let conn: WsUdsConnection
@@ -308,6 +318,7 @@ export function startCodexDaemonLine(opts: DaemonOptions): CodexDaemonLine {
       return undefined
     }
     try {
+      if (!(await sameDaemon())) return undefined
       const rpcSide = createRpc({
         ...(opts.rpcTimeoutMs === undefined ? {} : { timeoutMs: opts.rpcTimeoutMs }),
         send: (t, guard) => conn.send(t, guard),
@@ -362,6 +373,8 @@ export function startCodexDaemonLine(opts: DaemonOptions): CodexDaemonLine {
   let unanswered = 0
   let current: WsUdsConnection | undefined
   let liveRpc: Rpc | undefined
+  /** ★ The identity of the socket the line connected to (`SocketLook.key`); side connections go only there */
+  let lineKey: string | undefined
   let generation = 0
 
   /** Whether a state was logged yet (the first one is logged even when it is the starting `no-daemon`) */
@@ -383,6 +396,14 @@ export function startCodexDaemonLine(opts: DaemonOptions): CodexDaemonLine {
     const early: string[] = []
     const conn = await deps.connect(home.socketPath, (text) => (rpc ? rpc.receive(text) : early.push(text)))
     current = conn
+    // ★★ Still the socket we looked at (codex review: a daemon restarted between the look and this dial was taken —
+    //   uninitialized by the TUI, rule 2's settling skipped — while side connections went on checking the old key and
+    //   refused every read). Left before `initialize`; the loop looks again and settles.
+    const again = await deps.look(home.socketPath)
+    if (again.type !== 'present' || again.key !== lineKey) {
+      conn.close()
+      return { reason: 'error', detail: 'replaced' }
+    }
     // ★ Reads for threads we learn about from notifications run one at a time, in order
     let chain: Promise<void> = Promise.resolve()
     const offer = hooks.offerApproval
@@ -689,6 +710,7 @@ export function startCodexDaemonLine(opts: DaemonOptions): CodexDaemonLine {
         continue
       }
       setState({ type: 'connecting' })
+      lineKey = look.key
       const startedAt = deps.now()
       let why: WsClosed
       try {
@@ -698,6 +720,7 @@ export function startCodexDaemonLine(opts: DaemonOptions): CodexDaemonLine {
       }
       current = undefined
       liveRpc = undefined
+      lineKey = undefined
       book.reset()
       holds.clear()
       hooks.onChange?.()
@@ -765,6 +788,16 @@ export function startCodexDaemonLine(opts: DaemonOptions): CodexDaemonLine {
       const rpc = liveRpc
       // ⚠️ A row or a history row only (never an id from outside)
       if (!rpc || !(book.isRow(threadId) || closed.has(threadId))) return undefined
+      // ★★ Whole turns on a connection of their own (review CDX-2): a page past the 16 MiB message limit closed the
+      //   line, and every Codex approval card with it — a heavy thread opened on the phone wiped the cards. Only the
+      //   headers (small) stay on the line.
+      if (o.headersOnly !== true) {
+        const result = await withSideRpc(async (r) => {
+          const res = await r.call('thread/turns/list', { threadId, limit: o.limit, sortDirection: 'desc', itemsView: 'full', ...(o.cursor === undefined ? {} : { cursor: o.cursor }) })
+          return res.ok ? res.result : undefined
+        })
+        return result === undefined ? undefined : parseTurnsPage(result)
+      }
       const res = await rpc.call('thread/turns/list', {
         threadId,
         limit: o.limit,

@@ -173,6 +173,10 @@ const permissions = body.permissions
 knownPending = permissions.length > 0
 const quiet = typeof body.quiet === 'number' ? body.quiet : 0
 knownPending ||= quiet > 0
+// ★★ Cards left out of the list as too large for one relay frame (agent `withinBudget`): still live approvals (codex
+//   review: the only pending card was left out and this said "safe to restart")
+const omitted = typeof body.omitted === 'number' ? body.omitted : 0
+knownPending ||= omitted > 0
 const autoApprove = Array.isArray(body.autoApprove) ? body.autoApprove : []
 
 // ★★ Auto-approve mode (per session, with a deadline / agent/src/autoApprove.ts).
@@ -216,9 +220,20 @@ if (autoApprove.length > 0) {
 //    ⚠️ **Not being displayed does not make them any less an approval that must not be killed.**
 //       Without adding it, for 6 seconds it answers "none" and **kills a live approval by restarting**
 //       (2026-08-14 review, medium. What CLAUDE.md calls "the worst accident")
-if (permissions.length === 0 && quiet === 0) {
+if (permissions.length === 0 && quiet === 0 && omitted === 0) {
   console.log(t('承認待ち: なし ✔ 再起動して安全です', 'Pending approvals: none ✔ safe to restart'))
   process.exit(0)
+}
+
+if (omitted > 0) {
+  console.log(
+    t(
+      `⚠️ 承認待ち ${permissions.length + omitted} 件（うち ${omitted} 件は大きすぎてスマホに出していません。PC で答えてください）`,
+      `⚠️ Pending approvals: ${permissions.length + omitted} (${omitted} too large to show on the phone; answer them on the PC)`,
+    ),
+  )
+  console.log(t('→ 先に答えてから再起動してください', '→ Answer them first, then restart'))
+  process.exit(1)
 }
 
 if (permissions.length === 0) {

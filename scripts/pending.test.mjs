@@ -279,3 +279,30 @@ test('★★★ does not crash when the auto-approve list is malformed (the inpu
     rmSync(dir, { recursive: true, force: true })
   }
 })
+
+test('★★ cards left out of the list as too large still block a restart (codex review)', async () => {
+  const agent = await rawAgent((req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' })
+    res.end('{"permissions":[],"omitted":1,"quiet":0,"autoApprove":[]}')
+  })
+  const dir = stateDir()
+  try {
+    const out = await run({ NYAN_REMOTE_STATE_DIR: dir, NYAN_REMOTE_PORT: String(agent.port) })
+    assert.equal(out.code, 1, `a live approval was left out of the list but got ${out.code}: ${out.stdout}`)
+    assert.match(out.stdout, /承認待ち 1 件/)
+  } finally {
+    agent.server.close()
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('★★ left-out cards exist but printing crashes → still 1 (the flag is raised as soon as it is known)', async () => {
+  const dir = stateDir()
+  try {
+    const f = preload(dir, `{ permissions: [], omitted: 1, quiet: 0, get autoApprove() { throw new Error('想定外') } }`)
+    const out = await runWith(['--import', `file://${f}`], { NYAN_REMOTE_STATE_DIR: dir })
+    assert.equal(out.code, 1, `⚠️⚠️ a live approval exists but got ${out.code}: ${out.stderr}`)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})

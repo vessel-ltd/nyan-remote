@@ -56,7 +56,7 @@ test('★★ screen wiring (loading goes through the decision function, alignmen
   assert.match(src, /window\.scrollBy\(0, el\.getBoundingClientRect\(\)\.top - a\.top\)/)
   assert.match(src, /window\.scrollTo\(0, anchoredScrollY\(a, root\.scrollHeight\)\)/, '⚠️ does not restore position after loading (jumps on Safari)')
   // ★★ Restore on leaving the screen; do nothing if completion comes after leaving (codex round 19, medium #1)
-  assert.match(src, /if \(gen !== genRef\.current \|\| !threadRef\.current\) return/)
+  assert.match(src, /if \(gen !== genRef\.current \|\| reload !== reloadRef\.current \|\| !threadRef\.current\) return/)
   assert.match(src, /\(\) => \(\) => \{\s*genRef\.current \+= 1\s*anchorRef\.current = null\s*document\.documentElement\.style\.overflowAnchor = ''/)
   // ⚠️⚠️ Disable Chrome's auto anchoring while loading (otherwise Chrome and we move it **twice**)
   assert.match(src, /root\.style\.overflowAnchor = 'none'/)

@@ -62,7 +62,7 @@ test('a card: the agy row, the command and where it runs; the key changes with t
   assert.notEqual(again.key.split('#')[0], c.key.split('#')[0])
   assert.equal(again.origin, c.origin)
   // ⚠️ a direction-changing character is flagged (the phone marks it)
-  assert.equal(agyCard(row(), mark, { ...call, args: { CommandLine: 'cat a‮txt' } }, 'x')!.hidden, true)
+  assert.equal(agyCard(row(), mark, { ...call, args: { CommandLine: 'cat a\u202Etxt' } }, 'x')!.hidden, true)
   // ★ the call's own directory wins over the agy's folder (and is not part of the command text)
   const there = agyCard(row(), mark, { ...call, args: { CommandLine: 'rm -rf build', Cwd: '/srv/other' } }, 'x')!
   assert.equal(there.cwd, '/srv/other')
@@ -1807,4 +1807,13 @@ test('★★ subagent approval (agy 1.5.16): a card when the list shows every pe
   await new Promise((r) => setTimeout(r, 80))
   await c8.sync()
   assert.equal(agyCards().length, 1, 'back after the hold')
+})
+
+test('★ AGY-5: a look that throws is logged, never a rejection that could take the agent down (review)', async (t) => {
+  const l = lab(t)
+  const logs: string[] = []
+  const cards = new AgyCards({ ...l.deps, agy: () => { throw new Error('boom') }, log: (x) => void logs.push(x) })
+  await cards.sync()
+  await cards.fresh()
+  assert.ok(logs.some((x) => x.includes('card look failed: boom')), logs.join('\n'))
 })

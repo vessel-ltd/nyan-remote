@@ -48,7 +48,7 @@ import {
 import { sendToAll } from '../push.ts'
 import { clearLabelIfSettled, sweepResolved } from '../permissionSweep.ts'
 import { threadUrl } from '../pushUrl.ts'
-import { HttpError, readJsonBody, type Ctx } from '../router.ts'
+import { HOOK_BODY_MAX, HttpError, readJsonBody, type Ctx } from '../router.ts'
 
 import { buildUpdatedInput, describeInteraction, requiresInteraction } from '../claude/interaction.ts'
 import { buildCodexAnswers } from '../codex/questions.ts'
@@ -79,6 +79,8 @@ function str(v: unknown): string | undefined {
  */
 export async function permissions(): Promise<{
   permissions: PermissionRequest[]
+  /** ★ Cards left out as too large for one relay frame (absent = none). Still live: `npm run pending` counts them */
+  omitted?: number
   quiet: number
   pendingTags: string[]
   /**
@@ -107,7 +109,7 @@ export async function permissions(): Promise<{
   //      **during the 6 seconds after a surfaced approval went back to the quiet state**, it closed live notifications.
   //      Only allow erring in the "failing to remove" direction.
   return {
-    permissions: listPending(),
+    ...withBudgetCount(listPending()),
     quiet: quietCount(),
     pendingTags: pendingPermTags(),
     at: new Date().toISOString(),
@@ -120,6 +122,82 @@ export async function permissions(): Promise<{
       ...(isCodexSessionId(e.id) ? { tool: 'codex' as const } : e.id.startsWith(AGY_PREFIX) ? { tool: 'agy' as const } : {}),
     })),
   }
+}
+
+/**
+ * ★★ The cards' full texts within one relay frame (codex review: a dozen pending writes of ~8,000 Japanese characters
+ *   each passed 256 KiB, and the list closed the tunnel — every approval on that machine unreachable by relay). Past
+ *   the budget the later cards go without their full text, marked `detailClipped` (the phone asks again before allowing).
+ */
+export const PERMISSIONS_DETAIL_BUDGET = 160 * 1024
+
+/** ★ The list within the budget, and how many cards it left out (`npm run pending` counts those as live approvals) */
+function withBudgetCount(all: readonly PermissionRequest[]): { permissions: PermissionRequest[]; omitted?: number } {
+  const permissions = withinBudget(all)
+  const omitted = all.length - permissions.length
+  return omitted > 0 ? { permissions, omitted } : { permissions }
+}
+export function withinBudget(list: readonly PermissionRequest[], budget = PERMISSIONS_DETAIL_BUDGET): PermissionRequest[] {
+  // ★ The whole list counted (questions with their previews too / codex review); the full texts are taken off, largest
+  //   first, until it fits
+  const out = [...list]
+  let total = Buffer.byteLength(JSON.stringify(out))
+  const order = out
+    .map((p, i) => ({ i, size: p.detail === undefined ? 0 : Buffer.byteLength(JSON.stringify(p.detail)) }))
+    .filter((x) => x.size > 0)
+    .sort((a, b) => b.size - a.size)
+  for (const { i, size } of order) {
+    if (total <= budget) break
+    const { detail: _dropped, ...rest } = out[i]!
+    out[i] = { ...rest, detailClipped: true }
+    total -= size
+  }
+  // ★ Then the option diagrams, largest card first (codex review: three cards of four questions with full Japanese
+  //   previews were ~285 KiB with every full text gone). A card without them is marked `previewClipped`, so the phone
+  //   warns and does not answer on one tap
+  const byPreview = out
+    .map((p, i) => ({ i, size: previewBytes(p) }))
+    .filter((x) => x.size > 0)
+    .sort((a, b) => b.size - a.size)
+  for (const { i } of byPreview) {
+    if (total <= budget) break
+    const p = out[i]!
+    if (p.interaction?.kind !== 'question') continue
+    const before = Buffer.byteLength(JSON.stringify(p))
+    out[i] = {
+      ...p,
+      interaction: {
+        ...p.interaction,
+        questions: p.interaction.questions.map((q) => ({
+          ...q,
+          options: q.options.map(({ preview, previewClipped: _c, ...o }) =>
+            preview === undefined ? o : { ...o, previewClipped: true },
+          ),
+        })),
+      },
+    }
+    total -= before - Buffer.byteLength(JSON.stringify(out[i]))
+  }
+  // ★★ Last, whole cards, largest first (codex review: question and option texts have no bound of their own — four
+  //   cards of long option descriptions still passed the frame). A card left out is answered on the PC, and the phone
+  //   says so for a waiting session it has no card for (`Thread.tsx` "answer on the PC"); one list over the frame lost
+  //   every card on the machine instead
+  if (total <= budget) return out
+  const sized = out.map((p, i) => ({ i, size: Buffer.byteLength(JSON.stringify(p)) + 1 })).sort((a, b) => b.size - a.size)
+  const drop = new Set<number>()
+  for (const { i, size } of sized) {
+    if (total <= budget) break
+    drop.add(i)
+    total -= size
+  }
+  return out.filter((_, i) => !drop.has(i))
+}
+
+function previewBytes(p: PermissionRequest): number {
+  if (p.interaction?.kind !== 'question') return 0
+  let n = 0
+  for (const q of p.interaction.questions) for (const o of q.options) if (o.preview) n += Buffer.byteLength(JSON.stringify(o.preview))
+  return n
 }
 
 /**
@@ -201,7 +279,8 @@ const CWD_MAX = 1000
  *   defer: `{}` (no decision) → Claude Code proceeds with its normal approval flow = answer on the PC
  */
 export async function permissionRequest(ctx: Ctx): Promise<unknown> {
-  const body = await readJsonBody<HookPayload>(ctx.req)
+  // ★ A large tool input is still a card (review CTL-2 / `HOOK_BODY_MAX`)
+  const body = await readJsonBody<HookPayload>(ctx.req, HOOK_BODY_MAX)
   const info = buildPermissionInfo(body)
   const toolName = info.toolName
 

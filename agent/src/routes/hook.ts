@@ -43,7 +43,7 @@ import { sendToAll } from '../push.ts'
 import { threadUrl } from '../pushUrl.ts'
 import { appendJsonl } from '../state.ts'
 import { scheduleStopPush, type StatusProbe, type StopPushDeps } from '../stopPush.ts'
-import { readJsonBody, type Ctx } from '../router.ts'
+import { HOOK_BODY_MAX, readJsonBody, type Ctx } from '../router.ts'
 import { machineName } from '../machine.ts'
 
 /** /home/user/.claude-r/projects/-home-x/<uuid>.jsonl → { account: '.claude-r', sessionId: '<uuid>' } */
@@ -441,7 +441,8 @@ function originOfEvent(event: HookEvent): { account: string; transcriptPath?: st
 }
 
 export async function hook(ctx: Ctx): Promise<{ ok: true; pushed: number }> {
-  const payload = await readJsonBody<HookPayload>(ctx.req)
+  // ★ As `/permission` (review CTL-2 / `HOOK_BODY_MAX`)
+  const payload = await readJsonBody<HookPayload>(ctx.req, HOOK_BODY_MAX)
   const { account, sessionId } = parseTranscriptPath(payload.transcript_path)
   const name = typeof payload.hook_event_name === 'string' ? payload.hook_event_name : 'unknown'
   if (name === 'Notification') {

@@ -69,3 +69,41 @@ export function unpublishedEntries(pkgRoot, publicRoot) {
   walk(pkgRoot)
   return out
 }
+
+/**
+ * ★★ The runtime packages to copy into the tarball (review DIST-2 / 2026-11-25): those under `<root>/node_modules/`
+ *   whose real place is under it too. ⚠️ A workspace link (`node_modules/@nyan-remote/agent` → `../../agent`) is left
+ *   out: copied with links followed it put the whole on-disk `agent/` — git-ignored files included — into the package
+ *   outside the public checks (nothing imports it; the tree is shipped from git separately).
+ * @param {string[]} paths  `npm ls --parseable` lines
+ * @param {string} root     the repository root
+ * @param {(p: string) => string} real  `fs.realpathSync`
+ */
+export function runtimePackages(paths, root, real) {
+  const nm = `${root}/node_modules/`
+  return paths.filter((p) => {
+    if (!p.startsWith(nm)) return false
+    try {
+      return real(p).startsWith(nm)
+    } catch {
+      return false
+    }
+  })
+}
+
+/**
+ * ★★ The copy filter for those packages (codex review of DIST-2): a link inside an accepted package that points out of
+ *   node_modules is followed by the copy, so each entry is kept only while its real place is under `<root>/node_modules/`.
+ * @param {string} root
+ * @param {(p: string) => string} real  `fs.realpathSync`
+ */
+export function insideNodeModules(root, real) {
+  const nm = `${root}/node_modules/`
+  return (src) => {
+    try {
+      return real(src).startsWith(nm)
+    } catch {
+      return false
+    }
+  }
+}

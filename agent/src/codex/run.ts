@@ -412,7 +412,7 @@ export async function codexInterrupt(sessionId: string): Promise<CodexInterruptR
 /** The thread view of a Codex row or history row, or `undefined` if no line knows it right now. */
 export async function codexLog(
   sessionId: string,
-  opts: { before?: number | null; since?: number | null; limit?: number },
+  opts: { before?: number | null; since?: number | null; limit?: number; until?: number },
 ): Promise<LogPage | undefined> {
   const found = locate(sessionId, true)
   if (!found) return undefined

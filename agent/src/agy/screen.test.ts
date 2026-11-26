@@ -386,3 +386,17 @@ test('★ a command on the screen: spaces inside a row count, a wrap may or may 
   assert.equal(rowsShowCommand(['a.c'], 'abc'), false, 'no pattern characters')
   assert.equal(rowsShowCommand([], 'ls'), false)
 })
+
+test('★ AGY-1: a parent\'s top row that only looks like a header is the parent\'s view when its footer is the parent\'s (review)', () => {
+  for (const top of ['docs › guide › install.md', '  Settings › Privacy', 'user@host ~/x › ls']) {
+    assert.equal(viewOwnerOf(`${top}\n  some output\n────\n>\n────\n? for shortcuts                accept-edits · Gemini 4 Neon · high`), 'parent', top)
+    assert.equal(viewOwnerOf(`${top}\n  working\n────\n>\n────\nesc to cancel                  accept-edits · Gemini 4 Neon · high`), 'parent', top)
+  }
+  // a subagent's view with its id squeezed out stays unknown (its footer is not the parent's)
+  assert.equal(viewOwnerOf('  main › self\n  (1–1 of 26 lines)\nQuestion\n\nQuestion 1/1: x\n  ↑/↓ Navigate · enter Select · esc Skip'), undefined)
+  assert.equal(viewOwnerOf('  main › self\n  ⚠ Approval Required\n    > Bash\n  ↑/↓ navigate · / select · enter confirm · esc cancel\n     accept-edits · Gemini 4 Neon · high · 2 subagent(s)'), undefined)
+  assert.equal(viewOwnerOf('  main › self\n  ⚠ Approval Required\n    > Bash\n  ↑/↓ navigate · / select · enter confirm · esc cancel'), undefined, 'a child dialog\'s own "esc cancel" footer is not the parent\'s')
+  // the measured screens keep their owners
+  assert.equal(viewOwnerOf(parentOwn), 'parent')
+  assert.deepEqual(viewOwnerOf(v16.childApprovalOpen), { child: '1788a5a6-a988-4356-bcaf-5f50e974aa73' })
+})

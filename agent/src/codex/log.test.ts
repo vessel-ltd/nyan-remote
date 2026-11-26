@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs'
 import { test } from 'node:test'
 import type { LogEntry } from '../../../shared/types.ts'
 import { parseTurn, parseTurnsPage, type TurnsPage } from './history.ts'
-import { CodexLogs, FOLLOW_TURNS, MAX_CATCHUP_PAGES, PAGE_TURNS, REFRESH_MIN_MS, type CodexLogSource } from './log.ts'
+import { CodexLogs, FOLLOW_TURNS, MAX_CATCHUP_FAILS, MAX_CATCHUP_PAGES, PAGE_TURNS, REFRESH_MIN_MS, READ_BUDGET_MS, type CodexLogSource } from './log.ts'
 
 const FIX = JSON.parse(readFileSync(new URL('./fixtures/history-0.169.0.json', import.meta.url), 'utf8')) as {
   exchanges: Record<string, { response: { result: unknown } }>
@@ -306,6 +306,7 @@ test('too far behind to join up: a new journal from the newest turns (old positi
   c.now += REFRESH_MIN_MS * 2
   const follow = await logs.page(g, 't', '.codex', { since: open.tail })
   assert.deepEqual(follow.entries, [], 'a position from the old journal gets nothing')
+  assert.equal(follow.reload, true, 'and is told to reload (else the phone moves past the newest turns / codex review)')
   const now2 = await logs.page(g, 't', '.codex', { limit: 1000 })
   const got = texts(now2.entries)
   for (let i = 1; i < got.length; i++) assert.equal(got[i], got[i - 1]! + 1, 'contiguous')
@@ -328,6 +329,182 @@ test('a catch-up read that fails takes nothing for now (the newest alone would l
   c.now += REFRESH_MIN_MS * 2
   const second = await logs.page(g, 't', '.codex', { since: open.tail })
   assert.deepEqual(texts(second.entries), [6, 7, 8, 9, 10])
+})
+
+test('★ a read-back that keeps failing starts over from the newest (codex review: one unreadable turn froze the thread)', async () => {
+  const g = growing()
+  g.count = 5
+  const { c, now } = clock()
+  const logs = new CodexLogs(now)
+  const open = await logs.page(g, 't', '.codex', {})
+  g.count = 10 + FOLLOW_TURNS
+  g.olderDown = true
+  for (let i = 1; i < MAX_CATCHUP_FAILS; i++) {
+    c.now += REFRESH_MIN_MS * 2
+    assert.deepEqual((await logs.page(g, 't', '.codex', { since: open.tail })).entries, [], `failure ${i}: nothing yet`)
+  }
+  c.now += REFRESH_MIN_MS * 2
+  const stale = await logs.page(g, 't', '.codex', { since: open.tail })
+  assert.deepEqual(stale.entries, [], 'the old position gets nothing')
+  assert.equal(stale.reload, true, 'and is told to reload')
+  const fresh = texts((await logs.page(g, 't', '.codex', { limit: 1000 })).entries)
+  assert.equal(fresh.at(-1), g.count, 'the newest turns are shown')
+  for (let i = 1; i < fresh.length; i++) assert.equal(fresh[i], fresh[i - 1]! + 1, 'contiguous')
+})
+
+test('★ only failures in a row count: a refresh that joins up starts the count again', async () => {
+  const g = growing()
+  g.count = 5
+  const { c, now } = clock()
+  const logs = new CodexLogs(now)
+  let pos = (await logs.page(g, 't', '.codex', {})).tail
+  for (const round of [1, 2]) {
+    g.count += 5 + FOLLOW_TURNS
+    g.olderDown = true
+    for (let i = 1; i < MAX_CATCHUP_FAILS; i++) {
+      c.now += REFRESH_MIN_MS * 2
+      assert.deepEqual((await logs.page(g, 't', '.codex', { since: pos })).entries, [], `round ${round}, failure ${i}`)
+    }
+    g.olderDown = false
+    c.now += REFRESH_MIN_MS * 2
+    const joined = await logs.page(g, 't', '.codex', { since: pos })
+    assert.equal(texts(joined.entries).at(-1), g.count, `round ${round}: joined up, the old position keeps reading`)
+    pos = joined.tail
+  }
+})
+
+test('★ a newest page that cannot be read whole is read with fewer turns, down to one (codex review: blank thread)', async () => {
+  const g = growing()
+  g.count = 10
+  const { now } = clock()
+  const logs = new CodexLogs(now)
+  const inner = g.turns
+  const asked: number[] = []
+  g.turns = async (id, opts) => {
+    if (opts.cursor === undefined) asked.push(opts.limit)
+    // turn 8 is too large: any newest page holding it fails as a whole
+    if (opts.cursor === undefined && opts.limit >= 3) return undefined
+    return inner.call(g, id, opts)
+  }
+  const open = await logs.page(g, 't', '.codex', {})
+  assert.deepEqual(texts(open.entries), [9, 10], 'the newest turns that can be read')
+  assert.ok(asked.length > 1 && asked.at(-1)! <= 2, `asked ${asked.join(', ')}`)
+})
+
+test('★ catch-up and "load older" read past large turns that each fit alone (codex review: two of them stopped both)', async () => {
+  const g = growing()
+  g.count = 5
+  const { c, now } = clock()
+  const logs = new CodexLogs(now)
+  const inner = g.turns
+  // turns 7 and 8 are large: a page holding both is over the limit
+  g.turns = async (id, opts) => {
+    const page = await inner(id, opts)
+    const ids = page?.turns.map((x) => x.id) ?? []
+    return ids.includes('t7') && ids.includes('t8') ? undefined : page
+  }
+  const open = await logs.page(g, 't', '.codex', {})
+  g.count = 13
+  c.now += REFRESH_MIN_MS * 2
+  const follow = await logs.page(g, 't', '.codex', { since: open.tail })
+  assert.deepEqual(texts(follow.entries), [6, 7, 8, 9, 10, 11, 12, 13], 'caught up across both')
+  // a fresh reader scrolls back through them too
+  const fresh = new CodexLogs(now)
+  let page = await fresh.page(g, 't', '.codex', { limit: 3 })
+  const seen = texts(page.entries)
+  for (let i = 0; i < 20 && page.cursor !== null; i++) {
+    page = await fresh.page(g, 't', '.codex', { before: page.cursor, limit: 3 })
+    seen.unshift(...texts(page.entries))
+  }
+  assert.deepEqual(seen, Array.from({ length: 13 }, (_, i) => i + 1), 'every turn, in order')
+})
+
+test('★ a later, longer read never appends turns older than the journal holds (codex review: 3, 4, 5, 1, 2)', async () => {
+  const g = growing()
+  g.count = 5
+  const { c, now } = clock()
+  const logs = new CodexLogs(now)
+  const inner = g.turns
+  let failFive = true
+  g.turns = async (id, opts) => (failFive && opts.limit >= 5 ? undefined : inner(id, opts))
+  const open = await logs.page(g, 't', '.codex', {})
+  assert.deepEqual(texts(open.entries), [3, 4, 5], 'the first read was cut to fewer turns')
+  failFive = false
+  c.now += REFRESH_MIN_MS * 2
+  const follow = await logs.page(g, 't', '.codex', { since: open.tail })
+  assert.deepEqual(follow.entries, [], 'nothing new')
+  c.now += REFRESH_MIN_MS * 2
+  let page = await logs.page(g, 't', '.codex', { limit: 100 })
+  const seen = texts(page.entries)
+  assert.deepEqual(seen, [3, 4, 5])
+  while (page.cursor !== null) {
+    page = await logs.page(g, 't', '.codex', { before: page.cursor, limit: 100 })
+    seen.unshift(...texts(page.entries))
+  }
+  assert.deepEqual(seen, [1, 2, 3, 4, 5], 'the older ones come from behind')
+})
+
+test('★ one request reads only within READ_BUDGET_MS: retries and catch-up pages together (codex review)', async () => {
+  const g = growing()
+  g.count = 10
+  const { c, now } = clock()
+  const logs = new CodexLogs(now)
+  const asked: number[] = []
+  const inner = g.turns
+  g.turns = async (id, opts) => {
+    asked.push(opts.limit)
+    c.now += READ_BUDGET_MS / 2 + 1 // a slow daemon
+    return undefined
+  }
+  await logs.page(g, 't', '.codex', {})
+  assert.deepEqual(asked, [PAGE_TURNS, Math.ceil(PAGE_TURNS / 2)], 'one smaller retry, then no more')
+  // catch-up: slow pages that succeed stop at the budget too (taking nothing, as a failed read)
+  g.turns = inner
+  const open = await logs.page(g, 't', '.codex', {})
+  g.count = 40
+  let reads = 0
+  g.turns = async (id, opts) => {
+    reads++
+    c.now += READ_BUDGET_MS / 3 + 1
+    return inner(id, opts)
+  }
+  c.now += REFRESH_MIN_MS * 2
+  const follow = await logs.page(g, 't', '.codex', { since: open.tail })
+  assert.deepEqual(follow.entries, [], 'out of time: nothing taken yet')
+  assert.ok(reads <= 3, `${reads} reads in one request`)
+  // older reads stop at the budget as well, keeping the cursor to ask again
+  const fresh = new CodexLogs(now)
+  g.turns = inner
+  const top = await fresh.page(g, 't', '.codex', { limit: 3 })
+  reads = 0
+  g.turns = async (id, opts) => {
+    reads++
+    c.now += READ_BUDGET_MS / 3 + 1
+    return inner(id, opts)
+  }
+  const back = await fresh.page(g, 't', '.codex', { before: top.cursor, limit: 100 })
+  assert.ok(reads <= 3, `${reads} older reads in one request`)
+  assert.notEqual(back.cursor, null, 'the rest can be asked for again')
+})
+
+test('★ `until`: one budget for a whole request that asks again with smaller pages (fitPage / codex review)', async () => {
+  const g = growing()
+  g.count = 30
+  const { c, now } = clock()
+  const logs = new CodexLogs(now)
+  let reads = 0
+  const inner = g.turns
+  g.turns = async (id, opts) => {
+    reads++
+    c.now += READ_BUDGET_MS * 0.9
+    return inner(id, opts)
+  }
+  const until = c.now + READ_BUDGET_MS
+  await logs.page(g, 't', '.codex', { until })
+  c.now += REFRESH_MIN_MS * 2
+  await logs.page(g, 't', '.codex', { limit: 10, until })
+  await logs.page(g, 't', '.codex', { before: 1e15, limit: 5, until })
+  assert.equal(reads, 1, 'asked again past `until`: nothing more is read')
 })
 
 test('an older-read in flight when a refresh starts a new journal gets the empty page of an expired position (sixth review, medium #2)', async () => {
@@ -355,4 +532,12 @@ test('an older-read in flight when a refresh starts a new journal gets the empty
   release()
   const got = await older
   assert.deepEqual([got.entries, got.cursor], [[], null])
+})
+
+// ★ The route passes one `until` to every Codex read of a request (fitPage asks again with smaller pages)
+test('sessions.ts: both Codex log reads carry the request\'s `until`', async () => {
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync(new URL('../routes/sessions.ts', import.meta.url), 'utf8')
+  assert.match(src, /const until = Date\.now\(\) \+ READ_BUDGET_MS/)
+  assert.equal(src.match(/codexLog\(sessionId, \{[^}]*\buntil \}\)/g)?.length, 2)
 })

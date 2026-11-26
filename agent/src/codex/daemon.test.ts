@@ -1090,8 +1090,14 @@ test('turns: read only for a thread that is a row, with explicit order and view;
   assert.equal(await line.turns('t1', { limit: 5 }), undefined)
   assert.equal(await line.turns('t1', { limit: 5, cursor: 'opaque' }), undefined)
   // ★ Headers only: a reader that does not show the conversation never asks for the items (a big turn ends the line)
+  const connectionsBefore = w.daemon.connections
   assert.equal(await line.turns('t1', { limit: 1, headersOnly: true }), undefined)
-  const sent = w.daemon.received.slice(before).map((m) => m.params)
+  assert.equal(w.daemon.connections, connectionsBefore, 'headers stay on the line')
+  const sent = w.daemon.received.slice(before).filter((m) => m.method === 'thread/turns/list').map((m) => m.params)
+  // ★ whole turns each on a connection of their own (review CDX-2: a page over the message limit closed the line, and
+  //   every Codex card with it)
+  const lineLog = w.daemon.log[0]!.received.filter((m) => m.method === 'thread/turns/list').map((m) => m.params)
+  assert.deepEqual(lineLog, [{ threadId: 't1', limit: 1, sortDirection: 'desc', itemsView: 'notLoaded' }], 'only headers asked on the line')
   assert.deepEqual(sent, [
     { threadId: 't1', limit: 5, sortDirection: 'desc', itemsView: 'full' },
     { threadId: 't1', limit: 5, sortDirection: 'desc', itemsView: 'full', cursor: 'opaque' },
@@ -1105,6 +1111,44 @@ test('turns: read only for a thread that is a row, with explicit order and view;
   line.stop()
   await line.done
   assert.equal(await line.turns('t1', { limit: 5 }), undefined, 'nothing is read on a stopped line')
+})
+
+test('★★ a side connection goes only to the daemon the line is on (codex review: a restarted daemon was initialized by it before the TUI)', async () => {
+  const w = world()
+  w.daemon.threads.set('t1', thread('t1'))
+  const line = start(w)
+  await until(() => line.rows().length === 1, 'the snapshot')
+  const before = w.daemon.connections
+  // the socket is replaced (a new daemon) and the line has not noticed yet
+  w.socket.look = { type: 'present', ageMs: 0, key: 'b' }
+  assert.equal(await line.turns('t1', { limit: 5 }), undefined)
+  assert.equal(await line.turnsAside('t1', { limit: 1 }), undefined)
+  assert.equal(w.daemon.connections, before, 'not dialed')
+  // the same daemon: read as before
+  w.socket.look = { type: 'present', ageMs: 60_000, key: 'a' }
+  await line.turnsAside('t1', { limit: 1 })
+  assert.equal(w.daemon.connections, before + 1, 'dialed')
+})
+
+test('★★ the line leaves a socket replaced while it dialed, before initialize, and connects again (codex review)', async () => {
+  const w = world()
+  w.daemon.threads.set('t1', thread('t1'))
+  const dial = w.deps.connect
+  let first = true
+  w.deps.connect = async (path, onText) => {
+    const conn = await dial(path, onText)
+    if (first) {
+      first = false
+      w.socket.look = { type: 'present', ageMs: 0, key: 'b' }
+    }
+    return conn
+  }
+  const line = start(w)
+  await until(() => line.rows().length === 1, 'the snapshot on the new daemon')
+  assert.ok(!w.daemon.log[0]!.received.some((m) => m.method === 'initialize'), 'nothing initialized on the replaced dial')
+  const before = w.daemon.connections
+  await line.turnsAside('t1', { limit: 1 })
+  assert.equal(w.daemon.connections, before + 1, 'side reads go on (same key as the line)')
 })
 
 test('stop: ends while waiting, closes the line, and the loop finishes', async () => {

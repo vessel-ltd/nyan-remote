@@ -276,6 +276,12 @@ export function viewOwnerOf(screen: string): { child: string } | 'parent' | unde
     const m = /^ID: ([0-9a-fA-F-]{8,})$/.exec(l)
     if (m) return { child: m[1]!.toLowerCase() }
   }
+  // ★ A top row that only looks like a header ("docs › guide" scrolled up from the parent's output) on the parent's own
+  //   view: its last row is the parent's footer — "? for shortcuts" (idle) or "esc to cancel" (working, or its own
+  //   approval open). A subagent's view or dialog ends otherwise (measured 1.5.16 / 1.5.17). (Review AGY-1: every phone
+  //   action on that agy stopped until a key was pressed on the PC.)
+  const last = rows.filter((l) => l !== '').pop() ?? ''
+  if (/^(?:\? for shortcuts|esc to cancel)(?:\s|$)/.test(last)) return 'parent'
   return undefined
 }
 

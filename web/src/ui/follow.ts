@@ -24,9 +24,14 @@ export function followAction(args: {
   pageTail: number
   /** Number of display entries in the response */
   added: number
+  /** ★ The agent no longer has our position (`LogPage.reload`: a Codex journal that started over) */
+  reload?: boolean
 }): FollowAction {
   // ★ Drop anything that arrives after switching to another session or endpoint
   if (args.requestGen !== args.currentGen) return 'ignore'
+  // ★ The history started over: reload from the latest page (codex review: an empty page with a higher tail read as
+  //   "nothing new", and the position moved past the newest turns without showing them)
+  if (args.reload === true) return 'reset'
   // ★★ **tail shrank = the file was recreated** (codex review 2026-08-20, high #2).
   //    Follow is serialized, so within one generation responses never arrive out of order.
   //    ⇒ The shrink is real, so **reload from the latest page** (don't keep appending stale content).

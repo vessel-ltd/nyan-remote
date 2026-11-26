@@ -64,7 +64,14 @@ export async function readBody(req: IncomingMessage, limit = 256 * 1024): Promis
   return Buffer.concat(chunks).toString('utf8')
 }
 
-export async function readJsonBody<T>(req: IncomingMessage): Promise<T> {
+/**
+ * ★ The hooks' bodies (`/permission`, `/hook`): Claude Code sends the whole tool input, and a large Write / Edit or MCP
+ *   argument passed 256 KB — answered 413, that approval had no card, no ring and no auto-approve, and sat silently on
+ *   the PC (review CTL-2). Those routes are authenticated by the hook token before the body is read.
+ */
+export const HOOK_BODY_MAX = 16 * 1024 * 1024
+
+export async function readJsonBody<T>(req: IncomingMessage, limit?: number): Promise<T> {
   // ★ Require Content-Type.
   //
   // ⚠️ Without this, a `text/plain` "simple request" avoids the preflight,
@@ -76,7 +83,7 @@ export async function readJsonBody<T>(req: IncomingMessage): Promise<T> {
   if (type !== 'application/json') {
     throw new HttpError(415, t('content-type は application/json にしてください', 'Set content-type to application/json.'))
   }
-  const raw = await readBody(req)
+  const raw = await readBody(req, limit)
   if (!raw) return {} as T
   let parsed: unknown
   try {

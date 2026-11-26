@@ -460,15 +460,20 @@ export function openTunnel(o: {
     }
     // ⚠️ nothing is sent after closing (`close()` has already sent the reason)
     if (closed) return { ok: true }
+    // ★ A response too big for one frame answers that request alone with 413 (review E2E-8 / codex review: an oversized
+    //   card list closed the whole tunnel — every approval on that machine unreachable by relay until it shrank)
+    let reply: Uint8Array
     try {
-      await enqueueSend(
-        FRAME.response,
-        encodeResponse({
-          id: request.id,
-          status: out.status,
-          ...(out.kind === 'body' && out.body !== undefined ? { body: out.body } : {}),
-        }),
-      )
+      reply = encodeResponse({
+        id: request.id,
+        status: out.status,
+        ...(out.kind === 'body' && out.body !== undefined ? { body: out.body } : {}),
+      })
+    } catch {
+      reply = encodeResponse({ id: request.id, status: 413, body: { error: t('応答が大きすぎます', 'The response is too large.') } })
+    }
+    try {
+      await enqueueSend(FRAME.response, reply)
     } catch (err) {
       // ⚠️⚠️ **never throw because sending failed** (do not break the carrier's receiver).
       //    ★ cannot send = this connection is unusable, so `fatal` (the carrier closes it).

@@ -22,6 +22,11 @@ test('Permissions.tsx: summary and detail are only rendered through <Revealed>',
   for (const f of ['q.question', 'q.header', 'o.label', 'o.description']) {
     assert.match(code, new RegExp(`<Revealed text=\\{${f.replace('.', '\\.')}\\} scope="bidi" />`), f)
   }
+  // ★ the full text line by line with a hanging indent (a wrapped part never starts at the margin / codex review)
+  assert.match(code, /<div class="permfull mono"><Revealed text=\{p\.detail\} lines \/><\/div>/)
+  assert.match(code, /text\.split\('\\n'\)\.map\(\(line, i\) => <div key=\{i\} class="permline">/)
+  const css = readFileSync(new URL('../styles.css', import.meta.url), 'utf8')
+  assert.match(css, /\.permline \{[^}]*padding-left: 2ch;[^}]*text-indent: -2ch;/)
   // the "cut" warning is outside the expanded block (visible without opening)
   const clipAt = code.indexOf('{p.detailClipped ?')
   assert.ok(clipAt > code.indexOf('</button>') && clipAt > code.lastIndexOf('<div class="permfull mono">'))

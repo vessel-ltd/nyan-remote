@@ -28,12 +28,46 @@ export const DEFAULT_ENTRIES = 60
 const MAX_THREADS = 50
 /** How many extra pages a refresh reads back to join up with the journal before it starts over */
 export const MAX_CATCHUP_PAGES = 10
+/**
+ * ★ How many refreshes in a row may fail to read back before the journal starts over from the newest (codex review: a
+ *   turn too large to read — its page over the message limit — failed every catch-up, and the thread froze for good)
+ */
+export const MAX_CATCHUP_FAILS = 3
 
 export interface CodexLogSource {
   /** Changes on every (re)connect */
   generation(): number
   /** `undefined` = could not be read now (not connected, not a listed thread, or the daemon refused) */
   turns(threadId: string, opts: { limit: number; cursor?: string }): Promise<TurnsPage | undefined>
+}
+
+/**
+ * ★ Every read of turns goes through here: a page fails as a whole when it is over the message limit — one large turn
+ *   in it is enough while the others are small (codex review: a thread opened blank; catch-up and "load older" stopped
+ *   at two large turns that each fit alone). ⇒ Fewer turns from the same place, down to one.
+ */
+/**
+ * ★ One request reads from the daemon only this long: no read (a retry, a catch-up page, an older page) starts after it.
+ *   The phone waits 10 s for the whole request and then closes the relay line with the answers queued behind it
+ *   (codex review: slow retries, then slow catch-up pages, each within their own limit, added up past it)
+ */
+export const READ_BUDGET_MS = 4000
+
+async function readTurns(
+  source: CodexLogSource,
+  threadId: string,
+  opts: { limit: number; cursor?: string },
+  timeLeft: () => boolean,
+): Promise<TurnsPage | undefined> {
+  // (the first read too: a caller asking again within the same request may already be out of time)
+  if (!timeLeft()) return undefined
+  let n = opts.limit
+  let page = await source.turns(threadId, opts)
+  while (!page && n > 1 && timeLeft()) {
+    n = Math.ceil(n / 2)
+    page = await source.turns(threadId, { ...opts, limit: n })
+  }
+  return page
 }
 
 interface ThreadState {
@@ -45,6 +79,8 @@ interface ThreadState {
   loaded: boolean
   /** The refresh in flight, if any (one at a time per journal) */
   refreshing?: Promise<void>
+  /** Refreshes in a row whose read-back failed */
+  catchupFails?: number
 }
 
 export class CodexLogs {
@@ -81,13 +117,15 @@ export class CodexLogs {
    *    older answer arriving last, appended its oldest turn **after** the newer ones (`ingest` appends what it has not
    *    seen) — for good. A reader that comes while a refresh is in flight waits for that one.
    */
-  #refresh(source: CodexLogSource, threadId: string, s: ThreadState, limit: number): Promise<void> {
+  #refresh(source: CodexLogSource, threadId: string, s: ThreadState, limit: number, until?: number): Promise<void> {
     if (s.refreshing) return s.refreshing
     const now = this.#now()
     if (now - s.lastRefresh < REFRESH_MIN_MS) return Promise.resolve()
     s.lastRefresh = now
     const run = (async () => {
-      const page = await source.turns(threadId, { limit })
+      const end = until ?? this.#now() + READ_BUDGET_MS
+      const timeLeft = (): boolean => this.#now() < end
+      const page = await readTurns(source, threadId, { limit }, timeLeft)
       if (!page) return
       /** Newest first */
       const turns = [...page.turns]
@@ -106,13 +144,28 @@ export class CodexLogs {
             s.older = cursor
             break
           }
-          const more = await source.turns(threadId, { limit: PAGE_TURNS, cursor })
-          // Could not read the rest now: take nothing (the newest alone would leave a hole), try again next time
-          if (!more) return
+          // (out of time counts as a failed read: the next refresh goes on, and one that never can starts over)
+          const more = timeLeft() ? await readTurns(source, threadId, { limit: PAGE_TURNS, cursor }, timeLeft) : undefined
+          // Could not read the rest now: take nothing (the newest alone would leave a hole), try again next time —
+          // ⚠️ unless it keeps failing: then start over from the newest, as when too far behind
+          if (!more) {
+            s.catchupFails = (s.catchupFails ?? 0) + 1
+            if (s.catchupFails < MAX_CATCHUP_FAILS) return
+            s.journal = this.#newJournal()
+            s.older = cursor
+            break
+          }
           turns.push(...more.turns)
           cursor = more.nextCursor === cursor ? null : more.nextCursor
         }
       }
+      s.catchupFails = 0
+      // ★ Turns older than the oldest one the journal knows in this batch belong behind it ("older"), never after
+      //   (codex review: a first read cut to fewer turns, then a full read, appended turns 1–2 after 3–5). Known turns
+      //   stay (an unfinished one gets its new items)
+      let lastKnown = -1
+      for (let i = 0; i < turns.length; i++) if (s.journal.knows(turns[i]!.id)) lastKnown = i
+      if (lastKnown >= 0) turns.length = lastKnown + 1
       s.journal.ingest(turns.reverse())
       if (!s.loaded) {
         s.loaded = true
@@ -147,7 +200,11 @@ export class CodexLogs {
     source: CodexLogSource,
     threadId: string,
     account: string,
-    opts: { before?: number | null; since?: number | null; limit?: number },
+    /**
+     * `until`: the time (this clock) after which no read starts — one for the whole HTTP request, so a caller that asks
+     * again with a smaller page (`fitPage`) does not get a fresh budget each time (codex review). Default: now + budget.
+     */
+    opts: { before?: number | null; since?: number | null; limit?: number; until?: number },
   ): Promise<LogPage> {
     const s = this.#state(source, threadId)
     const limit = opts.limit ?? DEFAULT_ENTRIES
@@ -159,10 +216,13 @@ export class CodexLogs {
       /** "Nothing older" for a position that is not (or no longer) this journal's: an empty page, never a guess */
       const gone = (): LogPage => ({ ...base, entries: [], cursor: null, tail: s.journal.tail })
       if (journal.before(position, 0) === undefined) return gone()
+      const end = opts.until ?? this.#now() + READ_BUDGET_MS
+      const timeLeft = (): boolean => this.#now() < end
       // Not enough held before that position: read older turns from the daemon and put them in front
-      while (position - journal.front < limit && s.older !== null) {
+      // (out of time: what is held so far, and the cursor to ask again)
+      while (position - journal.front < limit && s.older !== null && timeLeft()) {
         const asked = s.older
-        const page = await source.turns(threadId, { limit: PAGE_TURNS, cursor: asked })
+        const page = await readTurns(source, threadId, { limit: PAGE_TURNS, cursor: asked }, timeLeft)
         // ⚠️⚠️ A refresh started a new journal meanwhile (sixth review, medium #2: too far behind to join up). The
         //    position is the old journal's ⇒ the same answer as for any expired position.
         if (s.journal !== journal) return gone()
@@ -190,16 +250,16 @@ export class CodexLogs {
     }
 
     if (opts.since !== null && opts.since !== undefined) {
-      await this.#refresh(source, threadId, s, s.loaded ? FOLLOW_TURNS : PAGE_TURNS)
+      await this.#refresh(source, threadId, s, s.loaded ? FOLLOW_TURNS : PAGE_TURNS, opts.until)
       const all = s.journal.since(opts.since)
-      if (!all) return { ...base, entries: [], cursor: null, tail: s.journal.tail }
+      if (!all) return { ...base, entries: [], cursor: null, tail: s.journal.tail, reload: true }
       // ★ Cut to fit one relay frame; the phone asks again from where it stopped (`more` / codex review)
       const n = countWithin(all)
       if (n >= all.length) return { ...base, entries: all, cursor: null, tail: s.journal.tail }
       return { ...base, entries: all.slice(0, n), cursor: null, tail: s.journal.after(opts.since, n), more: true }
     }
 
-    await this.#refresh(source, threadId, s, PAGE_TURNS)
+    await this.#refresh(source, threadId, s, PAGE_TURNS, opts.until)
     const got = s.journal.latest(limit)
     return { ...base, entries: got.entries, cursor: this.#cursor(s, got.from), tail: s.journal.tail }
   }

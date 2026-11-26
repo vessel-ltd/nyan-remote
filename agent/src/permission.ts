@@ -700,6 +700,7 @@ const SUMMARY_FIELD: Record<string, readonly string[]> = {
   Read: ['file_path'],
   Edit: ['file_path'],
   Write: ['file_path'],
+  MultiEdit: ['file_path'],
   NotebookEdit: ['notebook_path'],
   Glob: ['pattern'],
   Grep: ['pattern'],
@@ -737,8 +738,43 @@ export function summarize(toolName: string, input: unknown): string {
     case 'json':
       return clip(JSON.stringify(raw.value))
     default:
-      return clip(raw.text)
+      return clip(WRITE_TOOLS.has(toolName) ? pathShown(raw.text) : raw.text)
   }
+}
+
+/**
+ * ★ A file path as the card draws it: quoted as JSON when it holds a control character or "⏎" (codex review:
+ *   `release\nnotes.txt` and `release ⏎ notes.txt` read the same, and they name different files)
+ */
+function pathShown(path: string): string {
+  // ⚠️ also when it starts with `"`: a file literally named `"a\nb"` would read like the quoted form (codex review)
+  // ⚠️ and when it starts or ends with a blank (invisible at the edge: `package.json ` is another file / codex review)
+  return /^"|^\s|\s$|[\u0000-\u001f\u007f\u23ce\u2420\u21e5]/.test(path) ? JSON.stringify(path) : path
+}
+
+/**
+ * ★ The characters the card draws as marks ("⏎" a line break and "␠" a blank after `\\` in the folded line, "⇥" a tab
+ *   and "␠" a blank at a line's end in a write's full text: after the "│ " prefix a tab read as six spaces, and Python then fails / codex review).
+ *   When the input itself holds one, it is drawn as `U+XXXX`, so a mark always means what the agent put there (codex review: a literal "⏎" in
+ *   a comment read like a real line break that runs a second command), and the card warns (`hiddenIn`: the text
+ *   `U+23CE` and the character then read the same)
+ * ⚠️ A carriage return is left as it is: the phone draws it as a marker of its own (`shared/reveal.ts`), which no text
+ *    can imitate (codex review: "␍" in a write and a literal "␍" read the same; CRLF after `\\` read as `\\⏎`)
+ */
+const MARKS = /[\u23ce\u2420\u21e5]/g
+const HAS_MARK = /[\u23ce\u2420\u21e5]/
+/**
+ * ★ Blanks at the end of a line of a write's full text, drawn "␠" (invisible, yet `\\` + a blank ends a shell command /
+ *   codex review). A loop, not a regex (`/ +$/` backtracks over a long run of blanks)
+ */
+function trailingBlanks(line: string): string {
+  let i = line.length
+  while (i > 0 && line[i - 1] === ' ') i--
+  return i === line.length ? line : `${line.slice(0, i)}${'␠'.repeat(line.length - i)}`
+}
+
+function escapeMarks(text: string): string {
+  return text.replace(MARKS, (c) => `U+${c.codePointAt(0)!.toString(16).toUpperCase()}`)
 }
 
 /**
@@ -753,10 +789,78 @@ export function summarize(toolName: string, input: unknown): string {
  *
  * @returns `undefined` if the folded line is already the full text (so no open button is shown)
  */
+/**
+ * ★★★ What a file-writing tool is about to write (review PWA-3 / 2026-11-25): the card's one line is the path, and the
+ *   full text is the content — Write's whole text, Edit's old → new, NotebookEdit's new source. Before, the card showed
+ *   only the path with nothing to open, so a write was approved without seeing it (a hook, `package.json`, `.bashrc`).
+ *   ⚠️ Every string field is included (an unknown extra field is listed too), so nothing written is left off the card.
+ */
+const WRITE_TOOLS = new Set(['Write', 'Edit', 'NotebookEdit', 'MultiEdit'])
+function writeText(toolName: string, input: unknown): { text: string; clipped: boolean } | undefined {
+  if (!WRITE_TOOLS.has(toolName) || !input || typeof input !== 'object') return undefined
+  const o = input as Record<string, unknown>
+  const path = o['file_path'] ?? o['notebook_path']
+  const parts: string[] = []
+  // (the path on one line of its own, as given: a line break in it is drawn as "⏎")
+  if (typeof path === 'string') parts.push(pathShown(path))
+  const shown = new Set(['file_path', 'notebook_path'])
+  // ⚠️ Every line of what the tool gave starts with "│ ": a section heading cannot be forged by the content (codex
+  //    review: replacing `A` with `B⏎── new ──⏎C` read the same as replacing `A⏎── new ──⏎B` with `C`)
+  //   A carriage return stays as it is: the phone draws it as a marker (`shared/reveal.ts`), so CRLF and LF never read
+  //   the same (codex review: a script with CRLF in its shebang looked like the runnable one). Only the head of each field is laid out (a write of megabytes was laid out whole,
+  //   twice, to show 8,000 characters / codex review)
+  let cut = false
+  const body = (x: string): string => {
+    if (x.length > DETAIL_MAX) cut = true
+    return x
+      .slice(0, DETAIL_MAX)
+      .split('\n')
+      .map((l) => `│ ${trailingBlanks(escapeMarks(l).replace(/\t/g, '⇥'))}`)
+      .join('\n')
+  }
+  const block = (label: string, key: string): void => {
+    const v = o[key]
+    if (v === undefined) return
+    shown.add(key)
+    parts.push(`── ${label} ──`, body(typeof v === 'string' ? v : JSON.stringify(v, null, 2)))
+  }
+  if (toolName === 'Write') block(t('書き込む内容', 'content'), 'content')
+  if (toolName === 'Edit') {
+    block(t('置き換える前', 'old'), 'old_string')
+    block(t('置き換えた後', 'new'), 'new_string')
+  }
+  if (toolName === 'MultiEdit') block(t('編集', 'edits'), 'edits')
+  if (toolName === 'NotebookEdit') {
+    block(t('セル', 'cell'), 'cell_id')
+    block(t('操作', 'mode'), 'edit_mode')
+    block(t('新しい内容', 'new source'), 'new_source')
+  }
+  // anything else the tool was given (`replace_all`, a field this version does not know)
+  const rest = Object.fromEntries(Object.entries(o).filter(([k]) => !shown.has(k)))
+  if (Object.keys(rest).length > 0) parts.push(`── ${t('ほかの指定', 'other fields')} ──`, body(JSON.stringify(rest, null, 2)))
+  const text = parts.join('\n')
+  return { text: text.slice(0, DETAIL_MAX), clipped: cut || text.length > DETAIL_MAX }
+}
+
+/** ★ Every string a write tool was given (the hidden-character check reads them as they are, not a layout of them) */
+function writeStrings(toolName: string, input: unknown): string[] | undefined {
+  if (!WRITE_TOOLS.has(toolName) || !input || typeof input !== 'object') return undefined
+  const out: string[] = []
+  const walk = (v: unknown): void => {
+    if (typeof v === 'string') out.push(v)
+    else if (Array.isArray(v)) v.forEach(walk)
+    else if (v && typeof v === 'object') Object.values(v).forEach(walk)
+  }
+  walk(input)
+  return out
+}
+
 export function detailOf(
   toolName: string,
   input: unknown,
 ): { text: string; clipped: boolean } | undefined {
+  const write = writeText(toolName, input)
+  if (write !== undefined) return write
   const raw = rawText(toolName, input)
   if (!raw) return undefined
   // a question with choices is drawn as is (question and choices) by the card, so opening is pointless
@@ -765,17 +869,22 @@ export function detailOf(
   //   ⚠️ measuring by the length after formatting shows an open button **even though nothing was dropped**
   //      (2026-08-18 codex review, low #3)
   const source = raw.kind === 'json' ? JSON.stringify(raw.value) : raw.text
-  const flat = source.replace(/\s+/g, ' ').trim()
-  const truncated = flat.length > SUMMARY_MAX // does not fit in the folded line
-  // ★★ collapsing whitespace can **change the meaning** (`printf '%s' 'allow  deny'`
-  //   looks like a different command when collapsed / same review, medium #2). If only **leading and trailing whitespace**
-  //   was dropped, it looks the same, so only that case is excluded.
-  //   ⚠️ for JSON the folded line is already everything, so it is not opened just for formatting
-  const flattened = raw.kind !== 'json' && source.trim() !== flat
+  // ★ Decided by the folded line itself (codex review: a JSON whose first value was 3,300 spaces fitted once its spaces
+  //   were squashed, yet the folded line stopped at `{"note":"…` — and nothing opened to show the rest)
+  const folded = clipLine(source)
+  const truncated = folded.cut
+  // ★★ The full text goes with every card whose folded line is not the input word for word (only blanks at its very
+  //   start and end dropped, final line breaks drawn). Collapsing whitespace can **change the meaning**
+  //   (`printf '%s' 'allow  deny'` / medium #2), so can a line break, a trailing one too (`\` + a final newline vs a
+  //   bare `\` / codex review). JSON too: it is one line, so only blanks collapsed inside its strings count (codex
+  //   review: `"release  bot"` read `"release bot"`, another account)
+  //   (final line breaks, drawn "⏎" at the end of the folded line, need no full text: nothing more to see / low #2)
+  const flattened = folded.line.replace(/( ⏎)+$/, '') !== source.trim()
   // ★★ Hidden characters (2026-11-10 / security check): the collapsed line trims and squashes them away
   //   (`cat log.txt\u00A0` became `cat log.txt` with no full text = nothing for the phone to mark).
   //   ⇒ Whenever the input has a character the phone marks (`shared/reveal.ts`), the full text is sent as is.
-  const hidden = hasHidden(source)
+  // (a mark character in the input: the full text shows the input as it is, the folded line only `U+XXXX`)
+  const hidden = hasHidden(source) || HAS_MARK.test(source)
   if (!truncated && !flattened && !hidden) return undefined
   // ★ unknown tools / MCP are "one-line JSON", so **make it readable when opened**.
   //   ⚠️ shown as is, `\n` would just **sit there as characters** in a lump, defeating the point of opening
@@ -793,6 +902,9 @@ export function detailOf(
  *    nor warned about. The phone warns when this is set even if it cannot show where.
  */
 export function hiddenIn(toolName: string, input: unknown): boolean {
+  // ★ A write's whole content is what is approved (PWA-3): every field, not only the path
+  const write = writeStrings(toolName, input)
+  if (write !== undefined) return write.some((x) => hasHidden(x) || HAS_MARK.test(x))
   const raw = rawText(toolName, input)
   if (!raw) return false
   switch (raw.kind) {
@@ -801,15 +913,41 @@ export function hiddenIn(toolName: string, input: unknown): boolean {
       //   ⚠️ Only direction controls count in those: emoji ZWJ in a label is normal and must not raise the warning
       return hasHidden(...raw.items) || hasBidi(JSON.stringify(input))
     case 'json':
-      return hasHidden(JSON.stringify(raw.value))
+      return hasHidden(JSON.stringify(raw.value)) || HAS_MARK.test(JSON.stringify(raw.value))
     default:
-      return hasHidden(raw.text)
+      return hasHidden(raw.text) || HAS_MARK.test(raw.text)
   }
 }
 
 function clip(text: string): string {
-  const flat = text.replace(/\s+/g, ' ').trim()
-  return flat.length > SUMMARY_MAX ? `${flat.slice(0, SUMMARY_MAX - 1)}…` : flat
+  return clipLine(text).line
+}
+
+function clipLine(text: string): { line: string; cut: boolean } {
+  // ★ A line break is drawn as "⏎" (review CTL-3): folded into a space, `ls  # tidy⏎rm -rf ~` read as one harmless
+  //   command with a comment. Other runs of whitespace still fold to one space.
+  // ⚠️ Line by line, on a bounded head (codex review: one regex over the whole input backtracked quadratically on a
+  //    long run of spaces and held the agent)
+  // ⚠️ Leading blanks first (a run of them filled the head and the card read "…" alone / codex review); every line
+  //    break kept, blank lines too (a blank line after a `\` ends the command: dropped, a second command read as an
+  //    argument / codex review)
+  // ⚠️ A blank after a line's last `\` is drawn as "␠" (codex review: `\␠⏎` ends the command, `\⏎` continues it, and
+  //    both read `\ ⏎`)
+  const lead = text.trimStart()
+  const head = lead.length > SUMMARY_MAX * 8 ? lead.slice(0, SUMMARY_MAX * 8) : lead
+  // ⚠️ A final line break is kept (drawn "⏎" at the end: `\` + newline and a bare `\` differ / codex review)
+  const flat = head
+    .split('\n')
+    .map((l) => {
+      // (a carriage return kept, for the phone to mark: only the other blanks fold)
+      const line = escapeMarks(l).replace(/[^\S\r]+/g, ' ').replace(/^ | $/g, '')
+      return /\\[^\S\r]+$/.test(l) ? `${line}␠` : line
+    })
+    .join(' ⏎ ')
+    .replace(/ {2,}/g, ' ')
+    .replace(/ $/, '')
+  const cut = flat.length > SUMMARY_MAX || head.length < lead.length
+  return { line: cut ? `${flat.slice(0, SUMMARY_MAX - 1)}…` : flat, cut }
 }
 
 /**

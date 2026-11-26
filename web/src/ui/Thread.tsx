@@ -200,6 +200,12 @@ export function Thread({
   const firstLoadRef = useRef<Promise<void>>()
   /** Prevents double-starting the scrollback read (rapid taps would prepend the same page twice) */
   const olderRef = useRef(false)
+  /**
+   * ★ Counts reloads from the latest page (`loadFirst`). A "load older" begun before one belongs to the history that was
+   *   replaced: its entries and its cursor are dropped (codex review: its stale `cursor: null` hid "Load older", and
+   *   its old entries would go above the fresh page)
+   */
+  const reloadRef = useRef(0)
   const bottomRef = useRef<HTMLDivElement | null>(null)
   /**
    * ★★ The boundary between "end of the log" and "start of the approval cards" (2026-08-19 user report).
@@ -475,6 +481,7 @@ export function Thread({
     const page = await transport.getLog(sessionId, { limit: PAGE })
     // ★ If the generation changed by arrival time, discard it (we have moved to another thread)
     if (gen !== genRef.current) return
+    reloadRef.current++
     setEntries(page.entries)
     // ★ If the reload contains a just-sent message, clear "Sending…" (match only after the send time / pending.ts)
     setPending((prev) => consumeAfterReload(prev, page.entries, usedRef.current))
@@ -604,9 +611,10 @@ export function Thread({
             currentTail: tailRef.current,
             pageTail: page.tail,
             added: page.entries.length,
+            reload: page.reload === true,
           })
           if (action === 'ignore') return
-          // ★ The file was recreated. Reload from the latest page (do not append to old content)
+          // ★ The file was recreated, or the history started over. Reload from the latest page (do not append to old content)
           if (action === 'reset') {
             tailRef.current = -1
             await loadFirst(gen)
@@ -726,20 +734,21 @@ export function Thread({
     if (olderRef.current) return
     olderRef.current = true
     const gen = genRef.current
+    const reload = reloadRef.current
     try {
       let at: number | null = cursor
       const got: LogEntry[] = []
       for (let pages = 1; at !== null; pages++) {
         const page = await transport.getLog(sessionId, { before: at, limit: PAGE })
-        // ★ If we had moved to another thread by arrival, discard it
-        if (gen !== genRef.current) return
+        // ★ If we had moved to another thread by arrival, or the thread was reloaded, discard it
+        if (gen !== genRef.current || reload !== reloadRef.current) return
         // ⚠️ Later-fetched pages are older ⇒ prepend
         got.unshift(...page.entries)
         at = page.cursor
         if (!untilMine || !keepLoading(page, pages)) break
       }
       // ⚠️⚠️ Do nothing if the screen was left (do not leave only the alignment setting behind after leaving / codex round 19, medium #1)
-      if (gen !== genRef.current || !threadRef.current) return
+      if (gen !== genRef.current || reload !== reloadRef.current || !threadRef.current) return
       // ★★ **Stay where you were** even when adding above. ⚠️ Disable Chrome's automatic anchoring so it does not move twice
       const root = document.documentElement
       const kids = [...threadRef.current.children] as HTMLElement[]

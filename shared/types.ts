@@ -1474,6 +1474,13 @@ export interface LogPage {
    */
   more?: true
   /**
+   * ★ Live follow from a position this history no longer has (a Codex thread whose journal started over: too far
+   *   behind, a read-back that kept failing, a reconnect): reload from the latest page (codex review: the phone took the
+   *   empty page for "nothing new", moved its position past the newest turns and never showed them).
+   *   ⚠️ Absent from older agents (the phone then behaves as before).
+   */
+  reload?: true
+  /**
    * ★★ **Body not yet written to the transcript** (2026-08-21).
    *
    * The CLI batches transcript writes, and **flushing stops while it waits for a human answer**

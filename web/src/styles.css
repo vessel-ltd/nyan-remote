@@ -1778,6 +1778,14 @@ input.urlinput {
   direction: ltr;
   unicode-bidi: bidi-override;
 }
+/* ★ One line of a card's full text: a wrapped part is indented, so only a real line starts at the margin (a long line
+   wrapping just before it read like the "── new ──" heading / codex review). An empty line keeps its height */
+.permline {
+  padding-left: 2ch;
+  text-indent: -2ch;
+  min-height: 1.3em;
+  min-height: 1lh;
+}
 /* A hidden character drawn as a marker (`U+202E`). Must stand out from the command around it */
 .hiddenchar {
   color: var(--bad-fg);

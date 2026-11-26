@@ -339,6 +339,10 @@ export class AgyCards {
           const n = ++this.#begun
           try {
             await this.#look()
+          } catch (err) {
+            // ★ A look that throws must not take the agent down (every pending approval would go with it / review
+            //   AGY-5: callers fire `void this.sync()` with no catch, and the agent has no last-resort handler)
+            this.#deps.log?.(`[agy] card look failed: ${(err instanceof Error ? err.message : String(err)).slice(0, 200)}`)
           } finally {
             this.#settle(n)
           }

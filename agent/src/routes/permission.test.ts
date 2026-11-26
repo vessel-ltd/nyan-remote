@@ -209,6 +209,19 @@ test('★★ /permissions pendingTags is a superset (includes the quietly waitin
   resetPending()
 })
 
+test('★★ /permissions says how many cards it left out as too large (npm run pending counts them / codex review)', async () => {
+  resetPending()
+  const huge = 'あ'.repeat(2000)
+  void waitForDecision(req({ key: 'big', interaction: { kind: 'question', questions: Array.from({ length: 4 }, () => ({ question: huge, multiSelect: false, options: Array.from({ length: 4 }, () => ({ label: huge, description: huge })) })) } }), () => {})
+  const res = await permissions()
+  assert.equal(res.permissions.length, 0)
+  assert.equal(res.omitted, 1)
+  resetPending()
+  void waitForDecision(req({ key: 'k1' }), () => {})
+  assert.equal((await permissions()).omitted, undefined, 'absent when none')
+  resetPending()
+})
+
 test('★★ permissionPayload: even a long tool name stays under the push limit (so the notification still shows)', () => {
   // ⚠️⚠️ codex 2026-08-20, medium #6. `tool_name` has no length limit at the entry, so
   //    a long one makes **the push exceed 4KB and fail to send = the approval notification itself never shows**.
@@ -234,4 +247,41 @@ test('★★ /permissions returns "the time the list was taken" (used for orderi
   const at = Date.parse(res.at)
   assert.ok(!Number.isNaN(at), 'at is an ISO string')
   assert.ok(at >= before - 1000 && at <= Date.now() + 1000, 'it is the current time')
+})
+
+test('★★ the card list stays within one relay frame: past the budget the later cards go without their full text (codex review)', async () => {
+  const { withinBudget, PERMISSIONS_DETAIL_BUDGET } = await import('./permission.ts')
+  const card = (i: number) => ({ key: `k${i}`, origin: `o${i}`, machine: 'pc-a', account: '.claude', project: 'p', sessionId: 's', toolName: 'Write', summary: 'x', detail: 'あ'.repeat(8000), at: '2026-11-25T00:00:00Z' }) as never
+  const list = withinBudget(Array.from({ length: 20 }, (_, i) => card(i)))
+  const size = Buffer.byteLength(JSON.stringify(list))
+  assert.ok(size < PERMISSIONS_DETAIL_BUDGET + 20 * 400, `${size} bytes`)
+  const kept = list.filter((p) => (p as { detail?: string }).detail !== undefined).length
+  assert.ok(kept > 0 && kept < 20, `${kept} kept their full text`)
+  const off = list.find((p) => (p as { detail?: string }).detail === undefined) as { detailClipped?: boolean }
+  assert.equal(off.detailClipped, true, 'marked: the phone asks again before allowing')
+  // ★ the other cards count too: big question previews leave less room for full texts (codex review)
+  const question = (i: number) => ({ key: `q${i}`, origin: `q${i}`, machine: 'pc-a', account: '.claude', project: 'p', sessionId: 's', toolName: 'AskUserQuestion', summary: 'q', interaction: { kind: 'choice', questions: [{ question: 'q', options: [{ label: 'a', preview: 'x'.repeat(60_000) }] }] }, at: '2026-11-25T00:00:00Z' }) as never
+  const mixed = withinBudget([...Array.from({ length: 6 }, (_, i) => card(i)), question(1), question(2)])
+  assert.ok(Buffer.byteLength(JSON.stringify(mixed)) <= PERMISSIONS_DETAIL_BUDGET, 'the whole list fits')
+  // small lists untouched
+  assert.deepEqual(withinBudget([card(1)]), [card(1)])
+  // ★ with every full text gone, the option diagrams go next, largest card first, marked so the phone warns and does not
+  //   answer on one tap (codex review: three cards of four questions with four full Japanese previews were ~285 KiB)
+  const big = (i: number) => ({ key: `b${i}`, origin: `b${i}`, machine: 'pc-a', account: '.claude', project: 'p', sessionId: 's', toolName: 'AskUserQuestion', summary: 'q', interaction: { kind: 'question', questions: Array.from({ length: 4 }, () => ({ question: 'q', multiSelect: false, options: Array.from({ length: 4 }, (_, j) => ({ label: `o${j}`, preview: 'あ'.repeat(2000) })) })) }, at: '2026-11-25T00:00:00Z' }) as never
+  const three = withinBudget([big(1), big(2), big(3)])
+  assert.ok(Buffer.byteLength(JSON.stringify(three)) <= PERMISSIONS_DETAIL_BUDGET, `${Buffer.byteLength(JSON.stringify(three))} bytes`)
+  type Opt = { preview?: string; previewClipped?: boolean }
+  const opts = (p: unknown) => (p as { interaction: { questions: { options: Opt[] }[] } }).interaction.questions.flatMap((q) => q.options)
+  const stripped = three.filter((p) => opts(p).every((o) => o.preview === undefined && o.previewClipped === true))
+  assert.equal(stripped.length, 2, 'only as many cards as needed lose their diagrams')
+  assert.ok(opts(three.find((p) => !stripped.includes(p))).every((o) => o.preview !== undefined), 'the others keep theirs')
+  assert.deepEqual(withinBudget([big(1)]), [big(1)])
+  // ★★ last, whole cards (texts without a bound of their own: long option descriptions / codex review). The list always
+  //   fits, the smallest cards stay
+  const wordy = (i: number) => ({ key: `w${i}`, origin: `w${i}`, machine: 'pc-a', account: '.claude', project: 'p', sessionId: 's', toolName: 'AskUserQuestion', summary: 'q', interaction: { kind: 'question', questions: Array.from({ length: 4 }, () => ({ question: 'q', multiSelect: false, options: Array.from({ length: 4 }, (_, j) => ({ label: `o${j}`, description: 'あ'.repeat(1400) })) })) }, at: '2026-11-25T00:00:00Z' }) as never
+  const small = card(9)
+  const four = withinBudget([wordy(1), small, wordy(2), wordy(3), wordy(4)])
+  assert.ok(Buffer.byteLength(JSON.stringify(four)) <= PERMISSIONS_DETAIL_BUDGET, `${Buffer.byteLength(JSON.stringify(four))} bytes`)
+  assert.ok(four.length >= 2 && four.length < 5, `${four.length} cards`)
+  assert.ok(four.some((p) => (p as { key: string }).key === 'k9'), 'the small card stays')
 })

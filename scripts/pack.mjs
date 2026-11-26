@@ -15,13 +15,14 @@
 //   node scripts/pack.mjs --out <path>
 
 import { execFileSync } from 'node:child_process'
-import { cpSync, existsSync, lstatSync, mkdirSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import { cpSync, existsSync, lstatSync, mkdirSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { t } from '../shared/i18n.ts'
 import { formatRelease } from '../shared/release.ts'
 import { historyHashes } from './install-notify.mjs'
 import { classify, forbiddenPatterns, scan } from './publish-public.mjs'
 import { initCliLang } from './lib/lang.mjs'
+import { insideNodeModules, runtimePackages } from './lib/tarPolicy.mjs'
 
 // ★ Language first (before any message is built)
 initCliLang()
@@ -55,13 +56,14 @@ if (!existsSync(join(ROOT, 'web/dist/index.html'))) {
 }
 
 // ★ ② Collect the node_modules needed at runtime (⚠️ no dev ones)
-const runtime = execFileSync('npm', ['ls', '--all', '--parseable', '--omit=dev', '--workspace', 'agent'], {
+const runtimeLines = execFileSync('npm', ['ls', '--all', '--parseable', '--omit=dev', '--workspace', 'agent'], {
   cwd: ROOT,
   encoding: 'utf8',
 })
   .trim()
   .split('\n')
-  .filter((p) => p.includes(`${ROOT}/node_modules/`))
+// ★★ Only packages that really live in node_modules: a workspace link would copy the on-disk `agent/` (review DIST-2)
+const runtime = runtimePackages(runtimeLines, ROOT, (p) => realpathSync(p))
 if (runtime.length === 0) {
   console.error(t('✗ 実行時の依存を1つも見つけられませんでした（npm install が要ります）', '✗ Found no runtime dependencies (run npm install)'))
   process.exit(1)
@@ -125,8 +127,10 @@ if (refused.length) {
   process.exit(1)
 }
 cpSync(join(ROOT, 'web/dist'), join(stage, 'web/dist'), { recursive: true })
+// ⚠️ Each entry checked as it is copied: a link inside a package that leads out of node_modules is not followed (DIST-2)
+const stayInside = insideNodeModules(ROOT, (p) => realpathSync(p))
 for (const p of runtime) {
-  cpSync(p, join(stage, p.slice(ROOT.length + 1)), { recursive: true, dereference: true })
+  cpSync(p, join(stage, p.slice(ROOT.length + 1)), { recursive: true, dereference: true, filter: stayInside })
 }
 
 // ★ Record which version was shipped (⚠️ to match against the version shown on screen)
