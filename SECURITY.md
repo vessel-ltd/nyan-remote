@@ -33,10 +33,18 @@ What each route relies on, so you can pick the one that fits your machine:
   its key, and a registered phone can be revoked from the phone or with `nyan devices`.
 - **The Tailscale route** (self-hosting with `tailscale serve`) trusts the identity headers that `tailscale serve`
   adds, and assumes **you are the only OS user on that PC**: anyone logged in to the same PC can reach
-  `127.0.0.1:7777` and send those headers. On a shared PC, use the relay route instead.
+  `127.0.0.1:7777` and send those headers.
   Planned: device keys on the Tailscale route too, which removes this assumption.
-- **Anything running as your own OS user is trusted.** It can already run Claude Code and read your sessions; the
-  hook token in `~/.nyan-remote/` only lets your own hooks talk to the agent.
+- **One person per PC, on every route.** Your hooks and the `nyan` commands send the hook token to the agent's local
+  port (`127.0.0.1:7777` by default) without checking who is listening there. Another OS user on the same PC who takes
+  that port while the agent is not running (a restart, an update, a crash) receives the token, and receives the approval
+  requests sent meanwhile and can answer them. The token is enough to pair a phone, which then controls your sessions.
+  Do not run nyan-remote on a PC where other people have accounts.
+  The hooks are installed for one port: if you move the agent to another port, hooks left pointing at the old one
+  keep sending the token there while the agent runs elsewhere (`hooks/notify.sh` defaults to 7777 unless
+  `NYAN_REMOTE_HOOK_URL` is set).
+- **Anything running as your own OS user is trusted.** It can already run Claude Code and read your sessions.
+  The hook token in `~/.nyan-remote/` (readable only by you) can pair a phone, so treat it like a key to your sessions.
 
 Reports that go beyond these limits are especially welcome.
 

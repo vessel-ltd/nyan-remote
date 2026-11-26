@@ -10,7 +10,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { PLAN_LIMITS } from '../../shared/license.ts'
-import { FREE_MACHINES_PER_PHONE, PHONE_IDLE_MS, PHONE_ROOMS_MAX, claimRoom, prunePhoneLedger, readPhoneLedger, type PhoneLedger } from './phoneLedger.ts'
+import { FREE_MACHINES_PER_PHONE, PHONE_IDLE_MS, PHONE_ROOMS_MAX, claimRoom, phoneSweepAt, prunePhoneLedger, readPhoneLedger, type PhoneLedger } from './phoneLedger.ts'
 
 const EMPTY: PhoneLedger = { rooms: {} }
 const T0 = 1_700_000_000_000
@@ -86,4 +86,14 @@ test('★★ takeover moves the free slot here and names the rooms it left (the 
   assert.deepEqual(lic.ledger.rooms, { B: { first: T0 + 1, last: T0 + 2 } })
   // ⚠️ Without takeover, B is refused while A holds the slot (the mutation "takeover by default" must fail here)
   assert.equal(claimRoom(a.ledger, 'B', false, T0 + 1).ok, false)
+})
+
+test('★★ ACC-3: the phone ledger sweeps at the first room expiry; nothing left = undefined (the DO deletes its storage)', () => {
+  const T = 1_800_000_000_000
+  assert.equal(phoneSweepAt({ rooms: {} }), undefined)
+  const l: PhoneLedger = { rooms: { A: { first: T, last: T + 9 }, B: { first: T, last: T + 2 } } }
+  assert.equal(phoneSweepAt(l), T + 2 + PHONE_IDLE_MS + 1)
+  assert.deepEqual(Object.keys(prunePhoneLedger(l, T + 2 + PHONE_IDLE_MS).rooms), ['A', 'B'])
+  assert.deepEqual(Object.keys(prunePhoneLedger(l, T + 2 + PHONE_IDLE_MS + 1).rooms), ['A'])
+  assert.equal(phoneSweepAt(prunePhoneLedger(l, T + 10 + PHONE_IDLE_MS)), undefined)
 })

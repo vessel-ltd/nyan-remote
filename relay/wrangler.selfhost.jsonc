@@ -13,6 +13,8 @@
   "name": "nyan-relay",
   "main": "src/worker.ts",
   "compatibility_date": "2026-01-01",
+  // ★ One deleteAll() also removes the alarm (an emptied ledger leaves nothing behind / 2026-11-26 / `keepLedger`)
+  "compatibility_flags": ["delete_all_deletes_alarm"],
   // ⚠️ Per-version preview URLs would add public entry points running old code
   "preview_urls": false,
   "workers_dev": true,

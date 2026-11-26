@@ -67,6 +67,15 @@ export function prunePhoneLedger(prev: PhoneLedger, now: number): PhoneLedger {
 }
 
 /**
+ * ★★ When the next room runs out (2026-11-26 / review ACC-3). The Phones DO sets its alarm here and prunes then
+ *   (⚠️ a phone that never came back kept "phone key → machine keys" with times for good). undefined = nothing left.
+ */
+export function phoneSweepAt(prev: PhoneLedger): number | undefined {
+  const times = Object.values(readPhoneLedger(prev).rooms).map((e) => e.last + PHONE_IDLE_MS + 1)
+  return times.length ? Math.min(...times) : undefined
+}
+
+/**
  * ★ May this phone use this machine (`agentKey`) on the free tier?
  *   - `licensed` (the room has a plan ticket) ⇒ pass, and **release** the room from this ledger (it is counted by the account instead)
  *   - `takeover` ⇒ the free slot **moves** here: every other room is dropped (returned in `moved`) and this one is claimed

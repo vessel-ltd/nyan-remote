@@ -151,6 +151,21 @@ export function pruneLedger(prev: Ledger, now: number): Ledger {
   return out
 }
 
+/**
+ * ★★ When the next entry runs out (2026-11-26 / review ACC-3). The Accounts DO sets its alarm here and prunes then
+ *   (⚠️ pruning used to run only inside the next request to the same ledger = a ledger nobody used again kept machine keys,
+ *   passphrase numbers and times for good, against "forgets a machine after 30 days unused").
+ *   ⚠️ undefined = nothing left (the DO deletes its storage).
+ */
+export function ledgerSweepAt(prev: Ledger): number | undefined {
+  const l = readLedger(prev)
+  const times = [
+    ...Object.values(l.machines).flatMap((e) => [e.last, ...Object.values(e.mids)].map((t) => t + MACHINE_IDLE_MS + 1)),
+    ...Object.values(l.revoked).map((until) => until + 1),
+  ]
+  return times.length ? Math.min(...times) : undefined
+}
+
 /** ★ The hooks the removal procedure uses (wired by the Accounts DO in `worker.ts`) */
 export interface ReleaseIo {
   read(): Promise<Ledger>

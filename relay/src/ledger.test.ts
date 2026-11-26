@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { claimMachine, LEDGER_MAX, releaseCredential, MACHINE_IDLE_MS, pruneLedger, readLedger, REVOKED_KEEP_MS, revokeCredential, type Ledger } from './ledger.ts'
+import { readFileSync } from 'node:fs'
+import { claimMachine, LEDGER_MAX, ledgerSweepAt, releaseCredential, MACHINE_IDLE_MS, pruneLedger, readLedger, REVOKED_KEEP_MS, revokeCredential, type Ledger } from './ledger.ts'
 
 const T = 1_800_000_000_000
 const empty = (): Ledger => ({ machines: {}, revoked: {} })
@@ -153,4 +154,46 @@ test('★★ once both removals for the same slot finish, the slot is freed (do 
   assert.ok('K' in l.machines, '★ A is still using it')
   await releaseCredential(io, 'K', 'm_a')
   assert.equal('K' in l.machines, false, '⚠️⚠️ the slot stayed although no passphrase is left (cannot replace the machine)')
+})
+
+// ── Timed sweep (2026-11-26 / review ACC-3) ─────────────────────────────────────────────
+
+test('★★ ACC-3: the sweep time is the first expiry (machine, passphrase number or removed number); nothing left = undefined', () => {
+  assert.equal(ledgerSweepAt(empty()), undefined)
+  const l: Ledger = {
+    machines: { A: { first: T, last: T + 5, mids: { m1: T + 3, m2: T + 5 } } },
+    revoked: {},
+  }
+  assert.equal(ledgerSweepAt(l), T + 3 + MACHINE_IDLE_MS + 1, '⚠️ the old passphrase number runs out first')
+  // ★ At that time pruning really changes something (the alarm must not fire one tick early and find nothing to do)
+  assert.deepEqual(Object.keys(pruneLedger(l, T + 3 + MACHINE_IDLE_MS).machines.A!.mids), ['m1', 'm2'])
+  assert.deepEqual(Object.keys(pruneLedger(l, T + 3 + MACHINE_IDLE_MS + 1).machines.A!.mids), ['m2'])
+  const r: Ledger = { machines: {}, revoked: { mOld: T + REVOKED_KEEP_MS } }
+  assert.equal(ledgerSweepAt(r), T + REVOKED_KEEP_MS + 1)
+  assert.deepEqual(pruneLedger(r, T + REVOKED_KEEP_MS + 1).revoked, {})
+  // Everything ran out ⇒ the next sweep finds nothing (the DO deletes its storage)
+  assert.equal(ledgerSweepAt(pruneLedger(l, T + 6 + MACHINE_IDLE_MS)), undefined)
+})
+
+test('★★ ACC-3: the Accounts and Phones DOs set an alarm on every write and prune in alarm() (worker.ts is not run by npm test)', () => {
+  const src = readFileSync(new URL('./worker.ts', import.meta.url), 'utf8')
+    .split('\n')
+    .filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l))
+    .join('\n')
+  const cls = (name: string) => src.slice(src.indexOf(`export class ${name} `), src.indexOf('\nexport class', src.indexOf(`export class ${name} `) + 1))
+  const accounts = cls('Accounts')
+  const phones = cls('Phones')
+  assert.doesNotMatch(accounts + phones, /storage\.put\(/, '⚠️⚠️ a ledger write that sets no alarm (the ledger would never be swept)')
+  assert.match(accounts, /keepLedger\(this\.ctx\.storage, 'machines', l, ledgerSweepAt\(l\)\)/)
+  assert.match(accounts, /async alarm\(\)[\s\S]*pruneLedger\(await this\.#read\(\), Date\.now\(\)\)/)
+  assert.match(phones, /keepLedger\(this\.ctx\.storage, 'rooms', r\.ledger, phoneSweepAt\(r\.ledger\)\)/)
+  assert.match(phones, /async alarm\(\)[\s\S]*blockConcurrencyWhile[\s\S]*prunePhoneLedger\([\s\S]*keepLedger\(this\.ctx\.storage, 'rooms', l, phoneSweepAt\(l\)\)/)
+  const keep = src.slice(src.indexOf('async function keepLedger'), src.indexOf('\n}\n', src.indexOf('async function keepLedger')))
+  assert.match(keep, /if \(sweepAt === undefined\) \{\s*await storage\.deleteAll\(\)\s*return/, '⚠️ an empty ledger must leave no storage (one deleteAll, which also drops the alarm)')
+  assert.doesNotMatch(keep, /deleteAlarm/, '⚠️ deleteAlarm after deleteAll writes the alarm metadata back')
+  for (const name of ['wrangler.jsonc', 'wrangler.selfhost.jsonc']) {
+    const cfg = readFileSync(new URL(`../${name}`, import.meta.url), 'utf8')
+    assert.match(cfg, /"compatibility_flags":\s*\[[^\]]*"delete_all_deletes_alarm"/, `⚠️⚠️ ${name}: deleteAll() keeps the alarm without this flag`)
+  }
+  assert.match(keep, /const wrote = storage\.put\(name, value\)\s*const armed = storage\.setAlarm\(sweepAt\)\s*await Promise\.all\(\[wrote, armed\]\)/, '⚠️⚠️ an await between the write and the alarm (they must commit together)')
 })

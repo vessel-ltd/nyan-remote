@@ -205,7 +205,8 @@ The default relay is operated by us:
 | **Plus** | $2.99/month or $24/year | 5 machines, 5 phones |
 
 Free is counted per phone: each phone can use one machine through our relay without signing in (the phone proves its
-key to the relay; nothing else is stored about it). Pairing another machine moves your free machine to it, and the
+key to the relay, which remembers that phone key and the machine it used for free until 30 days after their last use;
+see the [privacy policy](https://nyan-remote.app/legal/privacy/)). Pairing another machine moves your free machine to it, and the
 connections page can move it back with one tap. For several machines on one phone, sign in on each PC with `nyan login`
 and manage your plan at <https://account.nyan-remote.app>. Every feature works on the free plan.
 If you would rather not depend on our relay, there are two alternatives, both free,
@@ -266,7 +267,7 @@ With several PCs, open the app from one of them (say `pc-a`) and pair the others
 (Nothing is accepted automatically: any web page served from any machine of your tailnet would otherwise be able to
 use your Tailscale identity against the agent.)
 
-The Tailscale route assumes you are the only OS user on that PC; on a shared PC use the relay route
+nyan-remote assumes you are the only OS user on the PC, on every route: do not run it on a shared PC
 (see [Assumptions and known limitations](SECURITY.md#assumptions-and-known-limitations)).
 
 Measured on the author's setup (3 machines, a full working day): the Durable Object was awake for

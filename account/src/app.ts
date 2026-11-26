@@ -18,7 +18,7 @@ import { licenseFor, PLAN_LIMITS, type License } from '../../shared/license.ts'
 import { adminPage, DEFAULT_SPIKE_DAILY, usageAlerts, type UsageDay } from './ops.ts'
 import { accountPage, landingPage, SUPPORT_NAME_MAX } from './pages.ts'
 import { cookieOf, makeSession, readSession, SESSION_COOKIE, SESSION_TTL_SEC, setCookie, STATE_COOKIE } from './session.ts'
-import { machineGroups, OPEN_STATUSES, planOf, summarize, type AccountRow, type Store } from './store.ts'
+import { machineGroups, OPEN_STATUSES, planOf, RECHECK_MS, summarize, type AccountRow, type LeaseKind, type Store } from './store.ts'
 import type { CheckoutParams, StripeApi } from './stripe.ts'
 import { StripeError, verifyWebhook } from './stripe.ts'
 
@@ -91,6 +91,51 @@ export async function runOps(d: Deps): Promise<number | 'off'> {
     sent += 1
   }
   return sent
+}
+
+/** ★ Accounts re-read from Stripe per cron run (⚠️ bounded: one Stripe call each, run every hour) */
+export const UPKEEP_SYNC_LIMIT = 50
+/** ⚠️ No new Stripe read starts after this (a cron run may last 15 minutes; one re-read is at most a few Stripe calls of 10 s) */
+export const UPKEEP_BUDGET_MS = 5 * 60 * 1000
+/** ⚠️ The thanks page re-reads at most this often */
+export const THANKS_REREAD_MS = 60_000
+/** ★ A Checkout lasts 24 hours at Stripe ⇒ the cron re-reads hourly for a little longer after handing one out */
+export const CHECKOUT_WATCH_MS = 25 * 60 * 60 * 1000
+/** ★ Support marks only count the day's sends (UTC) ⇒ two days is enough */
+export const SUPPORT_MARK_KEEP_MS = 2 * 24 * 60 * 60 * 1000
+
+/**
+ * ★★ Hourly upkeep (2026-11-26 / `scheduled` in `worker.ts`).
+ *   ① review ACC-1: re-read from Stripe the accounts whose webhook never finished, whose paid period ended, or that are
+ *      paid and were not re-read for `RECHECK_MS` (D1 changed the plan only inside a webhook, and a held lease made every
+ *      webhook 503 ⇒ a cancelled plan stayed Plus).
+ *      ⚠️ The same `syncAccount` as the webhook (lease, re-read until it settles). Every try is remembered (`markSyncTried`)
+ *      and the least recently tried go first ⇒ accounts that stay busy or failing cannot hold the batch.
+ *   ② review ACC-3: delete machines unused for `MACHINE_FORGET_MS` in **every** account (it used to run only when that
+ *      account signed in or opened the page = accounts nobody uses kept their machines for good).
+ *   ③ review ACC-2: drop support marks older than two days (they held the account id with no end).
+ */
+export async function runUpkeep(d: Deps): Promise<{ synced: number; busy: number; failed: number }> {
+  const now = d.now()
+  let synced = 0
+  let busy = 0
+  let failed = 0
+  // ★ Deletions first: a slow Stripe must not keep them from running (codex: 50 slow reads outlast the cron's time)
+  await d.store.pruneIdleMachines(now - MACHINE_FORGET_MS)
+  await d.store.pruneSupportMarks(now - SUPPORT_MARK_KEEP_MS)
+  for (const acct of await d.store.syncCandidates(now, now - RECHECK_MS, UPKEEP_SYNC_LIMIT)) {
+    // ⚠️ Stop starting new reads after the budget (the rest stay due for the next hour; least recently tried go first)
+    if (d.now() - now > UPKEEP_BUDGET_MS) break
+    await d.store.markSyncTried(acct.id, now)
+    try {
+      if (await syncAccount(d, acct)) synced += 1
+      else busy += 1
+    } catch (err) {
+      failed += 1
+      console.error('[upkeep] sync failed', acct.id, err instanceof Error ? err.message : String(err))
+    }
+  }
+  return { synced, busy, failed }
 }
 
 /** ⚠️ Limit on machine passphrases per account (do not let disposable ones pile up) */
@@ -244,16 +289,16 @@ interface Lease {
   renew(): Promise<void>
 }
 
-async function withLease<T>(d: Deps, acct: string, fn: (lease: Lease) => Promise<T>): Promise<T | undefined> {
+async function withLease<T>(d: Deps, acct: string, kind: LeaseKind, fn: (lease: Lease) => Promise<T>): Promise<T | undefined> {
   const token = toBase64Url(d.random(18))
-  if (!(await d.store.acquireLease(acct, token, d.now(), LEASE_MS))) return undefined
+  if (!(await d.store.acquireLease(acct, kind, token, d.now(), LEASE_MS))) return undefined
   const renew = async () => {
-    if (!(await d.store.renewLease(acct, token, d.now(), LEASE_MS))) throw new Error('lease lost')
+    if (!(await d.store.renewLease(acct, kind, token, d.now(), LEASE_MS))) throw new Error('lease lost')
   }
   try {
     return await fn({ token, renew })
   } finally {
-    await d.store.releaseLease(acct, token).catch(() => undefined)
+    await d.store.releaseLease(acct, kind, token).catch(() => undefined)
   }
 }
 
@@ -269,12 +314,19 @@ async function syncAccount(d: Deps, acct: AccountRow): Promise<boolean> {
   const customer = acct.stripeCustomer
   if (!customer) return true
   await d.store.bumpSync(acct.id)
-  const done = await withLease(d, acct.id, async (lease) => {
+  // ⚠️ The `sync` lease (never the Checkout one: a loop of Checkouts must not keep the re-read busy / codex)
+  const done = await withLease(d, acct.id, 'sync', async (lease) => {
     for (let round = 0; round < SYNC_ROUNDS; round++) {
       const before = (await d.store.accountById(acct.id))?.syncWanted
       const subs = await d.stripe.listSubscriptions(customer, lease.renew)
       await lease.renew()
-      if (!(await d.store.writeSync(acct.id, lease.token, summarize(subs), d.now()))) throw new Error('lease lost')
+      // ★ `before` is what this read reflects (`syncDone` / review ACC-1: a re-read asked after it stays pending for the cron)
+      // ⚠️⚠️ Written only while `syncWanted` is still `before` (codex: a payment notified during a slow read was overwritten by
+      //    the stale result for a moment = a Free ticket). Not written: a lost lease throws (`renew`), otherwise read again
+      if (!(await d.store.writeSync(acct.id, lease.token, summarize(subs), d.now(), before ?? 0))) {
+        await lease.renew()
+        continue
+      }
       if ((await d.store.accountById(acct.id))?.syncWanted === before) return true
     }
     return false
@@ -357,6 +409,9 @@ async function startCheckout(d: Deps, acct: AccountRow, choice: PriceChoice, lea
   await lease.renew()
   const stored = JSON.stringify({ params: p, at: d.now() })
   if (!(await d.store.setCheckoutAttempt(acct.id, lease.token, { key, params: stored }, d.now()))) throw new Error('lease lost')
+  // ★ Watch this account for a day (2026-11-26 / codex: a payment whose webhooks were lost, by a buyer who closed the tab
+  //   before the thanks page, left a payer on Free with nothing for the cron to notice). Set before creating = covers every URL
+  await d.store.watchSync(acct.id, d.now() + CHECKOUT_WATCH_MS)
   // ⚠️ Check the lease once more right before creating (if the response writing the attempt was late and the lease expired, the successor is recovering with the same key / round 30, high #1)
   await lease.renew()
   const made = await d.stripe.createCheckout(p, key)
@@ -475,7 +530,7 @@ export async function handle(req: Request, d: Deps): Promise<Response> {
       )
       if (!created) return json({ error: 'too-many-machines' }, 409)
       // ⚠️ The passphrase is shown only this once
-      return json({ credential, account: { id: acct.id, login: acct.githubLogin, plan: planOf(acct) } })
+      return json({ credential, account: { id: acct.id, login: acct.githubLogin, plan: planOf(acct, d.now()) } })
     }
     if (method === 'GET' && path === '/api/license') {
       const cred = bearer(req)
@@ -495,7 +550,7 @@ export async function handle(req: Request, d: Deps): Promise<Response> {
         if (again.agentKey !== key) return json({ error: 'key-mismatch' }, 409)
       } else if (m.agentKey !== key) return json({ error: 'key-mismatch' }, 409)
       await d.store.touchMachine(m.id, d.now())
-      const plan = planOf(acct)
+      const plan = planOf(acct, d.now())
       const lic = licenseFor(acct.id, key, m.id, plan, Math.floor(d.now() / 1000))
       return json({ license: await d.signLicense(lic), plan, login: acct.githubLogin, ...PLAN_LIMITS[plan], exp: lic.exp })
     }
@@ -564,10 +619,25 @@ export async function handle(req: Request, d: Deps): Promise<Response> {
     if (method === 'GET' && path === '/') {
       if (!acct) return html(landingPage(url.searchParams.get('e') === 'login'))
       await d.store.pruneMachines(acct.id, d.now() - MACHINE_FORGET_MS)
+      // ★ Back from a paid Checkout (`successUrl`): re-read now (2026-11-26 / codex: with the webhook endpoint down, a paying
+      //   customer stayed Free and the cron had no reason to look). ⚠️ Best effort: a busy or failing read stays pending
+      //   (`syncAccount` bumps first) and the cron picks it up.
+      //   ⚠️ Only while a Checkout handed out in the last day is watched, and at most once a minute (codex: reloading the
+      //   page must not spend the Stripe rate limit every customer shares)
+      let shown = acct
+      if (
+        url.searchParams.get('n') === 'thanks' &&
+        acct.stripeCustomer &&
+        (acct.syncWatch ?? 0) >= d.now() &&
+        (await d.store.claimSyncTry(acct.id, d.now(), THANKS_REREAD_MS))
+      ) {
+        await syncAccount(d, acct).catch((err) => console.error('[account] thanks re-read failed', err instanceof Error ? err.message : String(err)))
+        shown = (await d.store.accountById(acct.id)) ?? acct
+      }
       return html(
         accountPage({
-          account: acct,
-          plan: planOf(acct),
+          account: shown,
+          plan: planOf(shown, d.now()),
           machines: await d.store.machinesOf(acct.id),
           notice: url.searchParams.get('n') ?? undefined,
           admin: (d.config.adminGithubIds ?? []).includes(acct.githubId),
@@ -599,7 +669,7 @@ export async function handle(req: Request, d: Deps): Promise<Response> {
         if (!(PRICE_CHOICES as readonly string[]).includes(choice)) return redirect('/?n=bad-price')
         // ⚠️⚠️ **Only the one lease holder** checks "no subscription, no open Checkout" and creates one (codex round 27, high #2:
         //    two tabs could both read "none" and each create a Checkout). If the lease cannot be acquired, "wait a moment".
-        const to = await withLease(d, acct.id, (lease) => startCheckout(d, acct, choice as PriceChoice, lease)).catch((err) => {
+        const to = await withLease(d, acct.id, 'checkout', (lease) => startCheckout(d, acct, choice as PriceChoice, lease)).catch((err) => {
           if (err instanceof Busy) return undefined
           throw err
         })
@@ -622,7 +692,7 @@ export async function handle(req: Request, d: Deps): Promise<Response> {
         if (!d.ops?.sendAlert) return redirect('/?n=support-failed#support')
         const date = new Date(d.now()).toISOString().slice(0, 10)
         const lines = [
-          `From: ${acct.githubLogin} (GitHub id ${acct.githubId}, account ${acct.id}, plan ${planOf(acct)})`,
+          `From: ${acct.githubLogin} (GitHub id ${acct.githubId}, account ${acct.id}, plan ${planOf(acct, d.now())})`,
           `Name: ${name || '(not given)'}`,
           `Reply to: ${email || '(not given — reply through GitHub)'}`,
           `Machines: ${machineGroups(await d.store.machinesOf(acct.id)).length}`,
@@ -708,7 +778,7 @@ async function onWebhook(req: Request, d: Deps): Promise<Response> {
       return json({ ok: true })
     }
   }
-  // ⚠️ Someone else is re-reading, or it will not settle ⇒ 503 (Stripe resends = nothing is lost)
+  // ⚠️ Someone else is re-reading, or it will not settle ⇒ 503 (Stripe resends; if it gives up, the hourly `runUpkeep` re-reads)
   if (!(await syncAccount(d, acct))) return json({ error: 'busy' }, 503)
   return json({ ok: true })
 }

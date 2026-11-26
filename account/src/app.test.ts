@@ -3,13 +3,14 @@ import assert from 'node:assert/strict'
 import { createHmac } from 'node:crypto'
 import { test } from 'node:test'
 import { importLicensePublicKey, signLicense, verifyLicense, type License } from '../../shared/license.ts'
-import { AGENT_KEY_HEADER, ATTEMPT_SETTLE_MS, handle, loginBucket, MACHINE_FORGET_MS, MACHINE_REFUSE_MS, MAX_MACHINE_CREDENTIALS, sha256b64, type Deps } from './app.ts'
+import { AGENT_KEY_HEADER, ATTEMPT_SETTLE_MS, handle, loginBucket, MACHINE_FORGET_MS, MACHINE_REFUSE_MS, MAX_MACHINE_CREDENTIALS, runUpkeep, sha256b64, SUPPORT_MARK_KEEP_MS, UPKEEP_SYNC_LIMIT, CHECKOUT_WATCH_MS, THANKS_REREAD_MS, UPKEEP_BUDGET_MS, type Deps } from './app.ts'
 import { makeSession, SESSION_COOKIE } from './session.ts'
-import { memoryStore, summarize } from './store.ts'
+import { memoryStore, PLAN_GRACE_MS, planOf, RECHECK_MS, summarize } from './store.ts'
 import { StripeError } from './stripe.ts'
 
 const ORIGIN = 'https://account.nyan-remote.app'
 const T = 1_800_000_000_000
+const DAY = 24 * 60 * 60 * 1000
 
 async function rig() {
   const keys = (await crypto.subtle.generateKey({ name: 'Ed25519' }, true, ['sign', 'verify'])) as unknown as {
@@ -582,8 +583,8 @@ test('★★ webhook: an account with no bound customer yet is looked up from th
 test('★★ the Stripe list follows continuations (sync does not stop beyond 100 items / codex round 27, medium #8)', async () => {
   const { stripeApi } = await import('./stripe.ts')
   const pages = [
-    { data: Array.from({ length: 100 }, (_, i) => ({ id: `sub_${i}`, status: 'canceled' })), has_more: true },
-    { data: [{ id: 'sub_live', status: 'active' }], has_more: false },
+    { object: 'list', data: Array.from({ length: 100 }, (_, i) => ({ id: `sub_${i}`, status: 'canceled' })), has_more: true },
+    { object: 'list', data: [{ id: 'sub_live', status: 'active' }], has_more: false },
   ]
   const seen: string[] = []
   const api = stripeApi('rk_test', async (url) => {
@@ -593,6 +594,27 @@ test('★★ the Stripe list follows continuations (sync does not stop beyond 10
   const subs = await api.listSubscriptions('cus_1')
   assert.equal(subs.length, 101)
   assert.match(seen[1]!, /starting_after=sub_99/)
+})
+
+test('★★ a Stripe list that did not read (cut body, not a list, a broken item) throws instead of reading as "no subscription" (2026-11-26 / codex)', async () => {
+  const { stripeApi } = await import('./stripe.ts')
+  for (const body of ['{"object":"list","da', '{}', JSON.stringify({ data: [], has_more: false }), JSON.stringify({ object: 'list', data: [{ id: 'sub_1' }], has_more: false })]) {
+    const api = stripeApi('rk_test', async () => new Response(body))
+    await assert.rejects(api.listSubscriptions('cus_1'), Error, `⚠️⚠️ read ${body} as a list`)
+  }
+  // The rig: a cut reply during the hourly re-read keeps the stored Plus and stays due
+  const r = await rig()
+  const { body } = await login(r)
+  const acct = body.account.id
+  await r.store.setCustomerIfNone(acct, 'cus_1')
+  r.subs.set('cus_1', [{ id: 'sub_1', status: 'active', periodEnd: T + DAY }])
+  await hook(r, 'evt_1')
+  r.advance(DAY + 1)
+  r.stripeHooks.beforeList = async () => {
+    throw new Error('stripe list: not a list')
+  }
+  assert.deepEqual(await runUpkeep(r.d), { synced: 0, busy: 0, failed: 1 })
+  assert.equal(r.store.accounts.get(acct)!.subscriptionStatus, 'active')
 })
 
 test('★★ a Checkout half-made by a previous holder whose lease expired is recovered with the same key and closed by the successor (codex round 28, high #1)', async () => {
@@ -1106,4 +1128,344 @@ test('★★ billing line: the wording follows the stored dates; the clock only 
   assert.equal(billingLine(within, OCT + 1), '<p>Cancellation scheduled (not renewing).</p>', '⚠️⚠️ fell back to the period end')
   // cancel_at with no known period: no "not renewing" claim
   assert.equal(billingLine({ ...base, subscriptionCancelling: true, subscriptionCancelAt: DEC }, OCT), '<p class="dim">Cancellation scheduled for 2027-12-27.</p>')
+})
+
+// ── Hourly upkeep (2026-11-26 / review ACC-1 and ACC-3) ─────────────────────────────────────────────
+
+/** A webhook signed at the rig's current time (`hook` signs at `T`, which is too old once the clock moved on) */
+const hookNow = (r: Awaited<ReturnType<typeof rig>>, id: string, type = 'customer.subscription.updated') => {
+  const e = JSON.stringify({ id, type, data: { object: { id: 'sub_x', customer: 'cus_1', status: 'ignored' } } })
+  return r.call('/stripe/webhook', { method: 'POST', body: e, headers: signed(e, 'whsec_test', Math.floor(r.d.now() / 1000)) })
+}
+
+test('★★ ACC-1: holding the lease made every webhook 503 and a cancelled plan stayed Plus — now Free after the grace, and the cron re-reads it', async () => {
+  const r = await rig()
+  const { body } = await login(r)
+  const acct = body.account.id
+  await r.store.setCustomerIfNone(acct, 'cus_1')
+  const end = T + 10 * DAY
+  r.subs.set('cus_1', [{ id: 'sub_1', status: 'active', periodEnd: end, cancelling: true }])
+  assert.equal((await hook(r, 'evt_1')).status, 200)
+  assert.equal(await planNow(r, body.credential), 'plus')
+  // The period ends; Stripe now says cancelled. ★ The owner keeps the Checkout lease (Checkout in a loop): no longer blocks the re-read
+  r.subs.set('cus_1', [{ id: 'sub_1', status: 'canceled', periodEnd: end }])
+  r.advance(10 * DAY + 1)
+  assert.ok(await r.store.acquireLease(acct, 'checkout', 'hog', r.d.now(), 100 * DAY))
+  assert.equal((await hookNow(r, 'evt_2', 'customer.subscription.deleted')).status, 200, '⚠️⚠️ a held Checkout lease made the webhook busy')
+  assert.equal(await planNow(r, body.credential), 'free')
+  // Even if the re-read itself stays busy (a stuck holder of the sync lease), Plus does not outlive the grace
+  r.subs.set('cus_1', [{ id: 'sub_1', status: 'active', periodEnd: end }])
+  await hookNow(r, 'evt_3')
+  r.subs.set('cus_1', [{ id: 'sub_1', status: 'canceled', periodEnd: end }])
+  assert.ok(await r.store.acquireLease(acct, 'sync', 'hog', r.d.now(), 100 * DAY))
+  assert.equal((await hookNow(r, 'evt_4', 'customer.subscription.deleted')).status, 503)
+  assert.equal(await planNow(r, body.credential), 'plus', '★ within the grace a stale status is still believed (a late renewal webhook must not drop Plus)')
+  // ★ The cron cannot take the lease either: counted as busy, tried again next hour
+  assert.deepEqual(await runUpkeep(r.d), { synced: 0, busy: 1, failed: 0 })
+  r.advance(PLAN_GRACE_MS)
+  assert.equal(await planNow(r, body.credential), 'free', '⚠️⚠️ a paid status long past its period end still gave Plus tickets')
+  // The lease is let go ⇒ the cron re-reads from Stripe
+  await r.store.releaseLease(acct, 'sync', 'hog')
+  assert.deepEqual(await runUpkeep(r.d), { synced: 1, busy: 0, failed: 0 })
+  assert.equal(r.store.accounts.get(acct)!.subscriptionStatus, 'canceled')
+  assert.deepEqual(await runUpkeep(r.d), { synced: 0, busy: 0, failed: 0 }, '⚠️ re-read a settled account again')
+})
+
+test('★★ ACC-1: a webhook that could not finish (503) is re-read by the next cron run, once', async () => {
+  const r = await rig()
+  const { body } = await login(r)
+  const acct = body.account.id
+  await r.store.setCustomerIfNone(acct, 'cus_1')
+  r.subs.set('cus_1', [{ id: 'sub_1', status: 'active', periodEnd: T + 30 * DAY }])
+  assert.ok(await r.store.acquireLease(acct, 'sync', 'other', r.d.now(), 1000))
+  assert.equal((await hook(r, 'evt_1', 'customer.subscription.created')).status, 503)
+  assert.equal(await planNow(r, body.credential), 'free')
+  r.advance(1001)
+  assert.deepEqual(await runUpkeep(r.d), { synced: 1, busy: 0, failed: 0 }, '⚠️⚠️ a 503 webhook was never re-read (sync_wanted had no reader)')
+  assert.equal(await planNow(r, body.credential), 'plus')
+  assert.deepEqual(await runUpkeep(r.d), { synced: 0, busy: 0, failed: 0 })
+})
+
+test('★★ ACC-1: a re-read that never settles stays pending (syncDone is what the read reflects, not the count at the end)', async () => {
+  const r = await rig()
+  const { body } = await login(r)
+  const acct = body.account.id
+  await r.store.setCustomerIfNone(acct, 'cus_1')
+  r.subs.set('cus_1', [{ id: 'sub_1', status: 'active', periodEnd: T + 30 * DAY }])
+  // Another notification arrives during every read ⇒ the loop gives up (503)
+  r.stripeHooks.beforeList = async () => r.store.bumpSync(acct)
+  assert.equal((await hook(r, 'evt_1')).status, 503)
+  const a = r.store.accounts.get(acct)!
+  assert.ok((a.syncWanted ?? 0) > (a.syncDone ?? 0), '⚠️⚠️ marked done although notifications arrived after the last read')
+  r.stripeHooks.beforeList = undefined
+  assert.deepEqual(await runUpkeep(r.d), { synced: 1, busy: 0, failed: 0 })
+})
+
+test('★★ ACC-1: a paid period that ended is re-read even without a pending webhook (a renewal moves the period on and it stops)', async () => {
+  const r = await rig()
+  const { body } = await login(r)
+  const acct = body.account.id
+  await r.store.setCustomerIfNone(acct, 'cus_1')
+  r.subs.set('cus_1', [{ id: 'sub_1', status: 'active', periodEnd: T + DAY }])
+  await hook(r, 'evt_1')
+  assert.deepEqual(await runUpkeep(r.d), { synced: 0, busy: 0, failed: 0 }, '⚠️ re-read a current paid period')
+  // The renewal webhook is lost; Stripe moved the period on
+  r.subs.set('cus_1', [{ id: 'sub_1', status: 'active', periodEnd: T + 31 * DAY }])
+  r.advance(DAY + 1)
+  assert.deepEqual(await runUpkeep(r.d), { synced: 1, busy: 0, failed: 0 })
+  assert.equal(r.store.accounts.get(acct)!.subscriptionPeriodEnd, T + 31 * DAY)
+  assert.deepEqual(await runUpkeep(r.d), { synced: 0, busy: 0, failed: 0 })
+  // A failing Stripe is counted and tried again (never thrown out of the cron)
+  r.advance(30 * DAY)
+  r.stripeHooks.beforeList = async () => {
+    throw new Error('stripe down')
+  }
+  assert.deepEqual(await runUpkeep(r.d), { synced: 0, busy: 0, failed: 1 })
+})
+
+test('★★ planOf: paid statuses are Plus until paidThrough + grace (exactly at the edge still Plus); a row not re-read yet = Plus', () => {
+  const a = { id: 'a', githubId: 1, githubLogin: 'x', created: 0, subscriptionStatus: 'active', subscriptionPeriodEnd: T, paidThrough: T }
+  assert.equal(planOf(a, T + PLAN_GRACE_MS), 'plus')
+  assert.equal(planOf(a, T + PLAN_GRACE_MS + 1), 'free')
+  assert.equal(planOf({ ...a, subscriptionStatus: 'past_due' }, T), 'plus')
+  assert.equal(planOf({ ...a, subscriptionStatus: 'canceled' }, T), 'free')
+  // ⚠️ A row from before this version (no paidThrough): no cut-off until it is re-read (its single date may be the shorter subscription)
+  const { paidThrough: _p, ...legacy } = a
+  assert.equal(planOf(legacy, T + 100 * DAY), 'plus')
+})
+
+test('★★ ACC-3: the cron deletes idle machines of accounts nobody opens; ACC-2: support marks older than two days go', async () => {
+  const r = await rig()
+  const idle = await login(r)
+  const otherAcct = await login(r, 'gho_other', KEY2)
+  r.advance(MACHINE_FORGET_MS - DAY)
+  // Only the second account's machine is used again
+  await license(r, otherAcct.body.credential, KEY2)
+  assert.ok(await r.store.reserveSupport(idle.body.account.id, '2027-01-01', 'support:a:2027-01-01:x', 5, r.d.now()))
+  assert.ok(await r.store.markAlert('usage:2027-01', r.d.now()))
+  r.advance(DAY + 1)
+  await runUpkeep(r.d)
+  assert.equal(r.store.machines.size, 1, '⚠️⚠️ a machine unused for 90 days stayed because its account never signed in again')
+  assert.ok([...r.store.machines.values()].every((m) => m.accountId === otherAcct.body.account.id))
+  assert.equal(await r.store.alerted('support:a:2027-01-01:x'), true, '⚠️ dropped a support mark of today')
+  r.advance(SUPPORT_MARK_KEEP_MS)
+  await runUpkeep(r.d)
+  assert.equal(await r.store.alerted('support:a:2027-01-01:x'), false, '⚠️ kept the support mark (it holds the account id) forever')
+  assert.equal(await r.store.alerted('usage:2027-01'), true, '⚠️⚠️ dropped a usage alert mark (it would be sent again)')
+})
+
+test('★★ ACC-1: paid accounts are re-checked weekly (a lost cancellation after past_due retries, a row without a period end)', async () => {
+  const r = await rig()
+  const { body } = await login(r)
+  const acct = body.account.id
+  await r.store.setCustomerIfNone(acct, 'cus_1')
+  // Annual Plus, payment failing: the period already moved on a year
+  r.subs.set('cus_1', [{ id: 'sub_1', status: 'past_due', periodEnd: T + 365 * DAY }])
+  await hook(r, 'evt_1')
+  assert.deepEqual(await runUpkeep(r.d), { synced: 0, busy: 0, failed: 0 })
+  // Stripe gives up and cancels; the webhook is lost
+  r.subs.set('cus_1', [{ id: 'sub_1', status: 'canceled', periodEnd: T + 365 * DAY }])
+  r.advance(RECHECK_MS - 1)
+  assert.deepEqual(await runUpkeep(r.d), { synced: 0, busy: 0, failed: 0 }, '⚠️ re-read before the week was over')
+  r.advance(2)
+  assert.deepEqual(await runUpkeep(r.d), { synced: 1, busy: 0, failed: 0 }, '⚠️⚠️ a lost cancellation kept an annual Plus until the next period end')
+  assert.equal(await planNow(r, body.credential), 'free')
+  // A paid row without any end date (never re-read since) is due too
+  const { subscriptionPeriodEnd: _e, syncChecked: _c, ...rest } = r.store.accounts.get(acct)!
+  r.store.accounts.set(acct, { ...rest, subscriptionStatus: 'active' })
+  r.subs.set('cus_1', [{ id: 'sub_1', status: 'active', periodEnd: r.d.now() + 30 * DAY }])
+  assert.deepEqual(await runUpkeep(r.d), { synced: 1, busy: 0, failed: 0 })
+})
+
+test('★★ ACC-1: a scheduled cancel_at before the period end counts as the end (plan and re-read)', async () => {
+  const r = await rig()
+  const { body } = await login(r)
+  const acct = body.account.id
+  await r.store.setCustomerIfNone(acct, 'cus_1')
+  r.subs.set('cus_1', [{ id: 'sub_1', status: 'active', periodEnd: T + 300 * DAY, cancelling: true, cancelAt: T + 10 * DAY }])
+  await hook(r, 'evt_1')
+  r.subs.set('cus_1', [{ id: 'sub_1', status: 'canceled', periodEnd: T + 300 * DAY }])
+  r.advance(10 * DAY + 1)
+  assert.ok(await r.store.acquireLease(acct, 'sync', 'hog', r.d.now(), 100 * DAY))
+  assert.deepEqual(await runUpkeep(r.d), { synced: 0, busy: 1, failed: 0 }, '⚠️ a passed cancel_at did not make the account due')
+  r.advance(PLAN_GRACE_MS)
+  assert.equal(await planNow(r, body.credential), 'free', '⚠️⚠️ Plus outlived its cancel_at')
+})
+
+test('★★ ACC-1: accounts that stay busy cannot hold the batch (the least recently tried go first)', async () => {
+  const r = await rig()
+  const ids: string[] = []
+  for (let i = 0; i <= UPKEEP_SYNC_LIMIT; i++) {
+    const id = `acct_${String(i).padStart(3, '0')}`
+    await r.store.createAccount({ id, githubId: 1000 + i, githubLogin: `u${i}`, created: T })
+    await r.store.setCustomerIfNone(id, `cus_x${i}`)
+    await r.store.bumpSync(id)
+    ids.push(id)
+  }
+  // All but the last stay busy forever
+  for (const id of ids.slice(0, -1)) assert.ok(await r.store.acquireLease(id, 'sync', 'hog', r.d.now(), 100 * DAY))
+  const first = await runUpkeep(r.d)
+  assert.equal(first.synced + first.busy, UPKEEP_SYNC_LIMIT)
+  r.advance(60 * 60 * 1000)
+  const second = await runUpkeep(r.d)
+  assert.equal(second.synced, 1, '⚠️⚠️ the same stuck accounts were picked again and the last one never ran')
+})
+
+test('★★ back from a paid Checkout (?n=thanks), the page re-reads Stripe (a webhook that never came cannot leave a payer on Free)', async () => {
+  const r = await rig()
+  const { body } = await login(r)
+  const acct = body.account.id
+  const cookie = await sessionCookie(r, acct)
+  const reads: string[] = []
+  r.stripeHooks.beforeList = async (c) => void reads.push(c)
+  // ⚠️ Without a Checkout handed out, the thanks page reads nothing (it must not spend the shared Stripe rate limit)
+  await r.store.setCustomerIfNone(acct, 'cus_1')
+  await r.call('/?n=thanks', { headers: { cookie } })
+  assert.equal(reads.length, 0, '⚠️⚠️ the thanks page read Stripe without a Checkout')
+  const go = await r.call('/billing/checkout', { method: 'POST', body: new URLSearchParams({ price: 'usd-month' }), headers: { cookie, origin: ORIGIN } })
+  assert.match(go.headers.get('location') ?? '', /^https:\/\/checkout\.stripe\.com\/c\//)
+  r.subs.set('cus_1', [{ id: 'sub_1', status: 'active', periodEnd: T + 30 * DAY }])
+  r.advance(THANKS_REREAD_MS + 1)
+  reads.length = 0
+  assert.equal((await r.call('/', { headers: { cookie } })).status, 200)
+  assert.equal(reads.length, 0, '⚠️ the plain page read Stripe')
+  await r.call('/?n=thanks', { headers: { cookie } })
+  assert.equal(r.store.accounts.get(acct)!.subscriptionStatus, 'active', '⚠️⚠️ the thanks page did not re-read')
+  assert.equal(await planNow(r, body.credential), 'plus')
+  // ⚠️ Reloading within a minute does not read again
+  await r.call('/?n=thanks', { headers: { cookie } })
+  assert.equal(reads.length, 1, '⚠️ a reload read Stripe again within a minute')
+  // A failing read still shows the page (and stays pending for the cron)
+  r.advance(THANKS_REREAD_MS + 1)
+  r.stripeHooks.beforeList = async () => {
+    throw new Error('stripe down')
+  }
+  assert.equal((await r.call('/?n=thanks', { headers: { cookie } })).status, 200)
+  const a = r.store.accounts.get(acct)!
+  assert.ok((a.syncWanted ?? 0) > (a.syncDone ?? 0))
+  // ⚠️ A failed read still holds the minute (reloads during a Stripe 429 must not keep calling it)
+  let calls = 0
+  r.stripeHooks.beforeList = async () => {
+    calls += 1
+    throw new Error('stripe 429')
+  }
+  await r.call('/?n=thanks', { headers: { cookie } })
+  assert.equal(calls, 0, '⚠️⚠️ a reload right after a failed read called Stripe again')
+})
+
+test('★★ after a Checkout is handed out, the cron re-reads hourly for a day (paid with every webhook lost and no thanks page)', async () => {
+  const r = await rig()
+  const { body } = await login(r)
+  const acct = body.account.id
+  const cookie = await sessionCookie(r, acct)
+  const res = await r.call('/billing/checkout', { method: 'POST', body: new URLSearchParams({ price: 'usd-month' }), headers: { cookie, origin: ORIGIN } })
+  assert.match(res.headers.get('location') ?? '', /^https:\/\/checkout\.stripe\.com\/c\//)
+  const customer = r.store.accounts.get(acct)!.stripeCustomer!
+  // Not paid yet: re-read, nothing to write but still watched
+  assert.deepEqual(await runUpkeep(r.d), { synced: 1, busy: 0, failed: 0 })
+  // Paid later; every webhook lost, the buyer closed the tab
+  r.subs.set(customer, [{ id: 'sub_1', status: 'active', periodEnd: T + 31 * DAY }])
+  r.advance(60 * 60 * 1000)
+  assert.deepEqual(await runUpkeep(r.d), { synced: 1, busy: 0, failed: 0 }, '⚠️⚠️ a paid Checkout was never looked at')
+  assert.equal(await planNow(r, body.credential), 'plus')
+  // After the watch, a Free account with nothing pending is left alone
+  r.subs.set(customer, [])
+  const fresh = await login(r, 'gho_other', KEY2)
+  await r.store.setCustomerIfNone(fresh.body.account.id, 'cus_quiet')
+  await r.store.watchSync(fresh.body.account.id, r.d.now() + 1000)
+  r.advance(CHECKOUT_WATCH_MS)
+  const seen: string[] = []
+  r.stripeHooks.beforeList = async (c) => void seen.push(c)
+  await runUpkeep(r.d)
+  assert.ok(!seen.includes('cus_quiet'), '⚠️ kept re-reading after the watch ended')
+})
+
+test('★★ open but unpaid statuses (incomplete / unpaid) are re-checked weekly too', async () => {
+  const r = await rig()
+  const { body } = await login(r)
+  const acct = body.account.id
+  await r.store.setCustomerIfNone(acct, 'cus_1')
+  r.subs.set('cus_1', [{ id: 'sub_1', status: 'incomplete' }])
+  await hook(r, 'evt_1')
+  assert.deepEqual(await runUpkeep(r.d), { synced: 0, busy: 0, failed: 0 })
+  r.subs.set('cus_1', [{ id: 'sub_1', status: 'active', periodEnd: T + 40 * DAY }])
+  r.advance(RECHECK_MS + 1)
+  assert.deepEqual(await runUpkeep(r.d), { synced: 1, busy: 0, failed: 0 }, '⚠️⚠️ an incomplete payment that went through was never seen')
+  assert.equal(await planNow(r, body.credential), 'plus')
+})
+
+test('★★ a slow Stripe cannot keep the deletions from running, and stops new reads after the budget (the rest wait for the next hour)', async () => {
+  const r = await rig()
+  await login(r)
+  for (let i = 0; i < 20; i++) {
+    const id = `acct_slow${String(i).padStart(2, '0')}`
+    await r.store.createAccount({ id, githubId: 2000 + i, githubLogin: `s${i}`, created: T })
+    await r.store.setCustomerIfNone(id, `cus_s${i}`)
+    await r.store.bumpSync(id)
+  }
+  r.advance(MACHINE_FORGET_MS + 1)
+  // Each read takes 20 s (within the lease): 16 reads pass the 5-minute budget
+  const step = 20_000
+  assert.equal(UPKEEP_BUDGET_MS / step, 15)
+  r.stripeHooks.beforeList = async () => r.advance(step)
+  assert.deepEqual(await runUpkeep(r.d), { synced: 16, busy: 0, failed: 0 }, '⚠️ kept starting reads after the budget')
+  assert.equal(r.store.machines.size, 0, '⚠️⚠️ the deletion waited behind the Stripe reads')
+  r.stripeHooks.beforeList = undefined
+  assert.deepEqual(await runUpkeep(r.d), { synced: 4, busy: 0, failed: 0 }, '⚠️ the rest were not picked up next time')
+})
+
+test('★★ two cancelling subscriptions: the one paid for longer decides (a monthly one listed first must not hide an annual one)', () => {
+  const s = summarize([
+    { id: 'sub_m', status: 'active', periodEnd: T + 5 * DAY, cancelling: true },
+    { id: 'sub_y', status: 'active', periodEnd: T + 300 * DAY, cancelling: true },
+  ])
+  assert.equal(s.subscriptionId, 'sub_y')
+  assert.equal(planOf({ id: 'a', githubId: 1, githubLogin: 'x', created: 0, ...s }, T + 10 * DAY), 'plus')
+  // A renewing one still wins over a longer cancelling one (the page must not say "until")
+  assert.equal(summarize([{ id: 'sub_y', status: 'active', periodEnd: T + 300 * DAY, cancelling: true }, { id: 'sub_m', status: 'active', periodEnd: T + 5 * DAY }]).subscriptionId, 'sub_m')
+})
+
+test('★★ plan: every paid subscription counts (a renewing monthly one shown on the page cannot cut off a paid annual one)', () => {
+  const s = summarize([
+    { id: 'sub_y', status: 'active', periodEnd: T + 300 * DAY, cancelling: true },
+    { id: 'sub_m', status: 'active', periodEnd: T + 5 * DAY },
+  ])
+  assert.equal(s.subscriptionId, 'sub_m')
+  assert.equal(s.paidThrough, T + 300 * DAY)
+  const row = { id: 'a', githubId: 1, githubLogin: 'x', created: 0, ...s }
+  assert.equal(planOf(row, T + 100 * DAY), 'plus', '⚠️⚠️ a late monthly renewal cut off the annual term')
+  assert.equal(planOf(row, T + 300 * DAY + PLAN_GRACE_MS + 1), 'free')
+  // A paid subscription whose end cannot be read: no cut-off by date (another subscription's date must not end Plus)
+  const unknown = summarize([{ id: 'm', status: 'active', periodEnd: T }, { id: 'y', status: 'past_due' }])
+  assert.equal(planOf({ id: 'a', githubId: 1, githubLogin: 'x', created: 0, ...unknown }, T + 100 * DAY), 'plus')
+  // Unpaid subscriptions do not extend it
+  assert.equal(summarize([{ id: 'a', status: 'active', periodEnd: T }, { id: 'b', status: 'incomplete', periodEnd: T + 99 * DAY }]).paidThrough, T)
+})
+
+test('★★ a notification during a slow read stops the stale result from being written even for a moment (codex)', async () => {
+  const r = await rig()
+  const { body } = await login(r)
+  const acct = body.account.id
+  await r.store.setCustomerIfNone(acct, 'cus_1')
+  r.subs.set('cus_1', [{ id: 'sub_1', status: 'past_due', periodEnd: T + 30 * DAY }])
+  await hook(r, 'evt_1')
+  const written: string[] = []
+  const write = r.store.writeSync
+  r.store.writeSync = async (...a) => {
+    const ok = await write(...a)
+    if (ok) written.push(a[2].subscriptionStatus ?? '')
+    return ok
+  }
+  // The read sees `unpaid`; the customer pays meanwhile and the webhook asks for a re-read
+  r.subs.set('cus_1', [{ id: 'sub_1', status: 'unpaid', periodEnd: T + 30 * DAY }])
+  let once = true
+  r.stripeHooks.beforeList = async () => {
+    if (!once) return
+    once = false
+    r.subs.set('cus_1', [{ id: 'sub_1', status: 'active', periodEnd: T + 30 * DAY }])
+    await r.store.bumpSync(acct)
+  }
+  r.advance(RECHECK_MS + 1)
+  assert.deepEqual(await runUpkeep(r.d), { synced: 1, busy: 0, failed: 0 })
+  assert.deepEqual(written, ['active'], '⚠️⚠️ the stale `unpaid` was written before the re-read')
 })

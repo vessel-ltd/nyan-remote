@@ -4,9 +4,9 @@
 import { fromBase64Url } from '../../shared/crypto.ts'
 import { signLicense, type License } from '../../shared/license.ts'
 import { EmailMessage } from 'cloudflare:email'
-import { handle, PRICE_CHOICES, runOps, type Deps, type PriceChoice } from './app.ts'
+import { handle, PRICE_CHOICES, runOps, runUpkeep, type Deps, type PriceChoice } from './app.ts'
 import { parseUsage, USAGE_QUERY } from './ops.ts'
-import type { AccountRow, MachineRow, Store } from './store.ts'
+import { PLAN_GRACE_MS, type AccountRow, type LeaseKind, type MachineRow, type Store } from './store.ts'
 import { stripeApi } from './stripe.ts'
 
 interface RelayAccounts {
@@ -62,6 +62,11 @@ const toAccount = (r: Row | null): AccountRow | undefined =>
         ...(r['subscription_cancelling'] ? { subscriptionCancelling: true } : {}),
         ...(r['subscription_cancel_at'] != null ? { subscriptionCancelAt: Number(r['subscription_cancel_at']) } : {}),
         ...(r['sync_wanted'] != null ? { syncWanted: Number(r['sync_wanted']) } : {}),
+        ...(r['sync_done'] != null ? { syncDone: Number(r['sync_done']) } : {}),
+        ...(r['sync_checked'] != null ? { syncChecked: Number(r['sync_checked']) } : {}),
+        ...(r['sync_tried'] != null ? { syncTried: Number(r['sync_tried']) } : {}),
+        ...(r['sync_watch'] != null ? { syncWatch: Number(r['sync_watch']) } : {}),
+        ...(r['paid_through'] != null ? { paidThrough: Number(r['paid_through']) } : {}),
         ...(r['checkout_key'] ? { checkoutKey: String(r['checkout_key']) } : {}),
         ...(r['checkout_params'] ? { checkoutParams: String(r['checkout_params']) } : {}),
         ...(r['checkout_session'] ? { checkoutSession: String(r['checkout_session']) } : {}),
@@ -82,6 +87,12 @@ const toMachine = (r: Row | null): MachineRow | undefined =>
       }
     : undefined
 
+/** ★ The two leases (`LeaseKind` in store.ts): token column, expiry column */
+const LEASE_COLUMNS: Record<LeaseKind, [string, string]> = {
+  checkout: ['lease_token', 'lease_until'],
+  sync: ['sync_lease_token', 'sync_lease_until'],
+}
+
 function d1Store(db: D1Database): Store {
   const one = (sql: string, ...args: unknown[]) => db.prepare(sql).bind(...args).first<Row>()
   const run = (sql: string, ...args: unknown[]) => db.prepare(sql).bind(...args).run()
@@ -99,21 +110,19 @@ function d1Store(db: D1Database): Store {
     setCustomerIfNone: async (id, customer) => {
       await run('UPDATE accounts SET stripe_customer = ? WHERE id = ? AND stripe_customer IS NULL', customer, id)
     },
-    acquireLease: async (id, token, now, ttl) => {
-      const r = await run(
-        'UPDATE accounts SET lease_token = ?, lease_until = ? WHERE id = ? AND (lease_until IS NULL OR lease_until < ?)',
-        token,
-        now + ttl,
-        id,
-        now,
-      )
+    // ★ Column names come from this fixed table only (never from input)
+    acquireLease: async (id, kind, token, now, ttl) => {
+      const [t, u] = LEASE_COLUMNS[kind]
+      const r = await run(`UPDATE accounts SET ${t} = ?, ${u} = ? WHERE id = ? AND (${u} IS NULL OR ${u} < ?)`, token, now + ttl, id, now)
       return (r.meta.changes ?? 0) > 0
     },
-    releaseLease: async (id, token) => {
-      await run('UPDATE accounts SET lease_token = NULL, lease_until = NULL WHERE id = ? AND lease_token = ?', id, token)
+    releaseLease: async (id, kind, token) => {
+      const [t, u] = LEASE_COLUMNS[kind]
+      await run(`UPDATE accounts SET ${t} = NULL, ${u} = NULL WHERE id = ? AND ${t} = ?`, id, token)
     },
-    renewLease: async (id, token, now, ttl) => {
-      const r = await run('UPDATE accounts SET lease_until = ? WHERE id = ? AND lease_token = ? AND lease_until >= ?', now + ttl, id, token, now)
+    renewLease: async (id, kind, token, now, ttl) => {
+      const [t, u] = LEASE_COLUMNS[kind]
+      const r = await run(`UPDATE accounts SET ${u} = ? WHERE id = ? AND ${t} = ? AND ${u} >= ?`, now + ttl, id, token, now)
       return (r.meta.changes ?? 0) > 0
     },
     setCheckoutAttempt: async (id, token, attempt, now) => {
@@ -132,18 +141,22 @@ function d1Store(db: D1Database): Store {
       await run('UPDATE accounts SET sync_wanted = COALESCE(sync_wanted, 0) + 1 WHERE id = ?', id)
     },
     // ⚠️⚠️ Write only while holding the lease (never overwrite with a stale read after it expired and someone else took it)
-    writeSync: async (id, token, sum, now) => {
+    writeSync: async (id, token, sum, now, done) => {
       const r = await run(
-        'UPDATE accounts SET subscription_id = ?, subscription_status = ?, subscription_count = ?, subscription_period_end = ?, subscription_cancelling = ?, subscription_cancel_at = ? WHERE id = ? AND lease_token = ? AND lease_until >= ?',
+        'UPDATE accounts SET subscription_id = ?, subscription_status = ?, subscription_count = ?, subscription_period_end = ?, subscription_cancelling = ?, subscription_cancel_at = ?, paid_through = ?, sync_done = ?, sync_checked = ? WHERE id = ? AND sync_lease_token = ? AND sync_lease_until >= ? AND COALESCE(sync_wanted, 0) = ?',
         sum.subscriptionId ?? null,
         sum.subscriptionStatus ?? null,
         sum.subscriptionCount,
         sum.subscriptionPeriodEnd ?? null,
         sum.subscriptionCancelling ? 1 : 0,
         sum.subscriptionCancelAt ?? null,
+        sum.paidThrough ?? null,
+        done,
+        now,
         id,
         token,
         now,
+        done,
       )
       return (r.meta.changes ?? 0) > 0
     },
@@ -190,10 +203,41 @@ function d1Store(db: D1Database): Store {
     pruneMachines: async (acct, before) => {
       await run('DELETE FROM machines WHERE account_id = ? AND last_seen < ?', acct, before)
     },
+    pruneIdleMachines: async (before) => {
+      await run('DELETE FROM machines WHERE last_seen < ?', before)
+    },
+    pruneSupportMarks: async (before) => {
+      await run("DELETE FROM ops_alerts WHERE key LIKE 'support:%' AND at < ?", before)
+    },
+    // ⚠️ Same rule as the memory store (`paidUntil` = the earlier of the period end and cancel_at; SQLite's min(a, b) is NULL if either is)
+    syncCandidates: async (now, recheckBefore, limit) =>
+      (
+        (
+          await db
+            .prepare(
+              "SELECT * FROM accounts WHERE stripe_customer IS NOT NULL AND (COALESCE(sync_wanted, 0) > COALESCE(sync_done, 0) OR COALESCE(sync_watch, 0) >= ? OR (subscription_status IN ('active','trialing','past_due') AND min(COALESCE(subscription_period_end, subscription_cancel_at), COALESCE(subscription_cancel_at, subscription_period_end)) < ?) OR (subscription_status IN ('active','trialing','past_due','incomplete','unpaid') AND COALESCE(sync_checked, 0) < ?)) ORDER BY COALESCE(sync_tried, 0) LIMIT ?",
+            )
+            .bind(now, now, recheckBefore, limit)
+            .all<Row>()
+        ).results ?? []
+      ).flatMap((r) => toAccount(r) ?? []),
+    markSyncTried: async (id, now) => {
+      await run('UPDATE accounts SET sync_tried = ? WHERE id = ?', now, id)
+    },
+    claimSyncTry: async (id, now, gap) => {
+      const r = await run('UPDATE accounts SET sync_tried = ? WHERE id = ? AND COALESCE(sync_tried, 0) <= ?', now, id, now - gap)
+      return (r.meta.changes ?? 0) > 0
+    },
+    watchSync: async (id, until) => {
+      await run('UPDATE accounts SET sync_watch = max(COALESCE(sync_watch, 0), ?) WHERE id = ?', until, id)
+    },
     stats: async (now) => {
       const a = await one(
-        "SELECT COUNT(*) AS n, SUM(created > ?) AS new7, SUM(subscription_status IN ('active','trialing','past_due')) AS plus, SUM(subscription_count > 1) AS dup FROM accounts",
+        // ⚠️ "plus" as `planOf` decides it (a paid status past its period end + grace is Free)
+        "SELECT COUNT(*) AS n, SUM(created > ?) AS new7, SUM(subscription_status IN ('active','trialing','past_due') AND (paid_through IS NULL OR paid_through + ? >= ?)) AS plus, SUM(subscription_count > 1) AS dup FROM accounts",
         now - 7 * 86400e3,
+        PLAN_GRACE_MS,
+        now,
       )
       const m = await one('SELECT COUNT(*) AS n, SUM(last_seen > ?) AS d1, SUM(last_seen > ?) AS d7 FROM machines', now - 86400e3, now - 7 * 86400e3)
       const num = (v: unknown) => Number(v ?? 0)
@@ -245,7 +289,11 @@ async function cfUsage(env: Env, days: number) {
   return parseUsage(await res.json())
 }
 
-/** ★ Email to the operators (Email Routing send_email / ⚠️ the body is English numbers only = no user information) */
+/**
+ * ★ Email to the operators (Email Routing send_email).
+ *   ⚠️ Usage alerts carry numbers only, but **support messages carry what the user wrote** (message, name, reply address)
+ *   plus the GitHub login and account id (review ACC-2 / the privacy policy says so).
+ */
 async function sendAlert(env: Env, subject: string, text: string, replyTo?: string) {
   if (!env.ALERT_EMAIL || !env.ALERT_FROM || !env.ALERT_TO) {
     // ⚠️ Never pretend success when it could not be sent (it would remember "reported" and stay silent next time too)
@@ -339,11 +387,18 @@ function deps(env: Env): Deps {
 export default {
   fetch: (request: Request, env: Env) => handle(request, deps(env)),
   // ★ Hourly watcher (a / `runOps` in `app.ts`)
+  // ★ Plus the upkeep (2026-11-26 / review ACC-1 and ACC-3: missed webhooks, idle machines, old support marks / `runUpkeep`).
+  //   ⚠️ Each in its own try: a failing usage query must not stop the re-reads (and the other way round)
   scheduled: async (_c: ScheduledController, env: Env) => {
     try {
       console.log('[ops]', await runOps(deps(env)))
     } catch (err) {
       console.error('[ops] failed', err instanceof Error ? err.message : String(err))
+    }
+    try {
+      console.log('[upkeep]', JSON.stringify(await runUpkeep(deps(env))))
+    } catch (err) {
+      console.error('[upkeep] failed', err instanceof Error ? err.message : String(err))
     }
   },
 } satisfies ExportedHandler<Env>

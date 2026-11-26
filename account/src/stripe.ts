@@ -124,7 +124,10 @@ export function stripeApi(secretKey: string, f: Fetch = (u, i) => fetch(u, i)): 
     for (let page = 0; page < LIST_PAGES; page++) {
       await onPage?.()
       const j = await call('GET', after ? `${path}&${formEncode({ starting_after: after })}` : path)
-      const data = Array.isArray(j['data']) ? (j['data'] as Record<string, unknown>[]) : []
+      // ⚠️⚠️ A body that did not read or is not a list throws (2026-11-26 / codex): reading it as "no items" made an annual
+      //    Plus look cancelled, and the hourly re-read then wrote Free and marked the account settled
+      if (j['object'] !== 'list' || !Array.isArray(j['data'])) throw new Error('stripe list: not a list')
+      const data = j['data'] as Record<string, unknown>[]
       out.push(...data)
       const last = data.at(-1)?.['id']
       if (j['has_more'] !== true) return out
@@ -163,9 +166,11 @@ export function stripeApi(secretKey: string, f: Fetch = (u, i) => fetch(u, i)): 
     },
     createPortal: async (o) => str((await post('billing_portal/sessions', { customer: o.customer, return_url: o.returnUrl })).url, 'portal url'),
     listSubscriptions: async (customer, onPage) =>
-      (await list(`subscriptions?${formEncode({ customer, status: 'all', limit: '100' })}`, onPage)).flatMap((s) =>
-        typeof s['id'] === 'string' && typeof s['status'] === 'string' ? [{ id: s['id'], status: s['status'], ...subscriptionDates(s) }] : [],
-      ),
+      // ⚠️ A subscription without an id or status throws (dropping it could drop the Plus it gives)
+      (await list(`subscriptions?${formEncode({ customer, status: 'all', limit: '100' })}`, onPage)).map((s) => {
+        if (typeof s['id'] !== 'string' || typeof s['status'] !== 'string') throw new Error('stripe: bad subscription')
+        return { id: s['id'], status: s['status'], ...subscriptionDates(s) }
+      }),
     listOpenCheckouts: async (customer, onPage) =>
       (await list(`checkout/sessions?${formEncode({ customer, status: 'open', limit: '100' })}`, onPage)).flatMap((s) =>
         typeof s['id'] === 'string' ? [s['id']] : [],

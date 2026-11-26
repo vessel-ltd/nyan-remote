@@ -23,8 +23,8 @@ import { RELAY_PING, RELAY_PONG, RELAY_V } from '../../shared/relayFrame.ts'
 import { relayBinding } from '../../shared/relayAuth.ts'
 import { CHALLENGE_NONCE_BYTES, KEY_RE, Room, type ClaimResult, type PhoneClaimResult, type RoomSocket, type Tag } from './room.ts'
 import { importLicensePublicKey, LICENSE_PUBLIC_KEY, verifyLicense, type LicenseCheck } from '../../shared/license.ts'
-import { claimMachine, readLedger, releaseCredential, type Ledger } from './ledger.ts'
-import { claimRoom, readPhoneLedger } from './phoneLedger.ts'
+import { claimMachine, ledgerSweepAt, pruneLedger, readLedger, releaseCredential, type Ledger } from './ledger.ts'
+import { claimRoom, phoneSweepAt, prunePhoneLedger, readPhoneLedger } from './phoneLedger.ts'
 
 export interface Env {
   RENDEZVOUS: DurableObjectNamespace<Rendezvous>
@@ -46,6 +46,23 @@ function licensePublicKey() {
 }
 
 /**
+ * ★★ Write a ledger and set the alarm for its next expiry (2026-11-26 / review ACC-3).
+ *   ⚠️⚠️ The write and the alarm go out with no await between them (the runtime coalesces them into one atomic write /
+ *   codex: a crash between two awaited calls left a ledger with no sweep).
+ *   ⚠️ Nothing left ⇒ one `deleteAll()`, which also removes the alarm (`delete_all_deletes_alarm` in wrangler.jsonc /
+ *   codex: a separate deleteAlarm() after it wrote the alarm's metadata back and left the emptied object holding storage).
+ */
+async function keepLedger(storage: DurableObjectStorage, name: string, value: unknown, sweepAt: number | undefined): Promise<void> {
+  if (sweepAt === undefined) {
+    await storage.deleteAll()
+    return
+  }
+  const wrote = storage.put(name, value)
+  const armed = storage.setAlarm(sweepAt)
+  await Promise.all([wrote, armed])
+}
+
+/**
  * ★★ Per-account ledger (one per `acct`). ⚠️ Decisions are in `ledger.ts` (this only wires reads and writes).
  */
 export class Accounts extends DurableObject<Env> {
@@ -55,10 +72,20 @@ export class Accounts extends DurableObject<Env> {
   }
 
   /** @param mid number of the passphrase that issued the ticket */
+  /** ★ Every write also sets the alarm to the next entry's expiry (review ACC-3 / `ledgerSweepAt`) */
+  async #write(l: Ledger): Promise<void> {
+    await keepLedger(this.ctx.storage, 'machines', l, ledgerSweepAt(l))
+  }
+
   async claim(key: string, max: number, mid: string): Promise<ClaimResult> {
     const r = claimMachine(await this.#read(), key, max, Date.now(), mid)
-    await this.ctx.storage.put('machines', r.ledger)
+    await this.#write(r.ledger)
     return r.ok ? 'ok' : (r.reason ?? 'machine-limit')
+  }
+
+  /** ★ Drop what ran out; an empty ledger deletes its storage (review ACC-3). ⚠️ Storage calls only = no other event interleaves */
+  override async alarm(): Promise<void> {
+    await this.#write(pruneLedger(await this.#read(), Date.now()))
   }
 
   /**
@@ -72,7 +99,7 @@ export class Accounts extends DurableObject<Env> {
     await releaseCredential(
       {
         read: () => this.#read(),
-        write: (l) => this.ctx.storage.put('machines', l),
+        write: (l) => this.#write(l),
         revokeRoom: () => this.env.RENDEZVOUS.getByName(key).revokeLicense(acct, mid),
         now: () => Date.now(),
       },
@@ -105,8 +132,16 @@ export class Phones extends DurableObject<Env> {
       // ★ A Plus connect releases the calling room: its other wires of this phone drop their free mark before the ledger forgets it
       //   (⚠️ the calling room is awaiting this call on an RPC, not storage, so it can take this one = no deadlock)
       if (r.released) await this.env.RENDEZVOUS.getByName(agentKey).phoneFreeReleased(dkey, connId)
-      await this.ctx.storage.put('rooms', r.ledger)
+      await keepLedger(this.ctx.storage, 'rooms', r.ledger, phoneSweepAt(r.ledger))
       return r.ok ? 'ok' : 'machine-limit'
+    })
+  }
+
+  /** ★ Drop rooms unused for `PHONE_IDLE_MS`; an empty ledger deletes its storage (review ACC-3). ⚠️ Same lock as `claim` */
+  override async alarm(): Promise<void> {
+    await this.ctx.blockConcurrencyWhile(async () => {
+      const l = prunePhoneLedger(readPhoneLedger(await this.ctx.storage.get('rooms')), Date.now())
+      await keepLedger(this.ctx.storage, 'rooms', l, phoneSweepAt(l))
     })
   }
 }

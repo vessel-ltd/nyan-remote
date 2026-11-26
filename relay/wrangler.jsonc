@@ -21,6 +21,8 @@
   "preview_urls": false,
   // ⚠️ Use a recent date (behaviour such as automatic WebSocket close replies changes)
   "compatibility_date": "2026-01-01",
+  // ★ One deleteAll() also removes the alarm (an emptied ledger leaves nothing behind / 2026-11-26 / `keepLedger`)
+  "compatibility_flags": ["delete_all_deletes_alarm"],
   // ★★ **Custom domain** (2026-09-21 / we got `nyan-remote.app` / user decision).
   //   ⚠️⚠️ **Do not turn off `*.workers.dev`.** The relay entry point in QR codes already handed out is
   //      `wss://nyan-relay.nyan-remote-relay.workers.dev`, so turning it off means
