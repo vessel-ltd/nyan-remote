@@ -67,6 +67,8 @@ export interface CodexTurn {
   status: TurnStatus | undefined
   /** Message of the turn's error, if it failed */
   error?: string
+  /** ★ The turn failed because the login hit a plan or spend limit (`isCodexLimitError`; 2026-11-26) */
+  limited?: true
   /** Unix seconds */
   completedAt?: number
   items: CodexItem[]
@@ -75,6 +77,24 @@ export interface CodexTurn {
 }
 
 const TURN_STATUSES = new Set<string>(['completed', 'interrupted', 'failed', 'inProgress'])
+
+/**
+ * ★ The `codexErrorInfo` values (app-server schema, codex 0.172.0) that mean "this login cannot work until its limit
+ *   resets or money is added" — the Codex side of the list's "rate-limited" (2026-11-26).
+ * ⚠️ Not `rateLimitExceeded` (a short throttle the CLI retries; the same call as Claude's "request rejected (429)"),
+ *    not `sessionBudgetExceeded` (a budget of that one session, not of the login), not overload or capacity errors.
+ * ⚠️ Only the bare string form: the object forms (`httpConnectionFailed: {…}`, …) are connection errors.
+ */
+export const CODEX_LIMIT_ERRORS: ReadonlySet<string> = new Set([
+  'usageLimitExceeded',
+  'apiKeySpendLimitExceeded',
+  'projectSpendLimitExceeded',
+  'organizationSpendLimitExceeded',
+])
+
+export function isCodexLimitError(info: unknown): boolean {
+  return typeof info === 'string' && CODEX_LIMIT_ERRORS.has(info)
+}
 
 export function parseTurn(raw: unknown): CodexTurn | undefined {
   if (!isObject(raw) || typeof raw.id !== 'string' || raw.id === '' || !Array.isArray(raw.items)) return undefined
@@ -93,6 +113,8 @@ export function parseTurn(raw: unknown): CodexTurn | undefined {
     id: raw.id,
     status,
     ...(isObject(err) && typeof err.message === 'string' && err.message !== '' ? { error: clip(err.message, 500) } : {}),
+    // ⚠️ Only a failed turn: an interrupted one can carry an error too, and it is not a stop at a limit
+    ...(status === 'failed' && isObject(err) && isCodexLimitError(err.codexErrorInfo) ? { limited: true as const } : {}),
     // ⚠️ Only a time a `Date` can hold (the journal turns it into an ISO string)
     ...(typeof raw.completedAt === 'number' && Number.isFinite(raw.completedAt) && Math.abs(raw.completedAt * 1000) <= MAX_DATE_MS
       ? { completedAt: raw.completedAt }

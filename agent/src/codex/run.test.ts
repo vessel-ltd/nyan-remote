@@ -4,6 +4,7 @@ import { createServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, test } from 'node:test'
+import { statusLabel } from '../../../shared/types.ts'
 import { validateCodexConfig } from '../config.ts'
 import type { DaemonDeps } from './daemon.ts'
 import { codexEnabled, codexLabelShared, codexFollowTick, codexHealth, codexHomes, codexNotice, codexRows, controlSocketOf, lookAtSocket, realSocketPath, startCodex, stopCodex } from './run.ts'
@@ -182,20 +183,39 @@ test('follow tick: nothing is read when Codex is off, when nobody is viewing, or
 })
 
 /** A daemon that answers `initialize` and an empty snapshot; `drop()` ends the current connection */
-function answeringDeps(): { deps: DaemonDeps; drop: () => void; connects: () => number } {
+function answeringDeps(daemon: { threads?: Array<Record<string, unknown>>; turns?: Record<string, unknown> } = {}): {
+  deps: DaemonDeps
+  drop: () => void
+  connects: () => number
+  /** Push a notification on the current connection */
+  emit: (method: string, params: unknown) => void
+} {
   let connects = 0
   let end: (() => void) | undefined
+  let push: ((text: string) => void) | undefined
   const deps: DaemonDeps = {
     look: async () => ({ type: 'present', ageMs: 60_000, key: 'a' }),
     connect: async (_path, onMessage) => {
       connects++
+      push = onMessage
       const closed = new Promise<{ reason: 'eof' }>((r) => (end = () => r({ reason: 'eof' })))
       return {
         send: async (text, guard) => {
           if (guard && !guard()) throw new Error('ws-cancelled')
           const m = JSON.parse(text) as { id?: number; method: string }
           if (m.id === undefined) return
-          const result = m.method === 'initialize' ? { codexHome: '/home/user/.codex' } : m.method === 'thread/loaded/list' ? { data: [], nextCursor: null } : {}
+          const p = (m as { params?: { threadId?: string } }).params
+          const threads = daemon.threads ?? []
+          const result =
+            m.method === 'initialize'
+              ? { codexHome: '/home/user/.codex' }
+              : m.method === 'thread/loaded/list'
+                ? { data: threads.map((t) => t.id), nextCursor: null }
+                : m.method === 'thread/read'
+                  ? { thread: threads.find((t) => t.id === p?.threadId) }
+                  : m.method === 'thread/turns/list' && daemon.turns
+                    ? daemon.turns
+                    : {}
           queueMicrotask(() => onMessage(JSON.stringify({ id: m.id, result })))
         },
         close: () => end?.(),
@@ -206,7 +226,7 @@ function answeringDeps(): { deps: DaemonDeps; drop: () => void; connects: () => 
     now: () => 0,
     random: () => 0,
   }
-  return { deps, drop: () => end?.(), connects: () => connects }
+  return { deps, drop: () => end?.(), connects: () => connects, emit: (method, params) => push?.(JSON.stringify({ method, params })) }
 }
 
 async function until(cond: () => boolean, what: string): Promise<void> {
@@ -230,6 +250,60 @@ test('★ the notice is logged once per agent start, on the first connect — no
   startCodex({ clientName: 'other-name' }, { machine: 'pc-a', version: '1', deps: answeringDeps().deps, home: '/home/user', hooks: { log: (l) => logs.push(l) } })
   await until(() => notices().length === 2, 'the notice after a restart')
   assert.match(notices()[1]!, /other-name/)
+})
+
+test('★ a thread standing at a usage limit when the agent starts: the row says rate-limited and nothing rings at start', async () => {
+  const thread = {
+    id: 't1', parentThreadId: null, preview: 'p', ephemeral: false, updatedAt: 1000, status: { type: 'systemError' },
+    cwd: '/home/user/proj', cliVersion: '0.172.0', source: 'vscode', threadSource: 'user', gitInfo: null, name: 'Fix login',
+  }
+  const turns = { data: [{ id: 'turn-1', status: 'failed', items: [], error: { message: 'm', codexErrorInfo: 'usageLimitExceeded' } }], nextCursor: null }
+  const d = answeringDeps({ threads: [thread], turns })
+  const sent: string[] = []
+  const logs: string[] = []
+  startCodex(undefined, {
+    machine: 'pc-a', version: '1', deps: d.deps, home: '/home/user',
+    notify: async (_row, fields) => { sent.push(fields.label); return 1 },
+    hooks: { log: (l) => logs.push(l) },
+  })
+  const limited = async (): Promise<boolean> => (await codexRows()).some((r) => r.status === 'rate-limited')
+  const untilAsync = async (cond: () => Promise<boolean>, what: string): Promise<void> => {
+    for (let i = 0; i < 2000 && !(await cond()); i++) await new Promise((r) => setImmediate(r))
+    assert.ok(await cond(), `timed out waiting for: ${what}`)
+  }
+  await untilAsync(limited, 'the quiet settle')
+  for (let i = 0; i < 50; i++) await new Promise((r) => setImmediate(r))
+  assert.deepEqual(sent, [], 'nothing at start')
+  d.drop()
+  await until(() => d.connects() === 2 && logs.filter((l) => l.endsWith(': connected')).length === 2, 'the reconnect')
+  await untilAsync(limited, 'the standing row read again')
+  await until(() => sent.length >= 1, 'the reconnect tells it')
+  for (let i = 0; i < 50; i++) await new Promise((r) => setImmediate(r))
+  // ⚠️ A reconnect tells standing rows once (as it told "failed" before): it does not know what was sent before it
+  assert.deepEqual(sent, [statusLabel('rate-limited')], 'none at start; the reconnect tells it once')
+  stopCodex()
+})
+
+test('★ live: a running thread that goes to systemError at a usage limit rings "rate-limited" once, and the row says so', async () => {
+  const thread = {
+    id: 't1', parentThreadId: null, preview: 'p', ephemeral: false, updatedAt: 1000, status: { type: 'idle' },
+    cwd: '/home/user/proj', cliVersion: '0.172.0', source: 'vscode', threadSource: 'user', gitInfo: null, name: 'Fix login',
+  }
+  const turns = { data: [{ id: 'turn-1', status: 'failed', items: [], error: { message: 'm', codexErrorInfo: 'usageLimitExceeded' } }], nextCursor: null }
+  const d = answeringDeps({ threads: [thread], turns })
+  const sent: string[] = []
+  startCodex(undefined, { machine: 'pc-a', version: '1', deps: d.deps, home: '/home/user', notify: async (_row, fields) => { sent.push(fields.label); return 1 } })
+  await until(() => d.connects() === 1, 'connected')
+  const rowsAre = async (status: string): Promise<boolean> => (await codexRows()).some((r) => r.status === status)
+  for (let i = 0; i < 2000 && !(await rowsAre('idle')); i++) await new Promise((r) => setImmediate(r))
+  d.emit('thread/status/changed', { threadId: 't1', status: { type: 'active', activeFlags: [] } })
+  d.emit('thread/status/changed', { threadId: 't1', status: { type: 'systemError' } })
+  for (let i = 0; i < 2000 && !(await rowsAre('rate-limited')); i++) await new Promise((r) => setImmediate(r))
+  await until(() => sent.length >= 1, 'the push')
+  for (let i = 0; i < 50; i++) await new Promise((r) => setImmediate(r))
+  assert.deepEqual(sent, [statusLabel('rate-limited')])
+  assert.ok(await rowsAre('rate-limited'))
+  stopCodex()
 })
 
 test('★ a PC without Codex logs its first state too (nyan status reads "no Codex" from it)', async () => {

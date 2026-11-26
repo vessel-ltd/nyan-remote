@@ -76,6 +76,17 @@ const user = (id: string, text: string, done = true) => ({ type: 'userMessage', 
 const agent = (id: string, text: string, done = true) => ({ type: 'agentMessage', id, text, ...(done ? { completedAtMs: 2000 } : {}) })
 const cmd = (id: string, over: Record<string, unknown> = {}) => ({ type: 'commandExecution', id, command: 'ls', status: 'completed', aggregatedOutput: 'a\nb\n', exitCode: 0, completedAtMs: 3000, ...over })
 
+test('parse: a failed turn with a plan or spend limit error is `limited`; nothing else is (2026-11-26)', () => {
+  const t = (status: string, err: unknown) => parseTurn({ id: 't', status, items: [], error: err })!
+  assert.equal(t('failed', { message: 'm', codexErrorInfo: 'usageLimitExceeded' }).limited, true)
+  assert.equal(t('failed', { message: '', codexErrorInfo: 'organizationSpendLimitExceeded' }).limited, true, 'the message is not needed')
+  assert.equal(t('interrupted', { message: 'm', codexErrorInfo: 'usageLimitExceeded' }).limited, undefined)
+  assert.equal(t('failed', { message: 'm', codexErrorInfo: 'rateLimitExceeded' }).limited, undefined)
+  assert.equal(t('failed', { message: 'm', codexErrorInfo: { usageLimitExceeded: null } }).limited, undefined)
+  assert.equal(t('failed', 'usageLimitExceeded').limited, undefined)
+  assert.equal(t('failed', null).limited, undefined)
+})
+
 test('parse: hostile shapes are skipped and counted, never thrown', () => {
   for (const bad of [null, 'x', [], {}, { id: 't' }, { id: '', items: [] }, { id: 5, items: [] }, { id: 't', items: 'x' }]) {
     assert.equal(parseTurn(bad), undefined, JSON.stringify(bad))

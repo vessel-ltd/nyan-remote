@@ -168,18 +168,23 @@ export function sortRows(rows: SessionSummary[]): SessionSummary[] {
  * How the last turn this connection watched ended, **as read back from the history** (`thread/turns/list`).
  * The thread status alone cannot say: a turn that failed or was interrupted also ends in `idle`.
  */
-export type TurnOutcome = 'failed' | 'interrupted'
+export type TurnOutcome = 'failed' | 'interrupted' | 'rate-limited'
 
 export function statusOf(status: CodexStatus, sawActive: boolean, outcome?: TurnOutcome): SessionStatus {
   switch (status.type) {
     case 'active':
       return status.waitingOnApproval || status.waitingOnUserInput ? 'waiting' : 'working'
     case 'systemError':
-      return 'error'
+      // ★ Codex puts a thread in `systemError` on any turn error, a plan limit included, until the next turn starts
+      //   (`thread_status.rs`, 0.172.0). The notifier reads that turn and records 'rate-limited' when it was a limit.
+      return outcome === 'rate-limited' ? 'rate-limited' : 'error'
     case 'idle':
       // ★ The list and the notification read the same thing: a failed turn is an error in both, an interrupted one
       //   is "idle" in the list and silent as a notification (someone stopped it by hand).
       if (outcome === 'failed') return 'error'
+      // ★ A turn that failed at a plan or spend limit (`CodexTurn.limited`): "制限中", the same word as a Claude row.
+      //   Cleared like the others when the thread goes active again (a retry after the reset).
+      if (outcome === 'rate-limited') return 'rate-limited'
       if (outcome === 'interrupted') return 'idle'
       return sawActive ? 'done' : 'idle'
     case 'notLoaded':
@@ -446,12 +451,14 @@ export class ThreadBook {
 
   /**
    * Record how the turn that just ended really ended. Returns whether the row changed.
-   * ⚠️ Only while the thread is idle **in the same status the reader settled** (`mark`, third review, medium #2): a
-   *    late answer about turn A must not land on turn B, which started and ended while A's history was being read.
+   * ⚠️ Only while the thread is idle (or in `systemError`) **in the same status the reader settled** (`mark`, third
+   *    review, medium #2): a late answer about turn A must not land on turn B, which started and ended while A's
+   *    history was being read.
    */
   setOutcome(threadId: string, outcome: TurnOutcome, mark: number): boolean {
     const entry = this.#threads.get(threadId)
-    if (!entry || entry.mark !== mark || entry.thread.status.type !== 'idle' || entry.outcome === outcome) return false
+    const type = entry?.thread.status.type
+    if (!entry || entry.mark !== mark || (type !== 'idle' && type !== 'systemError') || entry.outcome === outcome) return false
     this.#threads.set(threadId, { ...entry, outcome })
     return true
   }
@@ -483,14 +490,15 @@ export class ThreadBook {
   }
 
   /**
-   * The rows that stand in a state worth a notification right now (waiting / error), as status changes from "unknown".
+   * The rows that stand in a state worth a notification right now (waiting / error / rate-limited), as status changes
+   * from "unknown".
    * ★ For a reconnect: a "needs you" that could not be sent while the line was down has no status change to carry it.
    */
   standing(): Array<Extract<StatusChange, { type: 'changed' }>> {
     const out: Array<Extract<StatusChange, { type: 'changed' }>> = []
     for (const { thread, sawActive, outcome, mark } of this.#threads.values()) {
       const to = statusOf(thread.status, sawActive, outcome)
-      if (to === 'waiting' || to === 'error') out.push({ type: 'changed', thread, from: 'unknown', to, status: thread.status, mark })
+      if (to === 'waiting' || to === 'error' || to === 'rate-limited') out.push({ type: 'changed', thread, from: 'unknown', to, status: thread.status, mark })
     }
     return out
   }

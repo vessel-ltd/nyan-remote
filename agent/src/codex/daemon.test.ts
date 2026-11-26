@@ -232,6 +232,7 @@ afterEach(() => {
 
 type TestHooks = {
   changes?: StatusChange[]
+  settles?: StatusChange[]
   onChange?: () => void
   offerApproval?: DaemonHooks['offerApproval']
   askQuestion?: DaemonHooks['askQuestion']
@@ -257,6 +258,7 @@ function startLine(w: World, hooks: TestHooks = {}, rpcTimeoutMs?: number, histo
     deps: w.deps,
     hooks: {
       onStatus: (c) => hooks.changes?.push(c),
+      onSettle: (c) => hooks.settles?.push(c),
       ...(hooks.onChange ? { onChange: hooks.onChange } : {}),
       ...(hooks.offerApproval ? { offerApproval: hooks.offerApproval } : {}),
       ...(hooks.askQuestion ? { askQuestion: hooks.askQuestion } : {}),
@@ -1338,6 +1340,44 @@ test('★ a reconnect tells the notifier about threads that still wait (medium #
   const c = changes[0]!
   assert.equal(c.type === 'changed' && c.thread.id, 't1')
   assert.equal(c.type === 'changed' && c.to, 'waiting')
+  line.stop()
+  await line.done
+})
+
+test('★ the first connection settles threads in systemError quietly (onSettle); a reconnect tells the notifier (2026-11-26)', async () => {
+  const w = world()
+  w.daemon.threads.set('t1', thread('t1', { status: { type: 'systemError' } }))
+  w.daemon.threads.set('t2', thread('t2', { status: WAITING }))
+  const changes: StatusChange[] = []
+  const settles: StatusChange[] = []
+  const line = start(w, { changes, settles })
+  await until(() => settles.length === 1, 'the quiet settle')
+  assert.equal(changes.length, 0, 'the agent just started: nothing to tell')
+  assert.deepEqual(settles.map((c) => c.type === 'changed' && [c.thread.id, c.status.type]), [['t1', 'systemError']], 'only systemError, not the waiting one')
+  w.daemon.drop()
+  await until(() => lists(w) >= 2 && line.rows().length === 2, 'the reconnect')
+  await until(() => changes.length === 2, 'the standing states')
+  assert.deepEqual(changes.map((c) => c.type === 'changed' && c.thread.id).sort(), ['t1', 't2'])
+  assert.equal(settles.length, 1, 'a reconnect does not settle quietly')
+  line.stop()
+  await line.done
+})
+
+test('setOutcome: the row changes and the list is told at once (onChange), only for the current mark', async () => {
+  const w = world()
+  w.daemon.threads.set('t1', thread('t1', { status: { type: 'systemError' } }))
+  let changes = 0
+  const line = start(w, { onChange: () => changes++ })
+  await until(() => line.rows().length === 1, 'the snapshot')
+  const id = line.rows()[0]!.sessionId
+  const mark = line.mark('t1')!
+  const before = changes
+  line.setOutcome('t1', 'rate-limited', mark - 1)
+  assert.equal(changes, before, 'an old mark changes nothing')
+  assert.equal(line.rows()[0]!.status, 'error')
+  line.setOutcome('t1', 'rate-limited', mark)
+  assert.equal(changes, before + 1)
+  assert.equal(line.rows().find((r) => r.sessionId === id)!.status, 'rate-limited')
   line.stop()
   await line.done
 })

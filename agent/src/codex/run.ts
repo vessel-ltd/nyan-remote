@@ -205,6 +205,7 @@ export function startCodex(cfg: CodexConfig | undefined, opts: StartCodexOptions
           opts.onRowStatus?.(line.sessionIdOf(change.thread.id), change.to)
           void notifier?.onStatus(change)
         },
+        onSettle: (change) => void notifier?.onStatus(change, { quiet: true }),
         ...(opts.cardsChanged
           ? (() => {
               const cardDeps = { generation: () => line.generation(), changed: opts.cardsChanged, now: () => new Date(), ...(opts.hooks?.log ? { log: opts.hooks.log } : {}) }

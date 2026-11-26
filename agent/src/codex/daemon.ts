@@ -113,6 +113,11 @@ export interface DaemonHooks {
   /** One thread changed status (for notifications) */
   onStatus?: (change: Extract<StatusChange, { type: 'changed' }>) => void
   /**
+   * ★ The first connection's threads that stand in `systemError`: only to settle their words ("failed" or
+   *   "rate-limited"), never to notify (the agent just started; nothing was missed).
+   */
+  onSettle?: (change: Extract<StatusChange, { type: 'changed' }>) => void
+  /**
    * Show an approval card and wait for the phone (see `ApprovalsDeps.offer`). `row` is the thread's row as listed.
    * ⚠️ Absent ⇒ approvals are off: no thread is ever joined and no server request is ever answered.
    */
@@ -682,6 +687,7 @@ export function startCodexDaemonLine(opts: DaemonOptions): CodexDaemonLine {
     //   (codex review, medium #6). The notifier remembers what it already sent, so a thread told about is not told again.
     //   ⚠️ Not on the first connection: then nothing was missed by us (the agent just started).
     if (generation > 1 && liveRpc === live) for (const change of book.standing()) hooks.onStatus?.(change)
+    else if (liveRpc === live) for (const change of book.standing()) if (change.status.type === 'systemError') hooks.onSettle?.(change)
 
     return conn.closed
   }
