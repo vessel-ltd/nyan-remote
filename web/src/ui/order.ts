@@ -23,7 +23,8 @@ import { t } from '../../../shared/i18n.ts'
 export type Bucket = 'attention' | 'running' | 'history'
 
 /** States waiting for your action. Only these come to the very top of the screen */
-const ATTENTION: readonly SessionStatus[] = ['waiting', 'error', 'done']
+// ★ Rate-limited too (2026-11-26 / codex): a stopped session needs you (move the work, raise a cap, or wait for the reset)
+const ATTENTION: readonly SessionStatus[] = ['waiting', 'error', 'rate-limited', 'done']
 
 export function bucketOf(s: SessionSummary): Bucket {
   // No process means history. Do not lift it up even if a status label remains.
@@ -41,11 +42,12 @@ export function bucketOf(s: SessionSummary): Bucket {
 const RANK: Record<SessionStatus, number> = {
   waiting: 0,
   error: 1,
-  done: 2,
-  working: 3,
+  // ★ Next to a failure: the work stopped, and moving it elsewhere is up to you (2026-11-26)
+  'rate-limited': 2,
+  done: 3,
+  working: 4,
   // ★ Running in the background is on the "leave it alone" side. Below responding (no reply for a while)
-  background: 4,
-  'rate-limited': 5,
+  background: 5,
   idle: 6,
   unknown: 7,
 }

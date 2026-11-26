@@ -7,6 +7,7 @@ import {
   groupSessions,
   showMachineFor,
   sortSessions,
+  statusRank,
   synthesizeRows,
 } from './order.ts'
 import { explainWait, statusView } from './status.ts'
@@ -74,7 +75,12 @@ test('no process: goes to history even if a status label remains', () => {
 test('responding / starting go to "running" (the leave-it-alone side)', () => {
   assert.equal(bucketOf(s('a', 'working', true, '2026-08-12T01:00:00.000Z')), 'running')
   assert.equal(bucketOf(s('b', 'idle', true, '2026-08-12T01:00:00.000Z')), 'running')
-  assert.equal(bucketOf(s('c', 'rate-limited', true, '2026-08-12T01:00:00.000Z')), 'running')
+})
+
+test('★ rate-limited is "waiting for you", next to a failure (2026-11-26: the session stopped; moving the work is up to you)', () => {
+  // ⚠️ It used to be on the "running" side (meant for an SDK that waits and resumes by itself). Claude Code stops instead.
+  assert.equal(bucketOf(s('c', 'rate-limited', true, '2026-08-12T01:00:00.000Z')), 'attention')
+  assert.ok(statusRank('error') < statusRank('rate-limited') && statusRank('rate-limited') < statusRank('done'))
 })
 
 test('★ running in the background is on the "running" side, below done and below responding', () => {

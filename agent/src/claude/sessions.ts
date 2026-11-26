@@ -228,6 +228,9 @@ export function isKnownRawStatus(raw: string | undefined): boolean {
  * ⚠️ Take lastActivity only from conversation records (see the comment in transcript.ts).
  *    Including system housekeeping (away_summary is written 3 minutes later) makes the state vanish.
  */
+/** ★ Activity this long after a rate-limit stop is a new turn (the failure's own line lands ~0.5 s after the hook) */
+export const LIMIT_RETRY_GAP_MS = 2000
+
 export function resolveStatus(
   raw: string | undefined,
   isLive: boolean,
@@ -271,8 +274,13 @@ export function resolveStatus(
   //      It is a state meant to be raised as "waiting on you" so it gets noticed, yet merely something running in the background
   //      turned it into "running in the background" (introduced when `shell` was added).
   //   ⚠️ So that old failures do not linger, the "after the last activity" condition applies here too.
-  if (hooks?.stop?.event === 'StopFailure' && isAfterActivity(hooks.stop.at, HOOK_TOLERANCE_MS)) {
-    return { status: 'error', lastEvent: 'StopFailure' }
+  // ★ Stopped at a plan limit ⇒ "rate-limited", not "failed" (2026-11-26): the work did not fail, the login ran out
+  //   ⚠️ Any activity after the limit (inside the tolerance) is a new turn ⇒ decided as usual, whatever the raw status
+  //      (codex: the list stayed rate-limited while the retry waited for its first output, or for an approval)
+  //   ⚠️ With a margin: the failure's own transcript line lands ~0.5 s after the hook (measured 450 / 486 ms), not a new turn
+  const retried = hooks?.stop?.limited === true && activityAt > Date.parse(hooks.stop.at) + LIMIT_RETRY_GAP_MS
+  if (hooks?.stop?.event === 'StopFailure' && !retried && isAfterActivity(hooks.stop.at, HOOK_TOLERANCE_MS)) {
+    return { status: hooks.stop.limited ? 'rate-limited' : 'error', lastEvent: 'StopFailure' }
   }
 
   if (isLive && raw === 'busy') return { status: 'working' }
@@ -344,7 +352,8 @@ export function resolveStatus(
     }
   }
 
-  if (hooks?.stop && isAfterActivity(hooks.stop.at, HOOK_TOLERANCE_MS)) {
+  // ⚠️ Not a limit the user already moved past (`retried`): it must not come back as "failed" here (codex)
+  if (hooks?.stop && !retried && isAfterActivity(hooks.stop.at, HOOK_TOLERANCE_MS)) {
     return {
       status: hooks.stop.event === 'StopFailure' ? 'error' : 'done',
       lastEvent: hooks.stop.event,

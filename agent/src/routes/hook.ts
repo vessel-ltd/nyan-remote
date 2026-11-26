@@ -22,6 +22,7 @@ import {
   notificationText,
   sessionTag,
   shouldRing,
+  isClaudeLimitStop,
   statusLabel,
   waitingReason,
   type HookEvent,
@@ -68,12 +69,13 @@ export function sessionIdOf(x: unknown): string | undefined {
  * ⚠️ The wording is taken from `statusLabel`. Writing it directly here **makes the list and notifications disagree**
  *    (external review 2026-08-16, low #7: the same Japanese was in two places).
  */
-export function labelFor(event: string): string {
+export function labelFor(event: string, failure?: HookEvent['failure']): string {
   switch (event) {
     case 'Stop':
       return statusLabel('done')!
     case 'StopFailure':
-      return statusLabel('error')!
+      // ★ A plan limit is not a failure of the work (2026-11-26): "制限中" (rate-limited), the same word as the list
+      return statusLabel(failure === 'rate-limit' ? 'rate-limited' : 'error')!
     case 'Notification':
       return statusLabel('waiting')!
     case 'SessionEnd':
@@ -171,7 +173,7 @@ export interface StateContext {
 export function settledLabel(event: HookEvent, probe: StatusProbe, ctx: StateContext): string {
   // ★ Events that do not look at the state. ⚠️ `SessionEnd` is not in `PUSH_EVENTS` so it never becomes a notification, but
   //   this is explicit so that if it is added, it does not get decided from the state instead of "終了" (ended).
-  if (event.event === 'StopFailure' || event.event === 'SessionEnd') return labelFor(event.event)
+  if (event.event === 'StopFailure' || event.event === 'SessionEnd') return labelFor(event.event, event.failure)
   // ★ If `Stop` has no `sessionId`, it cannot be probed (`transcript_path` has an unexpected shape).
   //   ⚠️ It used to be `labelFor('Stop')` = "done" (fail-open). **Do not assert**
   //   (`/code-review` 2026-08-21, low #3. Noting that the behavior changed).
@@ -332,7 +334,7 @@ function clipTagPart(part: string): string {
 
 export function toPushPayload(
   event: HookEvent,
-  label = labelFor(event.event),
+  label = labelFor(event.event, event.failure),
   fields?: NotifyFields,
 ): PushPayload {
   // ★★ The wording is built in one place, `notificationText` (2026-08-21, so it never disagrees with the list).
@@ -467,6 +469,10 @@ export async function hook(ctx: Ctx): Promise<{ ok: true; pushed: number }> {
     ...(name === 'Notification' ? { notice: classifyNotice(payload) } : {}),
     // ★ The turn's id (so dedup does not cross turns / 2026-09-21)
     ...(typeof payload['prompt_id'] === 'string' ? { promptId: payload['prompt_id'] } : {}),
+    // ★ Stopped at a plan limit (2026-11-26 / measured on Claude Code 2.1.332: `error: "rate_limit"`, the same instant as the
+    //   "You've hit your … limit" line in the transcript). ⚠️ The category only, never the message (§6.2)
+    //   ⚠️ The message must be a plan-limit one too (a temporary server 429 has the same `error` / `isClaudeLimitStop`)
+    ...(name === 'StopFailure' && isClaudeLimitStop(payload['error'], payload['last_assistant_message']) ? { failure: 'rate-limit' as const } : {}),
   }
   if (typeof payload.transcript_path === 'string') eventPaths.set(event, payload.transcript_path)
   // Used as evidence for the list's status display (agents --json cannot tell needs attention / abnormal exit)

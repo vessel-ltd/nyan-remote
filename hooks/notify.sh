@@ -83,7 +83,14 @@ now="$(date +%H:%M)"
 case "$event" in
   Stop)          label="ターン終了" ;;
   Notification)  label="通知" ;;
-  StopFailure)   label="⚠ 異常終了" ;;
+  # ★ A plan limit says "制限中" (rate-limited), like the app (2026-11-26). ⚠️ Same words as `CLAUDE_NOT_A_LIMIT` /
+  #   `CLAUDE_CREDITS_RAN_OUT` in shared/types.ts (scripts/notifyHook.test.mjs keeps them equal); a temporary server 429 stays "異常終了"
+  StopFailure)
+    if [ "$(printf '%s' "$payload" | jq -r '((.last_assistant_message // "") | tostring | ascii_downcase) as $m | if (.error == "rate_limit" and ($m | contains("not your usage limit") or contains("experiencing high load") or contains("request rejected (429)") | not)) or (.error == "unknown" and ($m | contains("usage credits ran out"))) then "limit" else "" end' 2>/dev/null)" = limit ]; then
+      label="制限中"
+    else
+      label="⚠ 異常終了"
+    fi ;;
   SessionEnd)    label="終了" ;;
   *)             label="${event:-イベント}" ;;
 esac

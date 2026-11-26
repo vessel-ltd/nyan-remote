@@ -15,7 +15,7 @@ export type SessionStatus =
   | 'error' // failed (StopFailure hook)
   | 'done' // done (Stop hook. The turn ended and it waits for input)
   | 'idle' // running but none of the above
-  | 'rate-limited' // rate-limited (taken from SDK events in M4)
+  | 'rate-limited' // ★ stopped at a plan usage limit (Claude: `StopFailure` with `error: "rate_limit"` / 2026-11-26)
   | 'unknown'
 
 export type TitleSource = 'custom' | 'ai' | 'prompt' | 'fallback'
@@ -633,6 +633,33 @@ export interface HookEvent {
    * ⚠️ It is a UUID, not content, so keeping it in records does not touch §6.2.
    */
   promptId?: string
+  /**
+   * ★★ Why a `StopFailure` stopped (2026-11-26 / rate-limit detection). Only `'rate-limit'` is kept: the CLI's
+   *   `error: "rate_limit"` (5-hour, weekly or spend limit: "You've hit your 5-hour limit · resets 7:40am").
+   *   ⚠️ The category only (§6.2): never the message (`last_assistant_message` can be conversation text for other errors).
+   */
+  failure?: 'rate-limit'
+}
+
+/**
+ * ★★ How Claude Code 2.1.332 words the stops that look like limits (2026-11-26, read from its source):
+ *   - `error: "rate_limit"` is a plan limit ("You've hit your 5-hour limit · resets 7:40am", "Usage is paused for your
+ *     organization", …) **except** two: a temporary server 429 "(not your usage limit)", and model overload
+ *     "Opus is experiencing high load. Switch to Sonnet." (switching the model unblocks it; it is not the login's quota),
+ *     and on the API-key path "API Error: Request rejected (429) · Too many requests, retry in 10 seconds" (per-minute throttling).
+ *   - `error: "unknown"` with "Usage credits ran out before the response was finished." is a limit too.
+ *   ⚠️ Matching the limit messages instead missed new wordings every review round ⇒ every `rate_limit` is a limit unless
+ *   Claude Code itself says otherwise. ⚠️ Checked in memory only (§6.2).
+ *   ⚠️ `hooks/notify.sh` (Discord) has the same words for jq: `notifyHook.test.mjs` keeps the two equal.
+ */
+export const CLAUDE_NOT_A_LIMIT = ['not your usage limit', 'experiencing high load', 'request rejected (429)'] as const
+export const CLAUDE_CREDITS_RAN_OUT = 'usage credits ran out'
+
+/** ★ Did this `StopFailure` stop at a plan limit? (words compared in lower case) */
+export function isClaudeLimitStop(error: unknown, message: unknown): boolean {
+  const m = typeof message === 'string' ? message.toLowerCase() : ''
+  if (error === 'rate_limit') return !CLAUDE_NOT_A_LIMIT.some((w) => m.includes(w))
+  return error === 'unknown' && m.includes(CLAUDE_CREDITS_RAN_OUT)
 }
 
 /**

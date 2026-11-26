@@ -19,8 +19,8 @@ import { statePath } from '../state.ts'
 const SEED_BYTES = 128 * 1024
 
 export interface SessionHooks {
-  /** End of a turn. Stop → done / StopFailure → abnormal exit */
-  stop?: { event: 'Stop' | 'StopFailure'; at: string }
+  /** End of a turn. Stop → done / StopFailure → abnormal exit, or rate-limited when `limited` (2026-11-26) */
+  stop?: { event: 'Stop' | 'StopFailure'; at: string; limited?: true }
   /** Asking for approval (idle notices are not included) */
   permission?: { at: string }
 }
@@ -45,7 +45,7 @@ function apply(event: HookEvent, fromLog = false): void {
   if (!event.sessionId) return
   const cur = bySession.get(event.sessionId) ?? {}
   if (event.event === 'Stop' || event.event === 'StopFailure') {
-    cur.stop = { event: event.event, at: event.at }
+    cur.stop = { event: event.event, at: event.at, ...(event.event === 'StopFailure' && event.failure === 'rate-limit' ? { limited: true as const } : {}) }
   } else if (!fromLog && event.event === 'Notification' && event.notice === 'permission') {
     cur.permission = { at: event.at }
   }

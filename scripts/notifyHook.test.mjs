@@ -123,3 +123,32 @@ test('★★ notify.sh: token, body and webhook URL never appear in curl argv, y
     rmSync(dir, { recursive: true, force: true })
   }
 })
+
+test('★★ notify.sh (Discord) reads a plan limit by the same rule as the agent (isClaudeLimitStop)', async () => {
+  const { CLAUDE_CREDITS_RAN_OUT, CLAUDE_NOT_A_LIMIT, isClaudeLimitStop } = await import('../shared/types.ts')
+  const src = readFileSync(HOOK, 'utf8')
+  const expr = src.match(/jq -r '(\(\(\.last_assistant_message[^']*)'/)?.[1]
+  assert.ok(expr, 'the limit check is missing from notify.sh')
+  for (const w of [...CLAUDE_NOT_A_LIMIT, CLAUDE_CREDITS_RAN_OUT]) assert.ok(expr.includes(`contains("${w}")`), `⚠️⚠️ notify.sh does not know "${w}"`)
+  assert.equal((expr.match(/contains\(/g) ?? []).length, CLAUDE_NOT_A_LIMIT.length + 1, '⚠️⚠️ notify.sh has words the agent does not')
+  const { execFileSync } = await import('node:child_process')
+  const run = (o) => execFileSync('jq', ['-r', expr], { input: JSON.stringify(o) }).toString().trim()
+  const cases = [
+    { error: 'rate_limit', last_assistant_message: "You've hit your 5-hour limit · resets 7:40am" },
+    { error: 'rate_limit', last_assistant_message: 'Usage is paused for your organization.' },
+    { error: 'rate_limit', last_assistant_message: 'API Error: Server is temporarily limiting requests (not your usage limit) · Rate limited' },
+    { error: 'rate_limit', last_assistant_message: 'Claude is temporarily limiting requests to the usage page (Not Your Usage Limit)' },
+    { error: 'rate_limit', last_assistant_message: 'Opus is experiencing high load. Switch to Sonnet.' },
+    { error: 'rate_limit', last_assistant_message: 'API Error: Request rejected (429) · Too many requests, retry in 10 seconds' },
+    { error: 'unknown', last_assistant_message: 'API Error: Usage credits ran out before the response was finished.' },
+    { error: 'unknown', last_assistant_message: 'API Error: something else' },
+    { error: 'server_error', last_assistant_message: "You've hit your limit" },
+    { error: 'rate_limit' },
+    { error: 'rate_limit', last_assistant_message: 42 },
+  ]
+  for (const c of cases) {
+    assert.equal(run(c) === 'limit', isClaudeLimitStop(c.error, c.last_assistant_message), `⚠️⚠️ notify.sh and the agent disagree on ${JSON.stringify(c)}`)
+  }
+  assert.equal(run(cases[0]), 'limit')
+  assert.equal(run(cases[2]), '')
+})
