@@ -7,6 +7,7 @@
 //    the user's Codex is said in the README, once in the log on the first connect, and in `nyan status` / `Config.codex`).
 
 import { recordLimitStop } from '../usageHistory.ts'
+import { codexMemberLimited } from '../teamHooks.ts'
 import { realpath, stat } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, join, resolve } from 'node:path'
@@ -234,6 +235,8 @@ export function startCodex(cfg: CodexConfig | undefined, opts: StartCodexOptions
         // ⚠️ Not when two homes show the same label: they cannot be told apart (the history keeps neither's samples)
         onLimit: (id, turn) => {
           if (!codexLabelShared(home.label)) recordLimitStop('codex', home.label, `${id}:${turn}`)
+          // ★ Teams: a member stopped at its limit is told to its leader (`teamHooks.ts`)
+          codexMemberLimited(line.sessionIdOf(id), `${id}:${turn}`)
         },
         ...(opts.hooks?.log ? { log: opts.hooks.log } : {}),
       })

@@ -206,7 +206,7 @@ export function formatCandidates(list) {
       const team = c.team ? `  [${t('チーム', 'team')} ${c.team.id} ${c.team.role}]` : ''
       // ★ Session-supplied text (title, project) inside a random data fence; refs and addresses (ours) outside it (r23 medium #3)
       const fenced = fence(t('題名とプロジェクト（データ）', 'title and project (data)'), `${c.title}\n${c.project}`).replace(/^/gm, '    ')
-      return `${c.ref}  ${tags}${team}\n    ${t('上限', 'limits')}: ${formatLimits(c)}${c.address ? `\n    SendMessage to: ${c.address}` : ''}\n${fenced}`
+      return `${c.ref}  ${tags}${team}\n    ${t('上限', 'limits')}: ${formatLimits(c)}\n${fenced}`
     })
     .join('\n')
 }
@@ -225,12 +225,16 @@ export function formatStatus(s) {
     lines.push(`${m.name}  ${toolName(m.tool)} · ${m.account} · ${m.status}`)
     if (m.limits) lines.push(`    ${t('上限', 'limits')}: ${formatLimits(m)}`)
     lines.push(fence(t('題名（データ）', 'title (data)'), m.title).replace(/^/gm, '    '))
+    if (m.noReports) {
+      lines.push(
+        `    ⚠️ ${t('このプロファイルには nyan のフックが無いので、ターンの終わりや止まったことが届きません（人に nyan のフックを入れてもらう: ~/.claude* なら nyan update、ほかの場所なら手で。それまでは nyan team read で見る）', 'this profile has no nyan hooks, so its turn ends and stops never reach you (ask the user to install them: nyan update for ~/.claude* profiles, by hand elsewhere; until then use nyan team read)')}`,
+      )
+    }
+    // ★ Every member is reached the same way (2026-11-27): a Claude member through its inbox (`reachable` = it has one)
     lines.push(
-      m.address
-        ? `    SendMessage to: ${m.address}`
-        : m.tool === 'codex' || (m.tool === 'agy' && m.status !== 'replaced')
-          ? `    ${t('送る', 'send')}: nyan team send ${m.name} "<text>"`
-          : `    ${t('いまは届きません（受信箱が見つからない／別のプロセスに替わった）', 'not reachable now (no inbox, or replaced by another process)')}`,
+      m.reachable || m.tool === 'codex' || (m.tool === 'agy' && m.status !== 'replaced')
+        ? `    ${t('送る', 'send')}: nyan team send ${m.name} - < <file>`
+        : `    ${t('いまは届きません（受信箱が見つからない／別のプロセスに替わった）', 'not reachable now (no inbox, or replaced by another process)')}`,
     )
   }
   return lines.join('\n')
@@ -265,8 +269,8 @@ export function helpText() {
 
   nyan team candidates               候補（ほかの生きているセッション）
   nyan team create <ref>… [--approvals 3h|24h]   チームを作る（--approvals でメンバーの承認を任される）
-  nyan team status                   自分のチーム（Claude のメンバーの SendMessage の宛先も出る）
-  nyan team send <member> <text>     Codex・agy のメンバーに指示する（- で標準入力から）
+  nyan team status                   自分のチーム（メンバーと上限）
+  nyan team send <member> <text>     メンバーに指示する（- で標準入力から）
   nyan team read <member> [--last n] メンバーの最近の発言を読む
   nyan team pending                  メンバーの承認待ち
   nyan team approve <member> <r…> allow|deny [--choice <番号>|<質問>:<番号>] [--reason <文>]
@@ -278,8 +282,8 @@ export function helpText() {
 
   nyan team candidates               candidates (the other live sessions)
   nyan team create <ref>… [--approvals 3h|24h]   make a team (--approvals: answer the members' approvals)
-  nyan team status                   your team (with each Claude member's SendMessage address)
-  nyan team send <member> <text>     instruct a Codex or agy member (- reads stdin)
+  nyan team status                   your team (members and their limits)
+  nyan team send <member> <text>     instruct a member (- reads stdin)
   nyan team read <member> [--last n] read a member's recent messages
   nyan team pending                  the members' waiting approvals
   nyan team approve <member> <r…> allow|deny [--choice <n>|<q>:<n>] [--reason <text>]

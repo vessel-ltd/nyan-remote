@@ -40,7 +40,7 @@ import { aliveProcStartSync, readIndexEntriesDetailed, selectLive } from '../cla
 import { isKnownRawStatus, resolveStatus } from '../claude/sessions.ts'
 import { isPermissionHookInstalled } from '../claude/permissionHook.ts'
 import { abandonSession, hasPendingForSession, withPendingPerms } from '../permission.ts'
-import { sessionEnded, teamQuietLabel } from '../teamHooks.ts'
+import { claudeMemberReport, sessionEnded, teamQuietLabel } from '../teamHooks.ts'
 import { sendToAll } from '../push.ts'
 import { threadUrl } from '../pushUrl.ts'
 import { appendJsonl } from '../state.ts'
@@ -438,6 +438,13 @@ let loggedNotificationShape = false
  *   `teamHooks.ts`). ⚠️ Not a field of `HookEvent`: events go to `hooks.jsonl`, and the path names the home and project.
  */
 const eventPaths = new WeakMap<HookEvent, string>()
+/**
+ * ★ A `Stop` / `StopFailure`'s `last_assistant_message`, beside the event and never stored or logged (a team member's
+ *   last words go to its leader / `claudeMemberDone`). ⚠️ Not a field of `HookEvent` (it is conversation content / §6.2).
+ */
+const eventWords = new WeakMap<HookEvent, string>()
+/** ★ A team member's `Stop` report to its leader, started when the hook came (the settle waits for it / `sendSettled`) */
+const eventReports = new WeakMap<HookEvent, Promise<boolean>>()
 function originOfEvent(event: HookEvent): { account: string; transcriptPath?: string } {
   const p = eventPaths.get(event)
   return { account: event.account, ...(p ? { transcriptPath: p } : {}) }
@@ -476,11 +483,21 @@ export async function hook(ctx: Ctx): Promise<{ ok: true; pushed: number }> {
     ...(name === 'StopFailure' && isClaudeLimitStop(payload['error'], payload['last_assistant_message']) ? { failure: 'rate-limit' as const } : {}),
   }
   if (typeof payload.transcript_path === 'string') eventPaths.set(event, payload.transcript_path)
+  const words = payload['last_assistant_message']
+  if ((name === 'Stop' || name === 'StopFailure') && typeof words === 'string') eventWords.set(event, words)
   // ★ Usage history: a stop at a plan limit, once per session and turn (`usageHistory.ts`). Without a turn id, stops of
   //   one session within the same minute are one (a retry that is refused again at once is the same stop)
   if (event.failure === 'rate-limit' && sessionId && account) recordLimitStop('claude', account, `${sessionId}:${event.promptId || event.at.slice(0, 16)}`)
   // Used as evidence for the list's status display (agents --json cannot tell needs attention / abnormal exit)
   noteHook(event)
+  // ★ A team member's turn ended or stopped: its leader is told now, as the hook arrives (`claudeMemberReport`). A stop on
+  //   an error rings the phone as before; a "done" is kept quiet at the settle only when this report got through
+  if (name === 'Stop' || name === 'StopFailure') {
+    const kind = name === 'Stop' ? 'done' : event.failure === 'rate-limit' ? 'limit' : 'error'
+    // ⚠️ An empty `prompt_id` is no id (it would make every turn one / codex review r2)
+    const report = claudeMemberReport(kind, event.sessionId, originOfEvent(event), eventWords.get(event), event.promptId || event.at)
+    if (report && name === 'Stop') eventReports.set(event, report)
+  }
 
   // ★ When a turn ends, all pending approvals for that session are invalid.
   //
@@ -707,11 +724,23 @@ export async function sendSettled(event: HookEvent, probe: StatusProbe): Promise
       )
       return
     }
-    if (teamQuietLabel(event.sessionId, label, originOfEvent(event))) {
-      // ★ A team member's turn end is not rung (the user talks to the leader / docs/TEAM.md §4.6)
-      rememberLabel(event, label, why ?? undefined)
-      console.log(`[hook] ${event.account} ${event.project} — ${logLabel(label)} ${basis} team member: not rung`)
-      return
+    // ★ A team member's turn end is not rung: its last words go to the leader instead (the user talks to the leader /
+    //   docs/TEAM.md §4.6). ⚠️ Not delivered ⇒ rung as usual (nobody would hear it otherwise)
+    // ⚠️ Judged by this Stop's own report (the member may have been removed since; it was heard all the same / r2 low)
+    const report = eventReports.get(event)
+    if (report && label === statusLabel('done')) {
+      if (await report) {
+        rememberLabel(event, label, why ?? undefined)
+        console.log(`[hook] ${event.account} ${event.project} — ${logLabel(label)} ${basis} team member: told the leader, not rung`)
+        return
+      }
+      // ⚠️ The report failed after a wait: a newer turn end of the session since then is the state now — this older
+      //    "done" must not replace its notification (codex review r4)
+      const last = event.sessionId ? hooksFor(event.sessionId)?.stop : undefined
+      if (last && last.at > event.at) {
+        console.log(`[hook] ${event.account} ${event.project} — ${logLabel(label)} ${basis} team member: report failed, a newer turn end is current`)
+        return
+      }
     }
     if (!shouldSendLabel(event, label, why ?? undefined)) {
       console.log(

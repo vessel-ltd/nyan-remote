@@ -9,7 +9,7 @@ import { t } from '../../../shared/i18n.ts'
 import { looksLikeCommand, MAX_SEND_BYTES, type LogEntry, type PermissionRequest, type SessionSummary, type ToolUsage } from '../../../shared/types.ts'
 import { config } from '../config.ts'
 import { discoverConfigDirs } from '../claude/configDirs.ts'
-import { findTarget } from '../claude/inbox.ts'
+import { findTarget, sendToSession } from '../claude/inbox.ts'
 import { aliveProcStartFreshSync, sameProcStart } from '../claude/sessionIndex.ts'
 import { isCodexSessionId, shortSessionId } from '../codex/ids.ts'
 import { isQuiet, originOf, pendingWithMeta } from '../permission.ts'
@@ -31,7 +31,7 @@ import {
   type Team,
   type TeamMember,
 } from '../team.ts'
-import { TEAM_FRAME_CLOSE, TEAM_FRAME_MARK, agyInstructionSent, sendTag, agyStateNow, asMemberData, cardText, endTeam, soleProcessSync, indexStatusNow, leaderMay, leaderSessionNow, liveMember, memberUnique, ownsCard, revealed, cardRef, teamDeps, tellLeader } from '../teamHooks.ts'
+import { TEAM_FRAME_CLOSE, TEAM_FRAME_MARK, TEAM_SENDER, agyInstructionSent, sendTag, agyStateNow, asMemberData, cardText, endTeam, soleProcessSync, indexStatusNow, leaderMay, leaderSessionNow, liveMember, memberUnique, ownsCard, revealed, cardRef, teamDeps, tellLeader } from '../teamHooks.ts'
 import { agyDelivery, agyDeliveryMessage } from '../agy/cards.ts'
 import { AGY_DELIVERY_WAIT_MS, settledWithin } from './permission.ts'
 import { answerPermission, type AnswerBody } from './permission.ts'
@@ -42,9 +42,10 @@ import { AGY_SEND_REFUSAL, defaultAgyKeysDeps, findAgyTarget, looksLikeAgyShortc
 import { agyEntries } from '../agy/log.ts'
 import { lastTurnStart } from '../agy/pending.ts'
 import type { TeamTool } from '../team.ts'
-import { readFileSync, statSync } from 'node:fs'
+import { accessSync, constants, readFileSync, statSync } from 'node:fs'
+import { homedir } from 'node:os'
 import { readdir, stat } from 'node:fs/promises'
-import { dirname, join } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 import { sessions } from './sessions.ts'
 import { readLogSlice } from '../claude/log.ts'
 import { usage } from './usage.ts'
@@ -57,6 +58,42 @@ const READ_PAGES_MAX = 200
 interface LeaderBody {
   leader?: unknown
   pid?: unknown
+}
+
+/**
+ * ★ Whether a Claude profile has nyan's turn-end hook (`notify.sh` on `Stop`): without it a member's turn ends are never
+ *   heard, neither by the leader nor the phone (a profile made after `nyan update` / codex review r10). A warning only:
+ *   unreadable ⇒ false (the lead is told to check).
+ */
+export function hasTurnEndHook(configDir: string, home = homedir()): boolean {
+  const script = join(home, '.claude', 'hooks', 'notify.sh')
+  // ★ Only the forms the installer writes (`install-permission-hook.mjs` NOTIFY_COMMAND / its path, bare or quoted): a
+  //   moved profile's stale path also names notify.sh but runs nothing (codex review r12)
+  const ours = new Set(['"$HOME/.claude/hooks/notify.sh"', script, `'${script.replaceAll("'", "'\\''")}'`])
+  try {
+    // ⚠️ The script must be a regular, runnable file (a stale entry reports nothing / codex review r11)
+    if (!statSync(script).isFile()) return false
+    accessSync(script, constants.X_OK)
+    const o = JSON.parse(readFileSync(join(configDir, 'settings.json'), 'utf8')) as { hooks?: Record<string, unknown> }
+    // ★ Both turn ends: a finished turn (`Stop`) and a stop on an error or the plan limit (`StopFailure` / codex review r13)
+    return ['Stop', 'StopFailure'].every((ev) => {
+      const list = o.hooks?.[ev]
+      return (
+        Array.isArray(list) &&
+        list.some((e) => {
+          const hooks = e && typeof e === 'object' ? (e as { hooks?: unknown }).hooks : undefined
+          return Array.isArray(hooks) && hooks.some((h) => !!h && typeof h === 'object' && (h as { type?: unknown }).type === 'command' && ours.has(String((h as { command?: unknown }).command)))
+        })
+      )
+    })
+  } catch {
+    return false
+  }
+}
+
+/** The same profile directory, however it was written (`configDirs` may end in `/` / codex review) */
+function sameDir(a: string, b: string | undefined): boolean {
+  return b !== undefined && resolve(a) === resolve(b)
 }
 
 function str(v: unknown): string | undefined {
@@ -129,8 +166,8 @@ interface Candidate {
   model?: string
   effort?: string
   contextTokens?: number
-  /** Claude: where its own SendMessage reaches it (`uds:<socket>`). Codex / agy: absent (use `nyan team send`) */
-  address?: string
+  /** Claude: its inbox can be written to now (`nyan team send` reaches it). Codex / agy: absent */
+  reachable?: true
   /** Weekly limit used (0–100) of that profile's login, when known. ⚠️ Kept for an older `nyan team` (use `limits`) */
   weeklyUsedPercent?: number
   /** ★ That login's plan-limit windows with their reset times, and when they were read (2026-11-19) */
@@ -198,11 +235,11 @@ export async function teamCandidates(ctx: Ctx): Promise<{ candidates: Candidate[
     const tool = toolOf(row)
     // ★ agy (docs/TEAM.md §9): only a conversation nyan can type into (started through the relay, shown by one agy)
     if (tool === 'agy' && (row.sendRoute !== 'keys' || row.agyShared)) continue
-    let address: string | undefined
+    let reachable = false
     if (tool === 'claude') {
       const target = await findTarget(dirs, row.sessionId)
       if ('reason' in target) continue // not reachable now (no inbox, unverifiable, ambiguous): not a candidate
-      address = `uds:${target.socketPath}`
+      reachable = true
     }
     const limits = limitsOf(u, tool, row.account)
     const week = limits?.windows.find((w) => w.minutes === WEEK_MINUTES)
@@ -218,7 +255,7 @@ export async function teamCandidates(ctx: Ctx): Promise<{ candidates: Candidate[
       ...(row.model ? { model: row.model } : {}),
       ...(row.effort ? { effort: row.effort } : {}),
       ...(row.contextTokens !== undefined ? { contextTokens: row.contextTokens } : {}),
-      ...(address ? { address } : {}),
+      ...(reachable ? { reachable: true as const } : {}),
       ...(week ? { weeklyUsedPercent: week.usedPercent } : {}),
       ...(limits ? { limits } : {}),
       ...(inTeam ? { team: inTeam } : {}),
@@ -271,7 +308,7 @@ export async function teamCreate(ctx: Ctx): Promise<unknown> {
 
   const rows = await liveRows()
   const leaderRow = rows.find((r) => r.sessionId === sessionId)
-  const members: { sessionId: string; tool: TeamTool; account: string; pid?: number; procStart?: string; configDir?: string }[] = []
+  const members: { sessionId: string; tool: TeamTool; account: string; pid?: number; procStart?: string; configDir?: string; busyAtJoin?: boolean }[] = []
   for (const ref of refs) {
     // ⚠️ Matched only against our own refs (never a prefix of another program's id)
     if (!/^(c-|cx-|ag-)?[0-9a-f]{8}$/.test(ref)) throw new HttpError(400, t(`参照の形が違います: ${ref}`, `Not a candidate ref: ${ref}`))
@@ -287,7 +324,7 @@ export async function teamCreate(ctx: Ctx): Promise<unknown> {
       if ('reason' in at || typeof start !== 'string') {
         throw new HttpError(409, t(`「${ref}」のセッションを確かめられません（いま繋がっていない）`, `Cannot verify the session "${ref}" (not reachable now).`))
       }
-      members.push({ sessionId: row.sessionId, tool, account: row.account, pid: at.pid, procStart: start, configDir: dirname(at.sessionsDir) })
+      members.push({ sessionId: row.sessionId, tool, account: row.account, pid: at.pid, procStart: start, configDir: dirname(at.sessionsDir), ...(row.status === 'working' || row.status === 'waiting' ? { busyAtJoin: true } : {}) })
     } else if (tool === 'agy') {
       // ★ Bind an agy member to the agy process that shows the conversation now (the one keys would go to)
       const conv = conversationOf(row.sessionId)
@@ -309,7 +346,7 @@ export async function teamCreate(ctx: Ctx): Promise<unknown> {
       }
       members.push({ sessionId: row.sessionId, tool, account: row.account, pid: at.pid, procStart: start })
     } else {
-      members.push({ sessionId: row.sessionId, tool, account: row.account })
+      members.push({ sessionId: row.sessionId, tool, account: row.account, ...(row.status === 'working' || row.status === 'waiting' ? { busyAtJoin: true } : {}) })
     }
   }
   // ⚠️⚠️ No await from here to `createTeam`: the snapshot below is the grant's moment
@@ -371,13 +408,13 @@ async function statusOf(team: Team): Promise<unknown> {
   const members = []
   for (const m of v.members) {
     const row = rows.find((r) => r.sessionId === m.sessionId)
-    let address: string | undefined
+    let reachable = false
     let replaced = false
     if (m.tool === 'claude') {
       // ⚠️ Only the process the team was made with (a resume under the same id is a session the human never picked /
       //    r4 medium #10): otherwise no address, and the member is shown as replaced
       const target = await findTarget(dirs, m.sessionId)
-      if (!('reason' in target) && target.pid === m.pid && liveMember(m)) address = `uds:${target.socketPath}`
+      if (!('reason' in target) && target.pid === m.pid && liveMember(m)) reachable = true
       else replaced = true
     } else if (m.tool === 'agy') {
       // ★ No longer the recorded agy on this conversation (it exited, or the PC moved it elsewhere)
@@ -391,7 +428,8 @@ async function statusOf(team: Team): Promise<unknown> {
       account: m.account,
       title: row ? revealed(row.title) : '',
       status: replaced ? 'replaced' : (row?.status ?? 'gone'),
-      ...(address ? { address } : {}),
+      ...(reachable ? { reachable: true as const } : {}),
+      ...(m.tool === 'claude' && m.configDir && !hasTurnEndHook(m.configDir) ? { noReports: true as const } : {}),
       ...(limits ? { limits } : {}),
     })
   }
@@ -425,8 +463,8 @@ interface SendBody extends LeaderBody {
 }
 
 /**
- * ★ An instruction to a **Codex** or **agy** member (Claude members are reached with Claude's own SendMessage at their
- *   address). agy: typed into its TUI through its relay, only while it is idle (`sendToAgy`, docs/TEAM.md §9).
+ * ★ An instruction to a member of any tool (2026-11-27): Claude through its inbox, Codex through its daemon, agy typed
+ *   into its TUI through its relay, only while it is idle (`sendToAgy`, docs/TEAM.md §9).
  * ⚠️⚠️ The body is checked **before** the frame is added: `[nyan-team] …` in front would hide a leading `/` or `!`
  *    (codex design review, medium #1).
  */
@@ -437,24 +475,43 @@ export async function teamSend(ctx: Ctx): Promise<unknown> {
   const text = typeof body.text === 'string' ? body.text : ''
   if (!text.trim()) throw new HttpError(400, t('本文が空です', 'The text is empty.'))
   if (looksLikeCommand(text)) throw new HttpError(400, t('/ や ! で始まる文は送れません', 'Text starting with / or ! cannot be sent.'))
-  if (member.tool === 'claude') {
-    throw new HttpError(
-      400,
-      t(
-        `${member.name} は Claude です。SendMessage で送ってください（宛先は nyan team status に出ます）`,
-        `${member.name} is a Claude session. Use SendMessage (its address is in nyan team status).`,
-      ),
-    )
-  }
   // ★ agy: this send's own tag in the frame (the safety net knows its prompt by it / docs/TEAM.md §9.2)
   const tag = member.tool === 'agy' ? ` ${sendTag()}` : ''
+  // ★ Claude: the inbox says "from another session", and Claude then looks for someone to reply to — `nyan-team` is no
+  //   session, and a guessed recipient got the work in an unrelated session (docs/ARCHITECTURE.md, the inbox's side
+  //   effect / codex review r6). ⇒ Said in the frame: no reply message, the turn's last message is the report
+  const noReply =
+    member.tool === 'claude'
+      ? t('\n（SendMessage などで返事を送らないでください。nyan-team は受け取れません。）', '\n(Do not send a reply with SendMessage or any other tool; nyan-team cannot receive it.)')
+      : ''
   const framed = t(
-    `${TEAM_FRAME_MARK}リーダー（${shortSessionId(team.leader.sessionId)}${tag}）からの指示:\n${text}\n\n${TEAM_FRAME_CLOSE.ja}`,
-    `${TEAM_FRAME_MARK}Instruction from the team lead (${shortSessionId(team.leader.sessionId)}${tag}):\n${text}\n\n${TEAM_FRAME_CLOSE.en}`,
+    `${TEAM_FRAME_MARK}リーダー（${shortSessionId(team.leader.sessionId)}${tag}）からの指示:\n${text}\n\n${TEAM_FRAME_CLOSE.ja}${noReply}`,
+    `${TEAM_FRAME_MARK}Instruction from the team lead (${shortSessionId(team.leader.sessionId)}${tag}):\n${text}\n\n${TEAM_FRAME_CLOSE.en}${noReply}`,
   )
   if (Buffer.byteLength(framed, 'utf8') > MAX_SEND_BYTES) throw new HttpError(400, t('長すぎます', 'Too long.'))
   // ⚠️ Asked right before the daemon write: still this team's member, the leader still the same (r6 medium #3)
   const stillOurs = (): boolean => teamById(team.id) === team && team.members.includes(member) && leaderLive(team, teamDeps()) && leaderSessionNow(team)
+  if (member.tool === 'claude') {
+    // ★ Claude: its inbox (the socket Claude's own SendMessage writes to), busy or idle — Claude queues it (2026-11-27 /
+    //   every member is reached through nyan). ⚠️ Only the recorded process, in its own profile (a resume under the same
+    //   id, or the same id in another profile, is not the member the human picked / r5 medium #3, r6 medium #4)
+    if (!(await memberUnique(member))) throw new HttpError(409, REFUSAL_TEXT['member-gone']!())
+    if (!stillOurs()) throw new HttpError(409, REFUSAL_TEXT['no-team']!())
+    const dirs = (await discoverConfigDirs(config().configDirs)).filter((d) => sameDir(d.dir, member.configDir))
+    const r = await sendToSession(dirs, member.sessionId, framed, {
+      from: TEAM_SENDER,
+      ...(member.pid !== undefined ? { pid: member.pid } : {}),
+      ...(member.procStart !== undefined ? { procStart: member.procStart } : {}),
+      // ⚠️ Right before the write: still the member's process and session (a `/clear` keeps the pid / codex review)
+      guard: () => stillOurs() && liveMember(member) && soleProcessSync(member),
+    })
+    if (!r.ok) {
+      console.log(`[team] send team=${team.id} to=${member.name} not delivered (${r.reason})`)
+      throw new HttpError(409, r.message ?? REFUSAL_TEXT['member-gone']!())
+    }
+    console.log(`[team] send team=${team.id} to=${member.name} ${text.length} chars`)
+    return { ok: true, at: new Date().toISOString() }
+  }
   if (member.tool === 'agy') {
     // ⚠️ agy opens its shortcut list on a leading `?` (judged on the leader's own text, like `/` `!` above)
     if (looksLikeAgyShortcut(text)) throw new HttpError(400, AGY_SEND_REFUSAL['shortcut-like']()[1])
@@ -552,7 +609,7 @@ export async function teamRead(ctx: Ctx): Promise<unknown> {
     //    profile is not this member's work, and a resumed process is not the member the human picked
     if (!(await memberUnique(member))) throw new HttpError(409, REFUSAL_TEXT['member-gone']!())
     // ⚠️ Exactly one transcript with that id in the member's own profile directory (r6 medium #4)
-    const dirs = (await discoverConfigDirs(config().configDirs)).filter((d) => d.dir === member.configDir)
+    const dirs = (await discoverConfigDirs(config().configDirs)).filter((d) => sameDir(d.dir, member.configDir))
     const paths = await transcriptsOf(dirs, member.sessionId)
     if (paths.length > 1) throw new HttpError(409, t('この id の記録が複数あるので読めません', 'More than one transcript has this id; not read.'))
     entries = []

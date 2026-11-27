@@ -61,6 +61,11 @@ export interface TeamMember {
    *   base name (`~/a/.claude`, `~/b/.claude`); a card is the member's only when its transcript is under this directory.
    */
   configDir?: string
+  /**
+   * ★ Busy when the team was made: its first reported turn began before (it may be another lead's work / codex review
+   *   r7). Cleared by that first report.
+   */
+  busyAtJoin?: boolean
 }
 
 export interface TeamApprovals {
@@ -178,6 +183,7 @@ export function createTeam(
       account: m.account,
       ...(m.pid !== undefined && m.procStart !== undefined ? { pid: m.pid, procStart: m.procStart } : {}),
       ...(m.configDir !== undefined ? { configDir: m.configDir } : {}),
+      ...(m.busyAtJoin ? { busyAtJoin: true } : {}),
     })),
     ...(duration
       ? { approvals: { duration, grantedAtMs: now, untilMs: now + TEAM_APPROVAL_DURATIONS[duration], preexisting: [...preexistingKeys], waitingAtGrant: [...waitingAtGrant], cardlessAtGrant: [...cardlessAtGrant] } }

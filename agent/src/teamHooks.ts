@@ -495,12 +495,13 @@ export function codexMemberState(
       (await tellLeader(
         team,
         [
-          t(`[nyan-team] ${member.name}（Codex）のターンが終わりました`, `[nyan-team] ${member.name} (Codex) finished its turn`),
+          reportHead(team, member, 'Codex', 'のターンが終わりました', 'finished its turn'),
           ...(read?.text ? [asMemberData(member, read.text)] : []),
           ...(read === undefined ? [t('（結果を読めませんでした。nyan team read で見てください）', '(its result could not be read; see nyan team read)')] : []),
         ].join('\n'),
         stillMember,
       ))
+    if (told) member.busyAtJoin = false
     // ★ Not delivered, no longer a member, or the result could not be read (r36 medium #2): the phone rings too —
     //   only while that completion is still the thread's state (a newer wait must not be replaced by an old "done")
     if ((!told || read === undefined) && stillDone()) send(stillDone)
@@ -1426,6 +1427,116 @@ function answerText(records: readonly Record<string, unknown>[]): string | undef
     return typeof c === 'string' && c.trim() !== '' ? c.trim() : undefined
   }
   return undefined
+}
+
+/**
+ * ★ Who a report is about, with its team's id (a lead that re-made its team can tell an old team's report from a new
+ *   one: names `m1`, `m2` are given again / codex review r7), and a caution on the first report of a member that was
+ *   busy when the team was made (that turn may have begun before; the lead checks which turn it covers / r8).
+ */
+export function reportHead(team: Team, member: TeamMember, tool: string, ja: string, en: string): string {
+  const caution = member.busyAtJoin
+    ? t(
+        '\n（このメンバーはチームを作ったとき作業中でした。どのターンの報告か nyan team read で確かめてください）',
+        '\n(This member was busy when the team was made: check which turn this report covers with nyan team read.)',
+      )
+    : ''
+  return t(`[nyan-team] ${member.name}（${tool}・チーム ${team.id}）${ja}`, `[nyan-team] ${member.name} (${tool}, team ${team.id}) ${en}`) + caution
+}
+
+/**
+ * Each Claude member's last report (by session: its turn, kind and words) — so a replayed hook gets the **same** delivery
+ * result (in flight or done) instead of reporting twice, while a turn a blocking Stop hook made go on (a revised answer)
+ * or a later `StopFailure` of the same turn is reported (codex review r2)
+ */
+const claudeReports = new Map<string, { k: string; p: Promise<boolean> }>()
+/** The last report in flight per member session (reports of one member go out one after another) */
+const claudeReportChain = new Map<string, Promise<boolean>>()
+
+/**
+ * ★ A Claude member's turn ended (`Stop` ⇒ `done`) or stopped on an error (`StopFailure` ⇒ `limit` / `error`): its
+ *   leader is told, with the hook's `last_assistant_message` fenced as data (2026-11-27 / user decision: every member
+ *   reports through nyan, Claude ↔ Claude too). Decided **when the hook arrives** (codex review: a member that starts its
+ *   next queued instruction within the settle delay is busy by then, and its result would be lost).
+ * ⚠️ Only the member's own process (the recorded pid and start time, its index entry still naming the session, no second
+ *    process on it / `soleProcessSync`), in its own profile, of the team it was in when the hook came.
+ * @returns undefined when this is no team member's turn; otherwise whether the leader was told (false ⇒ the phone rings)
+ */
+export function claudeMemberReport(
+  kind: 'done' | 'limit' | 'error',
+  sessionId: string | undefined,
+  origin: { account?: string; transcriptPath?: string },
+  lastWords: string | undefined,
+  turn: string,
+  tell: typeof tellLeader = tellLeader,
+): Promise<boolean> | undefined {
+  const found = membershipOf(sessionId)
+  if (!found || found.member.tool !== 'claude' || !sameProfile(found.member, origin.account, origin.transcriptPath)) return undefined
+  const { team, member } = found
+  const ours = (): boolean => {
+    const now = membershipOf(sessionId)
+    return now?.team === team && now.member === member && liveMember(member) && soleProcessSync(member)
+  }
+  if (!ours()) return Promise.resolve(false)
+  const words = lastWords?.trim()
+  const k = createHash('sha256').update(`${sessionId}\u0000${turn}\u0000${kind}\u0000${words ?? ''}`).digest('base64url')
+  // ★ Only the member's last report counts as "the same" (A → B → A in one turn sends the final A again / codex r9)
+  const before = claudeReports.get(sessionId!)
+  if (before?.k === k) return before.p
+  const head =
+    kind === 'done'
+      ? reportHead(team, member, 'Claude', 'のターンが終わりました', 'finished its turn')
+      : kind === 'limit'
+        ? reportHead(team, member, 'Claude', 'がプランの上限で止まりました', 'stopped at its plan limit')
+        : reportHead(team, member, 'Claude', 'のターンがエラーで止まりました', 'stopped on an error')
+  const body = words
+    ? [asMemberData(member, words)]
+    : kind === 'done'
+      ? [t('（最後の発言に文がありませんでした。nyan team read で見てください）', '(its last message had no text; see nyan team read)')]
+      : []
+  // ★ One member's reports reach the leader in the order the hooks came (an error after a revised answer, not before /
+  //   codex review r3): each waits for the previous one of the same session
+  const prev = claudeReportChain.get(sessionId!) ?? Promise.resolve(true)
+  const cautioned = member.busyAtJoin === true
+  const p = prev.then(async () => {
+    const ok = await tell(team, [head, ...body].join('\n'), ours)
+    // ★ The caution is used up only by a report that got through (codex review r10)
+    if (ok && cautioned) member.busyAtJoin = false
+    return ok
+  })
+  claudeReportChain.set(sessionId!, p)
+  void p.finally(() => {
+    if (claudeReportChain.get(sessionId!) === p) claudeReportChain.delete(sessionId!)
+  })
+  claudeReports.set(sessionId!, { k, p })
+  if (claudeReports.size > 500) claudeReports.delete(claudeReports.keys().next().value as string)
+  return p
+}
+
+/** Codex limit stops already told to a leader (`thread:turn`), so a replay does not tell it twice */
+const codexLimitsTold = new Set<string>()
+
+/**
+ * ★ A Codex member's turn stopped at its plan limit (the notifier's `onLimit`, once per turn): the leader is told so it
+ *   can hand the work over (skill §3). The phone rings 制限中 as before; this is in addition.
+ */
+export function codexMemberLimited(sessionId: string | undefined, stop: string, tell: typeof tellLeader = tellLeader): void {
+  const found = membershipOf(sessionId)
+  if (!found) return
+  const k = `${sessionId}\u0000${stop}`
+  if (codexLimitsTold.has(k)) return
+  codexLimitsTold.add(k)
+  if (codexLimitsTold.size > 500) codexLimitsTold.delete(codexLimitsTold.values().next().value as string)
+  const { team, member } = found
+  void tell(
+    team,
+    reportHead(team, member, 'Codex', 'がプランの上限で止まりました', 'stopped at its plan limit'),
+    () => membershipOf(sessionId)?.team === team,
+  ).then((ok) => {
+    if (ok) member.busyAtJoin = false
+    // ★ Not delivered: a replay (a reconnect) may try again (codex review r14)
+    else codexLimitsTold.delete(k)
+  })
 }
 
 /** ★ Whether a Claude member's state notification is kept quiet (only "done": errors and needs-attention still ring) */

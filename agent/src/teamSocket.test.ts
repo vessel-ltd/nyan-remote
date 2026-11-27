@@ -144,7 +144,7 @@ test('★★★ refused: no delegation, a plan approval, one that waited before 
   }
 })
 
-test('★★ send: a body starting with / or ! is refused before any frame is added; Claude members are told to use SendMessage', async () => {
+test('★★ send: a body starting with / or ! is refused before any frame is added (Claude members: teamClaude.test.ts)', async () => {
   const { sock, server } = await open()
   try {
     assert.ok(
@@ -154,9 +154,8 @@ test('★★ send: a body starting with / or ! is refused before any frame is ad
     assert.equal(r1.status, 400)
     const r2 = await call(sock, 'POST', '/team/send', { leader: 'lead-x', pid: ME, member: 'm2', text: '  !rm -rf x' })
     assert.equal(r2.status, 400)
-    const r3 = await call(sock, 'POST', '/team/send', { leader: 'lead-x', pid: ME, member: 'm1', text: 'hello' })
+    const r3 = await call(sock, 'POST', '/team/send', { leader: 'lead-x', pid: ME, member: 'm1', text: '!ls' })
     assert.equal(r3.status, 400)
-    assert.match(String(r3.json['error']), /SendMessage/)
   } finally {
     server.close()
   }
