@@ -40,6 +40,8 @@ function world() {
     devices: 1,
     logs: [] as string[],
     auto: false,
+    /** Limit stops told to the usage history */
+    limits: [] as string[],
     /** Runs inside each history read, before it answers (what happens while the read is out) */
     duringRead: undefined as (() => void) | undefined,
     /** Runs inside each sleep (what happens in the world while the notifier waits) */
@@ -58,6 +60,7 @@ function world() {
       return turn ? { turns: [turn], nextCursor: null, skipped: 0 } : undefined
     },
     setOutcome: (id, outcome, mark) => void w.book.setOutcome(id, outcome, mark),
+    onLimit: (id, turn) => w.limits.push(`${id}:${turn}`),
     mark: (id) => w.book.mark(id),
     send: async (row, fields) => {
       w.sent.push({ row, fields })
@@ -577,4 +580,49 @@ test('★ an unreadable status while a turn settles: the read back keeps the mar
   await x.notifier.onStatus(x.idle())
   assert.deepEqual(labels(x), [statusLabel('error')])
   assert.equal(x.rowStatus(), 'error')
+})
+
+test('★ usage history: a limit stop is told once per turn; not on the quiet pass at start; not for other failures', async () => {
+  const x = world()
+  const error = { message: 'm', codexErrorInfo: 'usageLimitExceeded' }
+  x.w.history = [{ id: 'turn-1', status: 'failed', error }]
+  await x.notifier.onStatus(x.active())
+  await x.notifier.onStatus(x.set({ type: 'systemError' }))
+  assert.deepEqual(x.w.limits, ['t1:turn-1'])
+  // quiet (agent start): an old stop is not a new one
+  const q = world()
+  q.w.history = [{ id: 'turn-1', status: 'failed', error }]
+  q.w.book.upsert(raw({ status: { type: 'systemError' } }))
+  await q.notifier.onStatus(q.w.book.standing()[0]!, { quiet: true })
+  assert.deepEqual(q.w.limits, [])
+  // …nor when a reconnect replays that same standing turn
+  q.w.reads = 0
+  await q.notifier.onStatus(q.w.book.standing()[0]!)
+  assert.deepEqual(q.w.limits, [])
+  // a new turn that stops later is counted
+  q.w.history = [{ id: 'turn-2', status: 'failed', error }]
+  q.w.reads = 0
+  await q.notifier.onStatus(q.active())
+  await q.notifier.onStatus(q.set({ type: 'systemError' }))
+  assert.deepEqual(q.w.limits, ['t1:turn-2'])
+  // another failure
+  const f = world()
+  f.w.history = [{ id: 'turn-1', status: 'failed', error: { message: 'm', codexErrorInfo: 'serverOverloaded' } }]
+  await f.notifier.onStatus(f.active())
+  await f.notifier.onStatus(f.set({ type: 'systemError' }))
+  assert.deepEqual(f.w.limits, [])
+})
+
+test('★ usage history: a stop read while a new prompt already started is still counted (a fact about that turn)', async () => {
+  const x = world()
+  const error = { message: 'm', codexErrorInfo: 'usageLimitExceeded' }
+  x.w.history = [{ id: 'turn-1', status: 'failed', error }]
+  x.w.duringRead = () => {
+    x.w.duringRead = undefined
+    x.active()
+  }
+  await x.notifier.onStatus(x.active())
+  await x.notifier.onStatus(x.set({ type: 'systemError' }))
+  assert.deepEqual(x.w.limits, ['t1:turn-1'])
+  assert.deepEqual(x.sent, [], 'no push for an old change')
 })

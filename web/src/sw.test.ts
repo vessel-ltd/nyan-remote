@@ -476,6 +476,29 @@ test('★★ sw: the API does not touch the cache (existing contract)', { timeou
   assert.equal(h.has('/sessions?live=1'), false)
 })
 
+test('★★ sw: every GET endpoint of the agent is API (none is kept for offline use / codex review 2026-11-27)', { timeout: 5000 }, async () => {
+  const routes = readFileSync(join(import.meta.dirname, '../../agent/src/routes/index.ts'), 'utf8')
+  const paths = [...routes.matchAll(/router\.get\('([^']+)'/g)].map((m) => m[1]!.replace(/:[a-z]+/gi, 'x'))
+  assert.ok(paths.includes('/usage/history') && paths.length >= 10, 'the route table was not read')
+  for (const p of paths) {
+    const h = swHarness(() => res('{"ok":true}', { type: 'application/json' }))
+    await h.install()
+    assert.equal(await h.get({ url: `${ORIGIN}${p}` }), undefined, `⚠️ the SW answers ${p}`)
+    assert.equal(h.has(p), false, `⚠️ ${p} was stored`)
+  }
+})
+
+test('★ sw: activate drops API answers stored before they were named API', { timeout: 5000 }, async () => {
+  const h = swHarness(() => res('新しい殻'))
+  await h.install()
+  h.shelf().set(`${ORIGIN}/usage/history`, res('{"logins":[]}', { type: 'application/json' }))
+  h.shelf().set(`${ORIGIN}/devices`, res('{"devices":[]}', { type: 'application/json' }))
+  await h.activate()
+  assert.equal(h.has('/usage/history'), false)
+  assert.equal(h.has('/devices'), false)
+  assert.equal(h.body('/index.html'), '新しい殻', 'the shell stays')
+})
+
 /** ★ A "no network" world with the same cache contents (simulates relaunching) */
 function swHarnessOffline(h: ReturnType<typeof swHarness>) {
   const off = swHarness(() => undefined)

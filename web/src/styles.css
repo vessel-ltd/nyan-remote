@@ -1291,6 +1291,32 @@ button.fold.line code {
 }
 
 /* ★ Spacing when stacking rows in Settings → "Display" (language, theme) */
+/* ★ Usage history: one bar per finished week window (2026-11-27 / `UsageHistoryPanel.tsx`) */
+.histweeks {
+  display: flex;
+  align-items: flex-end;
+  gap: 3px;
+  height: 44px;
+  margin: 8px 0 2px;
+}
+.histbar {
+  flex: 1;
+  min-width: 0;
+  max-width: 18px;
+  background: color-mix(in srgb, var(--accent) 70%, transparent);
+  border-radius: 2px 2px 0 0;
+}
+.histbar.full {
+  background: var(--bad);
+}
+.histdates {
+  display: flex;
+  justify-content: space-between;
+  font-size: 11px;
+  color: var(--dim);
+  margin-bottom: 2px;
+}
+
 .notice > .pushrow + .pushrow {
   margin-top: 8px;
 }

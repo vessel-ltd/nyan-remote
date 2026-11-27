@@ -12,6 +12,7 @@ import { isClaudeLimitStop, statusLabel, type HookEvent } from '../../../shared/
 import { hooksFor, seedHookState } from '../claude/hookState.ts'
 import { resolveStatus } from '../claude/sessions.ts'
 import type { Ctx } from '../router.ts'
+import { usageHistory } from '../usageHistory.ts'
 import { hook, labelFor, settledLabel, toPushPayload } from './hook.ts'
 
 const SESSION = '5b1c0e8e-7c2f-4a51-9d3e-2f6a1c0b9e44'
@@ -63,6 +64,23 @@ test('★★ StopFailure with error "rate_limit" ⇒ the list says rate-limited 
   const last = JSON.parse(log.trim().split('\n').at(-1)!) as HookEvent
   assert.equal(last.failure, 'rate-limit')
   assert.doesNotMatch(log, /hit your|resets|details/, '⚠️⚠️ the message reached the record (§6.2)')
+  // ★ The usage history counts a stop once per turn (the same turn told again is not a second one), without the session id
+  await hook(hookCtx({ ...stopFailure('rate_limit'), prompt_id: 'p1' }))
+  await hook(hookCtx({ ...stopFailure('rate_limit'), prompt_id: 'p1' }))
+  await hook(hookCtx({ ...stopFailure('rate_limit'), prompt_id: 'p2' }))
+  await hook(hookCtx(stopFailure('server_error')))
+  await usageHistory().settled()
+  const hist = await readFile(join(dir, 'usage-history.jsonl'), 'utf8')
+  assert.doesNotMatch(hist, new RegExp(SESSION), '⚠️ the session id reached the history')
+  // the first (no prompt id) + p1 + p2; the server error is not a limit
+  assert.equal(usageHistory().summary().logins[0]?.limitStops.count, 3)
+  // ★ An empty prompt id is no id: the minute decides, as when it is absent (the same minute = the same stop)
+  const minute = new Date().toISOString().slice(0, 16)
+  await hook(hookCtx({ ...stopFailure('rate_limit'), session_id: SESSION, prompt_id: '' }))
+  await hook(hookCtx(stopFailure('rate_limit')))
+  await usageHistory().settled()
+  // (the test's first stop, also without an id, was in this minute too: all three are one stop)
+  if (new Date().toISOString().slice(0, 16) === minute) assert.equal(usageHistory().summary().logins[0]?.limitStops.count, 3, 'the same minute is one stop')
 })
 
 test('★★ any other StopFailure stays "failed" (only rate_limit is a limit)', async (t) => {

@@ -34,6 +34,8 @@ export const AGENT_FEATURES: AgentFeature[] = [
   'auto-approve-24h',
   // ★ `GET /usage` (plan limits per Claude profile / Codex home / 2026-11-17)
   'usage',
+  // ★ `GET /usage/history` (finished week windows and limit stops per login, kept on this PC / 2026-11-27)
+  'usage-history',
   // ★ Instructions up to 64 KB (`MAX_SEND_BYTES` / long ones as a bracketed paste / 2026-11-17)
   'long-send',
   // ★ Files from the phone (`POST /uploads` … / 2026-11-17)

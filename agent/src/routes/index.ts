@@ -2,7 +2,7 @@ import { attach } from '../events.ts'
 import { Router } from '../router.ts'
 import { serveStatic } from '../static.ts'
 import { health } from './health.ts'
-import { usage } from './usage.ts'
+import { usage, usageHistoryRoute } from './usage.ts'
 import { refreshAccountNow } from '../account.ts'
 import { sessionAutoApprove } from './autoApprove.ts'
 import { hook } from './hook.ts'
@@ -23,6 +23,8 @@ export function buildRouter(): Router {
   router.get('/health', health)
   // ★ Plan limits per profile (2026-11-17 / `usage.ts`)
   router.get('/usage', usage)
+  // ★ Usage history kept on this PC (2026-11-27 / `usageHistory.ts`)
+  router.get('/usage/history', usageHistoryRoute)
   // ★ Refetch the license right now (`nyan account` / 2026-09-24). ⚠️ This machine only (`isLocalOnlyPath` in `auth.ts`)
   router.post('/account/refresh', () => refreshAccountNow())
   router.get('/sessions', sessions)

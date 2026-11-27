@@ -7,6 +7,7 @@
 //
 // Each machine pushes only its own events, so duplicates structurally cannot occur (§6.3).
 
+import { recordLimitStop } from '../usageHistory.ts'
 import { currentLang, localizeNotificationBody, t } from '../../../shared/i18n.ts'
 import { endSessionAutoApprove } from '../autoApprove.ts'
 
@@ -475,6 +476,9 @@ export async function hook(ctx: Ctx): Promise<{ ok: true; pushed: number }> {
     ...(name === 'StopFailure' && isClaudeLimitStop(payload['error'], payload['last_assistant_message']) ? { failure: 'rate-limit' as const } : {}),
   }
   if (typeof payload.transcript_path === 'string') eventPaths.set(event, payload.transcript_path)
+  // ★ Usage history: a stop at a plan limit, once per session and turn (`usageHistory.ts`). Without a turn id, stops of
+  //   one session within the same minute are one (a retry that is refused again at once is the same stop)
+  if (event.failure === 'rate-limit' && sessionId && account) recordLimitStop('claude', account, `${sessionId}:${event.promptId || event.at.slice(0, 16)}`)
   // Used as evidence for the list's status display (agents --json cannot tell needs attention / abnormal exit)
   noteHook(event)
 

@@ -9,6 +9,7 @@ import { forWire, isStale } from './sessions.ts'
 import { testPayload } from './push.ts'
 import { test } from 'node:test'
 import { buildRouter } from './index.ts'
+import { usageHistoryRoute } from './usage.ts'
 import { sessionClear, sessionInterrupt } from './interrupt.ts'
 import { sessionCommand } from './command.ts'
 import { sessionAutoApprove } from './autoApprove.ts'
@@ -152,12 +153,13 @@ test('★★★ feature flags correspond to the endpoints actually registered', 
     // ★ A GET endpoint (⚠️ the method is in the METHOD table below)
     'log-follow': '/sessions/x/follow',
     usage: '/usage',
+    'usage-history': '/usage/history',
     // ★ A longer limit on the existing message endpoint (2026-11-17)
     'long-send': '/sessions/x/message',
     // ★ Files from the phone (2026-11-17)
     uploads: '/uploads',
   }
-  const METHOD: Record<string, string> = { 'log-follow': 'GET', usage: 'GET' }
+  const METHOD: Record<string, string> = { 'log-follow': 'GET', usage: 'GET', 'usage-history': 'GET' }
   for (const feature of AGENT_FEATURES) {
     const path = NEEDS[feature]
     assert.ok(path, `no endpoint in the table for flag ${feature} (fix this table too)`)
@@ -403,4 +405,8 @@ test('★★ an agy row’s table command: only compact, through `compactAgy`; n
   await assert.rejects(agyCommand(id, 'exit', ok), (e: { status?: number }) => e.status === 400)
   const draft = async () => ({ ok: false, reason: 'draft' as const })
   await assert.rejects(agyCommand(id, 'compact', draft), (e: { status?: number; message?: string }) => e.status === 409 && /draft|打ちかけ|unsent/i.test(e.message ?? ''))
+})
+
+test('GET /usage/history is answered by the history summary (not another handler)', () => {
+  assert.equal(buildRouter().match('GET', '/usage/history')?.handler, usageHistoryRoute)
 })

@@ -83,6 +83,10 @@ async function migrate(env) {
   const cache = await env.caches.open(CACHE)
   // ⚠️ Leftover from when two keys were written (this version does not store `/`)
   await cache.delete('/')
+  // ⚠️ API answers stored before `isApi` named them (the usage, the device list) are dropped
+  for (const req of await cache.keys()) {
+    if (isApi(new URL(req.url).pathname)) await cache.delete(req)
+  }
   for (const name of await env.caches.keys()) {
     if (name === CACHE) continue
     const old = await env.caches.open(name)
@@ -111,7 +115,11 @@ function isApi(pathname) {
     pathname === '/peers' ||
     pathname.startsWith('/sessions') ||
     pathname.startsWith('/permission') ||
-    pathname.startsWith('/push')
+    pathname.startsWith('/push') ||
+    // ★ 2026-11-27 (codex review): these were missing, so the usage and the device list were kept for offline use
+    pathname.startsWith('/usage') ||
+    pathname.startsWith('/devices') ||
+    pathname.startsWith('/pair')
   )
 }
 

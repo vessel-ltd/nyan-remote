@@ -54,6 +54,8 @@ export interface CodexNotifyDeps {
   sleep(ms: number): Promise<void>
   /** Whether auto-approve is in effect for this thread right now (rule 7). Absent = never. */
   autoApproving?(threadId: string): boolean
+  /** ★ A turn read as stopped at a limit (the usage history counts it once per thread and turn) */
+  onLimit?(threadId: string, turn: string): void
   log?: (line: string) => void
 }
 
@@ -70,6 +72,8 @@ export class CodexNotifier {
   readonly #deps: CodexNotifyDeps
   #chains = new Map<string, Promise<void>>()
   #sent = new Map<string, Sent>()
+  /** Limit stops seen on the quiet pass at start (thread · turn): not counted again when a reconnect replays them */
+  #quietStops = new Set<string>()
   /** Rule 9: per thread, the last turn a read confirmed as failed at a limit (a fact; it does not change) */
   #limitTurns = new Map<string, string>()
   /** Per thread: how many changes were fed (rule 7: "a newer change arrived") */
@@ -173,6 +177,17 @@ export class CodexNotifier {
       return
     }
 
+    // ★ Usage history: a turn read as stopped at a limit is a fact about that turn, told whether or not this change is
+    //   still current (a new prompt right after must not erase it / codex review).
+    // ⚠️ Not on the quiet pass at start: that turn may have stopped long ago (it was counted then, or before the history),
+    //    nor when a reconnect replays that same standing turn (codex · agy review)
+    if (outcome === 'rate-limited' && turn !== undefined) {
+      const k = `${id}\u0000${turn}`
+      if (quiet) {
+        this.#quietStops.add(k)
+        if (this.#quietStops.size > MAX_REMEMBERED) this.#quietStops.delete(this.#quietStops.values().next().value as string)
+      } else if (!this.#quietStops.has(k)) this.#deps.onLimit?.(id, turn)
+    }
     // Rule 8: every wait is behind us. The thread moved on meanwhile (a new turn, a reconnect) ⇒ this change is old
     // news, and the newer one is handled in its own right.
     if (this.#deps.mark(id) !== change.mark) return

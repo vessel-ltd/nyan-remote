@@ -20,6 +20,7 @@ import type {
   PeersResult,
   PermissionRequest,
   PushStatus,
+  UsageHistoryResponse,
   UsageResponse,
   UploadFinishResult,
   UploadStartResult,
@@ -243,6 +244,8 @@ export interface Transport {
 
   /** ★ Plan limits per Claude profile / Codex home (`GET /usage`). ⚠️ Only on agents with the `usage` feature */
   usage(): Promise<UsageResponse>
+  /** ★ Usage history kept on that PC (`GET /usage/history`). ⚠️ Only on agents with the `usage-history` feature */
+  usageHistory(): Promise<UsageHistoryResponse>
 
   /** Push: VAPID public key and this device's subscription state */
   pushStatus(): Promise<PushStatus>

@@ -24,6 +24,7 @@ import type {
   RevokeResult,
   PermissionRequest,
   PushStatus,
+  UsageHistoryResponse,
   UsageResponse,
   SessionsPage,
 } from '../../../shared/types.ts'
@@ -319,6 +320,10 @@ export class AgentTransport implements Transport {
 
   usage(): Promise<UsageResponse> {
     return this.get<UsageResponse>('/usage')
+  }
+
+  usageHistory(): Promise<UsageHistoryResponse> {
+    return this.get<UsageHistoryResponse>('/usage/history')
   }
 
   pushStatus(): Promise<PushStatus> {

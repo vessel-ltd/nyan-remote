@@ -42,6 +42,8 @@ import { readTailRecords, turnEnd, type TurnEnd } from './pending.ts'
 export interface AgyNotifyDeps {
   /** The listed agy rows now */
   rows(): Promise<SessionSummary[]>
+  /** ★ A stop at a limit about to be told (the usage history counts it once per conversation and stop) */
+  onLimit?(sessionId: string, stop: string): void
   /**
    * Rule 7b: whether this conversation's answer stands after children that reported and finished well
    * (`agyChildrenSettled`). Absent ⇒ rule 7b never rings.
@@ -414,6 +416,14 @@ export class AgyNotifier {
       }
       const label = statusLabel(row.status)
       if (!label) continue
+      // ⚠️ Only with a stable name for the stop (its turn, else its error record's time): a status file's time moves
+      if (to === 'rate-limited') {
+        // ★ Only the error record that ended the turn names the stop (the same while the status file catches up, and
+        //   on a retry after a read that missed it / codex review). Without its time the stop is not counted: one
+        //   missing stop is accepted, a stop counted under two names is not (user decision 2026-11-27).
+        const stop = end.erroredAt !== undefined ? `e${end.erroredAt}` : undefined
+        if (stop !== undefined) this.#deps.onLimit?.(row.sessionId, stop)
+      }
       // Rule 6
       const l = await latestOf(row.sessionId)
       if (!l) {

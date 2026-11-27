@@ -6,6 +6,7 @@
 // ⚠️⚠️ **On unless `config.json` says `"codex": { "enabled": false }`** (2026-11-15 / user decision; what it does to
 //    the user's Codex is said in the README, once in the log on the first connect, and in `nyan status` / `Config.codex`).
 
+import { recordLimitStop } from '../usageHistory.ts'
 import { realpath, stat } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, join, resolve } from 'node:path'
@@ -229,6 +230,11 @@ export function startCodex(cfg: CodexConfig | undefined, opts: StartCodexOptions
         send,
         sleep: (ms) => deps.sleep(ms, never),
         autoApproving: (id) => autoApproveFor(line.sessionIdOf(id), deps.now()) !== undefined,
+        // ★ Usage history (`usageHistory.ts`): the home's label is the login's, as in `GET /usage`
+        // ⚠️ Not when two homes show the same label: they cannot be told apart (the history keeps neither's samples)
+        onLimit: (id, turn) => {
+          if (!codexLabelShared(home.label)) recordLimitStop('codex', home.label, `${id}:${turn}`)
+        },
         ...(opts.hooks?.log ? { log: opts.hooks.log } : {}),
       })
     }

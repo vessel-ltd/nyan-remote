@@ -13,7 +13,9 @@ function rig(opts: { quiet?: (sessionId: string, card: string) => boolean | unde
   let gate: Promise<void> | undefined
   let clock = 0
   const sent: NotifyFields[] = []
+  const limits: string[] = []
   const n = new AgyNotifier({
+    onLimit: (id, stop) => limits.push(`${id}:${stop}`),
     rows: async () =>
       status
         ? [{ machine: 'pc-a', account: 'agy', tool: 'agy', sessionId: `agy-${A}`, cwd: '/home/user/p', project: 'p', title: 'Fix it', titleSource: 'ai', status, live: true, lastActivity: wrote } as SessionSummary]
@@ -33,6 +35,7 @@ function rig(opts: { quiet?: (sessionId: string, card: string) => boolean | unde
   return {
     n,
     sent,
+    limits,
     set(s: SessionStatus | undefined, r?: Record<string, unknown>[], at?: string) {
       status = s
       if (r) records = r
@@ -1279,4 +1282,24 @@ test('★ …but an older wait that never reached the phone still rings when the
   r.set('waiting', asking(0), '2026-11-20T00:00:20Z')
   await r.n.look()
   assert.equal(r.sent.length, 1)
+})
+
+test('★ usage history: a stop at a limit is told under its turn; a failed push retried says the same name', async () => {
+  const r = rig()
+  r.tick(Date.parse('2026-11-25T00:00:00Z'))
+  await r.n.look()
+  r.set('working', [{ step_index: 4, type: 'USER_INPUT', created_at: '2026-11-25T00:00:03Z' }], '2026-11-25T00:00:03Z')
+  r.tick(5000)
+  await r.n.look()
+  r.fail(true)
+  r.set('rate-limited', [{ step_index: 4, type: 'USER_INPUT', created_at: '2026-11-25T00:00:03Z' }, { step_index: 5, type: 'ERROR_MESSAGE', created_at: '2026-11-25T00:00:06Z', error: 'Usage limit reached' }], '2026-11-25T00:00:06Z')
+  r.tick(5000)
+  await r.n.look()
+  r.fail(false)
+  // The person typed again: the prompt of turn 6 is in the transcript, agy's state file still says the old stop
+  r.set('rate-limited', [{ step_index: 4, type: 'USER_INPUT', created_at: '2026-11-25T00:00:03Z' }, { step_index: 5, type: 'ERROR_MESSAGE', created_at: '2026-11-25T00:00:06Z', error: 'Usage limit reached' }, { step_index: 6, type: 'USER_INPUT', created_at: '2026-11-25T00:00:50Z' }])
+  r.tick(60_000)
+  await r.n.look()
+  assert.ok(r.limits.length >= 1)
+  assert.deepEqual([...new Set(r.limits)], [`agy-${A}:e${Date.parse('2026-11-25T00:00:06Z')}`], 'one name for the stop (its error record), whatever the status file says')
 })

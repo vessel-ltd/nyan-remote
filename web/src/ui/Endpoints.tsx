@@ -21,6 +21,7 @@ import { chooseLang, savedLangChoice, type LangChoice } from '../lang.ts'
 import { asThemeChoice, chooseTheme, savedThemeChoice } from '../theme.ts'
 import { MachineDevices, Pairing, usePairing } from './Pairing.tsx'
 import { UsagePanel } from './UsagePanel.tsx'
+import { UsageHistoryPanel } from './UsageHistoryPanel.tsx'
 import { PushPanel } from './PushPanel.tsx'
 import { type UnlinkOutcome, unlinkText } from './pairRun.ts'
 import { staleTwinText } from './pairing.ts'
@@ -486,6 +487,9 @@ export function Endpoints({
 
       {/* ★ Plan limits per account, Claude and Codex (2026-11-17 / `ui/usage.ts`) */}
       <UsagePanel transports={transports} />
+
+      {/* ★ Usage history, its own section (2026-11-27 / kept on each PC / `ui/usageHistory.ts`) */}
+      <UsageHistoryPanel transports={transports} />
 
       {/* ★★ Plan (2026-09-24 / billing / `ui/plan.ts`). ⚠️ Only when some agent reports account status */}
       {(() => {

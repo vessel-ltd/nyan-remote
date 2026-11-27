@@ -332,6 +332,8 @@ export type AgentFeature =
   | 'codex-compact'
   /** ★ `GET /usage`: each account's plan limits (5-hour / weekly windows), Claude and Codex (2026-11-17) */
   | 'usage'
+  /** ★ `GET /usage/history` (usage history kept on the PC / 2026-11-27) */
+  | 'usage-history'
   /**
    * ★ Instructions up to `MAX_SEND_BYTES` (64 KB; before: `MAX_MESSAGE_BYTES`) — long ones typed as a bracketed paste
    *   (2026-11-17). ⚠️ Without it the screen keeps the old limit (an older agent would refuse with 400)
@@ -410,6 +412,34 @@ export interface ToolUsage {
 
 export interface UsageResponse {
   usage: ToolUsage[]
+}
+
+/** ★ One login's history (`GET /usage/history` / 2026-11-27 / `agent/src/usageHistory.ts`). Numbers only. */
+export interface UsageHistoryLogin {
+  tool: ToolUsage['tool']
+  /** The profile label (`.claude-r` / `.codex` / `agy`) */
+  account: string
+  /** Equal on two PCs = one account (the phone shows it once) */
+  accountKey?: string
+  /** Finished week windows, oldest first: the highest use seen in each (≈ how much of it was used) */
+  weeks: Array<{ resetsAt: string; usedPercent: number }>
+  /**
+   * Finished 5-hour windows that reached 100%: their reset times, oldest first. ⚠️ Times, not a count: one account on
+   * two PCs sees the same windows (the phone counts them once).
+   */
+  fiveHourFull: string[]
+  /** Stops at a plan limit (制限中), with the most recent times (oldest first) */
+  limitStops: { count: number; recent: string[] }
+}
+
+export interface UsageHistoryResponse {
+  /** How many days are kept */
+  days: number
+  /** ★ The history is off on that PC (its file is not a regular file): not "nothing recorded" */
+  off?: true
+  /** The oldest time the history covers (absent = nothing yet) */
+  since?: string
+  logins: UsageHistoryLogin[]
 }
 
 /** One Codex home's line to its app-server daemon (`agent/src/codex/daemon.ts`) */

@@ -4,9 +4,11 @@
 //    Measured: other tailnet devices cannot reach WSL's ports (the Hyper-V firewall blocks them).
 //    Do not open the port. Opening it creates an unauthenticated entry point (§4.2.1).
 
+import { recordLimitStop, SAMPLE_MS, usageHistory } from './usageHistory.ts'
+import { usage } from './routes/usage.ts'
 import { startAgyWatch } from './agy/watch.ts'
 import { endAgyGrantsOver } from './agy/grants.ts'
-import { AGY_PREFIX, agyDir, agyChildrenSettledSeen, agyOthersWrote, agyOwnRowOf, agyOwnRows, conversationOf, defaultAgyDeps, transcriptPathOf, withLocksProbed } from './agy/sessions.ts'
+import { AGY_ACCOUNT, AGY_PREFIX, agyDir, agyChildrenSettledSeen, agyOthersWrote, agyOwnRowOf, agyOwnRows, conversationOf, defaultAgyDeps, transcriptPathOf, withLocksProbed } from './agy/sessions.ts'
 import { lastTurnStartCached, readTailRecords, turnEnd } from './agy/pending.ts'
 import { AgyCards } from './agy/cards.ts'
 import { homedir } from 'node:os'
@@ -28,7 +30,7 @@ import { discoverConfigDirs } from './claude/configDirs.ts'
 import { seedHookState } from './claude/hookState.ts'
 import { startSessionWatch } from './claude/sessionWatch.ts'
 import { uploads } from './uploads.ts'
-import { CODEX_FOLLOW_TICK_MS, codexFollowTick, codexLastWords, codexRowsNow, startCodex } from './codex/run.ts'
+import { CODEX_FOLLOW_TICK_MS, codexFollowTick, codexLabelShared, codexLastWords, codexRowsNow, startCodex } from './codex/run.ts'
 import { agyCardsChanged, agyMemberDone, agyTeamSafetyNet, agyTeamPcWaits, agyPhoneFallback, codexCardsChanged, codexMemberState, codexRowStatus, codexSnapshot, sessionEnded } from './teamHooks.ts'
 import { startTeamSocket } from './teamSocket.ts'
 import { codexPayload } from './codex/notify.ts'
@@ -164,6 +166,8 @@ async function main(): Promise<void> {
     // ★ Each lock-holding agy's own state (`notify.ts` rule 8)
     // ⚠️ Locks probed all at once without blocking (a Mac's `lsof` / `withLocksProbed`)
     rows: async () => agyOwnRows(machineName(), await withLocksProbed({ ...defaultAgyDeps(), aliveProcStart: aliveProcStartSync })),
+    // ★ Usage history (`usageHistory.ts`): agy's login is one (`AGY_ACCOUNT`)
+    onLimit: (sessionId, stop) => recordLimitStop('agy', AGY_ACCOUNT, `${sessionId}:${stop}`),
     statusNow: (sessionId) => {
       const conv = conversationOf(sessionId)
       // ★ Only that conversation's agy is probed (the guard runs before each device's send)
@@ -253,6 +257,28 @@ async function main(): Promise<void> {
   // ★ With the watcher, the periodic look goes through it: the list is told when a status changed without a status file
   //   (a limit's error record in the transcript / codex review). Its look ends with `agyLook` as well.
   setInterval(() => (agyWatcher ? agyWatcher.check() : agyLook()), AGY_LOOK_MS).unref()
+
+  // ★ Usage history (2026-11-27 / `usageHistory.ts`): read the limits every 15 minutes, keep what changed. On this PC
+  //   only. ⚠️ Never fatal: a reading that fails is skipped until the next round.
+  usageHistory()
+  // ⚠️ One reading at a time: a stuck read must not pile up more of them (codex review)
+  let sampling = false
+  const sampleUsage = (): void => {
+    if (sampling) return
+    sampling = true
+    // ⚠️ Not a Codex home whose label another home shares (cannot be told apart, even when only one has a reading)
+    void usage()
+      .then((r) => usageHistory().sample(r.usage.filter((u) => !(u.tool === 'codex' && codexLabelShared(u.account)))))
+      .catch((err: unknown) => console.warn(`[usage-history] could not read the limits: ${err instanceof Error ? err.message : String(err)}`))
+      .finally(() => {
+        sampling = false
+      })
+  }
+  // ★ Soon after start, so a stop right after a restart is filed under the account behind its profile
+  setTimeout(sampleUsage, 5_000).unref()
+  // …and once more after the Codex reading cache has expired (it may still have been connecting at five seconds)
+  setTimeout(sampleUsage, 75_000).unref()
+  setInterval(sampleUsage, SAMPLE_MS).unref()
   try {
     agyWatcher = await startAgyWatch(agyDir(), () => broadcast({ type: 'sessions-changed', at: new Date().toISOString() }), agyLook)
   } catch {
