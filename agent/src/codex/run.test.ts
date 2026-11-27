@@ -10,6 +10,17 @@ import type { DaemonDeps } from './daemon.ts'
 import { codexEnabled, codexLabelShared, codexFollowTick, codexHealth, codexHomes, codexNotice, codexRows, controlSocketOf, lookAtSocket, realSocketPath, startCodex, stopCodex } from './run.ts'
 import { connectWsUds } from './wsUds.ts'
 
+// ⚠️ These tests drive the real notifier, whose limit stops go to the usage history in the state folder: never the
+//    real `~/.nyan-remote` (a test run once wrote a stop there / 2026-11-27)
+const STATE = mkdtempSync(join(tmpdir(), 'nyan-codex-run-state-'))
+const prevState = process.env['NYAN_REMOTE_STATE_DIR']
+process.env['NYAN_REMOTE_STATE_DIR'] = STATE
+process.on('exit', () => {
+  if (prevState === undefined) delete process.env['NYAN_REMOTE_STATE_DIR']
+  else process.env['NYAN_REMOTE_STATE_DIR'] = prevState
+  rmSync(STATE, { recursive: true, force: true })
+})
+
 afterEach(() => stopCodex())
 
 test('★ homes: on unless explicitly off (2026-11-15: on by default)', () => {

@@ -20,8 +20,9 @@ Bash tool; it talks to the local nyan-remote agent). `nyan team help` lists the 
 2. Ask the user which to use with **AskUserQuestion** (`multiSelect: true`). A question holds at most 4 options and
    you may ask at most 4 questions: split Claude, Codex and agy sessions into separate questions, put the ref in the label
    and "profile · model · week N% · state" in the description. If there are more than fit, say so and let the user
-   type refs under "Other". Say that a spare member on another login or another tool is what lets the work go on when
-   one login hits its limit (§3); the user decides.
+   type refs under "Other". Recommend one spare member of **another tool** (Codex or agy when the work is on Claude,
+   and so on): when a login hits its limit, the work can be handed over to it, after asking, without re-creating the
+   team (§3). Another profile of the same tool is a weaker spare (it may be the same account). The user decides.
 3. In the same AskUserQuestion call, ask whether you may answer the members' approval prompts:
    "No — the user answers" / "Yes for 3 hours" / "Yes for 24 hours". Explain that with "Yes" you approve their
    commands (Bash included) for that time, and that plan approvals stay with the user.
@@ -59,18 +60,24 @@ Bash tool; it talks to the local nyan-remote agent). `nyan team help` lists the 
    overdue, or when the user says so. **`rate-limited`** is the agent's reading of the last stop (a plan or spend
    limit). Other states are not a limit as far as it can tell.
 2. **Find a member that can take it.** Read `nyan team status` (and `nyan team candidates` for sessions outside the
-   team) now; limits change.
-   - **Another login.** The same tool and the same profile is the same quota, and every agy session shares one Google
-     login. A profile whose limits line says "same login as <the stopped one's profile>" ("…と同じログイン") shares it.
-     Another profile of the same tool without that marker may still be the same login (the agent cannot always link
-     them): say so and let the user confirm. Another tool is a different quota.
+   team) now; limits change. In this order:
+   1. **Another tool** (a Codex or agy member when a Claude one stopped, and so on): a different quota for certain.
+      This is the one to recommend.
+   2. **Another login of the same tool**, only when it is not the same account. The same tool and the same profile is
+      the same quota, and every agy session shares one Google login. A profile whose limits line says "same login as
+      <the stopped one's profile>" ("…と同じログイン") shares it. Another profile without that marker may still be the
+      same login (the agent cannot always link them): say so and let the user confirm.
+
+   Either way it must be:
    - **Free and reachable**: `idle` or `done`, not `replaced` or `gone`, and not tagged `[team …]` (`[チーム …]`) in
      another team. Check again right before you send; after a failed send, check whether it started (§2) before
      moving the work anywhere else.
    - Limits lines are readings with an age, not promises, and may lack the window that ran out (agy shows its Gemini
      windows only). A reset time is when a retry may work.
-3. **Ask the user before moving anything** (AskUserQuestion): who stopped and its reset (or "unknown"), where you would
-   move the work and how much room it has, or "wait for the reset". For an agy target, ask the user to make sure its
+3. **Ask the user before moving anything** (AskUserQuestion): who stopped and its reset (or "unknown"), and the
+   choices — a free other-tool member first, marked recommended; then a free same-tool member on another profile not
+   marked same login (saying it may still be the same account, for the user to confirm); always "wait for the reset" —
+   each with how much room it has. For an agy target, ask the user to make sure its
    prompt on the PC is empty (typed text would be sent with the brief). If the user waits, stop here.
 4. **Make sure only one session writes.** If the stopped member or its children may still be working (an agy notice
    can say so, a Claude member can have subagents), do not send a brief that edits the same files until the user has
