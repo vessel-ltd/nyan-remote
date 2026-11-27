@@ -10,7 +10,7 @@
 
 import { watch, type FSWatcher } from 'node:fs'
 import { mkdir } from 'node:fs/promises'
-import { agyChildrenOutlived, agyQuestionWaitAt, agyStatus, readAgyFiles } from './sessions.ts'
+import { agyChildrenOutlived, agyLimited, agyQuestionWaitAt, agyStatus, readAgyFiles } from './sessions.ts'
 
 const DEBOUNCE_MS = 300
 
@@ -23,7 +23,7 @@ export async function agyStatuses(dir: string, home?: string): Promise<Map<strin
     //   between not seen, left the thread saying "approval" / codex review)
     // ★ And its own card beside a wait (a subagent's approval, then the parent's card: the same `waiting:question`, the
     //   phone kept the old reason until its next poll / codex review)
-    out.set(f.state.conversationId, `${f.state.pid}:${agyStatus(f.state, asking, agyChildrenOutlived(f.state, home))}${asking ? ':question' : ''}${f.state.confirmationPending ? ':card' : ''}`)
+    out.set(f.state.conversationId, `${f.state.pid}:${agyStatus(f.state, asking, agyChildrenOutlived(f.state, home), agyLimited(f.state, home))}${asking ? ':question' : ''}${f.state.confirmationPending ? ':card' : ''}`)
   }
   return out
 }
@@ -39,10 +39,10 @@ function same(a: Map<string, string>, b: Map<string, string>): boolean {
  * @param onTick after every look, changed or not (approval cards and notifications look themselves: a card's
  *   identity includes the status file's time, which can move without a status change / `cards.ts`)
  */
-export async function startAgyWatch(dir: string, onChange: () => void, onTick?: () => void): Promise<{ close(): void }> {
+export async function startAgyWatch(dir: string, onChange: () => void, onTick?: () => void, home?: string): Promise<{ close(): void; check(): void }> {
   // ⚠️ The directory is the installer's (0700); made here too so a later `nyan update` finds it watched
   await mkdir(dir, { recursive: true, mode: 0o700 }).catch(() => undefined)
-  let last = await agyStatuses(dir)
+  let last = await agyStatuses(dir, home)
   let timer: NodeJS.Timeout | undefined
   let running = false
   let again = false
@@ -55,7 +55,7 @@ export async function startAgyWatch(dir: string, onChange: () => void, onTick?: 
     try {
       do {
         again = false
-        const now = await agyStatuses(dir)
+        const now = await agyStatuses(dir, home)
         if (!same(now, last)) {
           last = now
           onChange()
@@ -80,6 +80,11 @@ export async function startAgyWatch(dir: string, onChange: () => void, onTick?: 
     close() {
       if (timer) clearTimeout(timer)
       w.close()
+    },
+    // ★ A look without a file event (the periodic one): a status read from the transcript (a limit's error record,
+    //   written after the last status file) changes the list too / codex review
+    check() {
+      void check().catch(() => undefined)
     },
   }
 }

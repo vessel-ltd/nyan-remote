@@ -75,6 +75,148 @@ test('★★ a card rings "needs you", a finished turn rings "done", in the list
   assert.deepEqual(r.sent.map((f) => f.label), ['要対応', '完了', '⚠ 異常終了'])
 })
 
+test('★ a turn stopped at a plan limit rings "制限中" once, like an error (2026-11-26)', async () => {
+  const r = rig()
+  await r.n.look()
+  r.set('working', [user(0)])
+  await r.n.look()
+  r.set('rate-limited', [user(0), { step_index: 1, type: 'ERROR_MESSAGE', error: 'You have exhausted your quota on this model.' }])
+  await r.n.look()
+  await r.n.look()
+  assert.deepEqual(r.sent.map((f) => f.label), ['制限中'])
+})
+
+test('★ a row first seen at a limit rings only when its error is newer than the last look (a reopened old one stays quiet)', async () => {
+  const look = async (r: ReturnType<typeof rig>) => {
+    r.tick(5000)
+    await r.n.look()
+  }
+  const limitErr = (at: string) => [user(0), { step_index: 1, type: 'ERROR_MESSAGE', created_at: at, error: 'You have exhausted your quota on this model.' }]
+  // Reopened: the error is days old
+  const old = rig()
+  old.tick(Date.parse('2026-11-25T00:00:00Z'))
+  old.set(undefined)
+  await look(old)
+  await look(old)
+  // (agy writes a fresh status file on reopening)
+  old.set('rate-limited', limitErr('2026-11-20T00:00:01Z'), '2026-11-25T00:00:12Z')
+  await look(old)
+  await look(old)
+  assert.deepEqual(old.sent, [])
+  // New: a first turn that stopped at the limit between two looks
+  const fresh = rig()
+  fresh.tick(Date.parse('2026-11-25T00:00:00Z'))
+  fresh.set(undefined)
+  await look(fresh)
+  await look(fresh)
+  fresh.set('rate-limited', limitErr('2026-11-25T00:00:12Z'))
+  await look(fresh)
+  await look(fresh)
+  assert.deepEqual(fresh.sent.map((f) => f.label), ['制限中'])
+  // A recent turn whose error carries no time rings too
+  const recentTurn = rig()
+  recentTurn.tick(Date.parse('2026-11-25T00:00:00Z'))
+  recentTurn.set(undefined)
+  await look(recentTurn)
+  await look(recentTurn)
+  recentTurn.set('rate-limited', [{ step_index: 0, type: 'USER_INPUT', created_at: '2026-11-25T00:00:12Z' }, { step_index: 1, type: 'ERROR_MESSAGE', error: 'x' }])
+  await look(recentTurn)
+  assert.deepEqual(recentTurn.sent.map((f) => f.label), ['制限中'])
+})
+
+test('★ a reopened conversation that shows idle first, then its old limit, stays quiet; a new limit from idle rings', async () => {
+  const look = async (r: ReturnType<typeof rig>) => {
+    r.tick(5000)
+    await r.n.look()
+  }
+  const limitErr = (at: string) => [user(0), { step_index: 1, type: 'ERROR_MESSAGE', created_at: at, error: 'You have exhausted your quota on this model.' }]
+  for (const [errAt, want] of [['2026-11-20T00:00:01Z', []], ['2026-11-25T00:00:12Z', ['制限中']]] as const) {
+    const r = rig()
+    r.tick(Date.parse('2026-11-25T00:00:00Z'))
+    r.set('idle', [user(0)])
+    await look(r)
+    await look(r)
+    r.set('rate-limited', limitErr(errAt), '2026-11-25T00:00:12Z')
+    await look(r)
+    await look(r)
+    assert.deepEqual(r.sent.map((f) => f.label), [...want], errAt)
+  }
+  // Whole seconds and the relay's delay: the previous look ran at …:01.200, the error was written at …:00.900 and
+  // recorded as …:00 (codex)
+  const edge = rig()
+  edge.tick(Date.parse('2026-11-25T00:00:00Z') - 8800)
+  edge.set(undefined)
+  await look(edge)
+  await look(edge)
+  edge.set('rate-limited', limitErr('2026-11-25T00:00:00Z'), '2026-11-25T00:00:01Z')
+  await look(edge)
+  assert.deepEqual(edge.sent.map((f) => f.label), ['制限中'], 'the allowance')
+  // The window's edges: an error 2.5 s before the previous look rings; 3.5 s before stays quiet
+  for (const [before, want] of [[2500, ['制限中']], [3500, []]] as const) {
+    const w = rig()
+    w.tick(Date.parse('2026-11-25T00:00:00Z') + before - 10_000)
+    w.set(undefined)
+    await look(w)
+    await look(w)
+    w.set('rate-limited', limitErr('2026-11-25T00:00:00Z'), '2026-11-25T00:00:05Z')
+    await look(w)
+    assert.deepEqual(w.sent.map((f) => f.label), [...want], `${before} ms before`)
+  }
+  // Undated records with a fresh status file (reopened): quiet
+  const r = rig()
+  r.tick(Date.parse('2026-11-25T00:00:00Z'))
+  r.set(undefined)
+  await look(r)
+  await look(r)
+  r.set('rate-limited', [{ step_index: 0, type: 'USER_INPUT' }, { step_index: 1, type: 'ERROR_MESSAGE', error: 'Usage limit reached' }], '2026-11-25T00:00:12Z')
+  await look(r)
+  assert.deepEqual(r.sent, [])
+})
+
+test('★ a new prompt landing before agy rewrites its old error state: no "failed" after "rate-limited" (agy review)', async () => {
+  const r = rig()
+  r.tick(Date.parse('2026-11-25T00:00:00Z'))
+  await r.n.look()
+  r.set('working', [user(0)])
+  r.tick(5000)
+  await r.n.look()
+  r.set('rate-limited', [user(0), { step_index: 1, type: 'ERROR_MESSAGE', created_at: '2026-11-25T00:00:08Z', error: 'Usage limit reached' }], '2026-11-25T00:00:08Z')
+  r.tick(5000)
+  await r.n.look()
+  assert.deepEqual(r.sent.map((f) => f.label), ['制限中'])
+  // The person types again: the prompt is in the transcript, agy's state file is still the old `error`
+  r.set('error', [user(0), { step_index: 1, type: 'ERROR_MESSAGE', error: 'Usage limit reached' }, { step_index: 2, type: 'USER_INPUT', created_at: '2026-11-25T00:01:00Z' }])
+  r.tick(5000)
+  await r.n.look()
+  assert.deepEqual(r.sent.map((f) => f.label), ['制限中'])
+})
+
+test('two turns that each stop at the limit ring once each; a new turn after a limit that fails otherwise rings "failed"', async () => {
+  const r = rig()
+  r.tick(Date.parse('2026-11-25T00:00:00Z'))
+  await r.n.look()
+  const stop = (step: number, at: string, words: string) => [{ step_index: step, type: 'USER_INPUT', created_at: at }, { step_index: step + 1, type: 'ERROR_MESSAGE', created_at: at, error: words }]
+  for (const [step, at] of [[0, '2026-11-25T00:00:03Z'], [10, '2026-11-25T00:00:13Z']] as const) {
+    r.set('working', [{ step_index: step, type: 'USER_INPUT', created_at: at }], at)
+    r.tick(5000)
+    await r.n.look()
+    r.set('rate-limited', stop(step, at, 'Usage limit reached'), at)
+    r.tick(5000)
+    await r.n.look()
+  }
+  assert.deepEqual(r.sent.map((f) => f.label), ['制限中', '制限中'])
+  // A third stop seen right after the second, no working look between (the state file rewritten after the prompt)
+  r.set('rate-limited', stop(30, '2026-11-25T00:00:23Z', 'Usage limit reached'), '2026-11-25T00:00:25Z')
+  r.tick(5000)
+  await r.n.look()
+  assert.deepEqual(r.sent.map((f) => f.label), ['制限中', '制限中', '制限中'])
+  // A new turn whose state file was written after its prompt, failing for another reason (no working look between)
+  r.set('error', stop(20, '2026-11-25T00:00:30Z', 'No capacity available for model x on the server'), '2026-11-25T00:00:32Z')
+  r.tick(5000)
+  await r.n.look()
+  assert.deepEqual(r.sent.map((f) => f.label), ['制限中', '制限中', '制限中', '⚠ 異常終了'])
+})
+
 test('★★ a stopped turn or a declined card sends nothing (the transcript ends without an answer)', async () => {
   const r = rig()
   await r.n.look()

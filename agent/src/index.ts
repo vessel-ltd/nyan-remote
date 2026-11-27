@@ -136,7 +136,7 @@ async function main(): Promise<void> {
   }
 
   // ★ agy conversations (docs/AGY.md): say "sessions changed" when one changes state. ⚠️ Never fatal (polling remains)
-  let agyWatcher: { close(): void } | undefined
+  let agyWatcher: { close(): void; check(): void } | undefined
   // ★ agy approval cards and notifications (docs/AGY.md §9): looked at on every status file change, and every few
   //   seconds in case watching fails. ⚠️ Never throws into the watcher or the timer.
   const agyCards = new AgyCards({
@@ -250,7 +250,9 @@ async function main(): Promise<void> {
     agyLook()
   }
   agyLook()
-  setInterval(agyLook, AGY_LOOK_MS).unref()
+  // ★ With the watcher, the periodic look goes through it: the list is told when a status changed without a status file
+  //   (a limit's error record in the transcript / codex review). Its look ends with `agyLook` as well.
+  setInterval(() => (agyWatcher ? agyWatcher.check() : agyLook()), AGY_LOOK_MS).unref()
   try {
     agyWatcher = await startAgyWatch(agyDir(), () => broadcast({ type: 'sessions-changed', at: new Date().toISOString() }), agyLook)
   } catch {

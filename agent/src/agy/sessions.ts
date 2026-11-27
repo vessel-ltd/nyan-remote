@@ -166,7 +166,7 @@ function activeRoles(v: unknown): { activeSubagentRoles?: string[] } {
 export const AGY_QUESTION_TOOL = 'ask_question'
 
 /** The last answer per transcript, kept while the file does not change (a question writes nothing while it is up) */
-const askCache = new Map<string, { size: number; mtimeMs: number; pending: PendingCall | undefined; answered: boolean; answeredAt?: number; answerLast?: true; messageAfter?: true; heard?: readonly string[]; turnChildren?: { launches: number; ids: readonly string[] }; launched?: true; partial?: true; errored?: true }>()
+const askCache = new Map<string, { size: number; mtimeMs: number; pending: PendingCall | undefined; answered: boolean; answeredAt?: number; answerLast?: true; messageAfter?: true; heard?: readonly string[]; turnChildren?: { launches: number; ids: readonly string[] }; launched?: true; partial?: true; errored?: true; limitError?: true }>()
 /** ★ Large enough for every child of a long conversation (codex review: 64 thrashed and re-read them on every look) */
 const ASK_CACHE_MAX = 4096
 
@@ -321,6 +321,9 @@ function pendingOf(transcript: string, tail: (path: string) => Record<string, un
       size: st.size,
       mtimeMs: st.mtimeMs,
       ...(lastOwn?.['type'] === 'ERROR_MESSAGE' ? { errored: true as const } : {}),
+      // ★ The error that ends the turn names a plan limit (`isAgyLimitText`; implies `errored`). ⚠️ The words are looked
+      //    at here and never kept
+      ...(lastOwn?.['type'] === 'ERROR_MESSAGE' && (isAgyLimitText(lastOwn['error']) || isAgyLimitText(lastOwn['content'])) ? { limitError: true as const } : {}),
       pending,
       answered: end.answered,
       ...(end.answeredAt !== undefined ? { answeredAt: end.answeredAt } : {}),
@@ -343,11 +346,45 @@ function pendingOf(transcript: string, tail: (path: string) => Record<string, un
 
 
 /**
+ * ★ The words of an agy error that name a plan limit (2026-11-26). No real sample exists yet: these are agy's own
+ *   strings (1.5.16 binary: "You have exhausted your quota on this model.", "model %s is out of quota until %s",
+ *   "Usage limit reached") and Google's API status for an exhausted quota (`RESOURCE_EXHAUSTED`, "exhausted your
+ *   capacity").
+ * ⚠️ Not "No capacity available for model … (503)": that is the server's capacity, not the login's limit (measured).
+ * ⚠️ Not a bare 429: the same code is a short per-minute throttle that agy retries.
+ */
+export const AGY_LIMIT_RE = /exhausted your (quota|capacity)|out of quota|quota (has been )?exceeded|usage limit reached|RESOURCE_EXHAUSTED/i
+
+export function isAgyLimitText(v: unknown): boolean {
+  return typeof v === 'string' && AGY_LIMIT_RE.test(v)
+}
+
+/**
+ * ★★ The conversation stopped at a plan limit (2026-11-26 / docs/AGY.md §20): agy is `error` or `idle`, and the
+ *   transcript's last record of the model's side is an `ERROR_MESSAGE` whose words name a limit (`isAgyLimitText`).
+ * ★ Words only (user decision 2026-11-27): the status line's quota at 0 was tried as a second sign, but a reading is
+ *   not kept with the turn, and holding it brought a run of races in review. The words stay in the transcript until
+ *   the next prompt, so this needs no memory: a new prompt ends it by itself.
+ * ⚠️ Inferred: no real sample yet. Words agy uses that the pattern misses show "異常終了"/"完了" as before.
+ */
+export function agyLimited(
+  s: Pick<AgyState, 'conversationId' | 'agentState'>,
+  home?: string,
+  tail: (path: string) => Record<string, unknown>[] = readTailRecords,
+): boolean {
+  if (s.agentState !== 'error' && s.agentState !== 'idle') return false
+  const transcript = transcriptPathOf(s.conversationId, home)
+  const hit = pendingOf(transcript, tail) === null ? askCache.get(transcript) : undefined
+  return hit?.limitError === true
+}
+
+/**
  * ★ The list state, in the words a Claude row uses.
  * - a card is up ⇒ `waiting` (only while agy says so; the flag comes with `tool_use`)
  * - ★ a question is up (`asking`, from `agyAsking`) ⇒ `waiting`
  * - `working` / `tool_use` / `reviewing` ⇒ `working`
- * - `error` ⇒ `error`
+ * - `error` ⇒ `error`, or ★ `rate-limited` when `limited` (`agyLimited`)
+ * - ★ `idle` with `limited` (a turn that ended in an error at a plan limit) ⇒ `rate-limited`
  * - `idle` after a turn this conversation was seen working in ⇒ `done`; before any ⇒ `idle`
  * - `initializing` / `authenticating` / unknown ⇒ `idle`
  * ⚠️ A turn stopped with ESC or a declined card also ends `idle` after working, so it reads `done` (agy sends no
@@ -358,6 +395,8 @@ export function agyStatus(
   asking: boolean,
   /** ★ Its children wrote after the turn's answer (`agyChildrenOutlived`): idle, not "done" */
   outlived: boolean,
+  /** ★ It stopped at a plan limit (`agyLimited`). ⚠️ Required, like `asking` */
+  limited: boolean,
 ): SessionStatus {
   if (s.confirmationPending || asking) return 'waiting'
   // ★ A child agent still running: the conversation is still at work, though the parent waits (docs/AGY.md §13: an
@@ -369,8 +408,9 @@ export function agyStatus(
     case 'reviewing':
       return 'working'
     case 'error':
-      return 'error'
+      return limited ? 'rate-limited' : 'error'
     case 'idle':
+      if (limited) return 'rate-limited'
       return s.busyAt > 0 && !outlived ? 'done' : 'idle'
     default:
       return 'idle'
@@ -420,6 +460,8 @@ export interface AgyRowContext {
   asking: boolean
   /** ★ Its children wrote after the turn's answer (`agyChildrenOutlived`). ⚠️ Required, like `asking` */
   outlived: boolean
+  /** ★ It stopped at a plan limit (`agyLimited`). ⚠️ Required, like `asking` */
+  limited: boolean
 }
 
 export function agyRow(s: AgyState, ctx: AgyRowContext): SessionSummary {
@@ -429,7 +471,7 @@ export function agyRow(s: AgyState, ctx: AgyRowContext): SessionSummary {
     : ctx.promptTitle
       ? { title: ctx.promptTitle, titleSource: 'prompt' }
       : { title: project, titleSource: 'fallback' }
-  const status = agyStatus(s, ctx.asking, ctx.outlived)
+  const status = agyStatus(s, ctx.asking, ctx.outlived, ctx.limited)
   return {
     machine: ctx.machine,
     account: AGY_ACCOUNT,
@@ -841,7 +883,7 @@ export function agyOwnRows(machine: string, deps: AgyDeps): SessionSummary[] {
     //   "done" on one failed probe)
     if (!byConv.has(id)) settledSeen.set(id, !outlived && f.state.hadSubagents && agyChildrenSettled(f.state, deps.home))
     else settledSeen.delete(id)
-    byConv.set(id, byConv.has(id) ? null : agyRow(f.state, { machine, transcriptBytes: 0, lastActivity: waitName(f.state, ownWaitAt(f, deps.home), askedAt), asking, outlived }))
+    byConv.set(id, byConv.has(id) ? null : agyRow(f.state, { machine, transcriptBytes: 0, lastActivity: waitName(f.state, ownWaitAt(f, deps.home), askedAt), asking, outlived, limited: agyLimited(f.state, deps.home) }))
   }
   return [...byConv.values()].filter((r): r is SessionSummary => r !== null)
 }
@@ -859,7 +901,7 @@ export function agyOwnRowOf(machine: string, deps: AgyDeps, conversationId: stri
   const f = readAgyPidFile(deps.dir, holders[0]!)
   if (!f || f.state.conversationId !== want) return undefined
   const askedAt = agyQuestionWaitAt(f.state, f.mtimeMs, deps.home)
-  return agyRow(f.state, { machine, transcriptBytes: 0, lastActivity: waitName(f.state, ownWaitAt(f, deps.home), askedAt), asking: askedAt !== undefined, outlived: agyChildrenOutlived(f.state, deps.home) })
+  return agyRow(f.state, { machine, transcriptBytes: 0, lastActivity: waitName(f.state, ownWaitAt(f, deps.home), askedAt), asking: askedAt !== undefined, outlived: agyChildrenOutlived(f.state, deps.home), limited: agyLimited(f.state, deps.home) })
 }
 
 /**
@@ -1080,7 +1122,8 @@ export async function agyRows(machine: string, given: AgyDeps = defaultAgyDeps()
     //   card stays listed even then (never hide something that needs an answer)
     const asking = bytes > 0 && agyQuestionWaitAt(f.state, f.mtimeMs, deps.home) !== undefined
     const outlived = bytes > 0 && agyChildrenOutlived(f.state, deps.home)
-    const status = agyStatus(f.state, asking, outlived)
+    const limited = agyLimited(f.state, deps.home)
+    const status = agyStatus(f.state, asking, outlived, limited)
     if (bytes === 0 && status !== 'working' && status !== 'waiting') continue
     let title = titles.get(f.state.conversationId)
     if (title === undefined && !f.state.title && bytes > 0) {
@@ -1098,6 +1141,7 @@ export async function agyRows(machine: string, given: AgyDeps = defaultAgyDeps()
         lastActivity: new Date(f.mtimeMs).toISOString(),
         asking,
         outlived,
+        limited,
         ...(title ? { promptTitle: title } : {}),
         // ⚠️ A conversation two agys show takes nothing from the phone (`agyConversations`), nor does one whose agy does
         //    not hold its lock (`findAgyTarget` refuses the same)

@@ -522,7 +522,7 @@ export class AgyCards {
       const id = markId(w.mark)
       if (this.#raised.has(conv) || this.#answered.get(conv) === id) continue
       // ★ The row as the list builds it, from this agy's own state (the list itself may not show it right now)
-      const row = agyRow(w.state, { machine: this.#deps.machine, transcriptBytes: 0, lastActivity: this.#deps.now().toISOString(), sendRoute: 'keys', asking: false, outlived: false })
+      const row = agyRow(w.state, { machine: this.#deps.machine, transcriptBytes: 0, lastActivity: this.#deps.now().toISOString(), sendRoute: 'keys', asking: false, outlived: false, limited: false })
       const last = this.#lastInfo.get(conv)
       const info = last?.id === id ? last.info : agyCard(row, w.mark, w.call, this.#deps.now().toISOString())
       if (!info) {
@@ -672,7 +672,7 @@ export class AgyCards {
       const id = qMarkId(w.mark)
       const callKey = `${conv}:${qCallId(w.mark)}`
       if (this.#qRaised.has(conv) || this.#qAnswered.get(conv) === id || this.#qLeft.has(callKey) || this.#qTyping.has(callKey)) continue
-      const row = agyRow(w.state, { machine: this.#deps.machine, transcriptBytes: 0, lastActivity: new Date(w.mark.askedAt).toISOString(), sendRoute: 'keys', asking: true, outlived: false })
+      const row = agyRow(w.state, { machine: this.#deps.machine, transcriptBytes: 0, lastActivity: new Date(w.mark.askedAt).toISOString(), sendRoute: 'keys', asking: true, outlived: false, limited: false })
       const info = agyQuestionCard(row, w.mark, w.q, this.#deps.now().toISOString())
       const raised: Raised = { id }
       this.#qRaised.set(conv, raised)
@@ -992,7 +992,7 @@ export class AgyCards {
         if (Date.now() - (this.#caAnsweredAt.get(conv) ?? 0) < (this.#deps.childAnsweredMs ?? CA_ANSWERED_MS)) continue
         this.#caAnswered.delete(conv)
       }
-      const row = agyRow(w.state, { machine: this.#deps.machine, transcriptBytes: 0, lastActivity: new Date(w.mark.askedAt).toISOString(), sendRoute: 'keys', asking: true, outlived: false })
+      const row = agyRow(w.state, { machine: this.#deps.machine, transcriptBytes: 0, lastActivity: new Date(w.mark.askedAt).toISOString(), sendRoute: 'keys', asking: true, outlived: false, limited: false })
       const info = agyChildApprovalCard(row, w.mark, w.call, this.#deps.now().toISOString())
       if (!info) continue
       const raised = { id, mark: w.mark }

@@ -38,6 +38,9 @@ export interface TurnEnd {
   answered: boolean
   /** When that answer was written (epoch ms, from its `created_at`; agy writes whole seconds) */
   answeredAt?: number
+  /** ★ The turn ended with an error record: when it was written (epoch ms, its `created_at`). For a newly seen
+   *    "rate-limited" row: only a recent error rings (a reopened old conversation does not / `notify.ts`) */
+  erroredAt?: number
   pending?: PendingCall
 }
 
@@ -112,6 +115,10 @@ export function turnEnd(records: readonly Record<string, unknown>[]): TurnEnd {
     }
     // the system's reminders sit between steps; they say nothing about the call
     if (type === 'SYSTEM_MESSAGE') continue
+    if (type === 'ERROR_MESSAGE' && results === 0) {
+      const at = typeof r['created_at'] === 'string' ? Date.parse(r['created_at']) : NaN
+      return withTurn({ ...(turn === undefined ? {} : { turn }), answered: false, ...(Number.isFinite(at) ? { erroredAt: at } : {}) })
+    }
     if (type !== 'PLANNER_RESPONSE') return withTurn({ ...(turn === undefined ? {} : { turn }), answered: false })
     const calls = Array.isArray(r['tool_calls']) ? (r['tool_calls'] as unknown[]) : []
     if (calls.length === 0) {

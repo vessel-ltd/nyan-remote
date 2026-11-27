@@ -136,6 +136,20 @@ function stateOfTurn(row: Pick<SessionSummary, 'lastActivity'>, end: TurnEnd | u
   return at >= end.turnAt + 1000 || (at >= end.turnAt && end.afterPrompt === true)
 }
 
+/**
+ * ★ Whether a row first seen at a limit is news: its error or its turn was written since the previous look.
+ * ⚠️ Records only: a reopened conversation gets a fresh status file, so its time says nothing about the error (codex).
+ *    A limit always has its error record (words only), so there is always something to go by; undated ⇒ quiet.
+ */
+export const NEW_SINCE_SLACK_MS = 3000
+
+function newSince(end: { erroredAt?: number; turnAt?: number }, prevAt: number | undefined): boolean {
+  if (prevAt === undefined) return false
+  // ⚠️ 3 s of slack: agy writes whole seconds, and its status line reaches us up to ~1 s later (codex)
+  const since = (t: number | undefined): boolean => t !== undefined && t >= prevAt - NEW_SINCE_SLACK_MS
+  return since(end.erroredAt) || since(end.turnAt)
+}
+
 export class AgyNotifier {
   readonly #deps: AgyNotifyDeps
   /** session → its status and turn at the last look */
@@ -323,7 +337,17 @@ export class AgyNotifier {
       } else if (!fresh) {
         // Rule 4b: the same state, with a push still owed for it
         if (!owed || owed.nextAt > nowMs) continue
-      } else if (to === 'waiting' || to === 'error') {
+      } else if (to === 'rate-limited' && (from === undefined || from.status === 'idle') && !newSince(end, prevAt)) {
+        // ★ A row seen for the first time at a limit, or coming from idle, rings only when its turn or its error is
+        //   newer than the last look (as rule 7 for "done"): reopening an old conversation whose last turn stopped at a
+        //   limit stays quiet, also when agy says `authenticating` first (codex · agy review). A turn that hit the limit
+        //   between two looks still rings.
+        continue
+      } else if (to === 'error' && from?.status === 'rate-limited' && !stateAfterTurn) {
+        // ★ A new prompt reached the transcript before agy rewrote its old `error` state: the limit's error is no longer
+        //   last, so the row reads "failed" for a moment. Not news (agy review); the new turn speaks for itself.
+        continue
+      } else if (to === 'waiting' || to === 'error' || to === 'rate-limited') {
         // fall through to send
       } else if (to === 'done' && from !== undefined && (ACTIVE.has(from.status) || newTurn)) {
         // Rule 2
