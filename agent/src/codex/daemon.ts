@@ -277,7 +277,11 @@ function movedReason(now: 'working' | 'waiting' | 'idle'): 'waiting' | 'idle' {
 
 /** A failed call in a few words for the log: the kind and the code, never the daemon's message (it can quote text) */
 function failureDetail(f: RpcFailure): string {
-  return f.type === 'error' ? `error ${String(f.error.code)}` : f.type === 'timeout' ? (f.written ? 'timeout-unknown' : 'timeout-unsent') : f.type
+  if (f.type === 'error') return `error ${String(f.error.code)}`
+  if (f.type === 'timeout') return f.written ? 'timeout-unknown' : 'timeout-unsent'
+  // ★ Written, then the line went away before an answer: as unknown as a timeout (codex review ② r2 #5)
+  if (f.type === 'closed' && f.written) return 'closed-unknown'
+  return f.type
 }
 
 /** ★ How many file-change lookups the line remembers at once (each one is a request still waiting) */

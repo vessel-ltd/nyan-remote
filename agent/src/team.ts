@@ -1,9 +1,9 @@
 // ★★ Teams (`/nyan-team` / docs/TEAM.md / 2026-11-19).
 //
-// One session (the leader) directs other sessions on this machine (the members), across profiles and across Claude
-// Code / Codex. Claude ↔ Claude talk uses Claude's own cross-session messages (the leader is told each member's
-// address); this module keeps who leads whom, bridges what Claude's messages cannot reach (Codex members), lets the
-// leader answer its members' approvals when the user chose so, and keeps the members' turn-end pushes quiet.
+// One session (the leader: Claude Code or Codex) directs other sessions on this machine (the members: Claude Code,
+// Codex or agy), across profiles. nyan carries every message both ways (2026-11-27 / docs/TEAM.md §10); this module
+// keeps who leads whom, lets the leader answer its members' approvals when the user chose so, and keeps the members'
+// turn-end pushes quiet.
 //
 // ⚠️⚠️ **Memory only** (docs/TEAM.md §4.2 / codex design review, high #5). No `teams.json`: an agent restart disbands
 //    every team, and every delegated approval goes back to the human. ⇒ A grant cannot come back from a stale file, and
@@ -16,7 +16,7 @@
 //    and decisions reserved for people (`ExitPlanMode`).
 
 import { randomBytes } from 'node:crypto'
-import type { PermissionRequest } from '../../shared/types.ts'
+import { TEAM_CREATE_TOOL, type PermissionRequest } from '../../shared/types.ts'
 import { requiresInteraction } from './claude/interaction.ts'
 import { shortSessionId } from './codex/ids.ts'
 
@@ -28,18 +28,40 @@ export type TeamApprovalDuration = keyof typeof TEAM_APPROVAL_DURATIONS
 /** At most this many members (a leader reading eight threads is already a lot) */
 export const MAX_TEAM_MEMBERS = 8
 
-/** ★ agy (2026-11-22 / docs/TEAM.md §9): a member only (it has no inbox, so it cannot lead) */
+/** ★ agy (2026-11-22 / docs/TEAM.md §9): a member only so far (a lead is phase ③ / docs/TEAM.md §10) */
 export type TeamTool = 'claude' | 'codex' | 'agy'
 
-export interface TeamLeader {
-  sessionId: string
-  /** Profile (base name of the config dir) */
-  account: string
-  /** ★ Its profile directory (hooks from another profile with the same base name are not this leader / r6 medium #2) */
-  configDir?: string
-  /** The leader's process and its start time: the instance the team belongs to */
-  pid: number
-  procStart: string
+/**
+ * ★ The lead. A Claude lead is bound to its process instance (pid + start time); a Codex lead (2026-11-27 / docs/TEAM.md
+ *   §10) to its row id (`codex-<home>-<thread>`): every Codex thread runs in the one shared daemon process, so there is
+ *   no process of its own — the thread being listed by the daemon is its life.
+ */
+export type TeamLeader =
+  | {
+      tool?: 'claude'
+      sessionId: string
+      /** Profile (base name of the config dir) */
+      account: string
+      /** ★ Its profile directory (hooks from another profile with the same base name are not this leader / r6 medium #2) */
+      configDir?: string
+      /** The leader's process and its start time: the instance the team belongs to */
+      pid: number
+      procStart: string
+    }
+  | {
+      tool: 'codex'
+      /** The Codex row id (`codex-<home>-<thread>`) */
+      sessionId: string
+      /** The Codex home's label */
+      account: string
+      configDir?: undefined
+      pid?: undefined
+      procStart?: undefined
+    }
+
+/** Whether the lead is a Codex thread */
+export function codexLed(team: Pick<Team, 'leader'>): boolean {
+  return team.leader.tool === 'codex'
 }
 
 export interface TeamMember {
@@ -104,6 +126,12 @@ export interface TeamDeps {
   /** The start time of a live process now (`null` = gone). ⚠️ Fresh, never cached (same as the inbox's last check) */
   procStart(pid: number): string | null | undefined
   sameProcStart(a: string, b: string): boolean
+  /**
+   * ★ Whether a Codex row is listed by its daemon now (a Codex lead's life). Absent = never (fail closed). ⚠️ "Not
+   *   listed" is not "gone" (a line reconnecting lists nothing): a Codex lead's team is ended only by its thread closing
+   *   or a complete snapshot without it (`teamHooks.ts` `sessionEnded` / `codexSnapshot`).
+   */
+  codexListed?(sessionId: string): boolean
 }
 
 const teams = new Map<string, Team>()
@@ -206,9 +234,14 @@ export function instanceState(pid: number, procStart: string, deps: TeamDeps): '
   return deps.sameProcStart(now, procStart) ? 'same' : 'gone'
 }
 
-/** Whether the leader's process is the one the team was made with (pid reuse and resume are other leaders) */
+/**
+ * Whether the leader's process is the one the team was made with (pid reuse and resume are other leaders).
+ * ★ A Codex lead: its thread listed by the daemon now.
+ */
 export function leaderLive(team: Team, deps: TeamDeps): boolean {
-  return instanceState(team.leader.pid, team.leader.procStart, deps) === 'same'
+  const l = team.leader
+  if (l.tool === 'codex') return deps.codexListed?.(l.sessionId) ?? false
+  return instanceState(l.pid, l.procStart, deps) === 'same'
 }
 
 /**
@@ -223,6 +256,9 @@ export function teamLedBy(
 ): { ok: true; team: Team } | { ok: false; reason: 'no-team' | 'not-this-leader' | 'leader-gone'; ended?: Team } {
   const team = [...teams.values()].find((t) => t.leader.sessionId === sessionId)
   if (!team) return { ok: false, reason: 'no-team' }
+  // ★ A Codex lead has no process of its own: listed ⇒ it; not listed ⇒ refused now (never "gone" from here: a line
+  //   reconnecting lists nothing / its thread closing ends the team)
+  if (team.leader.tool === 'codex') return leaderLive(team, deps) ? { ok: true, team } : { ok: false, reason: 'not-this-leader' }
   const state = instanceState(team.leader.pid, team.leader.procStart, deps)
   // ⚠️ Ended only when confirmed gone; unknown ⇒ refused now, the team kept (r9 medium #1)
   if (state === 'gone') return { ok: false, reason: 'leader-gone', ended: team }
@@ -341,7 +377,10 @@ export function mayLeaderAnswer(
  *    another profile — one the agent does not even watch — is not this member. An unknown profile stays with the human.
  *    (The profile **directory** is checked by `teamHooks.ts` `ownsCard`, which has the card's transcript.)
  */
-export function cardFromMember(member: TeamMember, req: Pick<PermissionRequest, 'tool' | 'account' | 'accountUnknown'>): boolean {
+export function cardFromMember(member: TeamMember, req: Pick<PermissionRequest, 'tool' | 'account' | 'accountUnknown' | 'toolName'>): boolean {
+  // ⚠️⚠️ A team's own confirmation (a Codex lead's create, `teamConfirm.ts`) is the human's alone: never any leader's,
+  //    even if its session became a member somewhere while it waited
+  if (req.toolName === TEAM_CREATE_TOOL) return false
   if (member.tool === 'codex') return req.tool === 'codex'
   // ★ agy: its cards carry `tool: 'agy'` and the conversation's row id (which agy process: `teamHooks.ts` `memberIdentity`)
   if (member.tool === 'agy') return req.tool === 'agy'
@@ -372,7 +411,8 @@ export function sweepTeams(deps: TeamDeps, codexLive: ReadonlySet<string> | unde
   const gone: string[] = []
   for (const team of teams.values()) {
     // ⚠️ Only a confirmed exit ends a team or removes a member (unknown is retried next round / r9 medium #1)
-    if (instanceState(team.leader.pid, team.leader.procStart, deps) === 'gone') {
+    // ★ A Codex lead ends by its thread closing (`sessionEnded`) or a complete snapshot (`codexSnapshot`), not here
+    if (team.leader.tool !== 'codex' && instanceState(team.leader.pid, team.leader.procStart, deps) === 'gone') {
       deadLeaders.push(team)
       continue
     }

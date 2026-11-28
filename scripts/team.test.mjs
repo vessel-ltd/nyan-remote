@@ -22,6 +22,11 @@ test('★★ the caller is the nearest claude/codex above us (a Codex started in
     callerOf(env, 10, tree({ 10: { ppid: 9, comm: 'bash' }, 9: { ppid: 8, comm: 'codex' }, 8: { ppid: 7, comm: 'bash' }, 7: { ppid: 1, comm: 'claude' } })),
     { tool: 'codex' },
   )
+  // ★ a Codex lead names its thread and home (2026-11-27 / docs/TEAM.md §10)
+  assert.deepEqual(
+    callerOf({ ...env, CODEX_THREAD_ID: '01a21b76-a407-7fb2-ad45-77ed7bf38329', CODEX_HOME: '/home/user/.codex' }, 10, tree({ 10: { ppid: 9, comm: 'bash' }, 9: { ppid: 1, comm: 'codex' } })),
+    { tool: 'codex', thread: '01a21b76-a407-7fb2-ad45-77ed7bf38329', home: '/home/user/.codex' },
+  )
   // no claude above us (a plain terminal), or claude without its session id ⇒ unknown
   // claude above us without its session id: a session all the same (never a plain terminal)
   assert.deepEqual(callerOf({}, 10, tree({ 10: { ppid: 9, comm: 'claude' } })), { tool: 'claude', pid: 10 })
@@ -179,6 +184,34 @@ test('★ inside a session, list and disband <id> are refused (they are the huma
     errs.length = 0
     assert.equal(await main(['candidates'], { env, out: () => {}, err: (s) => errs.push(s), caller: { tool: 'agy' } }), 1)
     assert.match(errs.join('\n'), /agy/)
+    // ★ a Codex caller without its thread id is refused with why; one with it goes on to the agent (2026-11-27)
+    errs.length = 0
+    assert.equal(await main(['candidates'], { env, out: () => {}, err: (s) => errs.push(s), caller: { tool: 'codex' } }), 1)
+    assert.match(errs.join('\n'), /CODEX_THREAD_ID/)
+    errs.length = 0
+    assert.equal(await main(['candidates'], { env, out: () => {}, err: (s) => errs.push(s), caller: { tool: 'codex', thread: '01a21b76-a407-7fb2-ad45-77ed7bf38329' } }), 1)
+    assert.match(errs.join('\n'), /team socket|チームの口/, 'past the caller check: no agent in this test folder')
+    // ★ a Codex caller inside its sandbox is told how to get out (the folder check fails there first)
+    errs.length = 0
+    assert.equal(await main(['candidates'], { env: { NYAN_REMOTE_STATE_DIR: '/tmp' }, out: () => {}, err: (s) => errs.push(s), caller: { tool: 'codex', thread: 'x' } }), 1)
+    assert.match(errs.join('\n'), /nyan-remote\.rules/)
+    // ★ create inside the sandbox: the same hint (the phone confirms it, not an escalation / 2026-11-27)
+    errs.length = 0
+    assert.equal(await main(['create', 'cx-00000000'], { env: { NYAN_REMOTE_STATE_DIR: '/tmp' }, out: () => {}, err: (s) => errs.push(s), caller: { tool: 'codex', thread: 'x' } }), 1)
+    assert.match(errs.join('\n'), /nyan-remote\/nyan/)
+    assert.doesNotMatch(errs.join('\n'), /escalated/)
+    // ⚠️ --file reads a plain file only, never through a link, and no more than one send (codex review ② r1 #3)
+    const { symlinkSync: link, writeFileSync: write } = await import('node:fs')
+    write(join(d, 'brief.md'), 'do the thing')
+    link(join(d, 'brief.md'), join(d, 'via.md'))
+    write(join(d, 'big.md'), 'x'.repeat(64 * 1024 + 1))
+    for (const f of ['via.md', 'big.md']) {
+      errs.length = 0
+      assert.equal(await main(['send', 'm1', '--file', join(d, f)], { env, out: () => {}, err: (s) => errs.push(s), caller: { tool: 'claude', sessionId: 's', pid: 9 } }), 1)
+      assert.match(errs.join('\n'), /plain file|普通のファイル|too large|大きすぎ/)
+    }
+    errs.length = 0
+    assert.equal(await main(['send', 'm1', 'text', '--file', join(d, 'brief.md')], { env, out: () => {}, err: (s) => errs.push(s), caller: { tool: 'claude', sessionId: 's', pid: 9 } }), 2)
   } finally {
     rmSync(d, { recursive: true, force: true })
   }
@@ -199,4 +232,29 @@ test('★ status: a reachable Claude member is reached with nyan team send like 
   assert.doesNotMatch(st, /no nyan hooks|nyan のフックが無い/)
   const warn = formatStatus({ id: 'tm1', createdAt: 'x', leader: { sessionId: 's', account: '.claude-r' }, members: [{ name: 'm1', tool: 'claude', account: '.claude-new', status: 'idle', title: 't', reachable: true, noReports: true }] })
   assert.match(warn, /no nyan hooks|nyan のフックが無い/)
+})
+
+test('★★ --file is judged on the file actually opened: a link, a FIFO, a folder or too much is refused, never waited on (codex review ② r2 #3)', async () => {
+  const { readPlainFile, MAX_FILE_BYTES } = await import('./team.mjs')
+  const { mkdtempSync, writeFileSync, symlinkSync, mkdirSync, rmSync } = await import('node:fs')
+  const { execFileSync } = await import('node:child_process')
+  const { tmpdir } = await import('node:os')
+  const d = mkdtempSync(join(tmpdir(), 'nr-file-'))
+  try {
+    writeFileSync(join(d, 'ok.md'), 'do the thing')
+    assert.equal(readPlainFile(join(d, 'ok.md')), 'do the thing')
+    writeFileSync(join(d, 'edge.md'), 'x'.repeat(MAX_FILE_BYTES))
+    assert.equal(readPlainFile(join(d, 'edge.md')).length, MAX_FILE_BYTES)
+    writeFileSync(join(d, 'big.md'), 'x'.repeat(MAX_FILE_BYTES + 1))
+    assert.throws(() => readPlainFile(join(d, 'big.md')), /too large|大きすぎ/)
+    symlinkSync(join(d, 'ok.md'), join(d, 'link.md'))
+    assert.throws(() => readPlainFile(join(d, 'link.md')), /plain file|普通のファイル/)
+    mkdirSync(join(d, 'dir'))
+    assert.throws(() => readPlainFile(join(d, 'dir')), /plain file|普通のファイル/)
+    // ⚠️ a FIFO with no writer: opened without blocking, then refused (it would have waited forever)
+    execFileSync('mkfifo', [join(d, 'fifo')])
+    assert.throws(() => readPlainFile(join(d, 'fifo')), /plain file|普通のファイル/)
+  } finally {
+    rmSync(d, { recursive: true, force: true })
+  }
 })

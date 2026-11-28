@@ -739,6 +739,13 @@ export function legacySuggestionText(s: PermissionSuggestion): string {
  * ⚠️ `tool_input` comes from the conversation, so it **never goes into the Push body** (§6.2).
  *    It is shown after opening the app, never in a notification.
  */
+/**
+ * ★★ The tool name of the card a Codex lead's `nyan team create` raises (2026-11-27 / docs/TEAM.md §10.5): the human
+ *   confirms the team on the phone, the only place it is shown. ⚠️ Never answered by a leader (`cardFromMember`) nor
+ *   by auto-approve (it never goes through `shouldAutoApprove`).
+ */
+export const TEAM_CREATE_TOOL = 'nyan team create'
+
 export interface PermissionRequest {
   /** Idempotency key. Chosen with priority tool_use_id > prompt_id */
   key: string

@@ -87,10 +87,11 @@ test('fail: ends every waiting call and every later call with the reason', async
   await tick()
   h.rpc.fail('eof')
   h.rpc.fail('second reason is ignored')
-  const closed = { ok: false, failure: { type: 'closed', reason: 'eof' } }
-  assert.deepEqual(await a, closed)
-  assert.deepEqual(await b, closed)
-  assert.deepEqual(await h.rpc.call('c'), closed)
+  // ★ a and b were written before the line went away: the daemon may have acted on them (codex review ② r2 #5)
+  const closedWritten = { ok: false, failure: { type: 'closed', reason: 'eof', written: true } }
+  assert.deepEqual(await a, closedWritten)
+  assert.deepEqual(await b, closedWritten)
+  assert.deepEqual(await h.rpc.call('c'), { ok: false, failure: { type: 'closed', reason: 'eof' } })
   assert.equal(await h.rpc.notify('n'), false)
   assert.equal(await h.rpc.respond(7, {}), false)
   assert.equal(h.sent.length, 2, 'nothing is sent after the line is gone')
@@ -210,4 +211,22 @@ test('respond: the guard stops an answer that waited behind a slow line', async 
   l.open()
   assert.equal(await p, false)
   assert.deepEqual(l.written, [])
+})
+
+test('fail: a call still waiting to be written ends as closed without `written` (it never reached the daemon)', async () => {
+  let release: (() => void) | undefined
+  const rpc = createRpc({
+    send: async (_t, guard) => {
+      await new Promise<void>((r) => (release = r))
+      if (!guard()) throw new Error('cancelled')
+    },
+    onNotification: () => {},
+    onServerRequest: () => {},
+    timeoutMs: 1000,
+  })
+  const p = rpc.call('held')
+  await tick()
+  rpc.fail('eof')
+  release?.()
+  assert.deepEqual(await p, { ok: false, failure: { type: 'closed', reason: 'eof' } })
 })

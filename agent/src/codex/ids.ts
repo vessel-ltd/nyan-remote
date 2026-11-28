@@ -23,8 +23,13 @@ export function isCodexSessionId(id: string): boolean {
 
 /**
  * The id as journals print it. A Claude id: its first 8 characters, as before. A Codex row id: the whole home part
- * and the first 8 of the thread (8 characters would print `codex-3b` for every thread of a home — second review, low #5).
+ * and the first 8 of the thread (8 characters would print `codex-3b` for every thread of a home — second review, low #5),
+ * ★ then the thread's last 6: a Codex thread id is a UUIDv7 whose head is a timestamp, so two threads started seconds
+ *   apart printed the same (2026-11-27: two members looked like one session in the team journal).
  */
 export function shortSessionId(id: string): string {
-  return isCodexSessionId(id) ? id.slice(0, 'codex-'.length + HOME_HEX + 1 + 8) : id.slice(0, 8)
+  if (!isCodexSessionId(id)) return id.slice(0, 8)
+  const head = 'codex-'.length + HOME_HEX + 1
+  const thread = id.slice(head)
+  return thread.length > 16 ? `${id.slice(0, head + 8)}…${thread.slice(-6)}` : id.slice(0, head + 8)
 }

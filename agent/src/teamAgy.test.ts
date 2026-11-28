@@ -161,6 +161,39 @@ test('★★ an agy card raised again with a new key (a state rewrite) is announ
   resetPending()
 })
 
+test('★★ a queued notice dropped as stale because the card moved to a new key is told again with that key (codex review ② r2 #6)', async () => {
+  ownState(CONV)
+  const r = createTeam(LEADER, [member], '3h', Date.now() - 1000)
+  assert.ok(r.ok)
+  const told: { text: string; guard?: () => boolean; onStale?: () => void }[] = []
+  const deps = {
+    tell: async (_t: unknown, text: string, guard?: () => boolean, opts?: { onStale?: () => void }) => (told.push({ text, guard, onStale: opts?.onStale }), true),
+    unique: async () => true,
+  }
+  const card = (key: string): PermissionRequest => ({
+    key, origin: 'agy:moved-call', machine: 'pc-a', account: 'agy', project: 'p', sessionId: AGY, tool: 'agy', toolName: 'Bash', summary: 'date', at: new Date().toISOString(),
+  })
+  let withdraw: (() => void) | undefined
+  void waitForDecision(card('agy:k1#1'), (w) => (withdraw = w), { toolInput: { command: 'date' }, requestedAt: Date.now(), agyPid: ME })
+  agyCardsChanged(deps)
+  await new Promise((res) => setTimeout(res, 30))
+  assert.equal(told.length, 1)
+  assert.match(told[0]!.text, /k1|r[0-9a-f]{10}/)
+  // the state file is rewritten: the same call under a new key (the queued notice names the old one)
+  withdraw?.()
+  void waitForDecision(card('agy:k2#1'), () => {}, { toolInput: { command: 'date' }, requestedAt: Date.now(), agyPid: ME })
+  agyCardsChanged(deps)
+  await new Promise((res) => setTimeout(res, 30))
+  assert.equal(told.length, 1, 'the mark still stands while the first notice waits')
+  assert.equal(told[0]!.guard?.(), false, 'the waiting notice is stale now')
+  told[0]!.onStale?.()
+  await new Promise((res) => setTimeout(res, 30))
+  assert.equal(told.length, 2, 'told again')
+  assert.notEqual(told[1]!.text, told[0]!.text)
+  assert.equal(told[1]!.guard?.(), true)
+  resetPending()
+})
+
 test('★★ an agy that no longer holds the conversation\'s lock (a `/new` on the PC) is confirmed replaced, though its state file still names it', async () => {
   ownState(CONV)
   // this test process holds no agy lock at all: a probe that works and lacks the conversation

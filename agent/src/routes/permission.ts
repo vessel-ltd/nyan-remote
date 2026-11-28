@@ -15,6 +15,7 @@ import {
   legacySuggestionText,
   notificationText,
   permissionTag,
+  TEAM_CREATE_TOOL,
   type HookPayload,
   type NotifyFields,
   type PermissionRequest,
@@ -410,7 +411,21 @@ export async function permissionAnswer(ctx: Ctx, agyWaitMs = AGY_DELIVERY_WAIT_M
   //   so the phone waits for it (a key that never reached agy must not read as answered / codex review).
   //   ⚠️ Taken before answering (answering starts the typing)
   const delivery = typeof body.key === 'string' ? agyDelivery(body.key) : undefined
-  const r = answerPermission(body, actorOf(ctx.identity))
+  // ⚠️⚠️ A team's confirmation (a Codex lead's create, `teamConfirm.ts`) only from a paired phone (codex review ② r3 #1):
+  //    on a machine that uses `tailscale serve`, the loopback port believes forwarding headers, so a program of this
+  //    user that can reach it (a Codex with its network turned on) could answer as "tailscale". A paired phone proves
+  //    its key in a handshake nobody else can make.
+  const r = answerPermission(body, actorOf(ctx.identity), (target) =>
+    target?.toolName === TEAM_CREATE_TOOL && ctx.identity.via !== 'device'
+      ? {
+          ok: false,
+          reason: t(
+            'チーム作りの確認は、nyan-remote と組んだスマホ（アプリ）からだけ答えられます',
+            'A team confirmation can be answered only from a phone paired with nyan-remote (the app).',
+          ),
+        }
+      : { ok: true },
+  )
   if (!r.ok || !delivery) return r
   // ★ The outcome is told when the typing ends within `AGY_DELIVERY_WAIT_MS` (most do). ⚠️ Not longer: a relay line runs
   //    its requests one at a time, so a longer wait held the phone's next request (an instruction to Claude) past its

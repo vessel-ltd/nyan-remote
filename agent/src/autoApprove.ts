@@ -25,7 +25,7 @@
 //   ⚠️ When broken, **do not write** (keep the evidence / CLAUDE.md §2). ⇒ Turning it on is refused too.
 
 import { isCodexSessionId, shortSessionId } from './codex/ids.ts'
-import type { Interaction, PermissionRequest } from '../../shared/types.ts'
+import { TEAM_CREATE_TOOL, type Interaction, type PermissionRequest } from '../../shared/types.ts'
 import { requiresInteraction } from './claude/interaction.ts'
 import { readJsonFile, writeJson } from './state.ts'
 import { t } from '../../shared/i18n.ts'
@@ -263,6 +263,8 @@ export function shouldAutoApprove(
   //    an unexpected shape, `sessionId` can be `undefined`. Passing it here would make
   //    the "per session" setting meaningless
   if (!req.sessionId) return false
+  // ⚠️⚠️ A team's confirmation is the human's alone (`teamConfirm.ts` never asks here; this keeps it so if one ever does)
+  if (req.toolName === TEAM_CREATE_TOOL) return false
   // ⚠️⚠️ Stop the ones known by name first (`interaction` disappears on broken input)
   if (requiresInteraction(req.toolName)) return false
   // ★ Stop questions with choices and plan approvals (= not "yes/no")

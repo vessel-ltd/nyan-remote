@@ -8,7 +8,8 @@
 //    the teams are simply unavailable (the rest of the agent runs as before).
 // ⚠️ One agent per state directory (as for every other state file): a second agent never takes a live socket away,
 //    but two agents racing over the same leftover at the same instant are not arbitrated.
-// ⚠️ Codex's sandbox refuses Unix sockets as it refuses TCP (measured 2026-11-18): a Codex leader is phase 1b.
+// ⚠️ Codex's sandbox refuses Unix sockets as it refuses TCP (measured 2026-11-18): a Codex lead's `nyan team` runs
+//    outside it through the rule nyan update writes (docs/TEAM.md §10.2).
 
 import { lstat, chmod, unlink } from 'node:fs/promises'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'

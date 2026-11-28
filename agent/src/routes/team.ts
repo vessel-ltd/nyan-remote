@@ -3,6 +3,8 @@
 //
 // Every route that acts for a leader takes `leader` (its Claude session id) and `pid` (the Claude process the CLI runs
 // under) and checks them against the team's instance (`teamLedBy`) on every call.
+// ★ A Codex lead (2026-11-27 / docs/TEAM.md §10) sends `codexThread` (its `CODEX_THREAD_ID`) and `codexHome` instead:
+//   the agent makes the row id from them and the thread must be one its daemon lists.
 
 import { createHash } from 'node:crypto'
 import { t } from '../../../shared/i18n.ts'
@@ -12,7 +14,10 @@ import { discoverConfigDirs } from '../claude/configDirs.ts'
 import { findTarget, sendToSession } from '../claude/inbox.ts'
 import { aliveProcStartFreshSync, sameProcStart } from '../claude/sessionIndex.ts'
 import { isCodexSessionId, shortSessionId } from '../codex/ids.ts'
+import { codexSessionPrefix } from '../codex/daemon.ts'
 import { isQuiet, originOf, pendingWithMeta } from '../permission.ts'
+import { TEAM_CONFIRM_MS, confirmOnPhone, teamCreateCard } from '../teamConfirm.ts'
+import { machineName } from '../machine.ts'
 import { sweepResolved } from '../permissionSweep.ts'
 import { HttpError, readJsonBody, type Ctx } from '../router.ts'
 import {
@@ -27,13 +32,15 @@ import {
   leaderLive,
   teamLedBy,
   teamView,
+  MAX_TEAM_MEMBERS,
+  TEAM_APPROVAL_DURATIONS,
   type CreateFailure,
   type Team,
   type TeamMember,
 } from '../team.ts'
 import { TEAM_FRAME_CLOSE, TEAM_FRAME_MARK, TEAM_SENDER, agyInstructionSent, sendTag, agyStateNow, asMemberData, cardText, endTeam, soleProcessSync, indexStatusNow, leaderMay, leaderSessionNow, liveMember, memberUnique, ownsCard, revealed, cardRef, teamDeps, tellLeader } from '../teamHooks.ts'
 import { agyDelivery, agyDeliveryMessage } from '../agy/cards.ts'
-import { AGY_DELIVERY_WAIT_MS, settledWithin } from './permission.ts'
+import { AGY_DELIVERY_WAIT_MS, notifyPermission, settledWithin } from './permission.ts'
 import { answerPermission, type AnswerBody } from './permission.ts'
 import { codexMessage } from './message.ts'
 import { codexLabelShared, codexLists, codexLog, codexRowsNow, codexSend, codexStatusKnown } from '../codex/run.ts'
@@ -45,7 +52,7 @@ import type { TeamTool } from '../team.ts'
 import { accessSync, constants, readFileSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { readdir, stat } from 'node:fs/promises'
-import { dirname, join, resolve } from 'node:path'
+import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { sessions } from './sessions.ts'
 import { readLogSlice } from '../claude/log.ts'
 import { usage } from './usage.ts'
@@ -58,7 +65,15 @@ const READ_PAGES_MAX = 200
 interface LeaderBody {
   leader?: unknown
   pid?: unknown
+  /** ★ A Codex lead: its thread id (`CODEX_THREAD_ID`) and its home (`CODEX_HOME`, absent = `~/.codex`) */
+  codexThread?: unknown
+  codexHome?: unknown
 }
+
+/** Who calls: a Claude session (and the process the CLI runs under) or a Codex row */
+type Caller = { tool: 'claude'; sessionId: string; pid: number } | { tool: 'codex'; sessionId: string; pid?: undefined }
+
+const THREAD_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 
 /**
  * ★ Whether a Claude profile has nyan's turn-end hook (`notify.sh` on `Stop`): without it a member's turn ends are never
@@ -100,20 +115,34 @@ function str(v: unknown): string | undefined {
   return typeof v === 'string' && v.length > 0 ? v : undefined
 }
 
-function leaderOf(o: LeaderBody): { sessionId: string; pid: number } {
+function leaderOf(o: LeaderBody): Caller {
+  const thread = str(o.codexThread)
+  if (thread !== undefined) {
+    // ⚠️ Only the shape Codex gives (it becomes part of a row id we look up, never a path or a prefix)
+    if (!THREAD_ID.test(thread)) throw new HttpError(400, t('Codex のスレッドが分かりません', 'The Codex thread is unknown.'))
+    const home = str(o.codexHome)
+    if (home !== undefined && !isAbsolute(home)) throw new HttpError(400, t('CODEX_HOME が絶対パスではありません', 'CODEX_HOME is not an absolute path.'))
+    // ★ The same row id the daemon's line gives that thread (`codexHomes`: the resolved home path)
+    return { tool: 'codex', sessionId: codexSessionPrefix(resolve(home ?? join(homedir(), '.codex'))) + thread }
+  }
   const sessionId = str(o.leader)
   const pid = typeof o.pid === 'number' ? o.pid : Number(o.pid)
   if (!sessionId || !Number.isInteger(pid) || pid <= 0) {
     throw new HttpError(400, t('リーダーのセッションが分かりません（Claude Code の中から実行してください）', 'The leader session is unknown (run this inside Claude Code).'))
   }
-  if (isCodexSessionId(sessionId)) {
-    throw new HttpError(400, t('Codex をリーダーにするのはまだできません（Claude Code から実行してください）', 'A Codex session cannot lead a team yet (run this from Claude Code).'))
-  }
-  return { sessionId, pid }
+  // ⚠️ A Codex row id is never accepted as a Claude leader (a Codex lead names its thread instead)
+  if (isCodexSessionId(sessionId)) throw new HttpError(400, t('リーダーのセッションが分かりません', 'The leader session is unknown.'))
+  return { tool: 'claude', sessionId, pid }
 }
 
 function fromQuery(ctx: Ctx): LeaderBody {
-  return { leader: ctx.url.searchParams.get('leader') ?? undefined, pid: ctx.url.searchParams.get('pid') ?? undefined }
+  const p = (k: string): string | undefined => ctx.url.searchParams.get(k) ?? undefined
+  return { leader: p('leader'), pid: p('pid'), codexThread: p('codexThread'), codexHome: p('codexHome') }
+}
+
+/** ★ A Codex lead's thread is listed by its daemon now (the only proof of its life) */
+function codexLeadListed(sessionId: string): boolean {
+  return codexRowsNow().some((r) => r.sessionId === sessionId)
 }
 
 /** The team this caller leads, or a 404/409 that says what to do */
@@ -281,6 +310,49 @@ interface CreateBody extends LeaderBody {
   approvals?: unknown
 }
 
+/** Codex leads with a confirmation on the phone now, and when each was last declined (or went unanswered) */
+const confirming = new Set<string>()
+const refusedAt = new Map<string, number>()
+/** After a "no" (or no answer), how long a lead waits before it may ask again */
+const CONFIRM_PAUSE_MS = 60_000
+
+/**
+ * ⚠️ One confirmation at a time per lead, and a pause after a "no" (r15 #1: a prompt-injected Codex could fill the
+ *    phone with cards and pushes). Checked before the lookups and again right before the card.
+ */
+function pacedConfirm(sessionId: string): void {
+  if (confirming.has(sessionId)) throw new HttpError(409, t('このセッションのチーム作りの確認が、もうスマホに出ています', 'A team confirmation from this session is already on the phone.'))
+  const wait = (refusedAt.get(sessionId) ?? 0) + CONFIRM_PAUSE_MS - Date.now()
+  if (wait > 0) {
+    throw new HttpError(409, t(`チーム作りが断られたばかりです。${Math.ceil(wait / 1000)}秒待ってから、利用者に聞いてやり直してください`, `The team was just declined. Wait ${Math.ceil(wait / 1000)} s, ask the user, then try again.`))
+  }
+}
+
+/** ★ The one live session a candidate ref names (never the lead itself), or the 400/404 that says why */
+function rowForRef(rows: SessionSummary[], ref: string, leadId: string): SessionSummary {
+  // ⚠️ Matched only against our own refs (never a prefix of another program's id)
+  if (!/^(c-|cx-|ag-)?[0-9a-f]{8}$/.test(ref)) throw new HttpError(400, t(`参照の形が違います: ${ref}`, `Not a candidate ref: ${ref}`))
+  const hits = rows.filter((r) => r.sessionId !== leadId && refOf(r) === ref)
+  if (hits.length === 0) throw new HttpError(404, t(`「${ref}」に当たる生きているセッションがありません（nyan team candidates で確かめて）`, `No live session matches "${ref}" (check with nyan team candidates).`))
+  if (hits.length > 1) throw new HttpError(400, t(`「${ref}」に当たるセッションが複数あります`, `"${ref}" matches more than one session.`))
+  return hits[0]!
+}
+
+/**
+ * ★ Before a Codex lead's card goes up: what would fail anyway is said now, not after the human pressed "Allow"
+ *   (`createTeam` judges it all again afterwards)
+ */
+function precheckCodexLead(leadId: string, picked: { sessionId: string }[], approvals: string | undefined): void {
+  if (picked.length === 0) throw new HttpError(409, CREATE_TEXT['no-members']())
+  if (picked.length > MAX_TEAM_MEMBERS) throw new HttpError(409, CREATE_TEXT['too-many']())
+  if (new Set(picked.map((r) => r.sessionId)).size !== picked.length) throw new HttpError(409, CREATE_TEXT['duplicate-member']())
+  if (approvals !== undefined && !Object.hasOwn(TEAM_APPROVAL_DURATIONS, approvals)) throw new HttpError(409, CREATE_TEXT['bad-duration']())
+  for (const team of allTeams()) {
+    if (team.leader.sessionId === leadId) throw new HttpError(409, CREATE_TEXT['already-leading']())
+    if (team.members.some((m) => m.sessionId === leadId)) throw new HttpError(409, CREATE_TEXT['leader-in-team']())
+  }
+}
+
 /** Synchronously: the process's own index entry names this session (its status is not required / r22 low #3) */
 function indexNamesSession(configDir: string, pid: number, sessionId: string): boolean {
   try {
@@ -291,65 +363,185 @@ function indexNamesSession(configDir: string, pid: number, sessionId: string): b
   }
 }
 
+type MemberIn = { sessionId: string; tool: TeamTool; account: string; pid?: number; procStart?: string; configDir?: string; busyAtJoin?: boolean }
+
+/** ★ The member a picked row becomes: a Claude or agy member bound to its process instance now, or the 409 saying why */
+async function bindMember(row: SessionSummary, ref: string, dirs: Awaited<ReturnType<typeof discoverConfigDirs>>): Promise<MemberIn> {
+  const tool = toolOf(row)
+  if (tool === 'claude') {
+    // ★ Bind a Claude member to its process instance (codex review, high #1): a resume is another member
+    const at = await findTarget(dirs, row.sessionId)
+    const start = 'reason' in at ? undefined : aliveProcStartFreshSync(at.pid)
+    if ('reason' in at || typeof start !== 'string') {
+      throw new HttpError(409, t(`「${ref}」のセッションを確かめられません（いま繋がっていない）`, `Cannot verify the session "${ref}" (not reachable now).`))
+    }
+    return { sessionId: row.sessionId, tool, account: row.account, pid: at.pid, procStart: start, configDir: dirname(at.sessionsDir), ...(row.status === 'working' || row.status === 'waiting' ? { busyAtJoin: true } : {}) }
+  } else if (tool === 'agy') {
+    // ★ Bind an agy member to the agy process that shows the conversation now (the one keys would go to)
+    const conv = conversationOf(row.sessionId)
+    const at = conv === undefined || row.agyShared ? undefined : await findAgyTarget(conv, defaultAgyKeysDeps())
+    const start = at === undefined || typeof at === 'string' ? undefined : aliveProcStartFreshSync(at.pid)
+    if (at === undefined || typeof at === 'string' || typeof start !== 'string') {
+      throw new HttpError(409, t(`「${ref}」の agy を確かめられません（中継を通して起動した agy で、1つだけが開いているときに選べます）`, `Cannot verify the agy "${ref}" (pick one started through the relay, open in one agy only).`))
+    }
+    // ⚠️ Its own state file (`pid-<pid>.json`) must name the conversation: every later check reads it (codex review:
+    //    an agy with only the older per-conversation file was accepted, then shown as replaced and never usable)
+    if (!agyStateNow({ tool, pid: at.pid, sessionId: row.sessionId })) {
+      throw new HttpError(
+        409,
+        t(
+          `「${ref}」の agy の状態がまだ読めません（更新の前から開いている agy など）。その agy で何か1つ送ってから、もう一度作ってください`,
+          `Cannot read the state of the agy "${ref}" yet (an agy opened before an update, for example). Send it anything once, then create the team again.`,
+        ),
+      )
+    }
+    return { sessionId: row.sessionId, tool, account: row.account, pid: at.pid, procStart: start }
+  }
+  return { sessionId: row.sessionId, tool, account: row.account, ...(row.status === 'working' || row.status === 'waiting' ? { busyAtJoin: true } : {}) }
+}
+
+/** The same instance as when the human saw the card (tool, profile, process and its start) */
+function sameBinding(a: MemberIn, b: MemberIn): boolean {
+  return a.sessionId === b.sessionId && a.tool === b.tool && a.account === b.account && a.pid === b.pid && a.procStart === b.procStart && a.configDir === b.configDir
+}
+
 export async function teamCreate(ctx: Ctx): Promise<unknown> {
+  // ★ The CLI going away (Codex interrupted it), tracked from the very start (codex review ② r3 #4): a card is never
+  //   raised for it, a raised one is withdrawn, and an answered one makes no team.
+  //   ⚠️ The response's `close`, never the request's: a request's `close` fires as soon as its body is read (Node 24,
+  //      measured 2026-11-27: 2 ms after the body, while the client still waits)
+  let cliGone = false
+  let withdrawCard: (() => void) | undefined
+  /** The team made, until the reply has gone out (a Codex lead only) */
+  let unreported: Team | undefined
+  const onGone = (): void => {
+    if (ctx.res.writableEnded) return
+    cliGone = true
+    withdrawCard?.()
+    // ⚠️ Made, but the command that asked was stopped before it heard so (r4 #3): the team does not stay behind it
+    if (unreported && teamById(unreported.id) === unreported) endTeam(unreported, t('チームを作ったコマンドが止められた', 'the command that made it was stopped'))
+  }
+  ctx.res.once('close', onGone)
+  ctx.req.once('aborted', onGone)
+  const goneError = (): HttpError => new HttpError(409, t('コマンドが止められたので、チームは作りません', 'The command was stopped, so no team is made.'))
   const body = await readJsonBody<CreateBody>(ctx.req)
-  const { sessionId, pid } = leaderOf(body)
+  const lead = leaderOf(body)
+  const { sessionId } = lead
   const refs = Array.isArray(body.members) ? body.members.filter((x): x is string => typeof x === 'string' && x.length > 0) : []
   const approvals = body.approvals === undefined || body.approvals === null ? undefined : String(body.approvals)
 
+  // ⚠️ A Codex lead: the cheap refusals before any lookup or scan (r16 #1, r17 #2: a flood of creates made every ref be
+  //    looked up and the sessions be scanned)
+  if (lead.tool === 'codex') {
+    if (refs.length === 0) throw new HttpError(409, CREATE_TEXT['no-members']())
+    if (refs.length > MAX_TEAM_MEMBERS) throw new HttpError(409, CREATE_TEXT['too-many']())
+    if (new Set(refs).size !== refs.length) throw new HttpError(409, CREATE_TEXT['duplicate-member']())
+    pacedConfirm(sessionId)
+  }
   // ★ The leader instance: its live index entry must name the process the CLI runs under
   const dirs = await discoverConfigDirs(config().configDirs)
-  const target = await findTarget(dirs, sessionId)
-  if ('reason' in target || target.pid !== pid) {
-    throw new HttpError(409, t('リーダーのセッションを確かめられません（Claude Code の中から実行してください）', 'Cannot verify the leader session (run this inside Claude Code).'))
+  let claudeLead: { pid: number; procStart: string; configDir: string } | undefined
+  if (lead.tool === 'codex') {
+    // ★ A Codex lead: a thread its daemon lists (one the phone shows), started in the Codex app or CLI
+    if (!codexLeadListed(sessionId)) {
+      throw new HttpError(
+        409,
+        t(
+          'この Codex のセッションは nyan から見えていません（Codex のアプリか codex コマンドで開いたセッションから使ってください。codex exec は使えません）',
+          'nyan does not see this Codex session (use it from a session opened in the Codex app or the codex command; codex exec is not supported).',
+        ),
+      )
+    }
+  } else {
+    const target = await findTarget(dirs, sessionId)
+    if ('reason' in target || target.pid !== lead.pid) {
+      throw new HttpError(409, t('リーダーのセッションを確かめられません（Claude Code の中から実行してください）', 'Cannot verify the leader session (run this inside Claude Code).'))
+    }
+    const procStart = aliveProcStartFreshSync(lead.pid)
+    if (typeof procStart !== 'string') throw new HttpError(409, t('リーダーのプロセスを確かめられません', 'Cannot verify the leader process.'))
+    claudeLead = { pid: lead.pid, procStart, configDir: dirname(target.sessionsDir) }
   }
-  const procStart = aliveProcStartFreshSync(pid)
-  if (typeof procStart !== 'string') throw new HttpError(409, t('リーダーのプロセスを確かめられません', 'Cannot verify the leader process.'))
 
-  const rows = await liveRows()
-  const leaderRow = rows.find((r) => r.sessionId === sessionId)
-  const members: { sessionId: string; tool: TeamTool; account: string; pid?: number; procStart?: string; configDir?: string; busyAtJoin?: boolean }[] = []
-  for (const ref of refs) {
-    // ⚠️ Matched only against our own refs (never a prefix of another program's id)
-    if (!/^(c-|cx-|ag-)?[0-9a-f]{8}$/.test(ref)) throw new HttpError(400, t(`参照の形が違います: ${ref}`, `Not a candidate ref: ${ref}`))
-    const hits = rows.filter((r) => r.sessionId !== sessionId && refOf(r) === ref)
-    if (hits.length === 0) throw new HttpError(404, t(`「${ref}」に当たる生きているセッションがありません（nyan team candidates で確かめて）`, `No live session matches "${ref}" (check with nyan team candidates).`))
-    if (hits.length > 1) throw new HttpError(400, t(`「${ref}」に当たるセッションが複数あります`, `"${ref}" matches more than one session.`))
-    const row = hits[0]!
-    const tool = toolOf(row)
-    if (tool === 'claude') {
-      // ★ Bind a Claude member to its process instance (codex review, high #1): a resume is another member
-      const at = await findTarget(dirs, row.sessionId)
-      const start = 'reason' in at ? undefined : aliveProcStartFreshSync(at.pid)
-      if ('reason' in at || typeof start !== 'string') {
-        throw new HttpError(409, t(`「${ref}」のセッションを確かめられません（いま繋がっていない）`, `Cannot verify the session "${ref}" (not reachable now).`))
-      }
-      members.push({ sessionId: row.sessionId, tool, account: row.account, pid: at.pid, procStart: start, configDir: dirname(at.sessionsDir), ...(row.status === 'working' || row.status === 'waiting' ? { busyAtJoin: true } : {}) })
-    } else if (tool === 'agy') {
-      // ★ Bind an agy member to the agy process that shows the conversation now (the one keys would go to)
-      const conv = conversationOf(row.sessionId)
-      const at = conv === undefined || row.agyShared ? undefined : await findAgyTarget(conv, defaultAgyKeysDeps())
-      const start = at === undefined || typeof at === 'string' ? undefined : aliveProcStartFreshSync(at.pid)
-      if (at === undefined || typeof at === 'string' || typeof start !== 'string') {
-        throw new HttpError(409, t(`「${ref}」の agy を確かめられません（中継を通して起動した agy で、1つだけが開いているときに選べます）`, `Cannot verify the agy "${ref}" (pick one started through the relay, open in one agy only).`))
-      }
-      // ⚠️ Its own state file (`pid-<pid>.json`) must name the conversation: every later check reads it (codex review:
-      //    an agy with only the older per-conversation file was accepted, then shown as replaced and never usable)
-      if (!agyStateNow({ tool, pid: at.pid, sessionId: row.sessionId })) {
-        throw new HttpError(
-          409,
-          t(
-            `「${ref}」の agy の状態がまだ読めません（更新の前から開いている agy など）。その agy で何か1つ送ってから、もう一度作ってください`,
-            `Cannot read the state of the agy "${ref}" yet (an agy opened before an update, for example). Send it anything once, then create the team again.`,
-          ),
-        )
-      }
-      members.push({ sessionId: row.sessionId, tool, account: row.account, pid: at.pid, procStart: start })
-    } else {
-      members.push({ sessionId: row.sessionId, tool, account: row.account, ...(row.status === 'working' || row.status === 'waiting' ? { busyAtJoin: true } : {}) })
+  let rows = await liveRows()
+  const bindAll = async (): Promise<MemberIn[]> => {
+    const out: MemberIn[] = []
+    for (const ref of refs) out.push(await bindMember(rowForRef(rows, ref, sessionId), ref, dirs))
+    return out
+  }
+  let members = await bindAll()
+  // ★★ A Codex lead: the human says yes on the phone first (2026-11-27 / `teamConfirm.ts`). Every pick is bound to its
+  //    instance before the card; after the answer all is read again and must be the very same instances (r3 #3).
+  if (lead.tool === 'codex') {
+    precheckCodexLead(sessionId, members, approvals)
+    if (cliGone) throw goneError()
+    pacedConfirm(sessionId)
+    const leadRow = rows.find((r) => r.sessionId === sessionId)
+    const info = teamCreateCard({
+      machine: machineName(),
+      lead: { sessionId, account: leadRow?.account ?? '', project: leadRow?.project ?? '', title: leadRow?.title ?? '' },
+      members: refs.map((ref, i) => {
+        const r = rows.find((x) => x.sessionId === members[i]!.sessionId)!
+        return { ref, sessionId: r.sessionId, tool: toolOf(r), account: r.account, project: r.project, title: r.title }
+      }),
+      ...(approvals !== undefined ? { approvals } : {}),
+      at: new Date().toISOString(),
+    })
+    console.log(`[team] create waits for the phone lead=${shortSessionId(sessionId)} members=${members.length}${approvals ? ` approvals=${approvals}` : ''}`)
+    confirming.add(sessionId)
+    const answer = await confirmOnPhone(
+      info,
+      (withdraw) => {
+        withdrawCard = withdraw
+        if (cliGone) withdraw()
+      },
+      {
+        shown: (card) => {
+          broadcast({ type: 'permissions-changed', machine: card.machine, at: card.at })
+          void notifyPermission(card)
+        },
+        over: () => broadcast({ type: 'permissions-changed', machine: machineName(), at: new Date().toISOString() }),
+      },
+    )
+    withdrawCard = undefined
+    confirming.delete(sessionId)
+    if (answer !== 'allow') refusedAt.set(sessionId, Date.now())
+    console.log(`[team] create ${cliGone ? 'stopped (the command went away)' : answer} on the phone lead=${shortSessionId(sessionId)}`)
+    if (cliGone) throw goneError()
+    if (answer === 'deny') throw new HttpError(409, t('利用者がスマホでチーム作りを断りました', 'The user declined the team on the phone.'))
+    if (answer === 'no-answer') {
+      throw new HttpError(
+        409,
+        t(
+          `スマホで答えがありませんでした（${TEAM_CONFIRM_MS / 60_000}分で取り下げ）。利用者に聞いてから、もう一度作ってください`,
+          `No answer on the phone (withdrawn after ${TEAM_CONFIRM_MS / 60_000} minutes). Ask the user, then create the team again.`,
+        ),
+      )
+    }
+    // ⚠️ What follows reads the sessions as they are now, not as they were before the wait
+    const seen = members
+    rows = await liveRows()
+    members = await bindAll()
+    if (members.some((m, i) => !sameBinding(m, seen[i]!))) {
+      throw new HttpError(409, t('選んだセッションが、確認のあいだに変わりました。もう一度作ってください', 'The picked sessions changed while waiting for the confirmation. Create the team again.'))
+    }
+    if (!codexLeadListed(sessionId)) {
+      throw new HttpError(409, t('リーダーのセッションが変わりました。もう一度 /nyan-team から始めてください', 'The leader session changed. Start again from /nyan-team.'))
     }
   }
+  const leaderRow = rows.find((r) => r.sessionId === sessionId)
   // ⚠️⚠️ No await from here to `createTeam`: the snapshot below is the grant's moment
+  // ⚠️ Every Claude or agy member is still the very instance bound above — read synchronously, after the last await
+  //    (r4 #4: one could end or move on while a later pick was looked up, before a team existed to hear of it), and
+  //    **before** the baseline below (r5 #5: these reads can be slow on macOS — `ps` — and the baseline must be last)
+  for (const m of members) {
+    if (m.pid === undefined || m.procStart === undefined) continue
+    const now = aliveProcStartFreshSync(m.pid)
+    const same =
+      typeof now === 'string' &&
+      sameProcStart(now, m.procStart) &&
+      (m.tool === 'agy' ? !!agyStateNow({ tool: 'agy', pid: m.pid, sessionId: m.sessionId }) : m.configDir !== undefined && indexNamesSession(m.configDir, m.pid, m.sessionId))
+    if (!same) throw new HttpError(409, t('選んだセッションの1つが、いま変わりました。もう一度作ってください', 'One of the picked sessions just changed. Create the team again.'))
+  }
   // ★ Approvals already waiting now stay with the human (`mayLeaderAnswer`, low #2)
   const waiting = pendingWithMeta().map((p) => originOf(p.info))
   // ★ Members waiting right now (a Codex wait may have no card yet: a join replays it later / r4 high #4)
@@ -378,12 +570,26 @@ export async function teamCreate(ctx: Ctx): Promise<unknown> {
   }
   const cardless = waitingNow.filter((id) => !id.startsWith('codex-') && !id.startsWith(AGY_PREFIX) && !pendingWithMeta().some((p) => p.info.sessionId === id))
   // ⚠️ The leader itself, again, synchronously (r21 low #1: its session could end during the baseline reads)
-  const leaderNow = aliveProcStartFreshSync(pid)
-  if (typeof leaderNow !== 'string' || !sameProcStart(leaderNow, procStart) || !indexNamesSession(dirname(target.sessionsDir), pid, sessionId)) {
+  const leaderNow = claudeLead ? aliveProcStartFreshSync(claudeLead.pid) : undefined
+  const leaderStill = claudeLead
+    ? typeof leaderNow === 'string' && sameProcStart(leaderNow, claudeLead.procStart) && indexNamesSession(claudeLead.configDir, claudeLead.pid, sessionId)
+    : codexLeadListed(sessionId)
+  if (!leaderStill) {
     throw new HttpError(409, t('リーダーのセッションが変わりました。もう一度 /nyan-team から始めてください', 'The leader session changed. Start again from /nyan-team.'))
   }
-  const r = createTeam({ sessionId, account: leaderRow?.account ?? '', configDir: dirname(target.sessionsDir), pid, procStart }, members, approvals, Date.now(), waiting, waitingNow, cardless)
+  // ⚠️ Right before the team is made: the command that asked is still there (r3 #4)
+  if (cliGone) throw goneError()
+  const r = createTeam(
+    claudeLead ? { sessionId, account: leaderRow?.account ?? '', ...claudeLead } : { tool: 'codex', sessionId, account: leaderRow?.account ?? '' },
+    members,
+    approvals,
+    Date.now(),
+    waiting,
+    waitingNow,
+    cardless,
+  )
   if (!r.ok) throw new HttpError(409, CREATE_TEXT[r.reason]())
+  if (lead.tool === 'codex') unreported = r.team
   console.log(
     `[team] created team=${r.team.id} lead=${shortSessionId(sessionId)} members=${r.team.members.map((m) => `${m.name}:${shortSessionId(m.sessionId)}`).join(',')}` +
       (r.team.approvals ? ` approvals=${r.team.approvals.duration}` : ''),
@@ -393,7 +599,11 @@ export async function teamCreate(ctx: Ctx): Promise<unknown> {
   //   53.421): a call in the grant's own second reads as before it and stays the human's. The leader's first
   //   instruction is sent after this reply ⇒ reply once the next second has begun, so its calls are judged after.
   if (r.team.approvals && r.team.members.some((m) => m.tool === 'agy')) await new Promise((res) => setTimeout(res, untilNextSecondMs(Date.now())))
-  return await statusOf(r.team)
+  const out = await statusOf(r.team)
+  // ⚠️ Stopped meanwhile: `onGone` ended the team; never reported as made
+  if (cliGone) throw goneError()
+  unreported = undefined
+  return out
 }
 
 /** How long until the next whole second (+ a margin): an agy call's time has whole seconds only */
@@ -435,16 +645,16 @@ async function statusOf(team: Team): Promise<unknown> {
   }
   return {
     id: v.id,
-    leader: { sessionId: v.leader.sessionId, account: v.leader.account, ...leaderLimits(u, v.leader.account) },
+    leader: { sessionId: v.leader.sessionId, tool: v.leader.tool ?? 'claude', account: v.leader.account, ...leaderLimits(u, v.leader.tool ?? 'claude', v.leader.account) },
     members,
     ...(v.approvals ? { approvals: { duration: v.approvals.duration, until: new Date(v.approvals.untilMs).toISOString(), active: v.approvals.untilMs > Date.now() } } : {}),
     createdAt: new Date(v.createdAtMs).toISOString(),
   }
 }
 
-/** The lead is a Claude session (Codex cannot lead yet): its own login's limits, since its work counts too */
-function leaderLimits(u: { usage: ToolUsage[] }, account: string): { limits?: Limits } {
-  const limits = limitsOf(u, 'claude', account)
+/** The lead's own login's limits, since its work counts too */
+function leaderLimits(u: { usage: ToolUsage[] }, tool: TeamTool, account: string): { limits?: Limits } {
+  const limits = limitsOf(u, tool, account)
   return limits ? { limits } : {}
 }
 
@@ -854,7 +1064,7 @@ export async function teamDisband(ctx: Ctx): Promise<unknown> {
   const team = id ? teamById(id) : ledTeam(body)
   if (!team) throw new HttpError(404, t('そのチームはありません', 'No such team.'))
   endTeam(team, id ? 'disbanded by id' : 'disbanded by the leader')
-  if (id) void tellLeader(team, t('[nyan-team] チームは人の操作で解散されました', '[nyan-team] The team was disbanded by the human.'))
+  if (id) void tellLeader(team, t('[nyan-team] チームは人の操作で解散されました', '[nyan-team] The team was disbanded by the human.'), undefined, { final: true })
   return { ok: true }
 }
 

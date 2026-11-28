@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 // ★★ `nyan team …` — a leader session directs member sessions (docs/TEAM.md / skill `/nyan-team`).
 //
-// Run by the leader's own Bash tool (Claude Code). It talks to the agent over the team socket
+// Run by the leader's own shell tool (Claude Code, or Codex: 2026-11-27 / docs/TEAM.md §10 — Codex runs a copy of this file
+// from `<codex home>/.codex/nyan-remote/`, so it imports only what `scripts/install-skill.mjs` `COPY_FILES` copies). It talks to the agent over the team socket
 // (`~/.nyan-remote/team.sock` / `agent/src/teamSocket.ts`): only this OS user can open it, so no token is sent.
 // ⚠️ Who the caller is comes from Claude Code's environment (`CLAUDE_CODE_SESSION_ID`) and the nearest `claude`
 //    process above us (its pid binds the team to that process instance). The same user could fake both; the design
@@ -10,7 +11,7 @@
 
 import { execFileSync } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
-import { lstatSync, readFileSync } from 'node:fs'
+import { closeSync, constants as fsConstants, fstatSync, lstatSync, openSync, readFileSync, readSync } from 'node:fs'
 import { privateDirProblem, privateDirReal } from '../agent/src/privateDir.ts'
 import { request } from 'node:http'
 import { homedir } from 'node:os'
@@ -77,7 +78,8 @@ export function parentOf(pid, { readFile = readFileSync, run = execFileSync } = 
 /**
  * ★ Which session runs us: the nearest `claude` or `codex` process above us decides
  *   (a Codex started inside Claude also sees `CLAUDE_CODE_SESSION_ID` / measured 2026-11-18).
- * @returns `{ tool: 'claude', sessionId, pid }` (sessionId may be missing), `{ tool: 'codex' }`, `{ tool: 'agy' }`,
+ * @returns `{ tool: 'claude', sessionId, pid }` (sessionId may be missing), `{ tool: 'codex', thread, home }` (from
+ *          Codex's `CODEX_THREAD_ID` / `CODEX_HOME`; either may be missing), `{ tool: 'agy' }`,
  *          `{ tool: 'terminal' }` (confirmed: walked to the top with neither above us), or undefined (could not tell)
  *          — r33 medium #2: only a confirmed terminal may use the human's commands
  */
@@ -89,7 +91,9 @@ export function callerOf(env = process.env, startPid = process.ppid, up = parent
     if (!p) return undefined
     const comm = String(p.comm).toLowerCase()
     if (comm === 'claude') return { tool: 'claude', ...(env.CLAUDE_CODE_SESSION_ID ? { sessionId: env.CLAUDE_CODE_SESSION_ID } : {}), pid }
-    if (comm === 'codex' || comm.startsWith('codex-')) return { tool: 'codex' }
+    if (comm === 'codex' || comm.startsWith('codex-')) {
+      return { tool: 'codex', ...(env.CODEX_THREAD_ID ? { thread: env.CODEX_THREAD_ID } : {}), ...(env.CODEX_HOME ? { home: env.CODEX_HOME } : {}) }
+    }
     // ★ agy (a member only): never a terminal, never the Claude above it (agy review)
     if (comm === 'agy') return { tool: 'agy' }
     pid = p.ppid
@@ -113,7 +117,7 @@ export function parseArgs(argv, repeatable = ['choice']) {
   return { pos, opts }
 }
 
-function call(sock, method, path, body) {
+function call(sock, method, path, body, timeoutMs = 30_000) {
   return new Promise((resolveP, reject) => {
     const data = body === undefined ? undefined : JSON.stringify(body)
     const req = request(
@@ -132,7 +136,7 @@ function call(sock, method, path, body) {
         })
       },
     )
-    req.setTimeout(30_000, () => req.destroy(new Error('timeout')))
+    req.setTimeout(timeoutMs, () => req.destroy(new Error('timeout')))
     req.on('error', reject)
     if (data) req.write(data)
     req.end()
@@ -220,7 +224,7 @@ export function formatStatus(s) {
         : t('承認の任せは切れています', 'The approvals delegation has ended'),
     )
   }
-  if (s.leader?.limits) lines.push(`lead  Claude · ${s.leader.account}\n    ${t('上限', 'limits')}: ${formatLimits(s.leader)}`)
+  if (s.leader?.limits) lines.push(`lead  ${toolName(s.leader.tool)} · ${s.leader.account}\n    ${t('上限', 'limits')}: ${formatLimits(s.leader)}`)
   for (const m of s.members) {
     lines.push(`${m.name}  ${toolName(m.tool)} · ${m.account} · ${m.status}`)
     if (m.limits) lines.push(`    ${t('上限', 'limits')}: ${formatLimits(m)}`)
@@ -233,7 +237,7 @@ export function formatStatus(s) {
     // ★ Every member is reached the same way (2026-11-27): a Claude member through its inbox (`reachable` = it has one)
     lines.push(
       m.reachable || m.tool === 'codex' || (m.tool === 'agy' && m.status !== 'replaced')
-        ? `    ${t('送る', 'send')}: nyan team send ${m.name} - < <file>`
+        ? `    ${t('送る', 'send')}: nyan team send ${m.name} --file <file>`
         : `    ${t('いまは届きません（受信箱が見つからない／別のプロセスに替わった）', 'not reachable now (no inbox, or replaced by another process)')}`,
     )
   }
@@ -270,7 +274,7 @@ export function helpText() {
   nyan team candidates               候補（ほかの生きているセッション）
   nyan team create <ref>… [--approvals 3h|24h]   チームを作る（--approvals でメンバーの承認を任される）
   nyan team status                   自分のチーム（メンバーと上限）
-  nyan team send <member> <text>     メンバーに指示する（- で標準入力から）
+  nyan team send <member> --file <f> メンバーに指示する（<text> を直接・- で標準入力からも）
   nyan team read <member> [--last n] メンバーの最近の発言を読む
   nyan team pending                  メンバーの承認待ち
   nyan team approve <member> <r…> allow|deny [--choice <番号>|<質問>:<番号>] [--reason <文>]
@@ -283,7 +287,7 @@ export function helpText() {
   nyan team candidates               candidates (the other live sessions)
   nyan team create <ref>… [--approvals 3h|24h]   make a team (--approvals: answer the members' approvals)
   nyan team status                   your team (members and their limits)
-  nyan team send <member> <text>     instruct a member (- reads stdin)
+  nyan team send <member> --file <f> instruct a member (or <text> inline, or - for stdin)
   nyan team read <member> [--last n] read a member's recent messages
   nyan team pending                  the members' waiting approvals
   nyan team approve <member> <r…> allow|deny [--choice <n>|<q>:<n>] [--reason <text>]
@@ -292,6 +296,54 @@ export function helpText() {
   nyan team list                     every team on this machine
 `,
   )
+}
+
+/** At most this much text from `--file` (one send's limit: `MAX_SEND_BYTES`) */
+export const MAX_FILE_BYTES = 64 * 1024
+
+/** ★ What a Codex lead does when its sandbox stops `nyan team` (docs/TEAM.md §10.2) */
+const SANDBOX_HINT = () =>
+  t(
+    '  Codex の sandbox の中で動きました。skill に書かれた絶対パス（~/.codex/.codex/nyan-remote/nyan）で、それだけを1つのコマンドとして打ってください（パイプ・&&・<・環境変数を付けない）。nyan update が入れる許可のルール（~/.codex/rules/nyan-remote.rules）が、その形だけを sandbox の外で動かします（入れたあとは Codex を開き直す）。',
+    '  This ran inside Codex’s sandbox. Run it by the full path the skill gives (~/.codex/.codex/nyan-remote/nyan), as a command of its own (no pipe, &&, <, or variables in front): the rule nyan update writes (~/.codex/rules/nyan-remote.rules) runs only that form outside the sandbox (restart Codex after it is written).',
+  )
+
+/** ★ How long `create` waits for a Codex lead's team to be confirmed on the phone (the agent's card: 5 minutes) */
+export const CREATE_WAIT_MS = 5 * 60 * 1000 + 30_000
+
+/**
+ * ★ `--file`'s text: a plain file (never through a link, never a device or a pipe), at most `MAX_FILE_BYTES`.
+ *   ⚠️ Judged on the file actually opened (codex review ② r2 #3: a check by path, then a read by path, could be swapped
+ *   in between): opened without following a link and without blocking on a FIFO, then `fstat` and a bounded read.
+ */
+export function readPlainFile(path) {
+  const notPlain = () => new Error(t('普通のファイルではありません（リンクも不可）', 'not a plain file (links are not followed)'))
+  let fd
+  try {
+    fd = openSync(path, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0) | (fsConstants.O_NONBLOCK ?? 0))
+  } catch (e) {
+    // ⚠️ A link refused by O_NOFOLLOW (ELOOP; EMLINK on some BSDs): said in plain words
+    if (e?.code === 'ELOOP' || e?.code === 'EMLINK') throw notPlain()
+    throw e
+  }
+  try {
+    const st = fstatSync(fd)
+    if (!st.isFile()) throw notPlain()
+    const tooLarge = () => new Error(t(`大きすぎます（${MAX_FILE_BYTES} バイトまで）`, `too large (at most ${MAX_FILE_BYTES} bytes)`))
+    if (st.size > MAX_FILE_BYTES) throw tooLarge()
+    // ⚠️ Bounded by what we read, not by the size seen (it can grow meanwhile)
+    const buf = Buffer.alloc(MAX_FILE_BYTES + 1)
+    let n = 0
+    for (;;) {
+      const r = readSync(fd, buf, n, buf.length - n, null)
+      if (r === 0) break
+      n += r
+      if (n > MAX_FILE_BYTES) throw tooLarge()
+    }
+    return buf.subarray(0, n).toString('utf8')
+  } finally {
+    closeSync(fd)
+  }
 }
 
 function readStdin() {
@@ -311,8 +363,11 @@ export async function main(argv, { env = process.env, out = console.log, err = c
   const dir = stateDirOf(env)
   // ⚠️ Connect at the directory's checked **real** path (never through a link that could be swapped / r2 high #2)
   const checked = privateDirReal(dir)
+  const caller = injected === undefined ? callerOf(env) : injected
   if (!checked.ok) {
     err(t(`✗ 状態ディレクトリを使えません（${checked.problem}）: ${dir}`, `✗ The state directory cannot be used (${checked.problem}): ${dir}`))
+    // ★ Inside Codex's sandbox the folders look foreign (measured: "/ can be changed by someone else")
+    if (caller?.tool === 'codex') err(SANDBOX_HINT())
     return 1
   }
   const sock = join(checked.real, SOCKET_NAME)
@@ -332,7 +387,6 @@ export async function main(argv, { env = process.env, out = console.log, err = c
   const json = opts.json === true
 
   const humanOnly = cmd === 'list' || (cmd === 'disband' && pos[0])
-  const caller = injected === undefined ? callerOf(env) : injected
   // ⚠️ The human's ways out (every team, disband by id) are for a plain terminal only (r32 medium #3: a member session
   //    could end any team). A session uses `status` / `disband` for its own team.
   if (humanOnly && caller?.tool !== 'terminal') {
@@ -340,20 +394,20 @@ export async function main(argv, { env = process.env, out = console.log, err = c
     return 1
   }
   if (!humanOnly) {
-    if (caller?.tool === 'codex') {
-      err(t('✗ Codex をリーダーにするのはまだできません。Claude Code のセッションから使ってください。', '✗ A Codex session cannot lead a team yet. Use it from a Claude Code session.'))
+    if (caller?.tool === 'codex' && !caller.thread) {
+      err(t('✗ Codex のスレッドが分かりません（CODEX_THREAD_ID がありません。Codex の中から実行してください）', '✗ The Codex thread is unknown (no CODEX_THREAD_ID: run this inside Codex).'))
       return 1
     }
     if (caller?.tool === 'agy') {
-      err(t('✗ agy はリーダーになれません（メンバーだけ）。Claude Code のセッションから使ってください。', '✗ agy cannot lead a team (it can only be a member). Use it from a Claude Code session.'))
+      err(t('✗ agy はリーダーになれません（メンバーだけ）。Claude Code か Codex のセッションから使ってください。', '✗ agy cannot lead a team (it can only be a member). Use it from a Claude Code or Codex session.'))
       return 1
     }
-    if (caller?.tool !== 'claude' || !caller.sessionId) {
-      err(t('✗ Claude Code のセッションの中から実行してください（人が端末から使えるのは list と disband <team id> だけ）', '✗ Run this inside a Claude Code session (from a plain terminal only list and disband <team id> work).'))
+    if (caller?.tool !== 'codex' && (caller?.tool !== 'claude' || !caller.sessionId)) {
+      err(t('✗ Claude Code か Codex のセッションの中から実行してください（人が端末から使えるのは list と disband <team id> だけ）', '✗ Run this inside a Claude Code or Codex session (from a plain terminal only list and disband <team id> work).'))
       return 1
     }
   }
-  const who = caller ? { leader: caller.sessionId, pid: caller.pid } : {}
+  const who = caller?.tool === 'codex' ? { codexThread: caller.thread, codexHome: caller.home } : caller ? { leader: caller.sessionId, pid: caller.pid } : {}
 
   let res
   try {
@@ -368,7 +422,16 @@ export async function main(argv, { env = process.env, out = console.log, err = c
           return 2
         }
         const approvals = typeof opts.approvals === 'string' ? opts.approvals : undefined
-        res = await call(sock, 'POST', '/team/create', { ...who, members: pos, ...(approvals ? { approvals } : {}) })
+        // ★ A Codex lead's team is confirmed on the user's phone (`agent/src/teamConfirm.ts`): said first, then waited for
+        if (caller?.tool === 'codex') {
+          err(
+            t(
+              '… 利用者のスマホに「チームを作ってよいか」の確認を出しました。スマホで答えるまで待ちます（5分まで）。',
+              '… The user’s phone now asks whether to make this team. Waiting for the answer there (up to 5 minutes).',
+            ),
+          )
+        }
+        res = await call(sock, 'POST', '/team/create', { ...who, members: pos, ...(approvals ? { approvals } : {}) }, caller?.tool === 'codex' ? CREATE_WAIT_MS : 30_000)
         if (res.status === 200 && !json) return show(out, formatStatus(res.json))
         break
       }
@@ -383,7 +446,21 @@ export async function main(argv, { env = process.env, out = console.log, err = c
       case 'send': {
         const [member, ...words] = pos
         let text = words.join(' ')
-        if (text === '-') text = readStdin()
+        // ★ `--file`: a Codex lead's allow rule covers a bare `nyan team …` only (no `<`, no pipe / docs/TEAM.md §10.2)
+        if (typeof opts.file === 'string') {
+          if (text) {
+            err(t('✗ --file と本文は一緒に渡せません', '✗ Give either --file or the text, not both'))
+            return 2
+          }
+          // ⚠️ Run outside Codex's sandbox: a plain file only (no link, no device), and no larger than one send can be
+          //    (codex review ② r1 #3 — never a way to stream any path into a member's conversation)
+          try {
+            text = readPlainFile(opts.file)
+          } catch (e) {
+            err(t(`✗ ファイルを読めません: ${e?.message ?? e}`, `✗ Cannot read the file: ${e?.message ?? e}`))
+            return 1
+          }
+        } else if (text === '-') text = readStdin()
         if (!member || !text.trim()) {
           err(t('✗ nyan team send <member> <text>', '✗ nyan team send <member> <text>'))
           return 2
@@ -448,7 +525,8 @@ export async function main(argv, { env = process.env, out = console.log, err = c
     if (code === 'ENOENT' || code === 'ECONNREFUSED') {
       err(t('✗ agent のチームの口に繋がりません（agent が止まっているか、古い版です。nyan update / nyan status）', '✗ Cannot reach the agent’s team socket (the agent is stopped or too old: nyan update / nyan status)'))
     } else if (code === 'EPERM' || code === 'EACCES') {
-      err(t('✗ ソケットに繋ぐ権限がありません（Codex の sandbox の中では使えません）', '✗ Not permitted to open the socket (it does not work inside Codex’s sandbox)'))
+      err(t('✗ ソケットに繋ぐ権限がありません', '✗ Not permitted to open the socket'))
+      if (caller?.tool === 'codex') err(SANDBOX_HINT())
     } else {
       err(`✗ ${e?.message ?? e}`)
     }

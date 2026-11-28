@@ -29,7 +29,11 @@ export type RpcFailure =
   | { type: 'error'; error: RpcError } // the server answered with an error
   /** `written: false` ⇒ it was never handed to the line and never will be. `true` ⇒ the daemon may have acted on it. */
   | { type: 'timeout'; written: boolean }
-  | { type: 'closed'; reason: string } // the line went away (or `fail()` was called)
+  /**
+   * The line went away (or `fail()` was called). `written: true` ⇒ the request had been written before that: the daemon
+   * may have acted on it (codex review ② r2 #5 — a teardown used to drop this and read as "never sent")
+   */
+  | { type: 'closed'; reason: string; written?: boolean }
   | { type: 'send-failed' }
   /** The caller's `guard` said no right before writing: not sent */
   | { type: 'cancelled' }
@@ -89,7 +93,7 @@ export function createRpc(opts: RpcOptions): Rpc {
   let nextId = 1
   let dropped = 0
   let failed: string | undefined
-  const pending = new Map<number, { settle: (r: RpcResult) => void; timer: ReturnType<typeof setTimeout> }>()
+  const pending = new Map<number, { settle: (r: RpcResult) => void; timer: ReturnType<typeof setTimeout>; written: () => boolean }>()
 
   const settle = (id: number, r: RpcResult): void => {
     const p = pending.get(id)
@@ -129,7 +133,7 @@ export function createRpc(opts: RpcOptions): Rpc {
         // ⚠️ Once settled (timed out), `pending` no longer has the id ⇒ the guard below says no and it is never written
         const timer = setTimeout(() => settle(id, { ok: false, failure: { type: 'timeout', written } }), callOpts?.timeoutMs ?? defaultTimeout)
         // ★ Registered before sending: an answer can arrive before `send` resolves
-        pending.set(id, { settle: resolve, timer })
+        pending.set(id, { settle: resolve, timer, written: () => written })
         const guard = (): boolean => {
           if (!pending.has(id)) return false
           if (userGuard && !userGuard()) {
@@ -208,7 +212,7 @@ export function createRpc(opts: RpcOptions): Rpc {
     fail(reason) {
       if (failed !== undefined) return
       failed = reason
-      for (const id of [...pending.keys()]) settle(id, { ok: false, failure: { type: 'closed', reason } })
+      for (const [id, p] of [...pending]) settle(id, { ok: false, failure: { type: 'closed', reason, ...(p.written() ? { written: true } : {}) } })
     },
   }
 }
