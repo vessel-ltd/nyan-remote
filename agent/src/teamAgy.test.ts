@@ -1,6 +1,6 @@
 // ★★ agy members of a team (2026-11-22 / docs/TEAM.md §9): who the member is now, its waits, its turn-end report.
 import assert from 'node:assert/strict'
-import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { after, afterEach, test } from 'node:test'
@@ -2097,4 +2097,13 @@ test('★ PC-wait notice: a stale approval flag after the turn ended answered is
   rig.clock += AGY_PC_WAIT_MS * 2
   await agyTeamPcWaits(deps)
   assert.equal(rig.told.length, 0)
+})
+
+test('★★ wiring: a team’s send to an agy member types only into an empty input box (`emptyBoxOnly`, user decision 2026-11-28)', () => {
+  const src = readFileSync(new URL('./routes/team.ts', import.meta.url), 'utf8')
+  const code = src.split('\n').filter((l) => !l.trim().startsWith('//') && !l.trim().startsWith('*')).join('\n')
+  const at = code.indexOf('await sendToAgy(conversationOf(member.sessionId)!')
+  assert.ok(at > 0, 'the team send calls sendToAgy')
+  const call = code.slice(at, code.indexOf('if (!res.ok)', at))
+  assert.match(call, /\{ emptyBoxOnly: true \}\)\s*$/)
 })

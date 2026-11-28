@@ -329,6 +329,8 @@ export type AgySendFailure =
   | 'child-view'
   | 'no-screen'
   | 'draft'
+  | 'not-empty'
+  | 'box-unchecked'
   | 'too-soon'
 
 export type AgyStopFailure = AgyTargetFailure | 'waiting' | 'asking' | 'subagent' | 'unsure' | 'idle' | 'too-soon' | 'unreachable' | 'answering' | 'child-view' | 'not-stopped'
@@ -413,6 +415,20 @@ export const AGY_SEND_REFUSAL: Record<AgySendFailure, () => [number, string]> = 
     t(
       'この agy は古い中継で動いているため、スマホからは圧縮できません。新しいターミナルで agy を起こし直すと使えます。',
       'This agy runs through an older relay, so it cannot be compacted from the phone. Start agy again in a new terminal to use it.',
+    ),
+  ],
+  'not-empty': () => [
+    409,
+    t(
+      'PC の agy の入力欄に文字が入っています（消さずに、何も送らずに止めました）。利用者に PC で入力欄を空にしてもらってから、もう一度送ってください。',
+      'The agy input box on the PC has text in it (nothing was cleared or sent). Ask the user to empty it on the PC, then send again.',
+    ),
+  ],
+  'box-unchecked': () => [
+    409,
+    t(
+      'この agy は古い中継で動いているため、入力欄が空か確かめられません（何も送っていません）。新しいターミナルで agy を起こし直してください。',
+      'This agy runs through an older relay, so its input box cannot be checked (nothing was sent). Start agy again in a new terminal.',
     ),
   ],
   draft: () => [
@@ -545,6 +561,13 @@ export async function sendToAgy(
    *   codex · agy review: a send queued behind another operation typed into a second agy that had opened it meanwhile).
    */
   stillWanted?: (target: Pick<AgyTarget, 'pid'>) => boolean,
+  /**
+   * ★ `emptyBoxOnly` (a team's send / user decision 2026-11-28): typed only when the screen shows the PC's input box
+   *   empty — text there would be sent joined to the instruction, and it is never cleared for the user (their draft).
+   *   No screen (an older relay) ⇒ refused too (it cannot be checked). ⚠️ Someone typing on the PC in the moment
+   *   between this look and the keys is accepted (as for `/compact`).
+   */
+  opts: { emptyBoxOnly?: boolean } = {},
 ): Promise<AgyResult<AgySendFailure>> {
   const key = keyOf(conversationId)
   const read = deps.readNow ?? readNow
@@ -560,6 +583,8 @@ export async function sendToAgy(
     const target = await findAgyTarget(conversationId, deps)
     if (typeof target === 'string') return fail(target)
     if (stillWanted && !stillWanted(target)) return fail('unsure')
+    // ★ A team's send needs the screen to see the box: said first (not "a subagent runs" for an older relay / codex review)
+    if (opts.emptyBoxOnly && !target.pane.screen) return fail('box-unchecked')
     if (typedTooLong(clean.value.text)) return fail('too-long')
     // ★ Subagents running: allowed through a relay that shows the screen, once it shows the parent's view (below)
     //   (whether they run is read from the state file: no extra lock probe)
@@ -581,7 +606,14 @@ export async function sendToAgy(
     if (withKids && !(await parentViewShown(target, deps))) return fail('subagent')
     // ⚠️ A draft left in the box that starts like a command ("/", "!", "?"): the text would be joined to it and run as
     //    that command — "/" + "exit the tests" closes agy (codex review). Read on a relay that shows the screen.
-    if (target.pane.screen && unsafeDraft(await (deps.readScreen ?? ((p: string) => readAgyScreen(p)))(target.pane.socketPath))) return fail('draft')
+    if (opts.emptyBoxOnly) {
+      // ⚠️ The whole box (`inputBoxOf`: flush-left rules only), not one row: a draft whose own indented "────" line sits
+      //    under the prompt read as an empty one-row box (codex · agy review)
+      const s = await (deps.readScreen ?? ((p: string) => readAgyScreen(p)))(target.pane.socketPath)
+      const box = s === undefined ? undefined : inputBoxOf(s)
+      if (box === undefined) return fail('draft')
+      if (box.some((row) => row !== '')) return fail('not-empty')
+    } else if (target.pane.screen && unsafeDraft(await (deps.readScreen ?? ((p: string) => readAgyScreen(p)))(target.pane.socketPath))) return fail('draft')
     const keyHolds: LockCheck = probe ? probe.holdsLock : holds
     // ★ Looked at again right before the body and right before Enter (a card, a turn the PC started)
     let refusedBy: Exclude<AgyGate, 'idle' | 'ok'> | undefined

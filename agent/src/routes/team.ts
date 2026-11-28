@@ -757,7 +757,7 @@ export async function teamSend(ctx: Ctx): Promise<unknown> {
         beforeMtime = mtimeOf()
       }
       return ok
-    })
+    }, { emptyBoxOnly: true })
     if (!res.ok) {
       console.log(`[team] send team=${team.id} to=${member.name} not typed (${res.reason})`)
       throw new HttpError(...AGY_SEND_REFUSAL[res.reason ?? 'unreachable']())

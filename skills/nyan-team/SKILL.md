@@ -56,8 +56,9 @@ Every member is reached the same way, whatever its tool (Claude, Codex or agy):
     covers both): when an instruction needs a turn of its own, send it when the member is idle. A Codex or agy member
     takes it only when idle (agy: also not while a card or question is open on the PC).
   - A send that fails may still have started (Codex) or left text typed in the prompt (agy): check `nyan team status`
-    / `read`, and for agy ask the user to look at the PC, before trying again. Text someone left typed in an agy
-    member's prompt on the PC is sent along with yours: when the PC may be in use, ask the user first.
+    / `read`, and for agy ask the user to look at the PC, before trying again. nyan types into an agy member only
+    when its prompt on the PC is empty (no need to ask the user beforehand): if `send` says the box has text, ask the
+    user to empty it on the PC, then send again.
 - **Results**: when a member's turn finishes you receive a message from `nyan-team` with its last words (once, at that
   moment; if it does not reach you the user's phone rings instead — use `nyan team read m2`). **A Codex lead** gets
   them as a new turn that starts with `[nyan-team]`, only when it is idle: what arrives while you work waits, and
@@ -103,8 +104,7 @@ Every member is reached the same way, whatever its tool (Claude, Codex or agy):
 4. **Ask the user before moving anything** (AskUserQuestion; Codex: a message): who stopped and its reset (or "unknown"), and the
    choices — a free other-tool member first, marked recommended; then a free same-tool member on another profile not
    marked same login (saying it may still be the same account, for the user to confirm); always "wait for the reset" —
-   each with how much room it has. For an agy target, ask the user to make sure its
-   prompt on the PC is empty (typed text would be sent with the brief). If the user waits, stop here.
+   each with how much room it has. If the user waits, stop here.
 5. **Make sure only one session writes.** If the stopped member or its children may still be working (an agy notice
    can say so, a Claude member can have subagents), do not send a brief that edits the same files until the user has
    decided: wait for them to stop, or give the new member a separate folder or scope.

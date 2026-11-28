@@ -2589,6 +2589,48 @@ test('★★ send: a draft in the PC’s box starting like a command ("/", "!", 
   assert.equal((await sendToAgy(A, 'more', l.deps)).ok, true)
 })
 
+test('★★ send (a team’s, `emptyBoxOnly`): typed only into an empty box; any draft or no screen refuses, nothing cleared', async (t) => {
+  const l = await lab(t)
+  const only = { emptyBoxOnly: true }
+  // an ordinary draft (joined for the phone's send) refuses a team's send, and nothing is typed (no Ctrl-U either)
+  withScreenPane(l, () => ['  hi', RULE60, '> abc', RULE60, '? for shortcuts'].join('\n'))
+  assert.equal((await sendToAgy(A, 'more', l.deps, undefined, only)).reason, 'not-empty')
+  // a box holding only an invisible character is not empty
+  withScreenPane(l, () => ['  hi', RULE60, '> \u200b', RULE60, '? for shortcuts'].join('\n'))
+  assert.equal((await sendToAgy(A, 'more', l.deps, undefined, only)).reason, 'not-empty')
+  // a draft of several rows
+  withScreenPane(l, () => ['  hi', RULE60, '> abc', '  def', RULE60, '? for shortcuts'].join('\n'))
+  assert.equal((await sendToAgy(A, 'more', l.deps, undefined, only)).reason, 'not-empty')
+  // ⚠️ a draft starting with an empty row and its own indented "────" line (read as an empty one-row box by
+  //    `inputRowOf` / codex · agy review)
+  withScreenPane(l, () => ['  ok', RULE60, '>', `  ${RULE60}`, '  text', RULE60, '? for shortcuts'].join('\n'))
+  assert.equal((await sendToAgy(A, 'more', l.deps, undefined, only)).reason, 'not-empty')
+  // no box on the screen (the slash list pushed it off a short pane)
+  withScreenPane(l, () => ['> /', '> /compact  Compact the conversation now (summarize', '  ↑/↓ Navigate · enter Select'].join('\n'))
+  assert.equal((await sendToAgy(A, 'more', l.deps, undefined, only)).reason, 'draft')
+  await settle()
+  assert.equal(l.got.join(''), '')
+  // the empty box: typed
+  withScreenPane(l, () => ['  hi', RULE60, '>', RULE60, '? for shortcuts'].join('\n'))
+  const ok = await sendToAgy(A, 'more', l.deps, undefined, only)
+  assert.equal(ok.ok, true, ok.message)
+  assert.ok(l.got.join('').includes('more'))
+})
+
+test('★★ send (a team’s, `emptyBoxOnly`): an older relay that shows no screen refuses (the box cannot be checked)', async (t) => {
+  const l = await lab(t)
+  const res = await sendToAgy(A, 'more', l.deps, undefined, { emptyBoxOnly: true })
+  assert.equal(res.reason, 'box-unchecked')
+  // with a subagent running too: still told the relay is the matter (codex review)
+  l.setState({ subagents: [{ name: 'self', role: 'run', status: 'running' }] })
+  assert.equal((await sendToAgy(A, 'more', l.deps, undefined, { emptyBoxOnly: true })).reason, 'box-unchecked')
+  l.setState({})
+  await settle()
+  assert.equal(l.got.join(''), '')
+  // the phone's send through the same relay goes on as before
+  assert.equal((await sendToAgy(A, 'more', l.deps)).ok, true)
+})
+
 test('★★ send: the input box not readable as one row (a wrapped draft, the slash list pushing it off a short pane): refused', async (t) => {
   const l = await lab(t)
   // a short pane: "/" typed on the PC, the list pushed the box's rules off
