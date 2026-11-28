@@ -16,7 +16,7 @@
 //    and decisions reserved for people (`ExitPlanMode`).
 
 import { randomBytes } from 'node:crypto'
-import { TEAM_CREATE_TOOL, type PermissionRequest } from '../../shared/types.ts'
+import type { PermissionRequest } from '../../shared/types.ts'
 import { requiresInteraction } from './claude/interaction.ts'
 import { shortSessionId } from './codex/ids.ts'
 
@@ -377,10 +377,7 @@ export function mayLeaderAnswer(
  *    another profile — one the agent does not even watch — is not this member. An unknown profile stays with the human.
  *    (The profile **directory** is checked by `teamHooks.ts` `ownsCard`, which has the card's transcript.)
  */
-export function cardFromMember(member: TeamMember, req: Pick<PermissionRequest, 'tool' | 'account' | 'accountUnknown' | 'toolName'>): boolean {
-  // ⚠️⚠️ A team's own confirmation (a Codex lead's create, `teamConfirm.ts`) is the human's alone: never any leader's,
-  //    even if its session became a member somewhere while it waited
-  if (req.toolName === TEAM_CREATE_TOOL) return false
+export function cardFromMember(member: TeamMember, req: Pick<PermissionRequest, 'tool' | 'account' | 'accountUnknown'>): boolean {
   if (member.tool === 'codex') return req.tool === 'codex'
   // ★ agy: its cards carry `tool: 'agy'` and the conversation's row id (which agy process: `teamHooks.ts` `memberIdentity`)
   if (member.tool === 'agy') return req.tool === 'agy'

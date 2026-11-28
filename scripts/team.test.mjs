@@ -195,7 +195,7 @@ test('★ inside a session, list and disband <id> are refused (they are the huma
     errs.length = 0
     assert.equal(await main(['candidates'], { env: { NYAN_REMOTE_STATE_DIR: '/tmp' }, out: () => {}, err: (s) => errs.push(s), caller: { tool: 'codex', thread: 'x' } }), 1)
     assert.match(errs.join('\n'), /nyan-remote\.rules/)
-    // ★ create inside the sandbox: the same hint (the phone confirms it, not an escalation / 2026-11-27)
+    // ★ create inside the sandbox: the same hint (its rule asks the human in Codex, not an escalation / 2026-11-28)
     errs.length = 0
     assert.equal(await main(['create', 'cx-00000000'], { env: { NYAN_REMOTE_STATE_DIR: '/tmp' }, out: () => {}, err: (s) => errs.push(s), caller: { tool: 'codex', thread: 'x' } }), 1)
     assert.match(errs.join('\n'), /nyan-remote\/nyan/)

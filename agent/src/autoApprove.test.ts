@@ -46,7 +46,6 @@ import {
   setAutoApprove,
   shouldAutoApprove,
 } from './autoApprove.ts'
-import { TEAM_CREATE_TOOL } from '../../shared/types.ts'
 
 const SESSION = '960cbcc3-0c6e-435d-b024-1867c146dfa8'
 /** ★ The default duration (no name passed = older screens). ⚠️ Different from the cap (`AUTO_APPROVE_MAX_MS` = 24 hours) */
@@ -83,8 +82,6 @@ test('★ passes only "yes/no" approvals of sessions turned on', async (t) => {
   assert.equal(shouldAutoApprove({ sessionId: OTHER, toolName: 'Bash' }, now), false)
   // (1) Do not pass approvals whose `sessionId` could not be determined (unexpected transcript_path shape)
   assert.equal(shouldAutoApprove({ sessionId: undefined, toolName: 'Bash' }, now), false)
-  // ★★ A Codex lead's team confirmation is the human's alone, even on a session turned on (2026-11-27)
-  assert.equal(shouldAutoApprove({ sessionId: SESSION, toolName: TEAM_CREATE_TOOL }, now), false)
 })
 
 test('★★★ stops questions with choices and plan approvals (looks at both criteria)', async (t) => {

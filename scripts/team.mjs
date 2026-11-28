@@ -117,7 +117,7 @@ export function parseArgs(argv, repeatable = ['choice']) {
   return { pos, opts }
 }
 
-function call(sock, method, path, body, timeoutMs = 30_000) {
+function call(sock, method, path, body) {
   return new Promise((resolveP, reject) => {
     const data = body === undefined ? undefined : JSON.stringify(body)
     const req = request(
@@ -136,7 +136,7 @@ function call(sock, method, path, body, timeoutMs = 30_000) {
         })
       },
     )
-    req.setTimeout(timeoutMs, () => req.destroy(new Error('timeout')))
+    req.setTimeout(30_000, () => req.destroy(new Error('timeout')))
     req.on('error', reject)
     if (data) req.write(data)
     req.end()
@@ -308,9 +308,6 @@ const SANDBOX_HINT = () =>
     '  This ran inside Codex’s sandbox. Run it by the full path the skill gives (~/.codex/.codex/nyan-remote/nyan), as a command of its own (no pipe, &&, <, or variables in front): the rule nyan update writes (~/.codex/rules/nyan-remote.rules) runs only that form outside the sandbox (restart Codex after it is written).',
   )
 
-/** ★ How long `create` waits for a Codex lead's team to be confirmed on the phone (the agent's card: 5 minutes) */
-export const CREATE_WAIT_MS = 5 * 60 * 1000 + 30_000
-
 /**
  * ★ `--file`'s text: a plain file (never through a link, never a device or a pipe), at most `MAX_FILE_BYTES`.
  *   ⚠️ Judged on the file actually opened (codex review ② r2 #3: a check by path, then a read by path, could be swapped
@@ -422,16 +419,7 @@ export async function main(argv, { env = process.env, out = console.log, err = c
           return 2
         }
         const approvals = typeof opts.approvals === 'string' ? opts.approvals : undefined
-        // ★ A Codex lead's team is confirmed on the user's phone (`agent/src/teamConfirm.ts`): said first, then waited for
-        if (caller?.tool === 'codex') {
-          err(
-            t(
-              '… 利用者のスマホに「チームを作ってよいか」の確認を出しました。スマホで答えるまで待ちます（5分まで）。',
-              '… The user’s phone now asks whether to make this team. Waiting for the answer there (up to 5 minutes).',
-            ),
-          )
-        }
-        res = await call(sock, 'POST', '/team/create', { ...who, members: pos, ...(approvals ? { approvals } : {}) }, caller?.tool === 'codex' ? CREATE_WAIT_MS : 30_000)
+        res = await call(sock, 'POST', '/team/create', { ...who, members: pos, ...(approvals ? { approvals } : {}) })
         if (res.status === 200 && !json) return show(out, formatStatus(res.json))
         break
       }

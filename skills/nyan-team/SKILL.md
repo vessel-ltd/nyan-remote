@@ -15,10 +15,12 @@ You can be a Claude Code or a Codex session. **In Codex**:
 - Run every `nyan team …` by the full path given at the top of this file, as a command of its own — no pipe, `&&`, `;`,
   `<` or variables around it: nyan's rule runs exactly that form outside Codex's sandbox (anything else stays inside
   and cannot reach the agent).
-- `create` asks the user on their **phone** (nyan-remote's app) whether to make the team, and waits up to 5 minutes for
-  the answer. Before you run it, tell the user to answer it there. Run it like the others (not escalated).
-- Where this skill says AskUserQuestion, use your `request_user_input` tool if you have it; otherwise put the same
-  choices in a message, numbered, and wait for the user's answer before going on.
+- `create` always asks the user for approval in Codex first (nyan's rule; the request shows on their phone too). Run it
+  like the others (not escalated). If your approval mode never asks, Codex refuses it: tell the user to switch to a mode
+  that asks for approval, then run it again.
+- Where this skill says AskUserQuestion, use your `request_user_input` tool if you have it (it takes 1–3 questions of
+  2–3 choices each, one choice per question; the user may type another answer); otherwise put the same choices in
+  a message, numbered, and wait for the user's answer before going on.
 - Starting a new conversation (`/new`) does not move the team: the old thread stays the lead. Disband first
   (`nyan team disband`) if the team should stop.
 
@@ -27,7 +29,9 @@ You can be a Claude Code or a Codex session. **In Codex**:
 1. Run `nyan team candidates`. Each line: a **ref** (left), title, project, Claude/Codex/agy, profile, model, state, the
    plan limits of that login (each window's use and reset time, and how old the reading is). `nyan team status` shows
    the same limits for you and each member; run either again for the latest readings (each shows its age). How to spread the work over them is the user's call.
-2. Ask the user which to use with **AskUserQuestion** (`multiSelect: true`; Codex: a numbered message). A question holds at most 4 options and
+2. Ask the user which to use with **AskUserQuestion** (`multiSelect: true`). **Codex**: show the candidates as a table
+   in a message, then ask with `request_user_input` — its choices are 2–3 member sets you suggest (refs in each label),
+   and the user can type other refs instead. **Claude**: a question holds at most 4 options and
    you may ask at most 4 questions: split Claude, Codex and agy sessions into separate questions, put the ref in the label
    and "profile · model · week N% · state" in the description. If there are more than fit, say so and let the user
    type refs under "Other". Recommend one spare member of **another tool** (Codex or agy when the work is on Claude,
@@ -37,7 +41,7 @@ You can be a Claude Code or a Codex session. **In Codex**:
    "No — the user answers" / "Yes for 3 hours" / "Yes for 24 hours". Explain that with "Yes" you approve their
    commands (Bash included) for that time, and that plan approvals stay with the user.
 4. Never pick members or turn approvals on without the user's answer.
-5. Run `nyan team create <ref> <ref> … [--approvals 3h|24h]` (Codex: the user confirms it on the phone first). It prints the team: each member's short name
+5. Run `nyan team create <ref> <ref> … [--approvals 3h|24h]` (Codex: the user approves it in Codex first). It prints the team: each member's short name
    (`m1`, `m2`, …) and how to reach it. A member marked "no nyan hooks" never reports its turn ends or stops: tell
    the user (`nyan update` adds them to `~/.claude*` profiles; a profile elsewhere needs them by hand), and read it
    with `nyan team read` until then.
@@ -101,7 +105,7 @@ Every member is reached the same way, whatever its tool (Claude, Codex or agy):
      moving the work anywhere else.
    - Limits lines are readings with an age, not promises, and may lack the window that ran out (agy shows its Gemini
      windows only). A reset time is when a retry may work.
-4. **Ask the user before moving anything** (AskUserQuestion; Codex: a message): who stopped and its reset (or "unknown"), and the
+4. **Ask the user before moving anything** (AskUserQuestion; Codex: `request_user_input`, else a message): who stopped and its reset (or "unknown"), and the
    choices — a free other-tool member first, marked recommended; then a free same-tool member on another profile not
    marked same login (saying it may still be the same account, for the user to confirm); always "wait for the reset" —
    each with how much room it has. If the user waits, stop here.
@@ -175,6 +179,6 @@ approvals go back to the user, and notices still waiting for a Codex lead are lo
   (it writes the rule `~/.codex/rules/nyan-remote.rules`; their own Codex rules or settings may also block it).
 - "nyan does not see this Codex session" → lead from a session opened in the Codex app or the `codex` command (it
   shows on the user's phone); `codex exec` cannot lead.
-- "The user declined the team on the phone" / "No answer on the phone" → no team was made. Ask the user what to do;
-  never run `create` again without their word.
+- `create` declined in Codex's approval → no team was made. Ask the user what to do; never run `create` again without
+  their word.
 - An agy session cannot be the lead yet; use this skill from Claude Code or Codex.

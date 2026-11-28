@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'preact/hooks'
 import type { VNode } from 'preact'
-import { TEAM_CREATE_TOOL, type PermissionRequest } from '../../../shared/types.ts'
+import type { PermissionRequest } from '../../../shared/types.ts'
 import { closePermissionNotification, closeSessionNotification } from '../notifications.ts'
 import { clearLost, nextAttempt, rememberLost } from './lostAnswers.ts'
 import { hhmm } from '../time.ts'
@@ -456,16 +456,10 @@ export function Permissions({
               'バックグラウンドのエージェントからの要求は、PCの画面に出ないことがあります（ここで答えるのが確実です）。',
               'Requests from background agents may not appear on the PC screen (answering here is the sure way).',
             )
-          : /* ★ A Codex lead's team (`agent/src/teamConfirm.ts`): asked here only */
-            items.some((p) => p.toolName === TEAM_CREATE_TOOL)
-            ? t(
-                'チーム作りの確認は、ここでだけ答えられます（PCの画面には出ません）。',
-                'A team confirmation is answered here only (it is not shown on the PC).',
-              )
-            : t(
-                'PCの画面にも同じ確認が出ています。どちらで答えても構いません。',
-                'The same prompt is also shown on the PC screen. You can answer in either place.',
-              )}
+          : t(
+              'PCの画面にも同じ確認が出ています。どちらで答えても構いません。',
+              'The same prompt is also shown on the PC screen. You can answer in either place.',
+            )}
       </p>
       {/* ⚠️ Gone from the list (answered on the PC, timed out) ⇒ the question goes too */}
       {clippedAsk && items.some((i) => i.endpointId === clippedAsk.endpointId && i.key === clippedAsk.key) ? (
