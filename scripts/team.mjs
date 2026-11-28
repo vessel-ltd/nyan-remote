@@ -102,14 +102,16 @@ export function callerOf(env = process.env, startPid = process.ppid, up = parent
 }
 
 /** Split `argv` into positionals and `--flag value` options (repeatable flags collect into arrays) */
-export function parseArgs(argv, repeatable = ['choice']) {
+export function parseArgs(argv, repeatable = ['choice', 'pick'], flags = ['json']) {
   const pos = []
-  const opts = {}
+  // ⚠️ No prototype: `--__proto__` would set nothing and slip past the option checks (codex review)
+  const opts = Object.create(null)
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]
     if (a.startsWith('--')) {
       const [k, inline] = a.slice(2).split('=', 2)
-      const v = inline ?? (argv[i + 1] !== undefined && !argv[i + 1].startsWith('--') ? argv[++i] : true)
+      // ⚠️ A flag never takes the next word (codex review: `--json 1 3 A` ate the "1" of a pick)
+      const v = inline ?? (!flags.includes(k) && argv[i + 1] !== undefined && !argv[i + 1].startsWith('--') ? argv[++i] : true)
       if (repeatable.includes(k)) (opts[k] ??= []).push(v)
       else opts[k] = v
     } else pos.push(a)
@@ -191,7 +193,9 @@ export function formatLimits(c, nowMs = Date.now()) {
   const age = nowMs - Date.parse(c.limits.at)
   const old = Number.isFinite(age) ? t(`${span(age)}前の値`, `read ${span(age)} ago`) : ''
   // ★ Profiles logged in to the same account share these windows (one quota)
-  const shared = c.limits.sameLoginAs?.length ? t(`（${c.limits.sameLoginAs.join('・')} と同じログイン＝同じ枠）`, ` (same login as ${c.limits.sameLoginAs.join(', ')}: one quota)`) : ''
+  // (labels literal: they print outside the data fence / codex review)
+  const labels = (c.limits.sameLoginAs ?? []).map((l) => `\`${oneLine(l).replace(/`/g, 'ʼ')}\``)
+  const shared = labels.length ? t(`（${labels.join('・')} と同じログイン＝同じ枠）`, ` (same login as ${labels.join(', ')}: one quota)`) : ''
   return `${parts.join(' · ')}${old ? ` — ${old}` : ''}${shared}`
 }
 
@@ -200,19 +204,120 @@ export function toolName(tool) {
   return tool === 'codex' ? 'Codex' : tool === 'agy' ? 'agy' : 'Claude'
 }
 
-export function formatCandidates(list) {
-  if (list.length === 0) return t('候補はありません（ほかに生きているセッションがない）', 'No candidates (no other live session).')
-  return list
-    .map((c) => {
-      const tags = [toolName(c.tool), c.account, c.model && `${c.model}${c.effort ? `/${c.effort}` : ''}`, c.status]
-        .filter(Boolean)
-        .join(' · ')
-      const team = c.team ? `  [${t('チーム', 'team')} ${c.team.id} ${c.team.role}]` : ''
-      // ★ Session-supplied text (title, project) inside a random data fence; refs and addresses (ours) outside it (r23 medium #3)
-      const fenced = fence(t('題名とプロジェクト（データ）', 'title and project (data)'), `${c.title}\n${c.project}`).replace(/^/gm, '    ')
-      return `${c.ref}  ${tags}${team}\n    ${t('上限', 'limits')}: ${formatLimits(c)}\n${fenced}`
-    })
-    .join('\n')
+/** A state as the table names it */
+function stateLabel(status) {
+  const known = {
+    idle: () => t('待機中', 'idle'),
+    done: () => t('完了', 'done'),
+    working: () => t('作業中', 'working'),
+    waiting: () => t('承認待ち', 'waiting'),
+    'rate-limited': () => t('上限', 'limit'),
+    error: () => t('エラー', 'error'),
+  }
+  return known[status]?.() ?? String(status ?? '')
+}
+
+/** One table cell: one line, no `|`, at most `max` characters (session-supplied text) */
+function cell(text, max) {
+  const one = oneLine(text).replace(/\|/g, '¦').trim()
+  return one.length <= max ? one : `${one.slice(0, max - 1)}…`
+}
+
+/**
+ * A cell of session-supplied text shown as literal text (a code span): the lead copies the table into its reply, and
+ * Markdown there became a link on the phone (codex review). Backticks inside are swapped so the span cannot close.
+ */
+function literal(text, max) {
+  const c = cell(text, max).replace(/`/g, 'ʼ')
+  return c === '' ? '' : `\`${c}\``
+}
+
+/**
+ * ★★ The candidates as one fixed table (2026-11-28 / user decision): numbered rows the user picks by number, the same
+ *   columns and order every time (the lead shows it as is — a table the model rebuilt changed each time), whatever tool
+ *   leads. One row per session. Sessions already in a team are not rows (they cannot be picked), only counted.
+ * ⚠️ Titles and projects are the sessions' own text: the table sits inside a data fence (the lead shows it, never
+ *    follows it); our own lines (limits, how to answer) are outside it.
+ * ★ The order is the agent's (`teamCandidates`), and the numbers are the agent's table `pick` (its refs in order): the
+ *   agent turns the user's numbers back into refs (`create --pick`), never the model.
+ */
+export function formatCandidates(list, pick, nowMs = Date.now()) {
+  const taken = list.filter((c) => c.team)
+  // ★ Rows in the agent's order (the free ones come first); they must be the table's refs one for one (two sessions may
+  //   share a short ref, so never looked up by ref)
+  const free = list.filter((c) => !c.team)
+  const rows = pick && free.length === pick.refs.length && free.every((c, i) => c.ref === pick.refs[i]) ? free : []
+  const lines = []
+  if (rows.length === 0 && free.length > 0) {
+    // (an agent older than this command: no table to number by)
+    lines.push(t('agent が古いので番号の表を作れません。nyan update か agent の再起動のあとで、もう一度してください', 'The agent is too old to number the table. Run nyan update (or restart the agent), then try again.'))
+  } else if (rows.length === 0) {
+    lines.push(t('選べる候補はありません（ほかに生きているセッションがないか、どれもチームに入っています）', 'No candidates to pick (no other live session, or all are in a team).'))
+  } else {
+    const head = ['#', 'ref', t('題名', 'title'), t('プロジェクト', 'project'), t('ツール · プロファイル', 'tool · profile'), t('モデル', 'model'), t('状態', 'state')]
+    const body = rows.map((c, i) => [
+      String(i + 1),
+      c.ref,
+      literal(c.title, 40),
+      literal(c.project, 24),
+      c.tool === 'agy' ? 'agy' : `${toolName(c.tool)} · ${literal(c.account, 20)}`,
+      literal(c.model ? `${c.model}${c.effort ? `/${c.effort}` : ''}` : '', 24),
+      stateLabel(c.status),
+    ])
+    const table = [head, head.map(() => '---'), ...body].map((r) => `| ${r.join(' | ')} |`).join('\n')
+    lines.push(fence(t('候補の表（データ。そのまま利用者に見せる）', 'candidate table (data: show it to the user as is)'), table))
+  }
+  if (taken.length > 0) {
+    // ★ Their refs too (a lead re-making its team names its current members by ref / §3)
+    const byTeam = new Map()
+    for (const c of taken) byTeam.set(c.team.id, [...(byTeam.get(c.team.id) ?? []), c.ref])
+    const ids = [...byTeam].map(([id, refs]) => `${id}: ${refs.join(' ')}`).join(' / ')
+    lines.push(t(`ほかに ${taken.length} 件はチームに入っています（${ids}）。`, `${taken.length} more ${taken.length === 1 ? 'is' : 'are'} in a team (${ids}).`))
+  }
+  // ★ Limits once per login (profile), not per row
+  const seen = new Set()
+  const limits = []
+  for (const c of [...rows, ...taken]) {
+    const key = `${c.tool}:${c.account}`
+    if (seen.has(key) || (!c.limits && c.weeklyUsedPercent === undefined)) continue
+    seen.add(key)
+    // (labels one line, literal: they print outside the data fence / codex review)
+    limits.push(`- ${c.tool === 'agy' ? 'agy' : `${toolName(c.tool)} · ${literal(c.account, 40)}`}: ${oneLine(formatLimits(c, nowMs))}`)
+  }
+  if (limits.length > 0) lines.push(`${t('上限', 'Limits')}:\n${limits.join('\n')}`)
+  if (rows.length > 0) {
+    // ★ For the lead (ours, outside the fence): how the answer becomes the team
+    lines.push(
+      t(
+        `（リーダーへ: 表 ${pick.id}。利用者の答えをそのまま渡す: nyan team create --pick ${pick.id} <番号…> [A|B]）`,
+        `(For the lead: table ${pick.id}. Pass the user's answer as is: nyan team create --pick ${pick.id} <numbers…> [A|B])`,
+      ),
+    )
+    lines.push(
+      t(
+        `メンバーの番号を空白で区切って打ってください。メンバーの承認をリーダーに任せるなら、最後に A（3時間）か B（24時間）を付けます（Bash も含めて任せます。プランの承認はあなたに残ります）。何も付けなければ、承認はあなたが答えます。例: 1 3 A`,
+        `Type the members' numbers separated by spaces. To let the lead answer the members' approvals, end with A (3 hours) or B (24 hours) (Bash included; plan approvals stay with you). With neither, you answer them. Example: 1 3 A`,
+      ),
+    )
+  }
+  return lines.join('\n\n')
+}
+
+/**
+ * ★ The user's answer to the table ("1 3 A") as numbers and the approvals (pure): A = 3h, B = 24h, at the end only.
+ *   Which rows the numbers name is the agent's call (its table).
+ */
+export function parsePick(words) {
+  const w = words.flatMap((x) => String(x).split(/[\s,、]+/)).filter(Boolean)
+  let approvals
+  if (w.length > 0 && /^[abAB]$/.test(w[w.length - 1])) approvals = w.pop().toUpperCase() === 'A' ? '3h' : '24h'
+  if (w.length === 0) return { ok: false, word: '' }
+  const numbers = []
+  for (const x of w) {
+    if (!/^[0-9]{1,3}$/.test(x)) return { ok: false, word: x }
+    numbers.push(Number(x))
+  }
+  return { ok: true, numbers, ...(approvals ? { approvals } : {}) }
 }
 
 export function formatStatus(s) {
@@ -226,7 +331,7 @@ export function formatStatus(s) {
   }
   if (s.leader?.limits) lines.push(`lead  ${toolName(s.leader.tool)} · ${s.leader.account}\n    ${t('上限', 'limits')}: ${formatLimits(s.leader)}`)
   for (const m of s.members) {
-    lines.push(`${m.name}  ${toolName(m.tool)} · ${m.account} · ${m.status}`)
+    lines.push(`${m.name}  ${m.ref ? `${m.ref}  ` : ''}${toolName(m.tool)} · ${m.account} · ${m.status}`)
     if (m.limits) lines.push(`    ${t('上限', 'limits')}: ${formatLimits(m)}`)
     lines.push(fence(t('題名（データ）', 'title (data)'), m.title).replace(/^/gm, '    '))
     if (m.noReports) {
@@ -273,6 +378,7 @@ export function helpText() {
 
   nyan team candidates               候補（ほかの生きているセッション）
   nyan team create <ref>… [--approvals 3h|24h]   チームを作る（--approvals でメンバーの承認を任される）
+  nyan team create --pick <表> <番号…> [A|B]     candidates の表の番号でチームを作る（A=3時間・B=24時間 承認を任される）
   nyan team status                   自分のチーム（メンバーと上限）
   nyan team send <member> --file <f> メンバーに指示する（<text> を直接・- で標準入力からも）
   nyan team read <member> [--last n] メンバーの最近の発言を読む
@@ -286,6 +392,7 @@ export function helpText() {
 
   nyan team candidates               candidates (the other live sessions)
   nyan team create <ref>… [--approvals 3h|24h]   make a team (--approvals: answer the members' approvals)
+  nyan team create --pick <table> <number…> [A|B] make a team from the candidates table's numbers (A=3h, B=24h approvals)
   nyan team status                   your team (members and their limits)
   nyan team send <member> --file <f> instruct a member (or <text> inline, or - for stdin)
   nyan team read <member> [--last n] read a member's recent messages
@@ -302,8 +409,14 @@ export function helpText() {
 export const MAX_FILE_BYTES = 64 * 1024
 
 /** ★ What a Codex lead does when its sandbox stops `nyan team` (docs/TEAM.md §10.2) */
-const SANDBOX_HINT = () =>
-  t(
+const SANDBOX_HINT = (cmd) =>
+  cmd === 'create'
+    ? // ★ An approved create still runs inside the sandbox (its rule only asks / measured 2026-11-28): escalate it once
+      t(
+        '  Codex の sandbox の中で動きました。create は、skill に書かれた絶対パス（~/.codex/.codex/nyan-remote/nyan team create …）で、それだけを1つのコマンドとして、最初から sandbox の外での実行（sandbox_permissions: "require_escalated"）として頼んでください。nyan の許可のルールが create のたびに利用者に聞くので、承認は1回で済みます。',
+        '  This ran inside Codex’s sandbox. Run create by the full path the skill gives (~/.codex/.codex/nyan-remote/nyan team create …), as a command of its own, with escalated permissions from the start (sandbox_permissions: "require_escalated"): nyan’s rule asks the user for every create, so one approval does it.',
+      )
+    : t(
     '  Codex の sandbox の中で動きました。skill に書かれた絶対パス（~/.codex/.codex/nyan-remote/nyan）で、それだけを1つのコマンドとして打ってください（パイプ・&&・<・環境変数を付けない）。nyan update が入れる許可のルール（~/.codex/rules/nyan-remote.rules）が、その形だけを sandbox の外で動かします（入れたあとは Codex を開き直す）。',
     '  This ran inside Codex’s sandbox. Run it by the full path the skill gives (~/.codex/.codex/nyan-remote/nyan), as a command of its own (no pipe, &&, <, or variables in front): the rule nyan update writes (~/.codex/rules/nyan-remote.rules) runs only that form outside the sandbox (restart Codex after it is written).',
   )
@@ -364,7 +477,7 @@ export async function main(argv, { env = process.env, out = console.log, err = c
   if (!checked.ok) {
     err(t(`✗ 状態ディレクトリを使えません（${checked.problem}）: ${dir}`, `✗ The state directory cannot be used (${checked.problem}): ${dir}`))
     // ★ Inside Codex's sandbox the folders look foreign (measured: "/ can be changed by someone else")
-    if (caller?.tool === 'codex') err(SANDBOX_HINT())
+    if (caller?.tool === 'codex') err(SANDBOX_HINT(cmd))
     return 1
   }
   const sock = join(checked.real, SOCKET_NAME)
@@ -410,15 +523,45 @@ export async function main(argv, { env = process.env, out = console.log, err = c
   try {
     switch (cmd) {
       case 'candidates':
-        res = await call(sock, 'GET', `/team/candidates${q(who)}`)
-        if (res.status === 200 && !json) return show(out, formatCandidates(res.json.candidates))
+        // ★ The numbered table is asked for only when it is shown (a JSON lookup leaves the shown table as it is)
+        res = await call(sock, 'GET', `/team/candidates${q(json ? who : { ...who, table: '1' })}`)
+        if (res.status === 200 && !json) return show(out, formatCandidates(res.json.candidates, res.json.pick))
         break
       case 'create': {
         if (pos.length === 0) {
           err(t('✗ メンバーの ref を1つ以上（nyan team candidates の左の値）', '✗ Give one or more member refs (the left column of nyan team candidates)'))
           return 2
         }
-        const approvals = typeof opts.approvals === 'string' ? opts.approvals : undefined
+        let approvals = typeof opts.approvals === 'string' ? opts.approvals : undefined
+        // ★ By the table's numbers (the user's answer "1 3 A" as is): the agent turns them into refs from that table
+        if (opts.pick !== undefined) {
+          // ⚠️ One table only (codex review: a second --pick retargeted the numbers)
+          if (opts.pick.length !== 1) {
+            err(t('✗ --pick は1つだけ', '✗ Give --pick once'))
+            return 2
+          }
+          opts.pick = opts.pick[0]
+          const p = parsePick(pos)
+          if (typeof opts.pick !== 'string' || !p.ok) {
+            err(t(`✗ 表の番号として読めません: ${p.word ?? ''}（例: --pick ${typeof opts.pick === 'string' ? opts.pick : '<表>'} 1 3 A）`, `✗ Not table numbers: ${p.word ?? ''} (e.g. --pick ${typeof opts.pick === 'string' ? opts.pick : '<table>'} 1 3 A)`))
+            return 2
+          }
+          // ⚠️ The approvals come from the user's own answer only (its A/B), never a flag the lead adds (codex review)
+          // ⚠️ Nothing but the answer may shape the team: any other option is refused (codex review: `--` ate a number)
+          const other = Object.keys(opts).filter((k) => k !== 'pick' && k !== 'json' && k !== 'approvals')
+          if (other.length > 0) {
+            err(t(`✗ --pick では使えない指定です: --${other.join(' --')}`, `✗ Not with --pick: --${other.join(' --')}`))
+            return 2
+          }
+          if (opts.approvals !== undefined) {
+            err(t('✗ --pick では --approvals を使いません（利用者の答えの最後の A / B だけ）', '✗ No --approvals with --pick (only the A / B at the end of the user’s answer)'))
+            return 2
+          }
+          approvals = p.approvals
+          res = await call(sock, 'POST', '/team/create', { ...who, pick: { id: opts.pick, numbers: p.numbers }, ...(approvals ? { approvals } : {}) })
+          if (res.status === 200 && !json) return show(out, formatStatus(res.json))
+          break
+        }
         res = await call(sock, 'POST', '/team/create', { ...who, members: pos, ...(approvals ? { approvals } : {}) })
         if (res.status === 200 && !json) return show(out, formatStatus(res.json))
         break
@@ -514,7 +657,7 @@ export async function main(argv, { env = process.env, out = console.log, err = c
       err(t('✗ agent のチームの口に繋がりません（agent が止まっているか、古い版です。nyan update / nyan status）', '✗ Cannot reach the agent’s team socket (the agent is stopped or too old: nyan update / nyan status)'))
     } else if (code === 'EPERM' || code === 'EACCES') {
       err(t('✗ ソケットに繋ぐ権限がありません', '✗ Not permitted to open the socket'))
-      if (caller?.tool === 'codex') err(SANDBOX_HINT())
+      if (caller?.tool === 'codex') err(SANDBOX_HINT(cmd))
     } else {
       err(`✗ ${e?.message ?? e}`)
     }
@@ -535,5 +678,8 @@ function show(out, text) {
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   initCliLang()
-  main(process.argv.slice(2)).then((code) => process.exit(code))
+  // ⚠️ Not process.exit: a long table written to a pipe is still being flushed (codex review: cut after 31 rows)
+  main(process.argv.slice(2)).then((code) => {
+    process.exitCode = code
+  })
 }

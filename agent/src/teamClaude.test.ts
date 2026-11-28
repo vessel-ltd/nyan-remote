@@ -309,3 +309,31 @@ test('★ a Claude profile without the turn-end hook (or without a runnable noti
   writeFileSync(join(dir, 'settings.json'), JSON.stringify({ hooks: { Notification: [{ matcher: '', hooks: [{ type: 'command', command: '"$HOME/.claude/hooks/notify.sh"' }] }] } }))
   assert.equal(hasTurnEndHook(dir, home), false)
 })
+
+test('★★ a pick from the numbered table: the agent turns the numbers into the very sessions of that table (2026-11-28)', async () => {
+  const { rememberTable, rowsFromPick } = await import('./routes/team.ts')
+  const t0 = Date.parse('2026-11-28T00:00:00Z')
+  const row = (ref: string, sessionId = `${ref}-full`) => ({ ref, sessionId })
+  const shown = rememberTable('lead-p', [row('cx-bbbb2222'), row('aaaa1111'), row('ag-cccc3333')], t0)!
+  assert.deepEqual(shown.refs, ['cx-bbbb2222', 'aaaa1111', 'ag-cccc3333'])
+  assert.deepEqual(rowsFromPick('lead-p', { id: shown.id, numbers: [3, 1] }, t0), [row('ag-cccc3333'), row('cx-bbbb2222')])
+  // ⚠️ two sessions sharing a short ref stay two rows, each its own session (codex review)
+  const twins = rememberTable('lead-t', [row('aaaa1111', 'aaaa1111-one'), row('aaaa1111', 'aaaa1111-two')], t0)!
+  assert.deepEqual(rowsFromPick('lead-t', { id: twins.id, numbers: [2] }, t0), [row('aaaa1111', 'aaaa1111-two')])
+  // ⚠️ another lead's table, an older table, a stale one: never used
+  const is409 = (e: { status?: number }) => e.status === 409
+  assert.throws(() => rowsFromPick('lead-q', { id: shown.id, numbers: [1] }, t0), is409)
+  const again = rememberTable('lead-p', [row('aaaa1111')], t0)!
+  assert.throws(() => rowsFromPick('lead-p', { id: shown.id, numbers: [1] }, t0), is409)
+  assert.throws(() => rowsFromPick('lead-p', { id: again.id, numbers: [1] }, t0 + 31 * 60_000), is409)
+  // out of range, twice, none, not numbers
+  assert.throws(() => rowsFromPick('lead-p', { id: again.id, numbers: [2] }, t0), is409)
+  const now = rememberTable('lead-p', [row('aaaa1111'), row('cx-bbbb2222')], t0)!
+  assert.throws(() => rowsFromPick('lead-p', { id: now.id, numbers: [1, 1] }, t0), is409)
+  assert.throws(() => rowsFromPick('lead-p', { id: now.id, numbers: [] }, t0), is409)
+  assert.throws(() => rowsFromPick('lead-p', { id: now.id, numbers: ['1'] }, t0), (e: { status?: number }) => e.status === 400)
+  assert.deepEqual(rowsFromPick('lead-p', { id: now.id, numbers: [2] }, t0), [row('cx-bbbb2222')])
+  // nothing to pick: the table is forgotten
+  assert.equal(rememberTable('lead-p', [], t0), undefined)
+  assert.throws(() => rowsFromPick('lead-p', { id: now.id, numbers: [1] }, t0), is409)
+})

@@ -647,8 +647,8 @@ export function main(
         continue
       }
       entries.set(home, entry)
-      // ★ Codex's question tool (optional: without it Codex asks in a message / user decision 2026-11-28)
-      if (codexFeature(home, false) === 'changed') codexChanged = true
+      // ★ The config line an earlier version added is taken back (2026-11-28: no longer used)
+      if (removeCodexFeature(home) === 'changed') codexChanged = true
     }
     places.push({ dir: join(home, 'skills', SKILL_NAME), name: `${home.split('/').pop()}/skills/${SKILL_NAME}`, src: removing ? src : codexSkill(src, entries.get(home)) })
   }
@@ -711,7 +711,7 @@ export function main(
     for (const home of codexHomes) {
       if (!codexRule(home, true)) failed = true
       else if (!removeCodexLauncher(home)) failed = true
-      if (codexFeature(home, true) === 'failed') failed = true
+      if (removeCodexFeature(home) === 'failed') failed = true
     }
     if (codexHomes.length > 0) console.log(t('  開いている Codex は、開き直すと許可が外れます', '  Restart any open Codex to drop the rule'))
   } else {
@@ -720,7 +720,7 @@ export function main(
         console.error(t(`✗ 前に置いた Codex の許可を外せませんでした（${home}）。nyan uninstall か手で外してください`, `✗ Could not take out the Codex rule placed earlier (${home}). Remove it with nyan uninstall or by hand`))
         revokeFailed = true
       } else removeCodexLauncher(home) // (with the rule gone, a copy left behind lets nothing out)
-      codexFeature(home, true)
+      removeCodexFeature(home)
     }
     // ⚠️ An open Codex keeps the rules it read at its start (codex-rs 0.172.0 / r8 #1): only a restart drops the old one
     if (revoke.length > 0) {
@@ -741,22 +741,17 @@ export function main(
 }
 
 /**
- * ★★ Codex's question tool in its default mode (user decision 2026-11-28 / docs/TEAM.md §10.6): one marked line under
- *   `[features]` in `<codex home>/config.toml`, so /nyan-team asks with choices as Claude does. Without it Codex asks in
- *   a numbered message (it still works). ⚠️ The user's own file: only our marked line (and a `[features]` header we
- *   added, marked too) is ever written or removed; their own setting of the key is left alone.
+ * ★ Taking back the line 830142b put into `<codex home>/config.toml` (2026-11-28 / user decision: members are picked
+ *   from a numbered table, so Codex's question tool — an under-development feature — is not needed): `nyan update`
+ *   and uninstall remove our marked line under `[features]` (and the `[features]` header we added, marked too, once
+ *   nothing else is in it). ⚠️ The user's own file: nothing else is ever written; their own setting of the key stays.
  */
 export const FEATURE_KEY = 'default_mode_request_user_input'
 export const FEATURE_MARK = '# nyan-remote:managed'
-const FEATURE_LINE = `${FEATURE_KEY} = true  ${FEATURE_MARK} (lets /nyan-team ask with choices; nyan uninstall removes this line)`
 const FEATURE_HEADER = `[features]  ${FEATURE_MARK}`
-/** `features` as TOML may spell it: bare, "features" or 'features' (codex review: a quoted header was missed) */
-const FEATURES_NAME = `(?:features|"features"|'features')`
-const FEATURES_HEADER = new RegExp(`^\\s*\\[\\s*${FEATURES_NAME}\\s*\\]\\s*(#.*)?$`)
 const ANY_HEADER = /^\s*\[/
 /** Ours, however its spaces were reformatted (codex review: a reformatted line was missed on uninstall) */
 const OUR_FEATURE = new RegExp(`^\\s*${FEATURE_KEY}\\s*=\\s*true\\s*${FEATURE_MARK}`)
-const ANY_FEATURE = new RegExp(`^\\s*(?:${FEATURE_KEY}|"${FEATURE_KEY}"|'${FEATURE_KEY}')\\s*=`)
 
 /**
  * Per line: whether it starts inside a multi-line string (`"""` or `'''`): such a line is text, never a header or a
@@ -794,40 +789,6 @@ function inStrings(lines) {
   return out
 }
 
-/**
- * The text with our line in it (pure).
- * @returns state 'same' (ours already there), 'theirs' (the user sets the key: left alone), 'unsupported' (a
- *   `features` key written another way — dotted, inline, or a second header — left alone), or 'added'
- */
-export function withFeature(text) {
-  const lines = text.split('\n')
-  const text_ = inStrings(lines)
-  if (lines.some((l, i) => !text_[i] && OUR_FEATURE.test(l))) return { state: 'same', text }
-  let inFeatures = false
-  let header = -1
-  for (const [i, l] of lines.entries()) {
-    if (text_[i]) continue
-    // ⚠️ An escape in a header or a key (`"featur\u0065s"`) could name the same table or key: left alone (codex review)
-    if (/^\s*\[[^\]#]*\\/.test(l) || /^\s*"[^"=]*\\[^"=]*"\s*[.=]/.test(l)) return { state: 'unsupported', text }
-    if (ANY_HEADER.test(l)) {
-      inFeatures = FEATURES_HEADER.test(l)
-      if (inFeatures) {
-        if (header >= 0) return { state: 'unsupported', text }
-        header = i
-      }
-      continue
-    }
-    if (!inFeatures && new RegExp(`^\\s*${FEATURES_NAME}\\s*[.=]`).test(l)) return { state: 'unsupported', text }
-    if (inFeatures && ANY_FEATURE.test(l)) return { state: 'theirs', text }
-  }
-  if (header >= 0) {
-    lines.splice(header + 1, 0, FEATURE_LINE)
-    return { state: 'added', text: lines.join('\n') }
-  }
-  const body = text === '' || text.endsWith('\n') ? text : `${text}\n`
-  return { state: 'added', text: `${body}${body.trim() === '' ? '' : '\n'}${FEATURE_HEADER}\n${FEATURE_LINE}\n` }
-}
-
 /** The text without our line (and without our `[features]` header once nothing else is in its table) (pure) */
 export function withoutFeature(text) {
   const lines = text.split('\n')
@@ -850,74 +811,56 @@ export function withoutFeature(text) {
 }
 
 /**
- * Put our line into (or take it out of) `<codex home>/config.toml`. Never fatal: a home or file we must not write is
- * said, with the lines to add by hand.
+ * Take our line out of `<codex home>/config.toml`. A home or file we must not write (a link, a hard link, others can
+ * change it) is left alone.
  * @returns 'changed' | 'same' | 'skipped' | 'failed'
  */
-export function codexFeature(codexHome, removing) {
+export function removeCodexFeature(codexHome) {
   const file = join(codexHome, 'config.toml')
   const name = `${codexHome.split('/').pop()}/config.toml`
-  const byHand = () =>
-    console.log(
-      t(
-        `  /nyan-team で Codex に選択肢で聞かせるには、${file} の features に ${FEATURE_KEY} = true を足してください（features を書いている形に合わせて）`,
-        `  For /nyan-team to ask with choices in Codex, set ${FEATURE_KEY} = true in the features of ${file} (in the way features is already written there)`,
-      ),
-    )
   // ⚠️ The Codex home itself: a real folder of ours that others cannot change (a linked one leads into dotfiles)
   try {
     const st = lstatSync(codexHome)
     const uid = process.getuid?.()
-    if (st.isSymbolicLink() || !st.isDirectory() || (uid !== undefined && st.uid !== uid) || (st.mode & 0o022) !== 0 || aclBad(codexHome)) {
-      if (!removing) byHand()
-      return 'skipped'
-    }
+    if (st.isSymbolicLink() || !st.isDirectory() || (uid !== undefined && st.uid !== uid) || (st.mode & 0o022) !== 0 || aclBad(codexHome)) return 'skipped'
   } catch {
-    return removing ? 'same' : 'skipped'
+    return 'same'
   }
   let st
   try {
     st = lstatSync(file)
   } catch (err) {
-    if (err?.code !== 'ENOENT') {
-      console.error(t(`✗ ${name} が読めません`, `✗ Cannot read ${name}`))
-      return 'failed'
-    }
+    if (err?.code === 'ENOENT') return 'same'
+    console.error(t(`✗ ${name} が読めません`, `✗ Cannot read ${name}`))
+    return 'failed'
   }
-  // ⚠️ A hard link too (dotfiles): the rename would cut it off from its other name (codex review)
-  if (st && (!st.isFile() || st.nlink > 1 || fileUnsafe(file))) {
-    console.log(t(`${name} はリンク（か他人も書けるファイル）なので触りません`, `${name} is a symlink (or others can change it), leaving it as is`))
-    if (!removing) byHand()
+  // ⚠️ What it leads to must be a plain file before it is read (a FIFO would hang update and uninstall / codex review)
+  try {
+    if (!statSync(file).isFile()) return 'skipped'
+  } catch {
     return 'skipped'
   }
-  if (!st && removing) return 'same'
-  let text = ''
+  let text
   try {
-    if (st) text = readFileSync(file, 'utf8')
+    text = readFileSync(file, 'utf8')
   } catch {
     console.error(t(`✗ ${name} が読めません`, `✗ Cannot read ${name}`))
     return 'failed'
   }
-  if (removing) {
-    const r = withoutFeature(text)
-    if (!r.removed) return 'same'
-    if (!writeConfig(file, r.text, st, text)) return 'failed'
-    console.log(t(`Codex の設定から nyan の1行を外しました: ${name}`, `Removed nyan's line from the Codex config: ${name}`))
-    return 'changed'
-  }
-  const r = withFeature(text)
-  if (r.state === 'same') return 'same'
-  if (r.state === 'theirs') return 'same'
-  if (r.state === 'unsupported') {
-    console.log(t(`⚠️ ${name} の features の書き方が読めないので触りません`, `⚠️ ${name} sets features in a way this does not read, so it was left alone`))
-    byHand()
+  const r = withoutFeature(text)
+  if (!r.removed) return 'same'
+  // ⚠️ A link, a hard link (the rename would cut it off from its other name), or others can change it: said, untouched
+  if (!st.isFile() || st.nlink > 1 || fileUnsafe(file)) {
+    console.log(
+      t(
+        `${name} はリンク（か他人も書けるファイル）なので触りません。nyan が足した「${FEATURE_KEY} = true  ${FEATURE_MARK}」の行は、手で消してください`,
+        `${name} is a link (or others can change it), so it was left alone. Delete the line nyan added ("${FEATURE_KEY} = true  ${FEATURE_MARK}") by hand`,
+      ),
+    )
     return 'skipped'
   }
-  if (!writeConfig(file, r.text, st, st ? text : undefined)) {
-    byHand()
-    return 'failed'
-  }
-  console.log(t(`Codex の設定に1行足しました（/nyan-team が選択肢で聞けるように）: ${name}`, `Added one line to the Codex config (so /nyan-team can ask with choices): ${name}`))
+  if (!writeConfig(file, r.text, st, text)) return 'failed'
+  console.log(t(`Codex の設定から nyan が足した1行を外しました（もう使いません）: ${name}`, `Removed the line nyan had added to the Codex config (no longer used): ${name}`))
   return 'changed'
 }
 

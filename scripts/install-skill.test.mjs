@@ -150,10 +150,9 @@ test('★★ Codex: a read-only copy of the team command, its launcher, the skil
     assert.match(rule, new RegExp(`^prefix_rule\\(pattern=\\["${entry}", "team"\\], decision="allow"\\)$`, 'm'))
     assert.match(rule, new RegExp(`^prefix_rule\\(pattern=\\["${entry}", "team", "create"\\], decision="prompt"\\)$`, 'm'))
     assert.equal(rule.match(/^prefix_rule/gm)?.length, 2)
-    // ★ Codex's question tool: one marked line in its config (a new file: private)
+    // ★ nothing is written into Codex's own config (2026-11-28: the question tool is not used)
     const cfg = join(home, '.codex', 'config.toml')
-    assert.match(readFileSync(cfg, 'utf8'), /^\[features\]  # nyan-remote:managed\ndefault_mode_request_user_input = true  # nyan-remote:managed/m)
-    assert.equal(statSync(cfg).mode & 0o777, 0o600)
+    assert.equal(existsSync(cfg), false)
     assert.doesNotMatch(rule, /pattern=\["nyan"/)
     // up to date: nothing rewritten; a copy changed by hand is put back
     assert.equal(quiet(() => main([], home, ROOT, {}, { node, tmpRoots: [] })), 0)
@@ -204,8 +203,7 @@ test('★★ Codex: a read-only copy of the team command, its launcher, the skil
     assert.equal(existsSync(join(home, '.codex', '.codex', 'nyan-remote')), false)
     assert.equal(existsSync(join(home, '.codex', 'skills', 'nyan-team', 'SKILL.md')), false)
     assert.equal(existsSync(join(home, '.codex', 'rules', 'default.rules')), true)
-    // ★ and our config line with it (the header we added too: nothing else was in it)
-    assert.equal(readFileSync(cfg, 'utf8'), '')
+    assert.equal(existsSync(cfg), false)
     // ⚠️ a `nyan-remote` folder that is not ours: left alone, and no rule points into it
     mkdirSync(join(home, '.codex', '.codex', 'nyan-remote'), { recursive: true })
     writeFileSync(join(home, '.codex', '.codex', 'nyan-remote', 'nyan'), '#!/bin/sh\necho mine\n')
@@ -389,113 +387,77 @@ test('★ a rules folder Codex keeps read-only to us: no rule ⇒ no skill and n
   }
 })
 
-test('★★ Codex config: one marked line under [features], only ours ever written or removed (2026-11-28)', async () => {
-  const { withFeature, withoutFeature, codexFeature, FEATURE_KEY } = await import('./install-skill.mjs')
-  const ours = /^default_mode_request_user_input = true  # nyan-remote:managed/m
-  // a file with no [features]: a marked header and our line at the end; removal gives the file back as it was
+test('★★ Codex config: the line an earlier version added is taken back; nothing else is ever touched (2026-11-28)', async () => {
+  const { withoutFeature, removeCodexFeature } = await import('./install-skill.mjs')
+  const OURS = 'default_mode_request_user_input = true  # nyan-remote:managed (lets /nyan-team ask with choices; nyan uninstall removes this line)'
+  const Q3 = '"'.repeat(3)
+  // the header we added (marked) goes with it once empty; the file is back as it was before
   const plain = 'model = "x"\n\n[tui]\nnotifications = true\n'
-  const a = withFeature(plain)
-  assert.equal(a.state, 'added')
-  assert.match(a.text, ours)
-  assert.ok(a.text.startsWith(plain))
-  assert.equal(withoutFeature(a.text).text, plain)
-  // an existing [features] keeps its keys; ours goes right under the header; removal keeps the header (theirs)
+  assert.equal(withoutFeature(`${plain}\n[features]  # nyan-remote:managed\n${OURS}\n`).text, plain)
+  // under the user's own [features]: only our line goes
   const feat = 'model = "x"\n[features]\nweb_search = true\n[tui]\nx = 1\n'
-  const b = withFeature(feat)
-  assert.equal(b.state, 'added')
-  assert.equal(b.text, `model = "x"\n[features]\n${b.text.split('\n')[2]}\nweb_search = true\n[tui]\nx = 1\n`)
-  assert.match(b.text.split('\n')[2], ours)
-  assert.equal(withoutFeature(b.text).text, feat)
-  // already there: nothing
-  assert.equal(withFeature(b.text).state, 'same')
-  // the user's own setting of the key (true or false): left alone, never removed
-  for (const own of ['[features]\ndefault_mode_request_user_input = false\n', '[features]\n  default_mode_request_user_input=true\n']) {
-    assert.equal(withFeature(own).state, 'theirs')
-    assert.equal(withoutFeature(own).removed, false)
-  }
-  // features written another way: left alone
-  for (const other of ['features.web_search = true\n', 'features = { web_search = true }\n', '[features]\na = 1\n[features]\nb = 2\n']) assert.equal(withFeature(other).state, 'unsupported', other)
-  // ⚠️ quoted spellings are the same table / key (codex review: a duplicate table or key made the file unreadable)
-  const quoted = withFeature('["features"]\nweb_search = true\n')
-  assert.equal(quoted.state, 'added')
-  assert.equal(quoted.text.match(/features/g)?.length, 1)
-  assert.equal(withFeature("['features']\n\"default_mode_request_user_input\" = false\n").state, 'theirs')
-  assert.equal(withFeature("[features]\n'default_mode_request_user_input' = false\n").state, 'theirs')
-  assert.equal(withFeature('"features".web_search = true\n').state, 'unsupported')
-  // escapes in a quoted header or key may spell the same name: left alone (codex review)
-  assert.equal(withFeature('["featur\\u0065s"]\nb = 1\n').state, 'unsupported')
-  assert.equal(withFeature('[features]\n"default_mode_request_user_inpu\\u0074" = false\n').state, 'unsupported')
-  // but ordinary quoted headers (Codex's own projects) are fine
-  assert.equal(withFeature('[projects."/home/user"]\ntrust_level = "trusted"\n').state, 'added')
-  // ⚠️ lines inside a multi-line string are text: never a header, a key, or our line to remove (codex review)
-  const multi = 'developer_instructions = """\n[features]\ndefault_mode_request_user_input = true  # nyan-remote:managed\n"""\nmodel = "x"\n'
-  const m = withFeature(multi)
-  assert.equal(m.state, 'added')
-  assert.ok(m.text.startsWith(multi))
-  assert.equal(withoutFeature(multi).removed, false)
-  assert.equal(withoutFeature(m.text).text, multi)
-  // an escaped delimiter inside a basic multi-line string does not end it (codex review); a literal one has no escapes
-  const esc = 'developer_instructions = """\nsay \\""" here\n[features]\n"""\n[features]\nb = 1\n'
-  const e = withFeature(esc)
-  assert.equal(e.state, 'added')
-  assert.match(e.text.split('\n')[5], ours)
-  const lit = "notes = '''\n[features]\n'''\n"
-  assert.ok(withFeature(lit).text.startsWith(lit))
-  // a `#` or quotes inside a one-line string do not open anything
-  const one = 'a = "x # \\" y"\n[features]\nb = 1\n'
-  assert.match(withFeature(one).text.split('\n')[2], ours)
-  // our line reformatted (spaces) is still ours on removal (codex review)
+  assert.equal(withoutFeature(`model = "x"\n[features]\n${OURS}\nweb_search = true\n[tui]\nx = 1\n`).text, feat)
+  // reformatted spaces are still ours
   assert.equal(withoutFeature('[features]\ndefault_mode_request_user_input=true # nyan-remote:managed\nb = 1\n').text, '[features]\nb = 1\n')
-  // [features.sub] is not [features]
-  assert.equal(withFeature('[features.sub]\nx = 1\n').state, 'added')
-  // empty file
-  assert.match(withFeature('').text, /^\[features\]  # nyan-remote:managed\n/)
-  // ⚠️ the file on disk: its mode kept, a linked one left alone
-  const { realpathSync, statSync, chmodSync, lstatSync } = await import('node:fs')
+  // the user's own setting (no mark) stays
+  for (const own of ['[features]\ndefault_mode_request_user_input = true\n', '[features]\ndefault_mode_request_user_input = false\n']) assert.equal(withoutFeature(own).removed, false)
+  // ⚠️ a line inside a multi-line string is text, never removed (codex review); an escaped delimiter does not end it
+  assert.equal(withoutFeature(`developer_instructions = ${Q3}\n[features]  # nyan-remote:managed\n${OURS}\n${Q3}\nmodel = "x"\n`).removed, false)
+  assert.equal(withoutFeature(`developer_instructions = ${Q3}\nsay \\${Q3} here\n${OURS}\n${Q3}\n`).removed, false)
+  assert.equal(withoutFeature(`notes = '''\n${OURS}\n'''\n`).removed, false)
+  // ⚠️ the file on disk: its mode kept (under a narrow umask too), links and hard links left alone
+  const { realpathSync, statSync, chmodSync, linkSync } = await import('node:fs')
   const home = realpathSync(mkdtempSync(join(tmpdir(), 'nr-skill-cfg-')))
   try {
     const cx = join(home, '.codex')
     mkdirSync(cx, { mode: 0o700 })
     const cfg = join(cx, 'config.toml')
-    writeFileSync(cfg, feat, { mode: 0o640 })
+    const withOurs = `model = "x"\n[features]\n${OURS}\nweb_search = true\n[tui]\nx = 1\n`
+    writeFileSync(cfg, withOurs, { mode: 0o640 })
     chmodSync(cfg, 0o640)
-    // ⚠️ under a narrow umask too (codex review: 0640 became 0600)
     const mask = process.umask(0o077)
     try {
-      assert.equal(quiet(() => codexFeature(cx, false)), 'changed')
+      assert.equal(quiet(() => removeCodexFeature(cx)), 'changed')
     } finally {
       process.umask(mask)
     }
-    assert.equal(statSync(cfg).mode & 0o777, 0o640)
-    assert.equal(quiet(() => codexFeature(cx, false)), 'same')
-    assert.equal(quiet(() => codexFeature(cx, true)), 'changed')
     assert.equal(readFileSync(cfg, 'utf8'), feat)
-    assert.equal(quiet(() => codexFeature(cx, true)), 'same')
-    // a config.toml that is a link (dotfiles): untouched either way
-    const dot = join(home, 'dot.toml')
-    writeFileSync(dot, plain)
+    assert.equal(statSync(cfg).mode & 0o777, 0o640)
+    assert.equal(quiet(() => removeCodexFeature(cx)), 'same')
+    // no config at all
     rmSync(cfg)
+    assert.equal(quiet(() => removeCodexFeature(cx)), 'same')
+    // a symlinked config.toml (dotfiles): untouched
+    const dot = join(home, 'dot.toml')
+    writeFileSync(dot, withOurs)
     symlinkSync(dot, cfg)
-    assert.equal(quiet(() => codexFeature(cx, false)), 'skipped')
-    assert.equal(readFileSync(dot, 'utf8'), plain)
-    assert.ok(lstatSync(cfg).isSymbolicLink())
-    // a hard-linked config.toml: untouched (a rename would cut the link / codex review)
-    const { linkSync } = await import('node:fs')
+    assert.equal(quiet(() => removeCodexFeature(cx)), 'skipped')
+    assert.equal(readFileSync(dot, 'utf8'), withOurs)
+    // a hard-linked one: untouched (a rename would cut the link / codex review)
     rmSync(cfg)
     const hard = join(home, 'hard.toml')
-    writeFileSync(hard, plain)
+    writeFileSync(hard, withOurs)
     linkSync(hard, cfg)
-    assert.equal(quiet(() => codexFeature(cx, false)), 'skipped')
-    assert.equal(readFileSync(hard, 'utf8'), plain)
+    assert.equal(quiet(() => removeCodexFeature(cx)), 'skipped')
+    assert.equal(readFileSync(hard, 'utf8'), withOurs)
+    // ⚠️ a FIFO (or a link to one) is never opened: update and uninstall must not hang (codex review)
+    rmSync(cfg)
+    const { execFileSync } = await import('node:child_process')
+    execFileSync('mkfifo', [cfg])
+    assert.equal(quiet(() => removeCodexFeature(cx)), 'skipped')
+    rmSync(cfg)
+    const fifo = join(home, 'fifo')
+    execFileSync('mkfifo', [fifo])
+    symlinkSync(fifo, cfg)
+    assert.equal(quiet(() => removeCodexFeature(cx)), 'skipped')
     // a linked Codex home: untouched
     const away = join(home, 'away')
     mkdirSync(away, { mode: 0o700 })
-    writeFileSync(join(away, 'config.toml'), plain)
+    writeFileSync(join(away, 'config.toml'), withOurs)
     const linked = join(home, '.codex2')
     symlinkSync(away, linked)
-    assert.equal(quiet(() => codexFeature(linked, false)), 'skipped')
-    assert.equal(readFileSync(join(away, 'config.toml'), 'utf8'), plain)
-    assert.ok(FEATURE_KEY)
+    assert.equal(quiet(() => removeCodexFeature(linked)), 'skipped')
+    assert.equal(readFileSync(join(away, 'config.toml'), 'utf8'), withOurs)
   } finally {
     rmSync(home, { recursive: true, force: true })
   }

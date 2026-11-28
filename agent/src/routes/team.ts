@@ -6,7 +6,7 @@
 // ★ A Codex lead (2026-11-27 / docs/TEAM.md §10) sends `codexThread` (its `CODEX_THREAD_ID`) and `codexHome` instead:
 //   the agent makes the row id from them and the thread must be one its daemon lists.
 
-import { createHash } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import { t } from '../../../shared/i18n.ts'
 import { looksLikeCommand, MAX_SEND_BYTES, type LogEntry, type PermissionRequest, type SessionSummary, type ToolUsage } from '../../../shared/types.ts'
 import { config } from '../config.ts'
@@ -48,7 +48,7 @@ import type { TeamTool } from '../team.ts'
 import { accessSync, constants, readFileSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { readdir, stat } from 'node:fs/promises'
-import { dirname, isAbsolute, join, resolve } from 'node:path'
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
 import { sessions } from './sessions.ts'
 import { readLogSlice } from '../claude/log.ts'
 import { usage } from './usage.ts'
@@ -250,27 +250,44 @@ async function liveRows(): Promise<SessionSummary[]> {
   return page.sessions.filter((s) => s.live)
 }
 
-export async function teamCandidates(ctx: Ctx): Promise<{ candidates: Candidate[] }> {
+export async function teamCandidates(ctx: Ctx): Promise<{ candidates: Candidate[]; pick?: { id: string; refs: string[] } }> {
   const { sessionId: self } = leaderOf(fromQuery(ctx))
   const [rows, u] = await Promise.all([liveRows(), teamUsage()])
   const dirs = await discoverConfigDirs(config().configDirs)
-  const out: Candidate[] = []
+  /** (each row's full session id, kept beside it: the numbered table remembers it / never sent) */
+  const out: (Candidate & { sessionId: string; proc?: { pid: number; procStart: string } })[] = []
+  // ⚠️ A session id shown by more than one live row (two profiles holding the same conversation) is no candidate: which
+  //    process a pick would reach cannot be told (codex review; `findTarget` refuses it the same way by ref)
+  const seenIds = new Map<string, number>()
+  for (const row of rows) seenIds.set(row.sessionId, (seenIds.get(row.sessionId) ?? 0) + 1)
   for (const row of rows) {
     if (row.sessionId === self) continue
+    if ((seenIds.get(row.sessionId) ?? 0) > 1) continue
     const tool = toolOf(row)
     // ★ agy (docs/TEAM.md §9): only a conversation nyan can type into (started through the relay, shown by one agy)
     if (tool === 'agy' && (row.sendRoute !== 'keys' || row.agyShared)) continue
     let reachable = false
+    let proc: { pid: number; procStart: string } | undefined
     if (tool === 'claude') {
       const target = await findTarget(dirs, row.sessionId)
       if ('reason' in target) continue // not reachable now (no inbox, unverifiable, ambiguous): not a candidate
+      // ⚠️ The process found must be this row's own profile (codex review: two profiles sharing a session id gave both
+      //    rows one process)
+      if (basename(dirname(target.sessionsDir)) !== row.account) continue
       reachable = true
+      // ⚠️ No row without its process identity (codex review: one that exited right here would have been numbered with
+      //    none, and a resume under the same id picked later)
+      const start = aliveProcStartFreshSync(target.pid)
+      if (typeof start !== 'string') continue
+      proc = { pid: target.pid, procStart: start }
     }
     const limits = limitsOf(u, tool, row.account)
     const week = limits?.windows.find((w) => w.minutes === WEEK_MINUTES)
     const led = allTeams().find((x) => x.leader.sessionId === row.sessionId)
     const inTeam = led ? { id: led.id, role: 'lead' as const } : membershipOf(row.sessionId) ? { id: membershipOf(row.sessionId)!.team.id, role: 'member' as const } : undefined
     out.push({
+      sessionId: row.sessionId,
+      ...(proc ? { proc } : {}),
       ref: refOf(row),
       tool,
       account: row.account,
@@ -286,7 +303,78 @@ export async function teamCandidates(ctx: Ctx): Promise<{ candidates: Candidate[
       ...(inTeam ? { team: inTeam } : {}),
     })
   }
-  return { candidates: out }
+  // ★ One fixed order (the table numbers rows in it): the ones that can be picked first — by tool, by state, by title
+  const order = (c: Candidate): [number, number, number] => [c.team ? 1 : 0, TOOL_ORDER[c.tool] ?? 9, STATE_ORDER[c.status] ?? 9]
+  out.sort((a, b) => {
+    const x = order(a)
+    const y = order(b)
+    return x[0] - y[0] || x[1] - y[1] || x[2] - y[2] || a.title.localeCompare(b.title) || a.ref.localeCompare(b.ref)
+  })
+  // ⚠️ Each numbered row is remembered as its full session id, not its ref (codex review: two sessions can share a short
+  //    ref — if the one shown ended, the other would have been picked)
+  // ★ Only a table that is shown is remembered (`?table=1`): a JSON lookup between showing it and the answer keeps it
+  if (ctx.url.searchParams.get('table') !== '1') return { candidates: out.map(({ sessionId: _, proc: __, ...c }) => c) }
+  const pick = rememberTable(
+    self,
+    out.filter((c) => !c.team).map((c) => ({ ref: c.ref, sessionId: c.sessionId, ...(c.proc ? { proc: c.proc } : {}) })),
+  )
+  const candidates: Candidate[] = out.map(({ sessionId: _, proc: __, ...c }) => c)
+  return pick ? { candidates, pick } : { candidates }
+}
+
+/** One numbered row of a table: the ref shown and the session it is */
+export interface TableRow {
+  ref: string
+  sessionId: string
+  /** A Claude session's process and its start time when shown (a resume under the same id is another member / codex review) */
+  proc?: { pid: number; procStart: string }
+}
+
+/**
+ * ★ Remember the numbered table this lead is shown now (its pickable rows in order); none to pick ⇒ forgotten.
+ * @returns what the CLI numbers the table by (the refs in order)
+ */
+export function rememberTable(leadId: string, rows: TableRow[], now = Date.now()): { id: string; refs: string[] } | undefined {
+  if (rows.length === 0) {
+    shownTables.delete(leadId)
+    return undefined
+  }
+  const id = randomBytes(3).toString('hex')
+  shownTables.set(leadId, { id, rows, at: now })
+  return { id, refs: rows.map((r) => r.ref) }
+}
+
+const TOOL_ORDER: Record<string, number> = { claude: 0, codex: 1, agy: 2 }
+const STATE_ORDER: Record<string, number> = { idle: 0, done: 1, working: 2, waiting: 3 }
+
+/**
+ * ★★ The numbered table each lead was shown last (2026-11-28 / user decision: the user answers "1 3 A"). The agent,
+ *   not the model, turns the numbers into refs, from **this** table (sessions that came or went since cannot shift a
+ *   number onto someone else). Memory only, one per lead, `PICK_TTL_MS`.
+ */
+const shownTables = new Map<string, { id: string; rows: TableRow[]; at: number }>()
+const PICK_TTL_MS = 30 * 60_000
+
+/** The rows a pick names (`{ id, numbers }` from `nyan team create --pick <id> 1 3`), or the 4xx that says why */
+export function rowsFromPick(leadId: string, pick: unknown, now = Date.now()): TableRow[] {
+  const p = pick as { id?: unknown; numbers?: unknown } | null
+  if (!p || typeof p.id !== 'string' || !Array.isArray(p.numbers) || !p.numbers.every((n) => Number.isInteger(n))) {
+    throw new HttpError(400, t('番号の形が違います', 'Not a pick (a table id and numbers).'))
+  }
+  const shown = shownTables.get(leadId)
+  if (!shown || shown.id !== p.id || now - shown.at > PICK_TTL_MS) {
+    throw new HttpError(409, t('その表は古くなりました。nyan team candidates でもう一度表を出して、利用者に選び直してもらってください', 'That table is no longer current. Show it again with nyan team candidates and ask the user to pick again.'))
+  }
+  const numbers = p.numbers as number[]
+  if (numbers.length === 0) throw new HttpError(409, CREATE_TEXT['no-members']())
+  const picked: TableRow[] = []
+  for (const n of numbers) {
+    if (n < 1 || n > shown.rows.length) throw new HttpError(409, t(`表に ${n} 番はありません（1〜${shown.rows.length}）`, `The table has no row ${n} (1–${shown.rows.length}).`))
+    const row = shown.rows[n - 1]!
+    if (picked.includes(row)) throw new HttpError(409, CREATE_TEXT['duplicate-member']())
+    picked.push(row)
+  }
+  return picked
 }
 
 const CREATE_TEXT: Record<CreateFailure, () => string> = {
@@ -304,6 +392,8 @@ const CREATE_TEXT: Record<CreateFailure, () => string> = {
 interface CreateBody extends LeaderBody {
   members?: unknown
   approvals?: unknown
+  /** ★ Rows of the numbered table instead of refs: `{ id, numbers }` (`refsFromPick`) */
+  pick?: unknown
 }
 
 /** ★ The one live session a candidate ref names (never the lead itself), or the 400/404 that says why */
@@ -384,6 +474,11 @@ export async function teamCreate(ctx: Ctx): Promise<unknown> {
   const { sessionId } = lead
   const refs = Array.isArray(body.members) ? body.members.filter((x): x is string => typeof x === 'string' && x.length > 0) : []
   const approvals = body.approvals === undefined || body.approvals === null ? undefined : String(body.approvals)
+  let picked: TableRow[] | undefined
+  if (body.pick !== undefined) {
+    if (refs.length > 0) throw new HttpError(400, t('ref か表の番号の、どちらか一方で選んでください', 'Pick by refs or by table numbers, not both.'))
+    picked = rowsFromPick(sessionId, body.pick)
+  }
 
   // ★ The leader instance: its live index entry must name the process the CLI runs under
   const dirs = await discoverConfigDirs(config().configDirs)
@@ -413,7 +508,18 @@ export async function teamCreate(ctx: Ctx): Promise<unknown> {
   //   user decision 2026-11-28 / docs/TEAM.md §10.5) — as a Claude lead's create goes through Claude's own approval
   const rows = await liveRows()
   const members: MemberIn[] = []
-  for (const ref of refs) members.push(await bindMember(rowForRef(rows, ref, sessionId), ref, dirs))
+  if (picked) {
+    // ★ The very sessions the table showed (by full id): one that ended since is said, never replaced by a namesake
+    for (const [i, p] of picked.entries()) {
+      const row = rows.find((r) => r.sessionId === p.sessionId && r.sessionId !== sessionId)
+      const n = (body.pick as { numbers: number[] }).numbers[i]
+      const gone = () => new HttpError(409, t(`表の ${n} 番（${p.ref}）のセッションは、表を出したあとで閉じたか替わりました。表を出し直してください`, `The session in row ${n} (${p.ref}) ended or was replaced after the table was shown. Show the table again.`))
+      if (!row) throw gone()
+      const m = await bindMember(row, p.ref, dirs)
+      if (p.proc && (m.pid !== p.proc.pid || m.procStart === undefined || !sameProcStart(m.procStart, p.proc.procStart))) throw gone()
+      members.push(m)
+    }
+  } else for (const ref of refs) members.push(await bindMember(rowForRef(rows, ref, sessionId), ref, dirs))
   const leaderRow = rows.find((r) => r.sessionId === sessionId)
   // ⚠️⚠️ No await from here to `createTeam`: the snapshot below is the grant's moment
   // ⚠️ Every Claude or agy member is still the very instance bound above — read synchronously, after the last await
@@ -465,6 +571,11 @@ export async function teamCreate(ctx: Ctx): Promise<unknown> {
   }
   // ⚠️ Right before the team is made: the command that asked is still there (r3 #4)
   if (cliGone) throw goneError()
+  // ⚠️ And a pick's table is still the one shown (a newer `candidates` meanwhile replaced it / codex review)
+  const pickId = picked ? (body.pick as { id: string }).id : undefined
+  if (pickId !== undefined && shownTables.get(sessionId)?.id !== pickId) {
+    throw new HttpError(409, t('その表は古くなりました。nyan team candidates でもう一度表を出して、利用者に選び直してもらってください', 'That table is no longer current. Show it again with nyan team candidates and ask the user to pick again.'))
+  }
   const r = createTeam(
     claudeLead ? { sessionId, account: leaderRow?.account ?? '', ...claudeLead } : { tool: 'codex', sessionId, account: leaderRow?.account ?? '' },
     members,
@@ -476,6 +587,8 @@ export async function teamCreate(ctx: Ctx): Promise<unknown> {
   )
   if (!r.ok) throw new HttpError(409, CREATE_TEXT[r.reason]())
   if (lead.tool === 'codex') unreported = r.team
+  // (a table is picked from once)
+  if (pickId !== undefined && shownTables.get(sessionId)?.id === pickId) shownTables.delete(sessionId)
   console.log(
     `[team] created team=${r.team.id} lead=${shortSessionId(sessionId)} members=${r.team.members.map((m) => `${m.name}:${shortSessionId(m.sessionId)}`).join(',')}` +
       (r.team.approvals ? ` approvals=${r.team.approvals.duration}` : ''),
@@ -520,6 +633,8 @@ async function statusOf(team: Team): Promise<unknown> {
     members.push({
       name: m.name,
       sessionId: m.sessionId,
+      // ★ The ref a re-made team names it by (codex review: `m1` could not be told from the refs under the table)
+      ref: refOf({ sessionId: m.sessionId }),
       tool: m.tool,
       account: m.account,
       title: row ? revealed(row.title) : '',
